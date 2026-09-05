@@ -34,9 +34,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build (locked)
+        shell: bash
         run: cargo build --locked --verbose --target "${TARGET}"
 
       - name: Test (locked)
+        shell: bash
         run: cargo test --locked --verbose --target "${TARGET}"
 
       - name: Verify binary version
