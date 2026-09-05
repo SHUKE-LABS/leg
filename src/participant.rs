@@ -60,6 +60,8 @@ impl<T: Transport> Participant for LocalParticipant<T> {
             model: self.meta.model.clone(),
             base_url: self.meta.base_url.clone(),
             prompt: request.body.clone(),
+            session_id: None,
+            turn_index: None,
         };
 
         let (kind, body, outcome) = match result {
@@ -71,6 +73,8 @@ impl<T: Transport> Participant for LocalParticipant<T> {
                     input_tokens: reply.usage.input_tokens,
                     output_tokens: reply.usage.output_tokens,
                     stop_reason: reply.stop_reason.clone(),
+                    session_id: None,
+                    turn_index: None,
                 };
                 (MessageKind::Response, reply.text, outcome)
             }
@@ -80,6 +84,8 @@ impl<T: Transport> Participant for LocalParticipant<T> {
                     duration_ms,
                     kind: err.kind().to_string(),
                     message: err.to_string(),
+                    session_id: None,
+                    turn_index: None,
                 };
                 (MessageKind::Error, err.to_string(), outcome)
             }
