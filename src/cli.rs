@@ -1,7 +1,7 @@
 //! The command-line entry surface.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::time::Instant;
 
 use crate::config::LegConfig;
@@ -16,7 +16,7 @@ use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
-const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>]";
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
 /// to. An unset or blank value disables recording for `ask`/fresh `session`
@@ -56,6 +56,13 @@ enum Command {
         file: Option<String>,
         /// 1-based `--index`; the last exchange when absent.
         index: Option<usize>,
+    },
+    /// Runs one `baton.message/v1` request/response round-trip.
+    Exchange {
+        /// `--in <path>`; falls back to stdin when absent.
+        in_path: Option<String>,
+        /// `--out <path>`; falls back to stdout when absent.
+        out_path: Option<String>,
     },
 }
 
@@ -146,6 +153,9 @@ pub fn run() -> Result<()> {
             let stdout = std::io::stdout();
             execute_ask_with_config(config, &prompt, stdout.lock())
         }
+        Some(Command::Exchange { in_path, out_path }) => {
+            execute_exchange(in_path.as_deref(), out_path.as_deref())
+        }
     }
 }
 
@@ -158,7 +168,12 @@ fn help_text() -> String {
          LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, and LEG_SYSTEM_PROMPT.\n\n\
          LEG_EVENT_LOG names a JSONL file that `ask` and a fresh `session`\n\
          append an exchange trail to (unset/blank disables recording); `leg\n\
-         log show`/`leg log replay` read it back (or `--file <path>`)."
+         log show`/`leg log replay` read it back (or `--file <path>`).\n\n\
+         `leg exchange` reads a `baton.message/v1` envelope on --in/stdin and\n\
+         writes the response envelope on --out/stdout; given plain text\n\
+         instead, it writes just the reply body (or nothing, on failure) —\n\
+         the shape `baton serve --agent-cmd <path> --agent-arg exchange`\n\
+         expects."
     )
 }
 
@@ -176,6 +191,7 @@ fn parse_args(args: &[String]) -> Result<Option<Command>> {
         "ask" => parse_ask(iter).map(Some),
         "session" => parse_session(iter).map(Some),
         "log" => parse_log(iter).map(Some),
+        "exchange" => parse_exchange(iter).map(Some),
         other => Err(LegError::Usage(format!(
             "unrecognised argument {other:?}; {USAGE}"
         ))),
@@ -327,6 +343,165 @@ fn parse_index(raw: &str) -> Result<usize> {
         ));
     }
     Ok(parsed)
+}
+
+/// Parses the arguments following `exchange`: optional `--in <path>` and
+/// `--out <path>`. Any other token is a usage error.
+fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut in_path: Option<String> = None;
+    let mut out_path: Option<String> = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--in" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| LegError::Usage("--in requires a value".to_string()))?;
+                in_path = Some(value.clone());
+            }
+            "--out" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| LegError::Usage("--out requires a value".to_string()))?;
+                out_path = Some(value.clone());
+            }
+            other => {
+                return Err(LegError::Usage(format!("unexpected argument {other:?}")));
+            }
+        }
+    }
+
+    Ok(Command::Exchange { in_path, out_path })
+}
+
+/// Which protocol `leg exchange`'s input was, and therefore what shape its
+/// output takes.
+#[derive(Debug, PartialEq, Eq)]
+enum ExchangeMode {
+    /// The input parsed as a whole `baton.message/v1` envelope — mirrors
+    /// `baton exchange`'s own file/pipe contract. The output is always the
+    /// full response envelope, whatever `kind` it carries.
+    Envelope,
+    /// The input was plain text — the shape `baton serve --agent-cmd` feeds
+    /// on stdin. The output is just the reply body on success; on a
+    /// delivered `kind: "error"` response, nothing is written to the
+    /// response output (see [`execute_exchange`]), which is what lets
+    /// baton's own `ExternalAgentParticipant` machinery-error path take
+    /// over.
+    PlainText,
+}
+
+/// Builds the request `leg exchange` will answer, and the [`ExchangeMode`]
+/// that determines how the response is written.
+///
+/// Tries to parse the whole input as a `MessageEnvelope` first; a prompt
+/// landing on this accidentally is not a realistic risk, since the struct
+/// requires an exact set of fields (`schema`, `message_id`,
+/// `conversation_id`, `from`, `to`, one of five fixed `kind` strings, `body`,
+/// `ts_ms`). A parse failure falls back to treating the whole input as the
+/// prompt body, trimmed only of a trailing `\r`/`\n` so intentional trailing
+/// spaces/tabs survive.
+fn parse_exchange_request(raw: &str) -> (MessageEnvelope, ExchangeMode) {
+    if let Ok(envelope) = serde_json::from_str::<MessageEnvelope>(raw) {
+        return (envelope, ExchangeMode::Envelope);
+    }
+    let body = raw.trim_end_matches(['\r', '\n']);
+    let envelope = MessageEnvelope::new(
+        "exchange-1",
+        "exchange",
+        "external",
+        "leg",
+        MessageKind::Request,
+        body,
+        now_ms(),
+    );
+    (envelope, ExchangeMode::PlainText)
+}
+
+/// Runs one `leg exchange` request/response round-trip: reads `in_path`
+/// (stdin when absent), and writes to `out_path` (stdout when absent).
+///
+/// Config-load and `--in`/`--out` I/O failures propagate as `Err`; once a
+/// [`LocalParticipant`] answers, [`execute_exchange_core`] is infallible —
+/// see its doc for the per-mode output shape.
+fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()> {
+    let config = LegConfig::from_env()?;
+    let meta = exchange_meta(&config);
+    let client = ClaudeClient::from_config(config);
+    let participant = LocalParticipant::new(client, meta);
+
+    let mut raw = String::new();
+    open_input(in_path)?
+        .read_to_string(&mut raw)
+        .map_err(io_err)?;
+
+    let output = open_output(out_path)?;
+    execute_exchange_core(&participant, &raw, output)
+}
+
+/// Testable core of [`execute_exchange`], parameterised over a [`Participant`]
+/// so the per-mode output contract is exercisable without a network.
+///
+/// - [`ExchangeMode::Envelope`]: writes the full response envelope as one
+///   JSON line, whatever `kind` it carries (mirrors `baton exchange`).
+/// - [`ExchangeMode::PlainText`] + [`MessageKind::Response`]: writes just
+///   `response.body`.
+/// - [`ExchangeMode::PlainText`] + a delivered error kind: writes nothing to
+///   `output` and prints the message to stderr. Baton's own
+///   `ExternalAgentParticipant` treats exit-0-with-empty-stdout as a
+///   machinery failure and synthesizes its own delivered `kind: "error"`
+///   envelope — this is what makes AC3 observable for the external-agent
+///   path, since a plain-text reply carries no `kind` field of its own.
+///
+/// Every branch returns `Ok(())`: a participant-delivered outcome — success
+/// or error, either mode — never becomes a process `Err` here.
+fn execute_exchange_core(
+    participant: &impl Participant,
+    raw: &str,
+    mut output: impl Write,
+) -> Result<()> {
+    let (request, mode) = parse_exchange_request(raw);
+    let response = participant.respond(&request);
+
+    match (mode, response.kind) {
+        (ExchangeMode::Envelope, _) => {
+            let json = serde_json::to_string(&response).expect("MessageEnvelope always serializes");
+            writeln!(output, "{json}").map_err(io_err)
+        }
+        (ExchangeMode::PlainText, MessageKind::Response) => {
+            writeln!(output, "{}", response.body).map_err(io_err)
+        }
+        (ExchangeMode::PlainText, _) => {
+            eprintln!("{}", response.body);
+            Ok(())
+        }
+    }
+}
+
+/// Opens `leg exchange`'s request source: `path` when given, else stdin.
+fn open_input(path: Option<&str>) -> Result<Box<dyn Read>> {
+    match path {
+        Some(path) => {
+            let file = File::open(path)
+                .map_err(|err| LegError::Io(format!("failed to open --in file {path:?}: {err}")))?;
+            Ok(Box::new(file))
+        }
+        None => Ok(Box::new(std::io::stdin())),
+    }
+}
+
+/// Opens `leg exchange`'s response sink: `path` when given (created,
+/// truncated), else stdout.
+fn open_output(path: Option<&str>) -> Result<Box<dyn Write>> {
+    match path {
+        Some(path) => {
+            let file = File::create(path).map_err(|err| {
+                LegError::Io(format!("failed to create --out file {path:?}: {err}"))
+            })?;
+            Ok(Box::new(file))
+        }
+        None => Ok(Box::new(std::io::stdout())),
+    }
 }
 
 /// Runs one single-turn exchange and writes its result to `output`.
@@ -1729,5 +1904,141 @@ mod tests {
         );
         assert!(select_exchange(&exchanges, Some(3)).is_err());
         assert!(select_exchange(&[], None).is_err());
+    }
+
+    // -- `leg exchange` --------------------------------------------------
+
+    #[test]
+    fn parse_args_exchange_bare_defaults_both_paths_to_none() {
+        assert_eq!(
+            parse_args(&argv(&["exchange"])).unwrap(),
+            Some(Command::Exchange {
+                in_path: None,
+                out_path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_args_exchange_accepts_in_and_out() {
+        assert_eq!(
+            parse_args(&argv(&["exchange", "--in", "/tmp/a", "--out", "/tmp/b"])).unwrap(),
+            Some(Command::Exchange {
+                in_path: Some("/tmp/a".to_string()),
+                out_path: Some("/tmp/b".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_args_exchange_missing_in_value_is_usage_error() {
+        assert!(parse_args(&argv(&["exchange", "--in"])).is_err());
+    }
+
+    #[test]
+    fn parse_args_exchange_unexpected_argument_is_usage_error() {
+        assert!(parse_args(&argv(&["exchange", "--who"])).is_err());
+    }
+
+    #[test]
+    fn parse_exchange_request_valid_envelope_passes_through_unchanged() {
+        let envelope = MessageEnvelope::new(
+            "m-1",
+            "c-1",
+            "user",
+            "assistant",
+            MessageKind::Request,
+            "hello",
+            1_700_000_000_000,
+        );
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let (request, mode) = parse_exchange_request(&raw);
+        assert_eq!(mode, ExchangeMode::Envelope);
+        assert_eq!(request, envelope);
+    }
+
+    #[test]
+    fn parse_exchange_request_plain_text_synthesizes_a_request() {
+        let (request, mode) = parse_exchange_request("hello there\n");
+        assert_eq!(mode, ExchangeMode::PlainText);
+        assert_eq!(request.body, "hello there");
+        assert_eq!(request.kind, MessageKind::Request);
+    }
+
+    #[test]
+    fn parse_exchange_request_trims_trailing_newline_only_preserves_trailing_spaces() {
+        let (request, _) = parse_exchange_request("hello   \r\n");
+        assert_eq!(request.body, "hello   ");
+    }
+
+    #[test]
+    fn execute_exchange_core_envelope_mode_success_writes_full_response_envelope() {
+        let participant =
+            LocalParticipant::new(FakeTransport(Ok(AssistantReply::new("hi there"))), meta());
+        let envelope = MessageEnvelope::new(
+            "m-1",
+            "c-1",
+            "user",
+            "assistant",
+            MessageKind::Request,
+            "hello",
+            1_700_000_000_000,
+        );
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let mut buf = Vec::new();
+        execute_exchange_core(&participant, &raw, &mut buf).expect("infallible");
+        let printed = String::from_utf8(buf).unwrap();
+        let value: serde_json::Value = serde_json::from_str(printed.trim()).expect("valid json");
+        assert_eq!(value["kind"], "response");
+        assert_eq!(value["body"], "hi there");
+        assert_eq!(value["exchange"]["schema"], crate::events::SCHEMA);
+    }
+
+    #[test]
+    fn execute_exchange_core_envelope_mode_error_still_writes_full_error_envelope() {
+        let participant = LocalParticipant::new(
+            FakeTransport(Err(LegError::Auth("bad credentials".to_string()))),
+            meta(),
+        );
+        let envelope = MessageEnvelope::new(
+            "m-1",
+            "c-1",
+            "user",
+            "assistant",
+            MessageKind::Request,
+            "hello",
+            1_700_000_000_000,
+        );
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let mut buf = Vec::new();
+        execute_exchange_core(&participant, &raw, &mut buf).expect("infallible");
+        let printed = String::from_utf8(buf).unwrap();
+        let value: serde_json::Value = serde_json::from_str(printed.trim()).expect("valid json");
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["body"], "authentication error: bad credentials");
+    }
+
+    #[test]
+    fn execute_exchange_core_plain_text_success_writes_only_the_reply_body() {
+        let participant =
+            LocalParticipant::new(FakeTransport(Ok(AssistantReply::new("hi there"))), meta());
+        let mut buf = Vec::new();
+        execute_exchange_core(&participant, "hello", &mut buf).expect("infallible");
+        assert_eq!(String::from_utf8(buf).unwrap(), "hi there\n");
+    }
+
+    #[test]
+    fn execute_exchange_core_plain_text_failure_writes_nothing_and_still_returns_ok() {
+        let participant = LocalParticipant::new(
+            FakeTransport(Err(LegError::Auth("bad credentials".to_string()))),
+            meta(),
+        );
+        let mut buf = Vec::new();
+        execute_exchange_core(&participant, "hello", &mut buf)
+            .expect("delivered errors never propagate as Err");
+        assert!(
+            buf.is_empty(),
+            "plain-text failure must leave stdout empty so baton's machinery-error path fires"
+        );
     }
 }
