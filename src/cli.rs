@@ -9,11 +9,16 @@ use crate::message::{MessageEnvelope, MessageKind};
 use crate::participant::{LocalParticipant, Participant};
 use crate::transport::claude::ClaudeClient;
 
+/// The one-line usage summary, shared by `--help` output and usage errors.
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt>";
+
 /// A parsed command line.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     /// Prints the crate version.
     Version,
+    /// Prints usage help.
+    Help,
     /// Runs one single-turn provider exchange.
     Ask {
         /// The user prompt text.
@@ -32,11 +37,25 @@ pub fn run() -> Result<()> {
             println!("leg {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Some(Command::Help) => {
+            println!("{}", help_text());
+            Ok(())
+        }
         Some(Command::Ask { prompt, model }) => {
             let stdout = std::io::stdout();
             execute_ask(&prompt, model, stdout.lock())
         }
     }
+}
+
+/// The full `--help` body: the usage summary plus the env vars `ask` reads.
+fn help_text() -> String {
+    format!(
+        "{USAGE}\n\n\
+         Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
+         CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
+         LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, and LEG_SYSTEM_PROMPT."
+    )
 }
 
 /// Parses `args` into a [`Command`]. `None` means "do nothing" (no arguments),
@@ -49,9 +68,10 @@ fn parse_args(args: &[String]) -> Result<Option<Command>> {
 
     match first.as_str() {
         "--version" | "-V" => Ok(Some(Command::Version)),
+        "--help" | "-h" => Ok(Some(Command::Help)),
         "ask" => parse_ask(iter).map(Some),
         other => Err(LegError::Usage(format!(
-            "unrecognised argument {other:?}; expected \"ask\", \"--version\", or no arguments"
+            "unrecognised argument {other:?}; {USAGE}"
         ))),
     }
 }
@@ -98,9 +118,7 @@ fn parse_ask<'a>(iter: impl Iterator<Item = &'a String>) -> Result<Command> {
 /// (`"kind":"error"`) instead — both exit 0.
 fn execute_ask(prompt: &str, model: Option<String>, output: impl Write) -> Result<()> {
     let mut config = LegConfig::from_env()?;
-    if let Some(model) = model {
-        config.model = model;
-    }
+    apply_model_override(&mut config, model);
     let meta = ExchangeMeta {
         model: config.model.clone(),
         base_url: config.base_url.clone(),
@@ -135,6 +153,13 @@ fn run_ask(participant: &impl Participant, prompt: &str, mut output: impl Write)
 
 fn io_err(err: std::io::Error) -> LegError {
     LegError::Io(err.to_string())
+}
+
+/// Applies the `--model` override (if any) onto a loaded config, in place.
+fn apply_model_override(config: &mut LegConfig, model: Option<String>) {
+    if let Some(model) = model {
+        config.model = model;
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +226,20 @@ mod tests {
             Some(Command::Version)
         );
         assert_eq!(parse_args(&argv(&["-V"])).unwrap(), Some(Command::Version));
+    }
+
+    #[test]
+    fn help_flags_parse() {
+        assert_eq!(parse_args(&argv(&["--help"])).unwrap(), Some(Command::Help));
+        assert_eq!(parse_args(&argv(&["-h"])).unwrap(), Some(Command::Help));
+    }
+
+    #[test]
+    fn help_text_mentions_ask_usage_and_env_vars() {
+        let text = help_text();
+        assert!(text.contains("leg ask [--model <model>] <prompt>"));
+        assert!(text.contains("ANTHROPIC_API_KEY"));
+        assert!(text.contains("LEG_MODEL"));
     }
 
     #[test]
@@ -290,5 +329,56 @@ mod tests {
         let err = execute_ask("hello", None, &mut buf).unwrap_err();
         assert!(matches!(err, LegError::Config(_)));
         assert!(buf.is_empty());
+    }
+
+    /// A network-free [`crate::transport::http::HttpClient`] fake that
+    /// captures the JSON body of the last request it served, via a shared
+    /// handle a test retains after the fake is moved into a [`ClaudeClient`].
+    struct RecordingHttp {
+        captured_body: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    }
+
+    impl crate::transport::http::HttpClient for RecordingHttp {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            body: &str,
+        ) -> Result<crate::transport::http::HttpResponse> {
+            *self.captured_body.borrow_mut() = Some(body.to_string());
+            Ok(crate::transport::http::HttpResponse {
+                status: 200,
+                body: r#"{"content":[{"type":"text","text":"hi"}]}"#.to_string(),
+            })
+        }
+    }
+
+    /// End-to-end (network-free): `--model` reaches `execute_ask`'s config
+    /// override, which is stamped onto the outgoing Claude Messages request.
+    #[test]
+    fn model_override_reaches_the_outgoing_claude_request() {
+        let mut config = LegConfig::from_lookup(|key| {
+            (key == "ANTHROPIC_API_KEY").then(|| "secret".to_string())
+        })
+        .expect("config loads");
+        apply_model_override(&mut config, Some("claude-opus-4-8".to_string()));
+        let meta = ExchangeMeta {
+            model: config.model.clone(),
+            base_url: config.base_url.clone(),
+        };
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let http = RecordingHttp {
+            captured_body: std::rc::Rc::clone(&captured),
+        };
+        let client = ClaudeClient::with_http(config, http);
+        let participant = LocalParticipant::new(client, meta);
+
+        let mut buf = Vec::new();
+        run_ask(&participant, "hello", &mut buf).expect("infallible per Participant contract");
+
+        let sent = captured.borrow().clone().expect("request body captured");
+        let value: serde_json::Value = serde_json::from_str(&sent).expect("valid json");
+        assert_eq!(value["model"], "claude-opus-4-8");
     }
 }
