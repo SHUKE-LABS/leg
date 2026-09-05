@@ -9,7 +9,9 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -82,16 +84,82 @@ fn run_leg_exchange(base_url: &str, stdin_body: &str) -> (bool, String, String) 
     )
 }
 
+/// Returns a fresh, process-and-call-unique scratch directory under the OS
+/// temp dir (no `tempfile` dependency warranted for two tests).
+fn unique_scratch_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "leg-exchange-test-{tag}-{}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Spawns `leg exchange --in <in_path> --out <out_path>` against `base_url`,
+/// with no stdin/stdout piping (the file paths carry the request/response
+/// instead), and returns `(exit_success, stderr)`.
+fn run_leg_exchange_files(
+    base_url: &str,
+    in_path: &std::path::Path,
+    out_path: &std::path::Path,
+) -> (bool, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_leg"))
+        .arg("exchange")
+        .arg("--in")
+        .arg(in_path)
+        .arg("--out")
+        .arg(out_path)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("LEG_MODEL", "claude-test-model")
+        .env("LEG_TIMEOUT_SECS", "5")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg exchange");
+
+    let output = child
+        .wait_timeout_or_kill(Duration::from_secs(10))
+        .expect("child did not hang");
+
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 /// Minimal `wait-with-timeout`: `std::process::Child` has no built-in
 /// deadline, and pulling in a crate for one test is not warranted, so this
 /// polls `try_wait` — the child is a short-lived local process, not a hot
 /// loop concern.
+///
+/// stdout/stderr are drained on their own threads *while* the child runs, not
+/// after it exits — these fixtures are tiny, but draining only post-exit
+/// would deadlock a child that blocks writing to a full pipe before exiting.
 trait WaitTimeoutOrKill {
     fn wait_timeout_or_kill(&mut self, timeout: Duration) -> std::io::Result<std::process::Output>;
 }
 
 impl WaitTimeoutOrKill for std::process::Child {
     fn wait_timeout_or_kill(&mut self, timeout: Duration) -> std::io::Result<std::process::Output> {
+        let stdout_reader = self.stdout.take().map(|mut out| {
+            thread::spawn(move || -> Vec<u8> {
+                let mut buf = Vec::new();
+                let _ = out.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let stderr_reader = self.stderr.take().map(|mut err| {
+            thread::spawn(move || -> Vec<u8> {
+                let mut buf = Vec::new();
+                let _ = err.read_to_end(&mut buf);
+                buf
+            })
+        });
+
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if self.try_wait()?.is_some() {
@@ -105,15 +173,13 @@ impl WaitTimeoutOrKill for std::process::Child {
             thread::sleep(Duration::from_millis(20));
         }
 
-        let mut stdout = Vec::new();
-        if let Some(mut out) = self.stdout.take() {
-            let _ = out.read_to_end(&mut stdout);
-        }
-        let mut stderr = Vec::new();
-        if let Some(mut err) = self.stderr.take() {
-            let _ = err.read_to_end(&mut stderr);
-        }
         let status = self.wait()?;
+        let stdout = stdout_reader
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        let stderr = stderr_reader
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
         Ok(std::process::Output {
             status,
             stdout,
@@ -157,4 +223,52 @@ fn plain_text_provider_failure_leaves_stdout_empty_for_batons_machinery_error_pa
         stderr.contains("invalid x-api-key"),
         "the diagnostic must still be observable on stderr; got {stderr:?}"
     );
+}
+
+#[test]
+fn envelope_mode_round_trips_through_in_and_out_files() {
+    let base_url = spawn_mock_server(
+        200,
+        r#"{"content":[{"type":"text","text":"hi there"}],"stop_reason":"end_turn"}"#,
+    );
+
+    let dir = unique_scratch_dir("envelope-files");
+    let in_path = dir.join("request.json");
+    let out_path = dir.join("response.json");
+
+    let request = r#"{
+        "schema": "baton.message/v1",
+        "message_id": "m-1",
+        "conversation_id": "c-1",
+        "from": "external",
+        "to": "leg",
+        "in_reply_to": null,
+        "kind": "request",
+        "body": "hello",
+        "ts_ms": 1700000000000,
+        "exchange": null
+    }"#;
+    std::fs::write(&in_path, request).expect("write request file");
+
+    let (success, stderr) = run_leg_exchange_files(&base_url, &in_path, &out_path);
+    assert!(
+        success,
+        "leg exchange --in/--out should exit 0; stderr: {stderr}"
+    );
+
+    let response_raw = std::fs::read_to_string(&out_path).expect("read response file");
+    let response: serde_json::Value =
+        serde_json::from_str(&response_raw).expect("response file is valid JSON");
+
+    assert_eq!(response["schema"], "baton.message/v1");
+    assert_eq!(response["kind"], "response");
+    assert_eq!(response["in_reply_to"], "m-1");
+    assert_eq!(response["body"], "hi there");
+    assert_eq!(response["exchange"]["schema"], "baton.exchange/v1");
+    assert_eq!(
+        response["exchange"]["exchange"]["outcome"]["event"],
+        "response_ok"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
