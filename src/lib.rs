@@ -10,6 +10,8 @@
 //! - [`events`] — the exchange-record types nested in a peer message.
 //! - [`message`] — the `baton.message/v1` peer-message envelope.
 //! - [`participant`] — the envelope-in / envelope-out participant seam.
+//! - [`log`] — the JSONL exchange-trail read path (`leg log show`/`replay`,
+//!   `leg session --resume`).
 //! - [`error`] — shared error and result types.
 //! - [`cli`] — the command-line entry surface.
 
@@ -17,6 +19,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod log;
 pub mod message;
 pub mod model;
 pub mod participant;

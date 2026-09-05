@@ -50,6 +50,9 @@ pub enum LegError {
     Decode(String),
     /// A local I/O operation failed.
     Io(String),
+    /// A JSONL exchange trail (`LEG_EVENT_LOG` or a `--resume` file) could not
+    /// be parsed: a malformed line, or a known event missing required fields.
+    Log(String),
 }
 
 impl LegError {
@@ -68,6 +71,7 @@ impl LegError {
             LegError::Api { .. } => "api",
             LegError::Decode(_) => "decode",
             LegError::Io(_) => "io",
+            LegError::Log(_) => "log",
         }
     }
 }
@@ -88,6 +92,7 @@ impl fmt::Display for LegError {
             }
             LegError::Decode(msg) => write!(f, "response decode error: {msg}"),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
+            LegError::Log(msg) => write!(f, "log error: {msg}"),
         }
     }
 }
