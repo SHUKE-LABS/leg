@@ -16,9 +16,12 @@ use std::thread;
 use std::time::Duration;
 
 /// Starts a one-shot HTTP/1.1 mock server on an OS-assigned port, returning
-/// its base URL. It accepts exactly one connection, reads the request until
-/// the end of its headers (the body content is irrelevant to this proof),
-/// and replies with `status`/`body`.
+/// its base URL. It accepts exactly one connection, reads the request
+/// headers, then drains exactly `Content-Length` request-body bytes (the
+/// body content itself is irrelevant to this proof) before replying with
+/// `status`/`body` — closing the connection before the client has finished
+/// writing its request body aborts the write on some platforms (observed on
+/// Windows/ureq), so the full body must be consumed first.
 fn spawn_mock_server(status: u16, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let addr = listener.local_addr().expect("local addr");
@@ -29,12 +32,38 @@ fn spawn_mock_server(status: u16, body: &'static str) -> String {
         };
         let mut buf = [0u8; 8192];
         let mut received = Vec::new();
-        while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+        let header_end = loop {
+            if let Some(pos) = received
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| p + 4)
+            {
+                break pos;
+            }
             match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => return,
                 Ok(n) => received.extend_from_slice(&buf[..n]),
             }
+        };
+
+        let headers = String::from_utf8_lossy(&received[..header_end]);
+        let content_length: usize = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or(line.strip_prefix("content-length:"))
+            })
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+
+        let mut body_read = received.len() - header_end;
+        while body_read < content_length {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body_read += n,
+            }
         }
+
         let reason = if status == 200 { "OK" } else { "Error" };
         let response = format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
