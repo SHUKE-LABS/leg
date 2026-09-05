@@ -1,0 +1,319 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify tag matches Cargo.toml/Cargo.lock
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          bash scripts/release.sh verify-tag-matches-manifest "${tag}"
+          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            cross: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: false
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            cross: false
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            cross: false
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            cross: false
+          - runner: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            archive: tar.gz
+            cross: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.verify-tag.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build locked release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --locked --release --target "${TARGET}"
+          else
+            cargo build --locked --release --target "${TARGET}"
+          fi
+
+      - name: Verify binary version
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          binary="target/${TARGET}/release/leg"
+          if [[ "${TARGET}" == *-windows-* ]]; then
+            binary="${binary}.exe"
+          fi
+          test "$("./${binary}" --version)" = "leg ${version}"
+
+      - name: Enforce binary size budget
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          budget=$((20 * 1024 * 1024))
+          size="$(stat -c '%s' "target/${TARGET}/release/leg")"
+          if (( size >= budget )); then
+            echo "::error::linux-gnu binary is ${size} bytes, budget is < ${budget} bytes"
+            exit 1
+          fi
+
+      - name: Archive Unix binary
+        if: ${{ matrix.archive == 'tar.gz' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive="leg-${version}-${TARGET}.tar.gz"
+          staging="$(mktemp -d)"
+          trap 'rm -rf "${staging}"' EXIT
+          cp "target/${TARGET}/release/leg" "${staging}/leg"
+          tar -C "${staging}" -czf "${archive}" leg
+
+      - name: Archive Windows binary
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $archive = "leg-$version-$($env:TARGET).zip"
+          $staging = Join-Path $env:RUNNER_TEMP "leg-archive-$($env:TARGET)"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/$($env:TARGET)/release/leg.exe" (Join-Path $staging "leg.exe")
+          Compress-Archive -LiteralPath (Join-Path $staging "leg.exe") -DestinationPath $archive -Force
+
+      - name: Upload target archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: leg-${{ matrix.target }}
+          path: leg-*-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    needs: [verify-tag, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.verify-tag.outputs.tag }}
+
+      - name: Download target archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: leg-*
+          path: dist
+          merge-multiple: true
+
+      - name: Validate archives and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          assets=(
+            "leg-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-armv7-unknown-linux-musleabihf.tar.gz"
+            "leg-${version}-x86_64-apple-darwin.tar.gz"
+            "leg-${version}-aarch64-apple-darwin.tar.gz"
+            "leg-${version}-x86_64-pc-windows-msvc.zip"
+          )
+
+          for asset in "${assets[@]}"; do
+            test -f "dist/${asset}"
+            case "${asset}" in
+              *.tar.gz)
+                test "$(tar -tzf "dist/${asset}")" = "leg"
+                ;;
+              *.zip)
+                test "$(unzip -Z1 "dist/${asset}")" = "leg.exe"
+                ;;
+            esac
+          done
+
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "${#assets[@]}"
+          (
+            cd dist
+            sha256sum "${assets[@]}"
+          ) > SHA256SUMS
+          (
+            cd dist
+            sha256sum --check ../SHA256SUMS
+          )
+
+      - name: Stage and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          assets=(
+            "leg-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-armv7-unknown-linux-musleabihf.tar.gz"
+            "leg-${version}-x86_64-apple-darwin.tar.gz"
+            "leg-${version}-aarch64-apple-darwin.tar.gz"
+            "leg-${version}-x86_64-pc-windows-msvc.zip"
+          )
+          upload_paths=(SHA256SUMS)
+          for asset in "${assets[@]}"; do
+            upload_paths+=("dist/${asset}")
+          done
+
+          # Keep the release draft until every asset upload succeeds; a failed
+          # upload therefore cannot expose an incomplete release to consumers.
+          # This runs before npm publishing so the GitHub Release — which
+          # needs no external secret — never depends on the npm registry step
+          # that follows.
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --draft \
+            --title "leg ${RELEASE_TAG}" \
+            --generate-notes \
+            "${upload_paths[@]}"
+          gh release edit "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false
+
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Stage npm packages and preflight publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          bash scripts/release.sh stage-npm-packages "${version}" dist npm-packages
+
+          package_dirs=(
+            leg-linux-x64
+            leg-linux-arm64
+            leg-linux-arm
+            leg-darwin-x64
+            leg-darwin-arm64
+            leg-win32-x64
+            leg
+          )
+          mkdir -p npm-tarballs
+          pack_destination="${PWD}/npm-tarballs"
+          for package_dir in "${package_dirs[@]}"; do
+            (
+              cd "npm-packages/${package_dir}"
+              npm pack --ignore-scripts --pack-destination "${pack_destination}" >/dev/null
+            )
+          done
+
+          bash scripts/release.sh verify-npm-packages "${version}" npm-packages
+          bash scripts/release.sh npm-checksums npm-tarballs npm-SHA256SUMS
+          npm_tarballs=(
+            "shukelabs-leg-linux-x64-${version}.tgz"
+            "shukelabs-leg-linux-arm64-${version}.tgz"
+            "shukelabs-leg-linux-arm-${version}.tgz"
+            "shukelabs-leg-darwin-x64-${version}.tgz"
+            "shukelabs-leg-darwin-arm64-${version}.tgz"
+            "shukelabs-leg-win32-x64-${version}.tgz"
+            "shukelabs-leg-${version}.tgz"
+          )
+          test "$(find npm-tarballs -maxdepth 1 -type f -name '*.tgz' | wc -l)" -eq "${#npm_tarballs[@]}"
+          for tarball in "${npm_tarballs[@]}"; do
+            test -f "npm-tarballs/${tarball}"
+          done
+          (
+            cd npm-tarballs
+            sha256sum --check ../npm-SHA256SUMS
+          )
+
+      - name: Publish npm packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          npm_tarballs=(
+            "shukelabs-leg-linux-x64-${version}.tgz"
+            "shukelabs-leg-linux-arm64-${version}.tgz"
+            "shukelabs-leg-linux-arm-${version}.tgz"
+            "shukelabs-leg-darwin-x64-${version}.tgz"
+            "shukelabs-leg-darwin-arm64-${version}.tgz"
+            "shukelabs-leg-win32-x64-${version}.tgz"
+            "shukelabs-leg-${version}.tgz"
+          )
+          test -n "${NODE_AUTH_TOKEN:-}" || {
+            echo '::error::NPM_TOKEN release secret is required to publish npm packages'
+            exit 1
+          }
+
+          # npm has no multi-package transaction. All seven packages and their
+          # checksums are preflighted before this loop; publish the root last
+          # so an early failure never exposes an installable root without its
+          # native platform packages. A failure reports exactly what was
+          # published so the release can be repaired without guessing.
+          published=()
+          for tarball in "${npm_tarballs[@]}"; do
+            if npm publish --access public --ignore-scripts "npm-tarballs/${tarball}"; then
+              published+=("${tarball}")
+            else
+              echo "::error::npm publish failed after ${#published[@]} of ${#npm_tarballs[@]} packages"
+              printf 'published before failure: %s\n' "${published[*]:-none}"
+              exit 1
+            fi
+          done

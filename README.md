@@ -2,6 +2,22 @@
 
 `leg` binary skeleton.
 
+## Install
+
+```
+npm i -g @shukelabs/leg
+```
+
+or build from source directly:
+
+```
+cargo install --git https://github.com/SHUKE-LABS/leg --locked
+```
+
+Per-platform archives for every CI-supported target (`.tar.gz` on
+Unix, `.zip` on Windows) are attached to each
+[GitHub Release](https://github.com/SHUKE-LABS/leg/releases).
+
 ## Usage
 
 ```
