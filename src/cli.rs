@@ -349,25 +349,31 @@ fn execute_ask(prompt: &str, model: Option<String>, output: impl Write) -> Resul
 fn execute_ask_with_config(config: LegConfig, prompt: &str, output: impl Write) -> Result<()> {
     let meta = exchange_meta(&config);
     let client = ClaudeClient::from_config(config);
-    let participant = LocalParticipant::new(client, meta);
+    let participant = LocalParticipant::new(client, meta.clone());
     let mut sink = open_event_sink();
-    run_ask(&participant, prompt, output, sink.as_mut())
+    run_ask(&participant, &meta, prompt, output, sink.as_mut())
 }
 
 /// Testable core of [`execute_ask_with_config`], parameterised over a
 /// [`Participant`] so the success/error stdout contract is exercisable
 /// without a network.
 ///
-/// The provider call's request/outcome — already timed and recorded on the
-/// [`Participant`]'s response envelope — is additionally mirrored onto `sink`
-/// as flat `request`/`response_ok`/`response_error` JSONL lines, so `ask` and
-/// `session` share one trail format read back by [`crate::log`].
+/// The `request` event is recorded *before* the provider call — matching
+/// [`ExchangeEvent::Request`]'s documented "emitted before the provider call"
+/// contract, so a process killed mid-call still leaves a torn-but-present
+/// request line (the trail's documented in-flight/torn-request behaviour;
+/// see [`crate::log::parse_jsonl`]'s trailing-request handling). The
+/// [`Participant`]'s own nested exchange still supplies the terminal outcome
+/// (already timed against its own call), mirrored onto `sink` afterwards.
 fn run_ask(
     participant: &impl Participant,
+    meta: &ExchangeMeta,
     prompt: &str,
     mut output: impl Write,
     sink: &mut dyn EventSink,
 ) -> Result<()> {
+    emit(sink, &ExchangeEvent::request(now_ms(), meta, prompt));
+
     let request = MessageEnvelope::new(
         "ask-1",
         "ask",
@@ -380,10 +386,6 @@ fn run_ask(
     let response = participant.respond(&request);
 
     if let Some(wrapped) = &response.exchange {
-        emit(
-            sink,
-            &ExchangeEvent::from_request_record(&wrapped.exchange.request),
-        );
         emit(
             sink,
             &ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
@@ -855,6 +857,34 @@ mod tests {
         }
     }
 
+    /// A [`Transport`] that records every call's full message history and
+    /// answers from a queue of canned replies, in order — lets a test assert
+    /// exactly what history a later turn sent, not just its printed reply.
+    struct CapturingTransport {
+        replies: std::cell::RefCell<std::collections::VecDeque<AssistantReply>>,
+        calls: std::cell::RefCell<Vec<Vec<crate::model::Message>>>,
+    }
+
+    impl CapturingTransport {
+        fn new(replies: Vec<AssistantReply>) -> Self {
+            Self {
+                replies: std::cell::RefCell::new(replies.into()),
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Transport for CapturingTransport {
+        fn send_conversation(&self, messages: &[crate::model::Message]) -> Result<AssistantReply> {
+            self.calls.borrow_mut().push(messages.to_vec());
+            Ok(self
+                .replies
+                .borrow_mut()
+                .pop_front()
+                .expect("test queued enough replies for every expected call"))
+        }
+    }
+
     fn meta() -> ExchangeMeta {
         ExchangeMeta {
             model: "claude-test-model".to_string(),
@@ -868,7 +898,7 @@ mod tests {
             LocalParticipant::new(FakeTransport(Ok(AssistantReply::new("hi there"))), meta());
         let mut buf = Vec::new();
         let mut sink = NoopSink;
-        run_ask(&participant, "hello", &mut buf, &mut sink)
+        run_ask(&participant, &meta(), "hello", &mut buf, &mut sink)
             .expect("infallible per Participant contract");
         assert_eq!(String::from_utf8(buf).unwrap(), "hi there\n");
     }
@@ -881,7 +911,7 @@ mod tests {
         );
         let mut buf = Vec::new();
         let mut sink = NoopSink;
-        run_ask(&participant, "hello", &mut buf, &mut sink)
+        run_ask(&participant, &meta(), "hello", &mut buf, &mut sink)
             .expect("infallible per Participant contract");
         let printed = String::from_utf8(buf).unwrap();
         let value: serde_json::Value = serde_json::from_str(printed.trim()).expect("valid json");
@@ -897,7 +927,7 @@ mod tests {
         let mut trail = Vec::new();
         {
             let mut sink = WriterSink::new(&mut trail);
-            run_ask(&participant, "hello", &mut buf, &mut sink)
+            run_ask(&participant, &meta(), "hello", &mut buf, &mut sink)
                 .expect("infallible per Participant contract");
         }
         let text = String::from_utf8(trail).unwrap();
@@ -909,6 +939,108 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["event"], "response_ok");
         assert_eq!(second["reply"], "hi there");
+    }
+
+    /// A [`Transport`] that panics if called — proves `run_ask` records the
+    /// `request` event *before* invoking the provider (must be able to
+    /// observe a request line even if the call that follows never returns),
+    /// matching [`ExchangeEvent::Request`]'s documented ordering contract.
+    struct PanicTransport;
+
+    impl Transport for PanicTransport {
+        fn send_conversation(&self, _messages: &[crate::model::Message]) -> Result<AssistantReply> {
+            panic!("run_ask must not have called the transport yet");
+        }
+    }
+
+    /// A sink that panics on its first `record` call whose event is not
+    /// `request` — proves the request line is the *first* thing recorded,
+    /// i.e. emitted before the provider call runs (which, for
+    /// [`PanicTransport`], never returns at all).
+    struct RequestFirstSink {
+        seen_request: bool,
+    }
+
+    impl EventSink for RequestFirstSink {
+        fn record(&mut self, event: &ExchangeEvent) -> std::io::Result<()> {
+            match event {
+                ExchangeEvent::Request { .. } if !self.seen_request => {
+                    self.seen_request = true;
+                    Ok(())
+                }
+                ExchangeEvent::Request { .. } => panic!("request recorded more than once"),
+                _ => {
+                    assert!(self.seen_request, "outcome recorded before request");
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn run_ask_records_the_request_event_before_invoking_the_transport() {
+        // PanicTransport aborts the test the moment `run_ask` reaches the
+        // provider call, so simply completing this call proves the request
+        // line was recorded first (and RequestFirstSink additionally asserts
+        // ordering for any outcome recorded, on the success path elsewhere).
+        let participant = LocalParticipant::new(PanicTransport, meta());
+        let mut buf = Vec::new();
+        let mut sink = RequestFirstSink {
+            seen_request: false,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_ask(&participant, &meta(), "hello", &mut buf, &mut sink)
+        }));
+        assert!(
+            result.is_err(),
+            "PanicTransport should have been reached and panicked"
+        );
+        assert!(sink.seen_request, "request event must be recorded first");
+    }
+
+    /// Exercises the actual `run_ask` path (not just the `ExchangeEvent`
+    /// constructors) through a real [`WriterSink`], asserting the emitted
+    /// lines' field names/order/omissions match baton's own
+    /// `parses_valid_two_line_exchange` fixture (`baton/src/log.rs`) exactly
+    /// — everything except the wall-clock `ts_ms`/`duration_ms` values, which
+    /// neither `leg` nor baton makes deterministic in tests, so this
+    /// compares against a template built from the *actual* values `run_ask`
+    /// produced rather than fixed literals.
+    #[test]
+    fn run_ask_wire_lines_match_batons_field_order_and_omitted_fields() {
+        let participant =
+            LocalParticipant::new(FakeTransport(Ok(AssistantReply::new("hi there"))), meta());
+        let mut buf = Vec::new();
+        let mut trail = Vec::new();
+        {
+            let mut sink = WriterSink::new(&mut trail);
+            run_ask(&participant, &meta(), "hello", &mut buf, &mut sink)
+                .expect("infallible per Participant contract");
+        }
+        let text = String::from_utf8(trail).unwrap();
+        let mut lines = text.lines();
+        let request_line = lines.next().expect("request line");
+        let response_line = lines.next().expect("response line");
+        assert!(lines.next().is_none(), "exactly two lines for a plain ask");
+
+        let request_value: serde_json::Value = serde_json::from_str(request_line).unwrap();
+        let ts_ms = request_value["ts_ms"].as_u64().expect("ts_ms");
+        assert_eq!(
+            request_line,
+            format!(
+                r#"{{"event":"request","schema":"baton.exchange/v1","ts_ms":{ts_ms},"model":"claude-test-model","base_url":"https://api.anthropic.com","prompt":"hello"}}"#
+            ),
+        );
+
+        let response_value: serde_json::Value = serde_json::from_str(response_line).unwrap();
+        let r_ts_ms = response_value["ts_ms"].as_u64().expect("ts_ms");
+        let duration_ms = response_value["duration_ms"].as_u64().expect("duration_ms");
+        assert_eq!(
+            response_line,
+            format!(
+                r#"{{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":{r_ts_ms},"duration_ms":{duration_ms},"reply":"hi there"}}"#
+            ),
+        );
     }
 
     #[test]
@@ -1198,11 +1330,11 @@ mod tests {
             captured_body: std::rc::Rc::clone(&captured),
         };
         let client = ClaudeClient::with_http(config, http);
-        let participant = LocalParticipant::new(client, meta);
+        let participant = LocalParticipant::new(client, meta.clone());
 
         let mut buf = Vec::new();
         let mut sink = NoopSink;
-        run_ask(&participant, "hello", &mut buf, &mut sink)
+        run_ask(&participant, &meta, "hello", &mut buf, &mut sink)
             .expect("infallible per Participant contract");
 
         let sent = captured.borrow().clone().expect("request body captured");
@@ -1304,6 +1436,127 @@ mod tests {
         assert_eq!(events[2]["event"], "response_ok");
         assert_eq!(events[3]["event"], "session_end");
         assert_eq!(events[3]["turns"], 1);
+    }
+
+    #[test]
+    fn session_repl_sends_full_prior_history_on_a_later_turn() {
+        let transport = CapturingTransport::new(vec![
+            AssistantReply::new("reply-1"),
+            AssistantReply::new("reply-2"),
+        ]);
+        let mut output = Vec::new();
+        let mut warning = Vec::new();
+        let mut sink = NoopSink;
+        run_session_repl_with_warning(
+            &transport,
+            &mut sink,
+            &meta(),
+            std::io::Cursor::new(b"turn one\nturn two\n".to_vec()),
+            &mut output,
+            "sess-1".to_string(),
+            Conversation::new(),
+            0,
+            &mut warning,
+        )
+        .expect("session loop completes");
+
+        let calls = transport.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], vec![crate::model::Message::user("turn one")]);
+        assert_eq!(
+            calls[1],
+            vec![
+                crate::model::Message::user("turn one"),
+                crate::model::Message::assistant("reply-1"),
+                crate::model::Message::user("turn two"),
+            ],
+            "the second call must carry the full prior history, not just the new turn"
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), "reply-1\nreply-2\n");
+    }
+
+    /// End-to-end resume cycle: a first session run writes a real
+    /// [`WriterSink`] trail; that exact trail is re-parsed with
+    /// [`crate::log::parse_sessions`] and rehydrated with
+    /// [`select_and_rehydrate`] (no manually constructed [`SessionRecord`]);
+    /// the resumed run's next provider call must then carry the rehydrated
+    /// history plus the new turn, and its own trail must continue the same
+    /// `session_id` at the next `turn_index` with no fresh `session_start`.
+    #[test]
+    fn session_resume_round_trips_history_and_turn_index_through_a_real_trail() {
+        let first_transport = CapturingTransport::new(vec![AssistantReply::new("reply-1")]);
+        let mut first_output = Vec::new();
+        let mut trail = Vec::new();
+        {
+            let mut sink = WriterSink::new(&mut trail);
+            execute_session(
+                &first_transport,
+                &mut sink,
+                &meta(),
+                std::io::Cursor::new(b"hello\n".to_vec()),
+                &mut first_output,
+                "sess-1".to_string(),
+            )
+            .expect("first session run completes");
+        }
+
+        let report =
+            crate::log::parse_sessions(std::io::Cursor::new(trail.clone())).expect("parses");
+        let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates");
+        assert_eq!(resumed.session_id, "sess-1");
+        assert_eq!(resumed.next_turn_index, 1);
+        assert_eq!(
+            resumed.conversation.messages(),
+            &[
+                crate::model::Message::user("hello"),
+                crate::model::Message::assistant("reply-1"),
+            ]
+        );
+
+        let second_transport = CapturingTransport::new(vec![AssistantReply::new("reply-2")]);
+        let mut second_output = Vec::new();
+        let mut resumed_trail = Vec::new();
+        {
+            let mut sink = WriterSink::new(&mut resumed_trail);
+            execute_session_resumed(
+                &second_transport,
+                &mut sink,
+                &meta(),
+                std::io::Cursor::new(b"again\n".to_vec()),
+                &mut second_output,
+                resumed,
+            )
+            .expect("resumed session run completes");
+        }
+
+        let calls = second_transport.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![
+                crate::model::Message::user("hello"),
+                crate::model::Message::assistant("reply-1"),
+                crate::model::Message::user("again"),
+            ],
+            "the resumed call must carry the rehydrated history plus the new turn"
+        );
+        assert_eq!(String::from_utf8(second_output).unwrap(), "reply-2\n");
+
+        let resumed_text = String::from_utf8(resumed_trail).unwrap();
+        let resumed_lines: Vec<&str> = resumed_text.lines().collect();
+        assert_eq!(
+            resumed_lines.len(),
+            3,
+            "resuming emits no fresh session_start: {resumed_text}"
+        );
+        let request_event: serde_json::Value = serde_json::from_str(resumed_lines[0]).unwrap();
+        assert_eq!(request_event["event"], "request");
+        assert_eq!(request_event["session_id"], "sess-1");
+        assert_eq!(request_event["turn_index"], 1);
+        let end_event: serde_json::Value = serde_json::from_str(resumed_lines[2]).unwrap();
+        assert_eq!(end_event["event"], "session_end");
+        assert_eq!(end_event["session_id"], "sess-1");
+        assert_eq!(end_event["turns"], 2);
     }
 
     #[test]

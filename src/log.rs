@@ -533,6 +533,76 @@ mod tests {
         assert_eq!(line(&response_event), format!("{response_line}\n"));
     }
 
+    /// Session counterpart to
+    /// [`ask_exchange_is_byte_compatible_with_batons_trail_fixture`]: baton's
+    /// `SessionStart` carries optional `role`/`identity` fields (`leg` has no
+    /// `--role` framing, out of scope per issue #3) that are omitted via
+    /// `skip_serializing_if` whenever a session isn't role-framed — exactly
+    /// `leg`'s only case — so the plain (non-role) shapes line up field-for-
+    /// field. Every line here is checked against a literal built from
+    /// baton's own struct definitions (`baton/src/events.rs`), and the whole
+    /// trail round-trips through this module's own [`parse_sessions`].
+    #[test]
+    fn session_exchange_is_byte_compatible_with_batons_trail_fixture() {
+        let session_meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+
+        let start_line = r#"{"event":"session_start","schema":"baton.exchange/v1","ts_ms":1,"session_id":"sess-A"}"#;
+        let request_line = r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":2,"model":"m","base_url":"u","prompt":"hi","session_id":"sess-A","turn_index":0}"#;
+        let response_line = r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":3,"duration_ms":10,"reply":"hello","session_id":"sess-A","turn_index":0}"#;
+        let end_line = r#"{"event":"session_end","schema":"baton.exchange/v1","ts_ms":4,"session_id":"sess-A","turns":1}"#;
+
+        assert_eq!(
+            line(&crate::events::ExchangeEvent::session_start(1, "sess-A")),
+            format!("{start_line}\n")
+        );
+        assert_eq!(
+            line(&crate::events::ExchangeEvent::session_request(
+                2,
+                &session_meta,
+                "hi",
+                "sess-A",
+                0
+            )),
+            format!("{request_line}\n")
+        );
+        assert_eq!(
+            line(&crate::events::ExchangeEvent::session_response_ok(
+                3, 10, "hello", None, None, None, "sess-A", 0
+            )),
+            format!("{response_line}\n")
+        );
+        assert_eq!(
+            line(&crate::events::ExchangeEvent::session_end(4, "sess-A", 1)),
+            format!("{end_line}\n")
+        );
+
+        let trail = format!("{start_line}\n{request_line}\n{response_line}\n{end_line}\n");
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.sessions.len(), 1);
+        let session = &report.sessions[0];
+        assert_eq!(session.session_id, "sess-A");
+        assert!(session.started && session.ended);
+        assert_eq!(session.declared_turns, Some(1));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].request.turn_index, Some(0));
+        assert_eq!(
+            session.turns[0].outcome,
+            Some(Outcome::Ok {
+                ts_ms: 3,
+                duration_ms: 10,
+                reply: "hello".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                stop_reason: None,
+                session_id: Some("sess-A".to_string()),
+                turn_index: Some(0),
+            })
+        );
+    }
+
     #[test]
     fn parses_error_outcome() {
         let log = concat!(
