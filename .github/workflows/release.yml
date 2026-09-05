@@ -194,6 +194,48 @@ jobs:
             sha256sum --check ../SHA256SUMS
           )
 
+      - name: Stage and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          assets=(
+            "leg-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-armv7-unknown-linux-musleabihf.tar.gz"
+            "leg-${version}-x86_64-apple-darwin.tar.gz"
+            "leg-${version}-aarch64-apple-darwin.tar.gz"
+            "leg-${version}-x86_64-pc-windows-msvc.zip"
+          )
+          upload_paths=(SHA256SUMS)
+          for asset in "${assets[@]}"; do
+            upload_paths+=("dist/${asset}")
+          done
+
+          # Keep the release draft until every asset upload succeeds; a failed
+          # upload therefore cannot expose an incomplete release to consumers.
+          # This runs before npm publishing so the GitHub Release — which
+          # needs no external secret — never depends on the npm registry step
+          # that follows.
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --draft \
+            --title "leg ${RELEASE_TAG}" \
+            --generate-notes \
+            "${upload_paths[@]}"
+          gh release edit "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false
+
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
       - name: Stage npm packages and preflight publish
         shell: bash
         run: |
@@ -239,12 +281,6 @@ jobs:
             sha256sum --check ../npm-SHA256SUMS
           )
 
-      - name: Set up Node.js and npm registry
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
       - name: Publish npm packages
         shell: bash
         env:
@@ -281,36 +317,3 @@ jobs:
               exit 1
             fi
           done
-
-      - name: Stage and publish release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          version="${RELEASE_TAG#v}"
-          assets=(
-            "leg-${version}-x86_64-unknown-linux-gnu.tar.gz"
-            "leg-${version}-aarch64-unknown-linux-gnu.tar.gz"
-            "leg-${version}-armv7-unknown-linux-musleabihf.tar.gz"
-            "leg-${version}-x86_64-apple-darwin.tar.gz"
-            "leg-${version}-aarch64-apple-darwin.tar.gz"
-            "leg-${version}-x86_64-pc-windows-msvc.zip"
-          )
-          upload_paths=(SHA256SUMS npm-SHA256SUMS)
-          for asset in "${assets[@]}"; do
-            upload_paths+=("dist/${asset}")
-          done
-
-          # Keep the release draft until every asset upload succeeds; a failed
-          # upload therefore cannot expose an incomplete release to consumers.
-          gh release create "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --draft \
-            --title "leg ${RELEASE_TAG}" \
-            --generate-notes \
-            "${upload_paths[@]}"
-          gh release edit "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --draft=false

@@ -8,13 +8,14 @@
 npm i -g @shukelabs/leg
 ```
 
-or pin a release directly:
+or build from source directly:
 
 ```
-cargo install --git https://github.com/SHUKE-LABS/leg --tag v0.1.0 --locked
+cargo install --git https://github.com/SHUKE-LABS/leg --locked
 ```
 
-Per-platform tarballs for every CI-supported target are attached to each
+Per-platform archives for every CI-supported target (`.tar.gz` on
+Unix, `.zip` on Windows) are attached to each
 [GitHub Release](https://github.com/SHUKE-LABS/leg/releases).
 
 ## Usage
