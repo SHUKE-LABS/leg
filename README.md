@@ -2,6 +2,23 @@
 
 `leg` binary skeleton.
 
+## Quickstart
+
+```
+export ANTHROPIC_API_KEY=sk-...
+
+leg ask "hello"
+
+LEG_EVENT_LOG=trail.jsonl leg session
+# type a message, then Ctrl-D or /exit to end the session and create trail.jsonl
+
+leg session --resume trail.jsonl
+```
+
+See [Usage](#usage) and [Sessions](#sessions) below for the full flag set
+(model selection, alternate credential env vars, `--session <id>` when a
+trail holds more than one session, etc).
+
 ## Install
 
 ```
