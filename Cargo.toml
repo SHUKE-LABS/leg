@@ -1,0 +1,12 @@
+[package]
+name = "leg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "leg"
+readme = "README.md"
+license-file = "LICENSE"
+
+[[bin]]
+name = "leg"
+path = "src/main.rs"
