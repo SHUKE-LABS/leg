@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (locked)
+        shell: bash
+        run: cargo build --locked --verbose --target "${TARGET}"
+
+      - name: Test (locked)
+        shell: bash
+        run: cargo test --locked --verbose --target "${TARGET}"
+
+      - name: Verify binary version
+        shell: bash
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          binary="target/${TARGET}/debug/leg"
+          if [[ "${TARGET}" == *-windows-* ]]; then
+            binary="${binary}.exe"
+          fi
+          test "$("./${binary}" --version)" = "leg ${version}"
+
+  cross:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: armv7-unknown-linux-musleabihf
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cross-build (locked)
+        run: cross build --locked --verbose --target "${TARGET}"
