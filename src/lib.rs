@@ -5,7 +5,10 @@
 //! driver — without the harness (mailbox/service/registry/converse-ring).
 //!
 //! - [`config`] — environment-backed runtime configuration.
-//! - [`model`] — typed prompt/reply structures.
+//! - [`model`] — typed prompt/reply structures: role-tagged messages built
+//!   from `text`/`tool_use`/`tool_result` content blocks, and a structured
+//!   stop reason. Tool calls round-trip on the wire; executing them is not
+//!   `leg`'s job at this slice.
 //! - [`transport`] — the provider transport boundary.
 //! - [`events`] — the exchange-record types nested in a peer message.
 //! - [`message`] — the `baton.message/v1` peer-message envelope.

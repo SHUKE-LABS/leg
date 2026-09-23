@@ -10,7 +10,7 @@ use crate::events::{
     EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, WriterSink, now_ms,
 };
 use crate::message::{MessageEnvelope, MessageKind};
-use crate::model::{AssistantReply, Conversation};
+use crate::model::{AssistantReply, ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
@@ -707,7 +707,9 @@ fn run_session_repl_with_warning(
         match result {
             Ok(reply) => {
                 writeln!(output, "{}", reply.text).map_err(io_err)?;
-                conversation.push_assistant(reply.text);
+                // Keep the reply's full blocks (including any `tool_use`) so
+                // the resent history matches what the provider returned.
+                conversation.push(Message::new(Role::Assistant, reply.content));
             }
             Err(err) => {
                 // Roll the failed user turn back out so the next request does
@@ -750,11 +752,12 @@ fn timed_session_exchange(
     let duration_ms = start.elapsed().as_millis() as u64;
 
     if let Ok(reply) = &result
-        && let Some(stop_reason) = reply.stop_reason.as_deref()
+        && reply.stop_reason == Some(StopReason::MaxTokens)
     {
         let _ = writeln!(
             warning,
-            "warning: reply truncated (stop_reason: {stop_reason})"
+            "warning: reply truncated (stop_reason: {})",
+            StopReason::MaxTokens.as_str()
         );
     }
 
@@ -765,10 +768,11 @@ fn timed_session_exchange(
             &reply.text,
             reply.usage.input_tokens,
             reply.usage.output_tokens,
-            reply.stop_reason.as_deref(),
+            reply.stop_reason.as_ref().map(StopReason::as_str),
             session_id,
             turn_index,
-        ),
+        )
+        .with_content(&reply.content),
         Err(err) => ExchangeEvent::session_response_error(
             now_ms(),
             duration_ms,
@@ -837,7 +841,9 @@ fn load_resume(file: &str, session_id: Option<&str>) -> Result<ResumedSession> {
 /// the file must hold exactly one session: zero is a usage error, more than
 /// one names the available ids and requires `--session`. The selected
 /// session's turns are replayed in order into a fresh [`Conversation`]: each
-/// turn whose outcome is `Ok` contributes a user + an assistant turn. Turns
+/// turn whose outcome is `Ok` contributes a user + an assistant turn, rebuilt
+/// from the trail's `content` blocks when recorded (tool calls/results) and
+/// from the `prompt`/`reply` text otherwise (text-only and older trails). Turns
 /// with an `Error` or a torn (`None`) outcome contributed no assistant reply
 /// to the original in-memory history (the live loop rolls a failed user turn
 /// back out), so they are skipped. The next `turn_index` continues past the
@@ -873,9 +879,13 @@ fn select_and_rehydrate(
 
     let mut conversation = Conversation::new();
     for turn in &record.turns {
-        if let Some(Outcome::Ok { reply, .. }) = &turn.outcome {
-            conversation.push_user(turn.request.prompt.as_str());
-            conversation.push_assistant(reply.as_str());
+        if let Some(Outcome::Ok { reply, content, .. }) = &turn.outcome {
+            conversation.push(rehydrate(
+                Role::User,
+                &turn.request.prompt,
+                &turn.request.content,
+            ));
+            conversation.push(rehydrate(Role::Assistant, reply, content));
         }
     }
 
@@ -890,6 +900,15 @@ fn select_and_rehydrate(
         conversation,
         next_turn_index,
     })
+}
+
+/// Rebuilds one trail turn as a [`Message`]: its recorded `content` blocks when
+/// present, else a single text block from `text`.
+fn rehydrate(role: Role, text: &str, content: &Option<Vec<ContentBlock>>) -> Message {
+    match content {
+        Some(blocks) => Message::new(role, blocks.clone()),
+        None => Message::new(role, vec![ContentBlock::text(text)]),
+    }
 }
 
 /// Opens the event sink described by [`EVENT_LOG_ENV`].
@@ -1734,6 +1753,165 @@ mod tests {
         assert_eq!(end_event["turns"], 2);
     }
 
+    fn tool_use_block() -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"path": "a.txt"}),
+        }
+    }
+
+    fn tool_result_block() -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".to_string(),
+            content: "hello".to_string(),
+            is_error: None,
+        }
+    }
+
+    /// Runs one REPL turn per line of `input` against `transport`, returning
+    /// the trail and the warning stream.
+    fn run_repl(transport: &impl Transport, input: &[u8]) -> (String, String) {
+        let mut trail = Vec::new();
+        let mut warning = Vec::new();
+        {
+            let mut sink = WriterSink::new(&mut trail);
+            run_session_repl_with_warning(
+                transport,
+                &mut sink,
+                &meta(),
+                std::io::Cursor::new(input.to_vec()),
+                Vec::new(),
+                "sess-1".to_string(),
+                Conversation::new(),
+                0,
+                &mut warning,
+            )
+            .expect("session loop completes");
+        }
+        (
+            String::from_utf8(trail).unwrap(),
+            String::from_utf8(warning).unwrap(),
+        )
+    }
+
+    #[test]
+    fn session_repl_keeps_tool_use_blocks_in_history_and_trail() {
+        let tool_reply = AssistantReply::from_blocks(
+            vec![ContentBlock::text("checking"), tool_use_block()],
+            crate::model::TokenUsage::default(),
+            Some(StopReason::ToolUse),
+        );
+        let transport = CapturingTransport::new(vec![tool_reply, AssistantReply::new("done")]);
+        let (trail, warning) = run_repl(&transport, b"one\ntwo\n");
+
+        let calls = transport.calls.borrow();
+        assert_eq!(
+            calls[1][1],
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::text("checking"), tool_use_block()]
+            ),
+            "the resent history must keep the reply's tool_use block"
+        );
+        assert_eq!(warning, "", "tool_use is not a truncation");
+
+        let response: serde_json::Value =
+            serde_json::from_str(trail.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(response["event"], "response_ok");
+        assert_eq!(response["reply"], "checking");
+        assert_eq!(response["stop_reason"], "tool_use");
+        assert_eq!(
+            response["content"],
+            serde_json::json!([
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a.txt"}},
+            ])
+        );
+        let text_response: serde_json::Value =
+            serde_json::from_str(trail.lines().nth(3).unwrap()).unwrap();
+        assert!(
+            text_response.get("content").is_none(),
+            "a text-only reply omits content: {text_response}"
+        );
+    }
+
+    #[test]
+    fn session_repl_warns_only_on_max_tokens() {
+        let reply = |stop: StopReason| {
+            AssistantReply::from_blocks(
+                vec![ContentBlock::text("r")],
+                crate::model::TokenUsage::default(),
+                Some(stop),
+            )
+        };
+
+        let transport = CapturingTransport::new(vec![reply(StopReason::EndTurn)]);
+        let (_, warning) = run_repl(&transport, b"hi\n");
+        assert_eq!(warning, "", "end_turn must not warn");
+
+        let transport = CapturingTransport::new(vec![reply(StopReason::MaxTokens)]);
+        let (_, warning) = run_repl(&transport, b"hi\n");
+        assert_eq!(
+            warning,
+            "warning: reply truncated (stop_reason: max_tokens)\n"
+        );
+    }
+
+    /// All three block kinds written to a real trail — a `tool_use` reply and a
+    /// `tool_result` follow-up request — are rehydrated verbatim by `--resume`.
+    #[test]
+    fn select_and_rehydrate_restores_tool_blocks_from_a_real_trail() {
+        let mut trail = Vec::new();
+        {
+            let mut sink = WriterSink::new(&mut trail);
+            let events = [
+                ExchangeEvent::session_start(1, "sess-1"),
+                ExchangeEvent::session_request(2, &meta(), "read a.txt", "sess-1", 0),
+                ExchangeEvent::session_response_ok(
+                    3,
+                    1,
+                    "",
+                    None,
+                    None,
+                    Some("tool_use"),
+                    "sess-1",
+                    0,
+                )
+                .with_content(&[tool_use_block()]),
+                ExchangeEvent::session_request(4, &meta(), "", "sess-1", 1)
+                    .with_content(&[tool_result_block()]),
+                ExchangeEvent::session_response_ok(
+                    5,
+                    1,
+                    "it says hello",
+                    None,
+                    None,
+                    None,
+                    "sess-1",
+                    1,
+                )
+                .with_content(&[ContentBlock::text("it says hello")]),
+            ];
+            for event in &events {
+                sink.record(event).unwrap();
+            }
+        }
+
+        let report = crate::log::parse_sessions(std::io::Cursor::new(trail)).expect("parses");
+        let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates");
+        assert_eq!(
+            resumed.conversation.messages(),
+            &[
+                Message::user("read a.txt"),
+                Message::new(Role::Assistant, vec![tool_use_block()]),
+                Message::new(Role::User, vec![tool_result_block()]),
+                Message::assistant("it says hello"),
+            ]
+        );
+        assert_eq!(resumed.next_turn_index, 2);
+    }
+
     #[test]
     fn select_and_rehydrate_restores_conversation_and_next_turn_index() {
         let sessions = vec![crate::log::SessionRecord {
@@ -1748,6 +1926,7 @@ mod tests {
                         model: "m".to_string(),
                         base_url: "u".to_string(),
                         prompt: "hi".to_string(),
+                        content: None,
                         session_id: Some("sess-1".to_string()),
                         turn_index: Some(0),
                     },
@@ -1755,6 +1934,7 @@ mod tests {
                         ts_ms: 2,
                         duration_ms: 1,
                         reply: "hello".to_string(),
+                        content: None,
                         input_tokens: None,
                         output_tokens: None,
                         stop_reason: None,
@@ -1768,6 +1948,7 @@ mod tests {
                         model: "m".to_string(),
                         base_url: "u".to_string(),
                         prompt: "failed".to_string(),
+                        content: None,
                         session_id: Some("sess-1".to_string()),
                         turn_index: Some(1),
                     },
@@ -1822,6 +2003,7 @@ mod tests {
                 model: "m".to_string(),
                 base_url: "u".to_string(),
                 prompt: "hello".to_string(),
+                content: None,
                 session_id: None,
                 turn_index: None,
             },
@@ -1829,6 +2011,7 @@ mod tests {
                 ts_ms: 1_700_000_000_420,
                 duration_ms: 418,
                 reply: "hi there".to_string(),
+                content: None,
                 input_tokens: None,
                 output_tokens: None,
                 stop_reason: None,
@@ -1859,6 +2042,7 @@ mod tests {
                     model: "m".to_string(),
                     base_url: "u".to_string(),
                     prompt: "a".to_string(),
+                    content: None,
                     session_id: None,
                     turn_index: None,
                 },
@@ -1866,6 +2050,7 @@ mod tests {
                     ts_ms: 2,
                     duration_ms: 1,
                     reply: "ra".to_string(),
+                    content: None,
                     input_tokens: None,
                     output_tokens: None,
                     stop_reason: None,
@@ -1879,6 +2064,7 @@ mod tests {
                     model: "m".to_string(),
                     base_url: "u".to_string(),
                     prompt: "b".to_string(),
+                    content: None,
                     session_id: None,
                     turn_index: None,
                 },
@@ -1886,6 +2072,7 @@ mod tests {
                     ts_ms: 4,
                     duration_ms: 1,
                     reply: "rb".to_string(),
+                    content: None,
                     input_tokens: None,
                     output_tokens: None,
                     stop_reason: None,
