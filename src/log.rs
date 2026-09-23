@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use crate::error::{LegError, Result};
 use crate::events::{
-    Exchange, Outcome, RequestRecord, ToolCallRecord, ToolResultRecord, ToolStatus,
+    Exchange, Outcome, RequestRecord, ToolCallRecord, ToolResultRecord, ToolRoundRecord, ToolStatus,
 };
 
 /// The outcome of parsing a JSONL exchange trail: the complete [`Exchange`]
@@ -175,12 +175,18 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
 }
 
 /// One turn of a session, read back from the trail: the turn's `request`
-/// (which carries `session_id` and `turn_index`) paired with its terminal
-/// outcome.
+/// (which carries `session_id` and `turn_index`), the tool rounds it ran, and
+/// its terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTurn {
     /// The request that opened this turn.
     pub request: RequestRecord,
+    /// Each dispatched round's `tool_use` reply blocks (`tool_round` lines),
+    /// in order; empty for a text-only turn or a trail written before
+    /// `tool_round` existed.
+    pub rounds: Vec<Vec<crate::model::ContentBlock>>,
+    /// The turn's tool calls paired with their results, in call order.
+    pub tools: Vec<ToolPair>,
     /// The turn's outcome, or `None` when the run was killed after the
     /// request line but before its outcome landed (a torn tail) — the request
     /// still counts as a turn; its answer just never arrived.
@@ -294,11 +300,63 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                     let idx = session_index(&mut report.sessions, &mut index, &session_id);
                     report.sessions[idx].turns.push(SessionTurn {
                         request: record,
+                        rounds: Vec::new(),
+                        tools: Vec::new(),
                         outcome: None,
                     });
                 }
                 // A sessionless (`ask`) request carries no session_id and is
                 // skipped — it belongs to no session.
+            }
+            Some("tool_round") => {
+                let turn = session_turn(&report.sessions, &index, &value);
+                let round: ToolRoundRecord = from_value(value, line_no, "tool_round")?;
+                match turn {
+                    Some(Some(idx)) => report.sessions[idx.0].turns[idx.1]
+                        .rounds
+                        .push(round.content),
+                    Some(None) => report.warnings.push(format!(
+                        "line {line_no}: a tool_round had no matching session turn — it is \
+                         not resumed"
+                    )),
+                    None => {}
+                }
+            }
+            Some("tool_call") => {
+                let turn = session_turn(&report.sessions, &index, &value);
+                let call: ToolCallRecord = from_value(value, line_no, "tool_call")?;
+                match turn {
+                    Some(Some(idx)) => report.sessions[idx.0].turns[idx.1]
+                        .tools
+                        .push(ToolPair { call, result: None }),
+                    Some(None) => report.warnings.push(dangling_tool_warning(
+                        line_no,
+                        "tool_call",
+                        &call.tool_use_id,
+                    )),
+                    None => {}
+                }
+            }
+            Some("tool_result") => {
+                let turn = session_turn(&report.sessions, &index, &value);
+                let result: ToolResultRecord = from_value(value, line_no, "tool_result")?;
+                let slot = turn.flatten().and_then(|idx| {
+                    report.sessions[idx.0].turns[idx.1]
+                        .tools
+                        .iter_mut()
+                        .find(|pair| {
+                            pair.call.tool_use_id == result.tool_use_id && pair.result.is_none()
+                        })
+                });
+                match (turn, slot) {
+                    (_, Some(pair)) => pair.result = Some(result),
+                    (Some(_), None) => report.warnings.push(dangling_tool_warning(
+                        line_no,
+                        "tool_result",
+                        &result.tool_use_id,
+                    )),
+                    (None, None) => {}
+                }
             }
             Some("response_ok") | Some("response_error") => {
                 let event = value
@@ -334,6 +392,27 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
     }
 
     Ok(report)
+}
+
+/// Locates the session turn a tool line belongs to, by its `session_id` +
+/// `turn_index`, as `(session, turn)` indexes.
+///
+/// `None` for a sessionless (`ask`) line, which belongs to no session and is
+/// skipped; `Some(None)` for a session-stamped line with no matching turn.
+fn session_turn(
+    sessions: &[SessionRecord],
+    index: &std::collections::HashMap<String, usize>,
+    value: &Value,
+) -> Option<Option<(usize, usize)>> {
+    let session_id = value.get("session_id").and_then(Value::as_str)?;
+    let turn_index = value.get("turn_index").and_then(Value::as_u64)?;
+    Some(index.get(session_id).and_then(|&idx| {
+        sessions[idx]
+            .turns
+            .iter()
+            .position(|t| t.request.turn_index == Some(turn_index))
+            .map(|turn| (idx, turn))
+    }))
 }
 
 /// Returns the index of the [`SessionRecord`] for `session_id`, creating an
@@ -973,6 +1052,36 @@ mod tests {
         assert!(!report.sessions[0].ended);
         assert_eq!(report.sessions[0].turns.len(), 1);
         assert_eq!(report.sessions[0].turns[0].outcome, None);
+    }
+
+    #[test]
+    fn parse_sessions_attaches_tool_lines_to_their_turn() {
+        let trail = [
+            r#"{"event":"request","ts_ms":1,"model":"m","base_url":"u","prompt":"hi","session_id":"sess-1","turn_index":0}"#,
+            r#"{"event":"tool_round","ts_ms":2,"content":[{"type":"tool_use","id":"t1","name":"echo","input":{}}],"session_id":"sess-1","turn_index":0}"#,
+            r#"{"event":"tool_call","ts_ms":3,"tool_use_id":"t1","tool_name":"echo","input":{},"session_id":"sess-1","turn_index":0}"#,
+            r#"{"event":"tool_result","ts_ms":4,"tool_use_id":"t1","tool_name":"echo","status":"completed","result":"ok","session_id":"sess-1","turn_index":0}"#,
+            r#"{"event":"tool_call","ts_ms":5,"tool_use_id":"a1","tool_name":"echo","input":{}}"#,
+            r#"{"event":"tool_call","ts_ms":6,"tool_use_id":"t9","tool_name":"echo","input":{},"session_id":"sess-1","turn_index":7}"#,
+            r#"{"event":"response_ok","ts_ms":7,"duration_ms":1,"reply":"done","session_id":"sess-1","turn_index":0}"#,
+        ]
+        .map(|l| format!("{l}\n"))
+        .concat();
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        let turn = &report.sessions[0].turns[0];
+        assert_eq!(turn.rounds.len(), 1);
+        assert_eq!(turn.tools.len(), 1, "the sessionless ask call is skipped");
+        assert_eq!(turn.tools[0].call.tool_use_id, "t1");
+        assert_eq!(
+            turn.tools[0]
+                .result
+                .as_ref()
+                .and_then(|r| r.result.as_deref()),
+            Some("ok")
+        );
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].starts_with("line 6: a tool_call for t9"));
     }
 
     #[test]

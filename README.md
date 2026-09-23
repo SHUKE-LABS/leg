@@ -74,8 +74,9 @@ minted for the run.
 leg session --resume trail.jsonl [--session <id>]
 ```
 
-Reopens a prior session's trail, rehydrates its conversation history, and
-continues appending new turns to the same file. `--session <id>` selects
+Reopens a prior session's trail, rehydrates its conversation history —
+including each turn's tool rounds — and continues appending new turns to the
+same file. `--session <id>` selects
 which session to resume when the trail holds more than one; it is required
 in that case and otherwise optional.
 
@@ -92,15 +93,18 @@ call's result. `log replay` re-runs one logged exchange's
 prompt — the last one, or `--index <N>` (1-based) — against the *current*
 environment's credential, model, and base URL taken from the log entry;
 timeout, max tokens, and system prompt still come from today's environment.
-The replay's own request and outcome are appended to `LEG_EVENT_LOG` like
-any other `ask`.
+A tool-bearing exchange reruns only its prompt: the current tool loop
+executes the tools afresh (stored tool results are never fed back). The
+replay's own request, tool, and outcome lines are appended to `LEG_EVENT_LOG`
+like any other `ask`.
 
-Between a turn's `request` and its outcome, the trail records each tool call
-the loop dispatches as a `tool_call` line (`tool_use_id`, `tool_name`,
-`input`), followed by exactly one `tool_result` line with the same
-`tool_use_id`, a `status` of `completed` or `failed`, and the tool's `result`
-or `error`. Both carry `schema` and `ts_ms`, plus `session_id`/`turn_index`
-on session turns. `leg exchange` writes no trail.
+Between a turn's `request` and its outcome, the trail records each dispatched
+tool round as a `tool_round` line (`content`: the `tool_use` reply's blocks,
+text included), then each of that round's calls as a `tool_call` line
+(`tool_use_id`, `tool_name`, `input`), followed by exactly one `tool_result`
+line with the same `tool_use_id`, a `status` of `completed` or `failed`, and
+the tool's `result` or `error`. All three carry `schema` and `ts_ms`, plus
+`session_id`/`turn_index` on session turns. `leg exchange` writes no trail.
 
 ### Exchange
 

@@ -86,12 +86,20 @@ pub struct TurnOutcome {
 
 /// An in-memory notification of one dispatched tool call's lifecycle.
 ///
-/// Fired by [`ToolLoop::run_observed`]: `Call` just before a call is
-/// dispatched, then exactly one `Result` once it finishes. The persisted
-/// trail form is [`crate::events::ExchangeEvent::ToolCall`] /
+/// Fired by [`ToolLoop::run_observed`]: one `Round` per dispatched tool round,
+/// then per call a `Call` just before it is dispatched and exactly one
+/// `Result` once it finishes. The persisted trail form is
+/// [`crate::events::ExchangeEvent::ToolRound`] /
+/// [`crate::events::ExchangeEvent::ToolCall`] /
 /// [`crate::events::ExchangeEvent::ToolResult`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolEvent<'a> {
+    /// A `tool_use` reply whose calls are about to be dispatched: its full
+    /// content blocks (any text plus the `tool_use` blocks), in reply order.
+    Round {
+        /// The reply's content blocks.
+        content: &'a [ContentBlock],
+    },
     /// A `tool_use` call about to be dispatched.
     Call {
         /// Provider-assigned call id.
@@ -148,9 +156,9 @@ impl<T: Transport> ToolLoop<T> {
         self.run_observed(history, &mut |_| {})
     }
 
-    /// [`ToolLoop::run`], notifying `observe` of each dispatched call and its
-    /// result, in call order. The capped reply's calls are not dispatched and
-    /// emit nothing.
+    /// [`ToolLoop::run`], notifying `observe` of each dispatched round, then
+    /// each of its calls and their results, in call order. The capped reply's
+    /// calls are not dispatched and emit nothing.
     pub fn run_observed(
         &self,
         history: &[Message],
@@ -170,6 +178,9 @@ impl<T: Transport> ToolLoop<T> {
                     capped: true,
                 });
             }
+            observe(ToolEvent::Round {
+                content: &reply.content,
+            });
             let mut results = Vec::new();
             for block in &reply.content {
                 if let ContentBlock::ToolUse { id, name, input } = block {
@@ -369,6 +380,7 @@ pub(crate) mod tests {
         tool_loop
             .run_observed(&[Message::user("go")], &mut |event| {
                 seen.push(match event {
+                    ToolEvent::Round { content } => format!("round {}", content.len()),
                     ToolEvent::Call { id, name, .. } => format!("call {id} {name}"),
                     ToolEvent::Result {
                         id,
@@ -383,6 +395,7 @@ pub(crate) mod tests {
         assert_eq!(
             seen,
             [
+                "round 3",
                 "call toolu_1 echo",
                 "result toolu_1 false echo: hi",
                 "call toolu_2 missing",
