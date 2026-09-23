@@ -144,7 +144,7 @@ pub fn run() -> Result<()> {
         }
         Some(Command::LogReplay { file, index }) => {
             let report = read_log(file.as_deref())?;
-            let (config, prompt) = replay_target(&report, index, LegConfig::from_env()?)?;
+            let (config, prompt) = replay_target(&report, index, LegConfig::from_env)?;
 
             let stdout = std::io::stdout();
             execute_ask_with_config(config, &prompt, stdout.lock())
@@ -1101,9 +1101,11 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
 }
 
 /// Resolves what `leg log replay` reruns: the selected exchange's user prompt
-/// against `config` retargeted at that exchange's model + base_url.
+/// against the config from `load_config` retargeted at that exchange's model +
+/// base_url. The exchange is selected first, so a bad `--index` reports its
+/// usage error even when the environment's config would not load.
 ///
-/// The rest of `config` — the credential, timeout, max_tokens, system prompt
+/// The rest of the config — the credential, timeout, max_tokens, system prompt
 /// — is the *current* environment's, so a replay re-runs with today's auth,
 /// not a credential that was never recorded. A tool-bearing exchange reruns
 /// only its prompt: the current tool loop executes its tools afresh, and the
@@ -1111,9 +1113,10 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
 fn replay_target(
     report: &crate::log::ParseReport,
     index: Option<usize>,
-    mut config: LegConfig,
+    load_config: impl FnOnce() -> Result<LegConfig>,
 ) -> Result<(LegConfig, String)> {
     let request = &select_exchange(&report.exchanges, index)?.request;
+    let mut config = load_config()?;
     config.model = request.model.clone();
     config.base_url = request.base_url.clone();
     Ok((config, request.prompt.clone()))
@@ -2470,11 +2473,10 @@ mod tests {
 
         let report = crate::log::parse_jsonl(std::io::Cursor::new(trail.clone())).expect("parses");
         assert_eq!(report.exchanges.len(), 2, "global indexing spans sessions");
-        let config = LegConfig::from_lookup(|key| {
-            (key == "ANTHROPIC_API_KEY").then(|| "secret".to_string())
+        let (config, prompt) = replay_target(&report, Some(1), || {
+            LegConfig::from_lookup(|key| (key == "ANTHROPIC_API_KEY").then(|| "secret".to_string()))
         })
-        .expect("config loads");
-        let (config, prompt) = replay_target(&report, Some(1), config).expect("selects");
+        .expect("selects");
         assert_eq!(prompt, "use a tool");
         assert_eq!(config.model, "claude-test-model");
         assert_eq!(config.base_url, "https://api.anthropic.com");
@@ -2504,6 +2506,18 @@ mod tests {
         assert_eq!(report.tools[2].len(), 1);
         assert_eq!(report.tools[2][0].call.tool_use_id, "toolu_9");
         assert!(report.tools[2][0].result.is_some());
+    }
+
+    /// A bad `--index` is reported as a usage error before the environment's
+    /// config is loaded, so a missing credential cannot mask it.
+    #[test]
+    fn replay_target_reports_a_bad_index_before_loading_config() {
+        let report = crate::log::ParseReport::default();
+        let err = replay_target(&report, Some(3), || {
+            Err(LegError::Config("no credential".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, LegError::Usage(_)), "{err:?}");
     }
 
     #[test]
