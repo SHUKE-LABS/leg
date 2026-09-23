@@ -162,6 +162,7 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 base_url: "https://api.anthropic.com".to_string(),
                 prompt: "hello".to_string(),
+                content: None,
                 session_id: None,
                 turn_index: None,
             },
@@ -169,6 +170,7 @@ mod tests {
                 ts_ms: 1_700_000_000_420,
                 duration_ms: 418,
                 reply: "hi there".to_string(),
+                content: None,
                 input_tokens: None,
                 output_tokens: None,
                 stop_reason: Some("max_tokens".to_string()),
@@ -176,6 +178,42 @@ mod tests {
                 turn_index: None,
             },
         })
+    }
+
+    /// A nested exchange carrying content blocks round-trips through the
+    /// envelope, and a text-only one serializes no `content` key at all.
+    #[test]
+    fn round_trips_wrapped_exchange_with_content_blocks() {
+        use crate::model::ContentBlock;
+
+        let mut exchange = wrapped();
+        assert!(
+            !serde_json::to_string(&exchange)
+                .unwrap()
+                .contains("\"content\""),
+            "a text-only exchange must not emit content"
+        );
+
+        let tool_result = ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".to_string(),
+            content: "hello".to_string(),
+            is_error: Some(true),
+        };
+        let tool_use = ContentBlock::ToolUse {
+            id: "toolu_2".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"path": "b.txt"}),
+        };
+        exchange.exchange.request.content = Some(vec![tool_result]);
+        if let Outcome::Ok { content, .. } = &mut exchange.exchange.outcome {
+            *content = Some(vec![ContentBlock::text("again"), tool_use]);
+        }
+        let mut msg = base();
+        msg.exchange = Some(exchange);
+
+        let json = serde_json::to_string(&msg).expect("serializes");
+        let back: MessageEnvelope = serde_json::from_str(&json).expect("parses");
+        assert_eq!(msg, back);
     }
 
     /// Serialize → parse → equal, with no reply link and no wrapped exchange.

@@ -15,7 +15,9 @@ use crate::model::{AssistantReply, Message, Prompt};
 
 /// Sends a conversation and returns a single reply.
 ///
-/// Intentionally synchronous: no streaming or tool calling. The primitive is
+/// Intentionally synchronous and single-call: no streaming, and no tool
+/// execution loop — a reply's `tool_use` blocks are returned to the caller, who
+/// may send `tool_result` blocks back on a later call. The primitive is
 /// [`Transport::send_conversation`], which maps the full message history onto a
 /// provider request — so a multi-turn session resends its accumulated turns on
 /// every call. [`Transport::send`] is a single-turn convenience wrapping one

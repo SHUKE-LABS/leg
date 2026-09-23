@@ -20,6 +20,8 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{ContentBlock, as_single_text};
+
 /// Schema discriminator stamped on the nested exchange record.
 pub const SCHEMA: &str = "baton.exchange/v1";
 
@@ -52,6 +54,10 @@ pub struct RequestRecord {
     pub base_url: String,
     /// The user prompt text.
     pub prompt: String,
+    /// The turn's content blocks when it is not a single text block (tool
+    /// results, multiple blocks); absent for a text-only prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentBlock>>,
     /// Session this turn belongs to; absent on the single-turn `ask` path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -73,6 +79,10 @@ pub enum Outcome {
         duration_ms: u64,
         /// The assistant reply text.
         reply: String,
+        /// The reply's content blocks when it is not a single text block
+        /// (tool calls, multiple blocks); omitted for a text-only reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<ContentBlock>>,
         /// Provider-reported input (prompt) tokens; omitted when unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
@@ -111,6 +121,18 @@ pub enum Outcome {
     },
 }
 
+/// The trail's `content` field for `blocks`: `None` for a text-only turn (one
+/// text block, fully carried by `prompt`/`reply`), else the blocks verbatim.
+///
+/// Omitting the field for text-only turns keeps those trail lines
+/// byte-identical to the pre-block format that baton also reads.
+pub fn trail_content(blocks: &[ContentBlock]) -> Option<Vec<ContentBlock>> {
+    match as_single_text(blocks) {
+        Some(_) => None,
+        None => Some(blocks.to_vec()),
+    }
+}
+
 /// Current wall-clock time as Unix epoch milliseconds.
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -141,6 +163,10 @@ pub enum ExchangeEvent {
         base_url: String,
         /// The user prompt text.
         prompt: String,
+        /// The turn's content blocks when it is not a single text block;
+        /// omitted for a text-only prompt (see [`trail_content`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<ContentBlock>>,
         /// Session this turn belongs to, when emitted from `leg session`.
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -158,6 +184,10 @@ pub enum ExchangeEvent {
         duration_ms: u64,
         /// The assistant reply text.
         reply: String,
+        /// The reply's content blocks when it is not a single text block;
+        /// omitted for a text-only reply (see [`trail_content`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<ContentBlock>>,
         /// Provider-reported input (prompt) tokens; omitted when unknown.
         #[serde(skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
@@ -225,6 +255,7 @@ impl ExchangeEvent {
             model: meta.model.clone(),
             base_url: meta.base_url.clone(),
             prompt: prompt.to_string(),
+            content: None,
             session_id: None,
             turn_index: None,
         }
@@ -245,6 +276,7 @@ impl ExchangeEvent {
             model: meta.model.clone(),
             base_url: meta.base_url.clone(),
             prompt: prompt.to_string(),
+            content: None,
             session_id: Some(session_id.to_string()),
             turn_index: Some(turn_index),
         }
@@ -333,6 +365,7 @@ impl ExchangeEvent {
             ts_ms,
             duration_ms,
             reply: reply.to_string(),
+            content: None,
             input_tokens,
             output_tokens,
             stop_reason: stop_reason.map(str::to_string),
@@ -377,6 +410,19 @@ impl ExchangeEvent {
         }
     }
 
+    /// Attaches `blocks` as the `content` of a `request` or `response_ok`
+    /// event, keeping the field absent when `blocks` is text-only (see
+    /// [`trail_content`]). A no-op on every other event kind.
+    pub fn with_content(mut self, blocks: &[ContentBlock]) -> Self {
+        match &mut self {
+            ExchangeEvent::Request { content, .. } | ExchangeEvent::ResponseOk { content, .. } => {
+                *content = trail_content(blocks);
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Mirrors an already-recorded [`RequestRecord`] (from a [`Participant`]'s
     /// in-band [`Exchange`]) onto the flat JSONL trail, so `ask`'s single call
     /// through [`crate::participant::LocalParticipant`] and `session`'s direct
@@ -390,6 +436,7 @@ impl ExchangeEvent {
             model: request.model.clone(),
             base_url: request.base_url.clone(),
             prompt: request.prompt.clone(),
+            content: request.content.clone(),
             session_id: request.session_id.clone(),
             turn_index: request.turn_index,
         }
@@ -403,6 +450,7 @@ impl ExchangeEvent {
                 ts_ms,
                 duration_ms,
                 reply,
+                content,
                 input_tokens,
                 output_tokens,
                 stop_reason,
@@ -413,6 +461,7 @@ impl ExchangeEvent {
                 ts_ms: *ts_ms,
                 duration_ms: *duration_ms,
                 reply: reply.clone(),
+                content: content.clone(),
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
                 stop_reason: stop_reason.clone(),

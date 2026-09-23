@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::events::{Exchange, ExchangeMeta, Outcome, RequestRecord, now_ms};
+use crate::events::{Exchange, ExchangeMeta, Outcome, RequestRecord, now_ms, trail_content};
 use crate::message::{MessageEnvelope, MessageKind, WrappedExchange};
 use crate::model::Prompt;
 use crate::transport::Transport;
@@ -60,6 +60,7 @@ impl<T: Transport> Participant for LocalParticipant<T> {
             model: self.meta.model.clone(),
             base_url: self.meta.base_url.clone(),
             prompt: request.body.clone(),
+            content: None,
             session_id: None,
             turn_index: None,
         };
@@ -70,9 +71,10 @@ impl<T: Transport> Participant for LocalParticipant<T> {
                     ts_ms: outcome_ts,
                     duration_ms,
                     reply: reply.text.clone(),
+                    content: trail_content(&reply.content),
                     input_tokens: reply.usage.input_tokens,
                     output_tokens: reply.usage.output_tokens,
-                    stop_reason: reply.stop_reason.clone(),
+                    stop_reason: reply.stop_reason.as_ref().map(|r| r.as_str().to_string()),
                     session_id: None,
                     turn_index: None,
                 };

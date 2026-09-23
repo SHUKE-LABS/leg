@@ -2,8 +2,10 @@
 //!
 //! [`ClaudeClient`] implements [`Transport`] against `POST /v1/messages`. It
 //! sends a full conversation history (one or more role-tagged turns), plus any
-//! declared [`ToolSpec`]s, and decodes one assistant reply. Streaming, tool-use
-//! response parsing, and tool execution remain out of scope.
+//! declared [`ToolSpec`]s, and decodes one assistant reply. Message content is
+//! sent and parsed as content blocks: `tool_use` blocks in a reply are decoded
+//! alongside text, and `tool_result` blocks go out on a follow-up user turn.
+//! Streaming and tool execution remain out of scope.
 //! The request building and response parsing are pure functions so they can be
 //! tested without a network via a fake [`HttpClient`].
 
@@ -11,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Credential, LegConfig};
 use crate::error::{LegError, Result};
-use crate::model::{AssistantReply, Message, TokenUsage, ToolSpec};
+use crate::model::{
+    AssistantReply, ContentBlock, Message, StopReason, TokenUsage, ToolSpec, as_single_text,
+};
 use crate::transport::Transport;
 use crate::transport::http::{HttpClient, UreqHttpClient};
 
@@ -106,7 +110,10 @@ fn auth_header(credential: &Credential) -> (&'static str, String) {
 /// Serializes a Messages request body for `model` carrying `messages` in order.
 ///
 /// Each turn's [`Role`](crate::model::Role) is emitted as its wire `role` value,
-/// preserving order so multi-turn history reaches the provider intact. When
+/// preserving order so multi-turn history reaches the provider intact. A turn
+/// that is exactly one text block is sent as a bare `content` string; any other
+/// turn (tool calls, tool results, multiple blocks) is sent as the block array.
+/// When
 /// `system_prompt` is `Some`, it is emitted as the request's `system` field;
 /// `None` omits the field entirely. Likewise `tools` is emitted only when
 /// non-empty, so a tool-less request is byte-identical to one built before tool
@@ -126,7 +133,10 @@ fn build_request_body(
             .iter()
             .map(|message| RequestMessage {
                 role: message.role.as_str(),
-                content: &message.content,
+                content: match as_single_text(&message.content) {
+                    Some(text) => RequestContent::Text(text),
+                    None => RequestContent::Blocks(&message.content),
+                },
             })
             .collect(),
         tools,
@@ -156,24 +166,38 @@ fn parse_response(status: u16, body: &str) -> Result<AssistantReply> {
 
 /// Decodes a successful Messages response into an [`AssistantReply`].
 ///
-/// All `text` content blocks are concatenated in order and the provider's
-/// optional terminal reason is retained on the reply. A body that fails to
-/// decode, or that carries no assistant text, is a [`LegError::Decode`] — the
+/// `text` and `tool_use` content blocks are kept in order; any other block
+/// type (e.g. `thinking`) is skipped so a newer provider shape still decodes.
+/// The provider's optional terminal reason is retained as a [`StopReason`]. A
+/// body that fails to decode, a malformed `text`/`tool_use` block, or a reply
+/// with neither assistant text nor a tool call is a [`LegError::Decode`] — the
 /// client never returns a silently empty reply.
 fn parse_success(body: &str) -> Result<AssistantReply> {
     let response: MessagesResponse = serde_json::from_str(body)
         .map_err(|err| LegError::Decode(format!("malformed Messages response: {err}")))?;
 
-    let text: String = response
-        .content
-        .iter()
-        .filter(|block| block.block_type == "text")
-        .filter_map(|block| block.text.as_deref())
-        .collect();
+    let mut content = Vec::new();
+    for block in response.content {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") | Some("tool_use") => {
+                let block: ContentBlock = serde_json::from_value(block).map_err(|err| {
+                    LegError::Decode(format!("malformed response content block: {err}"))
+                })?;
+                content.push(block);
+            }
+            _ => {}
+        }
+    }
 
-    if text.is_empty() {
+    let has_tool_use = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    let has_text = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text { text } if !text.is_empty()));
+    if !has_text && !has_tool_use {
         return Err(LegError::Decode(
-            "response contained no assistant text".to_string(),
+            "response contained no assistant text or tool call".to_string(),
         ));
     }
 
@@ -186,10 +210,10 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
             output_tokens: u.output_tokens,
         });
 
-    Ok(AssistantReply::with_usage_and_stop_reason(
-        text,
+    Ok(AssistantReply::from_blocks(
+        content,
         usage,
-        response.stop_reason,
+        response.stop_reason.as_deref().map(StopReason::from_wire),
     ))
 }
 
@@ -221,13 +245,24 @@ struct MessagesRequest<'a> {
 #[derive(Serialize)]
 struct RequestMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: RequestContent<'a>,
+}
+
+/// A request turn's `content`: the Messages API accepts either a bare string
+/// or an array of content blocks.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RequestContent<'a> {
+    Text(&'a str),
+    Blocks(&'a [ContentBlock]),
 }
 
 #[derive(Deserialize)]
 struct MessagesResponse {
+    /// Raw blocks, filtered by `type` in [`parse_success`] so unknown block
+    /// types are skipped rather than failing the decode.
     #[serde(default)]
-    content: Vec<ContentBlock>,
+    content: Vec<serde_json::Value>,
     #[serde(default)]
     usage: Option<UsageBlock>,
     #[serde(default)]
@@ -246,14 +281,6 @@ struct UsageBlock {
 }
 
 #[derive(Deserialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct ErrorResponse {
     error: ErrorDetail,
 }
@@ -267,7 +294,7 @@ struct ErrorDetail {
 mod tests {
     use super::*;
     use crate::config::{Credential, DEFAULT_MAX_TOKENS};
-    use crate::model::Prompt;
+    use crate::model::{Prompt, Role};
     use std::cell::RefCell;
     use std::time::Duration;
 
@@ -348,7 +375,7 @@ mod tests {
         );
         let reply = client.send(&Prompt::new("hi")).expect("should succeed");
         assert_eq!(reply.text, "Hello there");
-        assert_eq!(reply.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(reply.stop_reason, Some(StopReason::EndTurn));
     }
 
     #[test]
@@ -365,7 +392,7 @@ mod tests {
         let reply = client.send(&Prompt::new("hi")).expect("should succeed");
 
         assert_eq!(reply.text, "unfinished");
-        assert_eq!(reply.stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(reply.stop_reason, Some(StopReason::MaxTokens));
     }
 
     #[test]
@@ -429,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn concatenates_multiple_text_blocks_and_ignores_non_text() {
+    fn keeps_text_and_tool_use_blocks_in_order() {
         let body = r#"{
             "content": [
                 {"type": "text", "text": "part one "},
@@ -443,6 +470,79 @@ mod tests {
         );
         let reply = client.send(&Prompt::new("hi")).expect("should succeed");
         assert_eq!(reply.text, "part one part two");
+        assert_eq!(
+            reply.content,
+            vec![
+                ContentBlock::text("part one "),
+                ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "x".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::text("part two"),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_unknown_block_types() {
+        let body = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "s"},
+                {"type": "text", "text": "answer"}
+            ]
+        }"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, body),
+        );
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+        assert_eq!(reply.content, vec![ContentBlock::text("answer")]);
+    }
+
+    #[test]
+    fn malformed_tool_use_block_is_decode_error() {
+        let body = r#"{"content": [{"type": "tool_use", "name": "x"}]}"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, body),
+        );
+        assert!(matches!(
+            client.send(&Prompt::new("hi")).unwrap_err(),
+            LegError::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn tool_result_follow_up_serializes_block_arrays() {
+        let tool_use = ContentBlock::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"path": "a.txt"}),
+        };
+        let history = [
+            Message::user("read a.txt"),
+            Message::new(Role::Assistant, vec![tool_use]),
+            Message::new(
+                Role::User,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "hello".to_string(),
+                    is_error: Some(false),
+                }],
+            ),
+        ];
+        let body = build_request_body("m", 16, &history, None, &[]).expect("serializes");
+        assert_eq!(
+            body,
+            concat!(
+                r#"{"model":"m","max_tokens":16,"messages":["#,
+                r#"{"role":"user","content":"read a.txt"},"#,
+                r#"{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a.txt"}}]},"#,
+                r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hello","is_error":false}]}"#,
+                r#"]}"#,
+            )
+        );
     }
 
     #[test]
@@ -740,16 +840,47 @@ mod tests {
     }
 
     #[test]
-    fn success_with_no_text_blocks_is_decode_error() {
-        let body = r#"{"content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]}"#;
+    fn tool_only_reply_parses_with_tool_use_stop_reason() {
+        let body = r#"{
+            "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {"a": 1}}],
+            "stop_reason": "tool_use"
+        }"#;
         let client = ClaudeClient::with_http(
             config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
             FakeHttp::new(200, body),
         );
-        assert!(matches!(
-            client.send(&Prompt::new("hi")).unwrap_err(),
-            LegError::Decode(_)
-        ));
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+        assert_eq!(reply.text, "");
+        assert_eq!(reply.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(
+            reply.content,
+            vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "x".to_string(),
+                input: serde_json::json!({"a": 1}),
+            }]
+        );
+    }
+
+    #[test]
+    fn success_with_no_text_or_tool_use_is_decode_error() {
+        for body in [
+            r#"{"content": []}"#,
+            r#"{"content": [{"type": "text", "text": ""}]}"#,
+            r#"{"content": [{"type": "thinking", "thinking": "hmm"}]}"#,
+        ] {
+            let client = ClaudeClient::with_http(
+                config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+                FakeHttp::new(200, body),
+            );
+            assert!(
+                matches!(
+                    client.send(&Prompt::new("hi")).unwrap_err(),
+                    LegError::Decode(_)
+                ),
+                "expected Decode for {body}"
+            );
+        }
     }
 
     /// A fake transport that always returns a transport-level error.

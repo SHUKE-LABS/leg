@@ -2,11 +2,15 @@
 //!
 //! [`Prompt`] and [`AssistantReply`] model the single-turn `ask` path. Multi-turn
 //! sessions build on [`Message`] (a role-tagged turn) and [`Conversation`] (the
-//! accumulated history that is resent with every request). [`ToolSpec`] declares
-//! a tool the provider may call; tool execution, tool-bearing replies, and
-//! streaming remain out of scope, so a message is plain text with a [`Role`].
+//! accumulated history that is resent with every request). A message's content
+//! is an ordered list of [`ContentBlock`]s — `text`, `tool_use`, and
+//! `tool_result` — so tool calls and their results round-trip through the
+//! transport, the trail, and `--resume`. [`ToolSpec`] declares a tool the
+//! provider may call and [`StopReason`] reports why a reply ended; executing
+//! tools and iterating on `tool_use` stop reasons (the agent loop) and
+//! streaming remain out of scope.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The author of a single conversation turn.
 ///
@@ -30,30 +34,98 @@ impl Role {
     }
 }
 
+/// One block of a message's content, mirroring a Messages API content block.
+///
+/// Serializes with the wire `type` tag (`text` / `tool_use` / `tool_result`),
+/// so the same shape is sent to the provider, parsed from its replies, and
+/// recorded on the trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    /// Plain text.
+    Text {
+        /// The text content.
+        text: String,
+    },
+    /// A tool call requested by the assistant.
+    ToolUse {
+        /// Provider-assigned call id, echoed back by the matching result.
+        id: String,
+        /// The called tool's name.
+        name: String,
+        /// The call's arguments, as the JSON object the provider sent.
+        input: serde_json::Value,
+    },
+    /// The result of a tool call, sent back on a user turn.
+    ToolResult {
+        /// The [`ContentBlock::ToolUse::id`] this result answers.
+        tool_use_id: String,
+        /// The tool's output text.
+        content: String,
+        /// Whether the tool call failed; omitted when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+}
+
+impl ContentBlock {
+    /// Creates a text block from anything string-like.
+    pub fn text(text: impl Into<String>) -> Self {
+        ContentBlock::Text { text: text.into() }
+    }
+}
+
+/// Concatenates the `text` blocks of `blocks` in order, ignoring tool blocks.
+pub fn blocks_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Returns the lone text of `blocks` when they are exactly one text block.
+///
+/// This is the "text-only" shape: the transport sends it as a bare string and
+/// the trail omits its `content` field, keeping text-only traffic byte-identical
+/// to the pre-block wire format.
+pub fn as_single_text(blocks: &[ContentBlock]) -> Option<&str> {
+    match blocks {
+        [ContentBlock::Text { text }] => Some(text),
+        _ => None,
+    }
+}
+
 /// A single role-tagged turn in a conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     /// Who authored this turn.
     pub role: Role,
-    /// The turn's text content.
-    pub content: String,
+    /// The turn's content blocks, in order.
+    pub content: Vec<ContentBlock>,
 }
 
 impl Message {
-    /// Creates a user turn from anything string-like.
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::User,
-            content: content.into(),
-        }
+    /// Creates a turn from explicit content blocks.
+    pub fn new(role: Role, content: Vec<ContentBlock>) -> Self {
+        Self { role, content }
     }
 
-    /// Creates an assistant turn from anything string-like.
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: content.into(),
-        }
+    /// Creates a user turn holding one text block.
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::new(Role::User, vec![ContentBlock::text(text)])
+    }
+
+    /// Creates an assistant turn holding one text block.
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::new(Role::Assistant, vec![ContentBlock::text(text)])
+    }
+
+    /// The turn's text blocks concatenated in order.
+    pub fn text(&self) -> String {
+        blocks_text(&self.content)
     }
 }
 
@@ -72,6 +144,11 @@ impl Conversation {
     /// Creates an empty conversation.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Appends a turn.
+    pub fn push(&mut self, message: Message) {
+        self.messages.push(message);
     }
 
     /// Appends a user turn.
@@ -168,40 +245,92 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
 }
 
-/// A single assistant reply returned by the provider.
+/// Why the provider stopped generating a reply.
+///
+/// Maps the Messages API `stop_reason` string; a value this client does not
+/// know is kept verbatim in [`StopReason::Other`] rather than rejected. An
+/// omitted `stop_reason` is modeled as `Option::None` (unknown), not an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssistantReply {
-    /// The reply text.
-    pub text: String,
-    /// Provider-reported token usage for the call, when available.
-    pub usage: TokenUsage,
-    /// Provider-reported terminal reason, when available.
-    pub stop_reason: Option<String>,
+pub enum StopReason {
+    /// The model finished its turn.
+    EndTurn,
+    /// The reply hit the `max_tokens` limit and is truncated.
+    MaxTokens,
+    /// A custom stop sequence was generated.
+    StopSequence,
+    /// The model requested one or more tool calls.
+    ToolUse,
+    /// The provider paused a long-running turn.
+    PauseTurn,
+    /// The model declined to answer.
+    Refusal,
+    /// Any other provider value, preserved as sent.
+    Other(String),
 }
 
-impl AssistantReply {
-    /// Creates a reply from anything string-like, with no usage recorded.
-    pub fn new(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            usage: TokenUsage::default(),
-            stop_reason: None,
+impl StopReason {
+    /// Parses a wire `stop_reason` value.
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "end_turn" => StopReason::EndTurn,
+            "max_tokens" => StopReason::MaxTokens,
+            "stop_sequence" => StopReason::StopSequence,
+            "tool_use" => StopReason::ToolUse,
+            "pause_turn" => StopReason::PauseTurn,
+            "refusal" => StopReason::Refusal,
+            other => StopReason::Other(other.to_string()),
         }
     }
 
-    /// Creates a reply carrying the provider's reported token usage.
-    pub fn with_usage(text: impl Into<String>, usage: TokenUsage) -> Self {
-        Self::with_usage_and_stop_reason(text, usage, None)
+    /// The wire value for this stop reason.
+    pub fn as_str(&self) -> &str {
+        match self {
+            StopReason::EndTurn => "end_turn",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::StopSequence => "stop_sequence",
+            StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
+            StopReason::Other(value) => value,
+        }
+    }
+}
+
+/// A single assistant reply returned by the provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantReply {
+    /// The reply's text blocks concatenated in order; empty for a tool-only
+    /// reply.
+    pub text: String,
+    /// The reply's content blocks, in order (text and `tool_use`).
+    pub content: Vec<ContentBlock>,
+    /// Provider-reported token usage for the call, when available.
+    pub usage: TokenUsage,
+    /// Provider-reported terminal reason, when available.
+    pub stop_reason: Option<StopReason>,
+}
+
+impl AssistantReply {
+    /// Creates a text reply from anything string-like, with no usage recorded.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self::with_usage(text, TokenUsage::default())
     }
 
-    /// Creates a reply carrying provider usage and its terminal reason.
-    pub fn with_usage_and_stop_reason(
-        text: impl Into<String>,
+    /// Creates a text reply carrying the provider's reported token usage.
+    pub fn with_usage(text: impl Into<String>, usage: TokenUsage) -> Self {
+        Self::from_blocks(vec![ContentBlock::text(text)], usage, None)
+    }
+
+    /// Creates a reply from its content blocks, usage, and terminal reason;
+    /// [`AssistantReply::text`] is derived from the text blocks.
+    pub fn from_blocks(
+        content: Vec<ContentBlock>,
         usage: TokenUsage,
-        stop_reason: Option<String>,
+        stop_reason: Option<StopReason>,
     ) -> Self {
         Self {
-            text: text.into(),
+            text: blocks_text(&content),
+            content,
             usage,
             stop_reason,
         }
@@ -234,17 +363,77 @@ mod tests {
     fn message_constructors_tag_the_role() {
         assert_eq!(
             Message::user("hi"),
-            Message {
-                role: Role::User,
-                content: "hi".to_string(),
-            }
+            Message::new(Role::User, vec![ContentBlock::text("hi")])
         );
         assert_eq!(
             Message::assistant("yo"),
-            Message {
-                role: Role::Assistant,
-                content: "yo".to_string(),
-            }
+            Message::new(Role::Assistant, vec![ContentBlock::text("yo")])
+        );
+    }
+
+    #[test]
+    fn content_blocks_serialize_with_wire_type_tags_and_round_trip() {
+        let blocks = vec![
+            ContentBlock::text("hi"),
+            ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "lookup".to_string(),
+                input: serde_json::json!({"q": "x"}),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: "found".to_string(),
+                is_error: None,
+            },
+        ];
+        let json = serde_json::to_value(&blocks).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}},
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "found"},
+            ])
+        );
+        let back: Vec<ContentBlock> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, blocks);
+    }
+
+    #[test]
+    fn text_helpers_ignore_tool_blocks() {
+        let tool = ContentBlock::ToolUse {
+            id: "t".to_string(),
+            name: "n".to_string(),
+            input: serde_json::json!({}),
+        };
+        let blocks = vec![
+            ContentBlock::text("a"),
+            tool.clone(),
+            ContentBlock::text("b"),
+        ];
+        assert_eq!(blocks_text(&blocks), "ab");
+        assert_eq!(as_single_text(&blocks), None);
+        assert_eq!(as_single_text(&[ContentBlock::text("a")]), Some("a"));
+        assert_eq!(as_single_text(&[tool]), None);
+    }
+
+    #[test]
+    fn stop_reason_round_trips_known_and_unknown_wire_values() {
+        for wire in [
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+            "pause_turn",
+            "refusal",
+            "something_new",
+        ] {
+            assert_eq!(StopReason::from_wire(wire).as_str(), wire);
+        }
+        assert_eq!(StopReason::from_wire("tool_use"), StopReason::ToolUse);
+        assert_eq!(
+            StopReason::from_wire("something_new"),
+            StopReason::Other("something_new".to_string())
         );
     }
 
