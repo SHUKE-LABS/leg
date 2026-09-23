@@ -1,7 +1,9 @@
 //! The command-line entry surface.
 
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read, Write};
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::config::LegConfig;
@@ -12,7 +14,7 @@ use crate::events::{
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant};
-use crate::tools::{TOOL_ROUND_LIMIT_WARNING, ToolLoop, ToolRegistry, TurnOutcome};
+use crate::tools::{TOOL_ROUND_LIMIT_WARNING, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 use crate::transport::http::UreqHttpClient;
@@ -135,13 +137,13 @@ pub fn run() -> Result<()> {
             }
         }
         Some(Command::LogShow { file }) => {
-            let exchanges = read_log(file.as_deref())?;
+            let report = read_log(file.as_deref())?;
             let stdout = std::io::stdout();
-            execute_log_show(&exchanges, stdout.lock())
+            execute_log_show(&report, stdout.lock())
         }
         Some(Command::LogReplay { file, index }) => {
-            let exchanges = read_log(file.as_deref())?;
-            let request = &select_exchange(&exchanges, index)?.request;
+            let report = read_log(file.as_deref())?;
+            let request = &select_exchange(&report.exchanges, index)?.request;
 
             // Replay targets the logged exchange's model + base_url, but uses
             // the *current* credential (and timeout / max_tokens / system
@@ -522,11 +524,25 @@ fn execute_ask(prompt: &str, model: Option<String>, output: impl Write) -> Resul
 /// The testable core of [`execute_ask`], parameterised over an already-built
 /// [`LegConfig`] so `leg log replay` (which overrides `model`/`base_url` from
 /// the logged exchange) shares this path.
+///
+/// The one opened trail is shared between `run_ask` and the tool loop's
+/// observer, so the turn's tool events land between its request and outcome.
 fn execute_ask_with_config(config: LegConfig, prompt: &str, output: impl Write) -> Result<()> {
     let meta = exchange_meta(&config);
-    let participant = LocalParticipant::new(build_transport(config), meta.clone());
-    let mut sink = open_event_sink();
-    run_ask(&participant, &meta, prompt, output, sink.as_mut())
+    let mut sink = Rc::new(RefCell::new(open_event_sink()));
+    let transport = build_transport(config).with_observer(tool_trail_observer(sink.clone()));
+    let participant = LocalParticipant::new(transport, meta.clone());
+    run_ask(&participant, &meta, prompt, output, &mut sink)
+}
+
+/// A tool-loop observer recording each sessionless tool event on `sink`.
+fn tool_trail_observer(mut sink: Rc<RefCell<Box<dyn EventSink>>>) -> ToolObserver {
+    Box::new(move |event| {
+        emit(
+            &mut sink,
+            &ExchangeEvent::from_tool_event(now_ms(), event, None),
+        )
+    })
 }
 
 /// Testable core of [`execute_ask_with_config`], parameterised over a
@@ -700,10 +716,20 @@ fn run_session_repl_with_warning(
         }
 
         conversation.push_user(line.as_str());
-        let result =
-            timed_session_exchange(sink, meta, &line, &session_id, turn_index, warning, || {
-                transport.run(conversation.messages())
-            });
+        let result = timed_session_exchange(
+            sink,
+            meta,
+            &line,
+            &session_id,
+            turn_index,
+            warning,
+            |sink| {
+                transport.run_observed(conversation.messages(), &mut |event| {
+                    let turn = Some((session_id.as_str(), turn_index));
+                    emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
+                })
+            },
+        );
         turn_index += 1;
 
         match result {
@@ -739,7 +765,8 @@ fn run_session_repl_with_warning(
 }
 
 /// Times one session turn's provider call, recording its `request` and
-/// terminal outcome on `sink` before returning the call's result.
+/// terminal outcome on `sink` before returning the call's result. `call`
+/// gets the sink so the turn's tool events land between the two.
 fn timed_session_exchange(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
@@ -747,13 +774,13 @@ fn timed_session_exchange(
     session_id: &str,
     turn_index: u64,
     warning: &mut dyn Write,
-    call: impl FnOnce() -> Result<TurnOutcome>,
+    call: impl FnOnce(&mut dyn EventSink) -> Result<TurnOutcome>,
 ) -> Result<TurnOutcome> {
     let request = ExchangeEvent::session_request(now_ms(), meta, prompt, session_id, turn_index);
     emit(sink, &request);
 
     let start = Instant::now();
-    let result = call();
+    let result = call(sink);
     let duration_ms = start.elapsed().as_millis() as u64;
 
     if let Ok(outcome) = &result {
@@ -992,7 +1019,7 @@ fn open_append_sink(path: &str) -> Box<dyn EventSink> {
 /// there is nothing to read, which is a usage error. Non-fatal warnings
 /// collected by [`crate::log::parse_jsonl`] are surfaced on stderr here,
 /// keeping `parse_jsonl` pure over its reader.
-fn read_log(file: Option<&str>) -> Result<Vec<Exchange>> {
+fn read_log(file: Option<&str>) -> Result<crate::log::ParseReport> {
     let path = resolve_log_path(file)?;
     let handle = File::open(&path)
         .map_err(|err| LegError::Io(format!("failed to open log file {path:?}: {err}")))?;
@@ -1000,7 +1027,7 @@ fn read_log(file: Option<&str>) -> Result<Vec<Exchange>> {
     for warning in &report.warnings {
         eprintln!("warning: {warning}");
     }
-    Ok(report.exchanges)
+    Ok(report)
 }
 
 /// Resolves the log file path: `--file` takes precedence, then
@@ -1040,13 +1067,20 @@ fn select_exchange(exchanges: &[Exchange], index: Option<usize>) -> Result<&Exch
     Ok(&exchanges[position])
 }
 
-/// Writes each exchange as a human-readable block to `output`.
+/// Writes each exchange, with the tool calls made within it, as a
+/// human-readable block to `output`.
 ///
 /// Parameterised over [`Write`] so the rendering is unit-testable with an
 /// in-memory buffer. An empty log produces no output.
-fn execute_log_show(exchanges: &[Exchange], mut output: impl Write) -> Result<()> {
-    for (i, exchange) in exchanges.iter().enumerate() {
-        write!(output, "{}", crate::log::format_exchange(i + 1, exchange)).map_err(io_err)?;
+fn execute_log_show(report: &crate::log::ParseReport, mut output: impl Write) -> Result<()> {
+    for (i, exchange) in report.exchanges.iter().enumerate() {
+        let tools = report.tools.get(i).map_or(&[][..], Vec::as_slice);
+        write!(
+            output,
+            "{}",
+            crate::log::format_exchange(i + 1, exchange, tools)
+        )
+        .map_err(io_err)?;
     }
     Ok(())
 }
@@ -1893,6 +1927,91 @@ mod tests {
         );
     }
 
+    /// Records every event it is given, for trail-order assertions.
+    struct CollectingSink(std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>>);
+
+    impl EventSink for CollectingSink {
+        fn record(&mut self, event: &ExchangeEvent) -> std::io::Result<()> {
+            self.0
+                .borrow_mut()
+                .push(serde_json::to_value(event).unwrap());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_ask_records_tool_events_between_request_and_outcome() {
+        let transport = CapturingTransport::new(vec![
+            crate::tools::tests::tool_use_reply("toolu_1", "echo"),
+            AssistantReply::new("final answer"),
+        ]);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink: Box<dyn EventSink> = Box::new(CollectingSink(events.clone()));
+        let mut sink = Rc::new(RefCell::new(sink));
+        let (tool_loop, _) = echo_looped(&transport);
+        let participant = LocalParticipant::new(
+            tool_loop.with_observer(tool_trail_observer(sink.clone())),
+            meta(),
+        );
+        let mut buf = Vec::new();
+        run_ask(&participant, &meta(), "hello", &mut buf, &mut sink).expect("infallible");
+
+        let events = events.borrow();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["request", "tool_call", "tool_result", "response_ok"]
+        );
+        assert_eq!(events[1]["tool_use_id"], "toolu_1");
+        assert_eq!(events[1]["tool_name"], "echo");
+        assert_eq!(events[1]["input"], serde_json::json!({"text": "hi"}));
+        assert_eq!(events[2]["tool_use_id"], "toolu_1");
+        assert_eq!(events[2]["status"], "completed");
+        assert_eq!(events[2]["result"], "echo: hi");
+        assert!(events[1].get("session_id").is_none());
+    }
+
+    #[test]
+    fn session_repl_records_framed_tool_events_within_the_turn() {
+        let transport = CapturingTransport::new(vec![
+            crate::tools::tests::tool_use_reply("toolu_1", "missing"),
+            AssistantReply::new("final answer"),
+        ]);
+        let (tool_loop, _) = echo_looped(&transport);
+        let (trail, _, _) = run_repl_with(&tool_loop, b"go\n");
+
+        let events: Vec<serde_json::Value> = trail
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "request",
+                "tool_call",
+                "tool_result",
+                "response_ok",
+                "session_end"
+            ]
+        );
+        for tool_event in &events[1..3] {
+            assert_eq!(tool_event["tool_use_id"], "toolu_1");
+            assert_eq!(tool_event["tool_name"], "missing");
+            assert_eq!(tool_event["session_id"], "sess-1");
+            assert_eq!(tool_event["turn_index"], 0);
+        }
+        assert_eq!(events[2]["status"], "failed");
+        assert_eq!(events[2]["error"], "unknown tool: missing");
+        assert!(events[2].get("result").is_none());
+    }
+
     #[test]
     fn execute_exchange_core_runs_the_loop_inside_one_envelope() {
         let transport = CapturingTransport::new(vec![
@@ -1969,8 +2088,9 @@ mod tests {
             "the next turn resends the prior turn's tool rounds"
         );
 
+        // request, tool_call, tool_result, then the turn's outcome.
         let response: serde_json::Value =
-            serde_json::from_str(trail.lines().nth(1).unwrap()).unwrap();
+            serde_json::from_str(trail.lines().nth(3).unwrap()).unwrap();
         assert_eq!(response["event"], "response_ok");
         assert_eq!(response["reply"], "done");
         assert!(
@@ -2196,8 +2316,13 @@ mod tests {
                 turn_index: None,
             },
         }];
+        let report = crate::log::ParseReport {
+            tools: vec![Vec::new()],
+            exchanges,
+            warnings: Vec::new(),
+        };
         let mut buf = Vec::new();
-        execute_log_show(&exchanges, &mut buf).expect("writes");
+        execute_log_show(&report, &mut buf).expect("writes");
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("#1"));
         assert!(text.contains("hello"));
@@ -2206,7 +2331,7 @@ mod tests {
     #[test]
     fn execute_log_show_on_empty_log_writes_nothing() {
         let mut buf = Vec::new();
-        execute_log_show(&[], &mut buf).expect("writes");
+        execute_log_show(&crate::log::ParseReport::default(), &mut buf).expect("writes");
         assert!(buf.is_empty());
     }
 
