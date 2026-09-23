@@ -10,10 +10,12 @@ use crate::events::{
     EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, WriterSink, now_ms,
 };
 use crate::message::{MessageEnvelope, MessageKind};
-use crate::model::{AssistantReply, ContentBlock, Conversation, Message, Role, StopReason};
+use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant};
+use crate::tools::{TOOL_ROUND_LIMIT_WARNING, ToolLoop, ToolRegistry, TurnOutcome};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
+use crate::transport::http::UreqHttpClient;
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
 const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>]";
@@ -100,7 +102,7 @@ pub fn run() -> Result<()> {
                 None => {
                     let config = LegConfig::from_env()?;
                     let meta = exchange_meta(&config);
-                    let client = ClaudeClient::from_config(config);
+                    let client = build_transport(config);
                     let mut sink = open_event_sink();
                     let session_id = new_session_id();
                     execute_session(
@@ -115,7 +117,7 @@ pub fn run() -> Result<()> {
                 Some(args) => {
                     let config = LegConfig::from_env()?;
                     let meta = exchange_meta(&config);
-                    let client = ClaudeClient::from_config(config);
+                    let client = build_transport(config);
                     // Resume: load + select the prior session *before* opening
                     // any sink, so a bad selection (missing id, empty/
                     // ambiguous trail) exits non-zero having written nothing.
@@ -427,8 +429,7 @@ fn parse_exchange_request(raw: &str) -> (MessageEnvelope, ExchangeMode) {
 fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()> {
     let config = LegConfig::from_env()?;
     let meta = exchange_meta(&config);
-    let client = ClaudeClient::from_config(config);
-    let participant = LocalParticipant::new(client, meta);
+    let participant = LocalParticipant::new(build_transport(config), meta);
 
     let mut raw = String::new();
     open_input(in_path)?
@@ -523,8 +524,7 @@ fn execute_ask(prompt: &str, model: Option<String>, output: impl Write) -> Resul
 /// the logged exchange) shares this path.
 fn execute_ask_with_config(config: LegConfig, prompt: &str, output: impl Write) -> Result<()> {
     let meta = exchange_meta(&config);
-    let client = ClaudeClient::from_config(config);
-    let participant = LocalParticipant::new(client, meta.clone());
+    let participant = LocalParticipant::new(build_transport(config), meta.clone());
     let mut sink = open_event_sink();
     run_ask(&participant, &meta, prompt, output, sink.as_mut())
 }
@@ -580,7 +580,7 @@ fn run_ask(
 /// turn's `request` carries `session_id`; the matching `session_end` closes it
 /// on a clean exit) and enters the shared REPL loop.
 fn execute_session(
-    transport: &impl Transport,
+    transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     input: impl BufRead,
@@ -610,7 +610,7 @@ fn execute_session(
 /// partitioning keys on `session_id` (see [`crate::log::parse_sessions`]), so
 /// the resumed run reuses that id and continues its `turn_index`.
 fn execute_session_resumed(
-    transport: &impl Transport,
+    transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     input: impl BufRead,
@@ -638,7 +638,7 @@ fn execute_session_resumed(
 /// [`execute_session_resumed`].
 #[allow(clippy::too_many_arguments)]
 fn run_session_repl(
-    transport: &impl Transport,
+    transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     input: impl BufRead,
@@ -666,8 +666,10 @@ fn run_session_repl(
 ///
 /// Each line read from `input` becomes a user turn appended to
 /// `conversation`; the full accumulated history is resent on every request,
-/// so turn N carries all prior user and assistant turns. The assistant reply
-/// is printed to `output` (and appended as the next turn). Blank lines are
+/// so turn N carries all prior user and assistant turns. Each turn runs
+/// through the [`ToolLoop`]; its tool rounds are appended to the history and
+/// only the final reply is printed to `output` (and appended as the next
+/// turn). Blank lines are
 /// ignored; EOF or a lone [`SESSION_EXIT_COMMAND`] line ends the loop cleanly.
 ///
 /// A turn that fails at the transport layer is **not** fatal: the error is
@@ -677,7 +679,7 @@ fn run_session_repl(
 /// plus one `response_ok`/`response_error` event, exactly like `ask`.
 #[allow(clippy::too_many_arguments)]
 fn run_session_repl_with_warning(
-    transport: &impl Transport,
+    transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     input: impl BufRead,
@@ -700,16 +702,19 @@ fn run_session_repl_with_warning(
         conversation.push_user(line.as_str());
         let result =
             timed_session_exchange(sink, meta, &line, &session_id, turn_index, warning, || {
-                transport.send_conversation(conversation.messages())
+                transport.run(conversation.messages())
             });
         turn_index += 1;
 
         match result {
-            Ok(reply) => {
-                writeln!(output, "{}", reply.text).map_err(io_err)?;
-                // Keep the reply's full blocks (including any `tool_use`) so
+            Ok(outcome) => {
+                writeln!(output, "{}", outcome.reply.text).map_err(io_err)?;
+                // Keep the turn's tool rounds and the reply's full blocks so
                 // the resent history matches what the provider returned.
-                conversation.push(Message::new(Role::Assistant, reply.content));
+                for message in outcome.transcript {
+                    conversation.push(message);
+                }
+                conversation.push(session_reply_message(outcome.reply.content, outcome.capped));
             }
             Err(err) => {
                 // Roll the failed user turn back out so the next request does
@@ -742,8 +747,8 @@ fn timed_session_exchange(
     session_id: &str,
     turn_index: u64,
     warning: &mut dyn Write,
-    call: impl FnOnce() -> Result<AssistantReply>,
-) -> Result<AssistantReply> {
+    call: impl FnOnce() -> Result<TurnOutcome>,
+) -> Result<TurnOutcome> {
     let request = ExchangeEvent::session_request(now_ms(), meta, prompt, session_id, turn_index);
     emit(sink, &request);
 
@@ -751,18 +756,21 @@ fn timed_session_exchange(
     let result = call();
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    if let Ok(reply) = &result
-        && reply.stop_reason == Some(StopReason::MaxTokens)
-    {
-        let _ = writeln!(
-            warning,
-            "warning: reply truncated (stop_reason: {})",
-            StopReason::MaxTokens.as_str()
-        );
+    if let Ok(outcome) = &result {
+        if outcome.reply.stop_reason == Some(StopReason::MaxTokens) {
+            let _ = writeln!(
+                warning,
+                "warning: reply truncated (stop_reason: {})",
+                StopReason::MaxTokens.as_str()
+            );
+        }
+        if outcome.capped {
+            let _ = writeln!(warning, "{TOOL_ROUND_LIMIT_WARNING}");
+        }
     }
 
     let event = match &result {
-        Ok(reply) => ExchangeEvent::session_response_ok(
+        Ok(TurnOutcome { reply, .. }) => ExchangeEvent::session_response_ok(
             now_ms(),
             duration_ms,
             &reply.text,
@@ -784,6 +792,40 @@ fn timed_session_exchange(
     emit(sink, &event);
 
     result
+}
+
+/// The history turn recorded for a session reply.
+///
+/// A reply that stopped at the tool-round limit still carries `tool_use`
+/// blocks that were never answered; the provider rejects a later request whose
+/// `tool_use` has no matching `tool_result`, so those blocks are dropped
+/// (leaving a placeholder when the reply had no text).
+fn session_reply_message(content: Vec<ContentBlock>, capped: bool) -> Message {
+    if !capped {
+        return Message::new(Role::Assistant, content);
+    }
+    let text: Vec<ContentBlock> = content
+        .into_iter()
+        .filter(|block| matches!(block, ContentBlock::Text { .. }))
+        .collect();
+    if text.is_empty() {
+        Message::assistant(TOOL_ROUND_LIMIT_PLACEHOLDER)
+    } else {
+        Message::new(Role::Assistant, text)
+    }
+}
+
+/// History text standing in for a tool-only reply stopped at the round limit.
+const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]";
+
+/// Builds the provider transport every command runs through: a
+/// [`ClaudeClient`] advertising the registry's tools, wrapped in the tool loop.
+///
+/// The registry is empty at this slice; the real tools land in Phase 3.
+fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> {
+    let registry = ToolRegistry::new();
+    let client = ClaudeClient::from_config(config).with_tools(registry.specs());
+    ToolLoop::new(client, registry)
 }
 
 /// Records `event`, downgrading a persistence failure to a stderr warning.
@@ -1077,6 +1119,11 @@ mod tests {
                 .pop_front()
                 .expect("test queued enough replies for every expected call"))
         }
+    }
+
+    /// Wraps a test transport in a tool loop with no registered tools.
+    fn looped<T: Transport>(transport: T) -> ToolLoop<T> {
+        ToolLoop::new(transport, ToolRegistry::new())
     }
 
     fn meta() -> ExchangeMeta {
@@ -1543,7 +1590,7 @@ mod tests {
         let mut warning = Vec::new();
         let mut sink = NoopSink;
         run_session_repl_with_warning(
-            &transport,
+            &looped(&transport),
             &mut sink,
             &meta(),
             std::io::Cursor::new(b"hello\n".to_vec()),
@@ -1564,7 +1611,7 @@ mod tests {
         let mut warning = Vec::new();
         let mut sink = NoopSink;
         run_session_repl_with_warning(
-            &transport,
+            &looped(&transport),
             &mut sink,
             &meta(),
             std::io::Cursor::new(b"\nhello\n\n/exit\nnever sent\n".to_vec()),
@@ -1585,7 +1632,7 @@ mod tests {
         let mut warning = Vec::new();
         let mut sink = NoopSink;
         run_session_repl_with_warning(
-            &transport,
+            &looped(&transport),
             &mut sink,
             &meta(),
             std::io::Cursor::new(b"hello\n".to_vec()),
@@ -1607,7 +1654,7 @@ mod tests {
         {
             let mut sink = WriterSink::new(&mut trail);
             execute_session(
-                &transport,
+                &looped(&transport),
                 &mut sink,
                 &meta(),
                 std::io::Cursor::new(b"hello\n".to_vec()),
@@ -1642,7 +1689,7 @@ mod tests {
         let mut warning = Vec::new();
         let mut sink = NoopSink;
         run_session_repl_with_warning(
-            &transport,
+            &looped(&transport),
             &mut sink,
             &meta(),
             std::io::Cursor::new(b"turn one\nturn two\n".to_vec()),
@@ -1684,7 +1731,7 @@ mod tests {
         {
             let mut sink = WriterSink::new(&mut trail);
             execute_session(
-                &first_transport,
+                &looped(&first_transport),
                 &mut sink,
                 &meta(),
                 std::io::Cursor::new(b"hello\n".to_vec()),
@@ -1713,7 +1760,7 @@ mod tests {
         {
             let mut sink = WriterSink::new(&mut resumed_trail);
             execute_session_resumed(
-                &second_transport,
+                &looped(&second_transport),
                 &mut sink,
                 &meta(),
                 std::io::Cursor::new(b"again\n".to_vec()),
@@ -1772,16 +1819,27 @@ mod tests {
     /// Runs one REPL turn per line of `input` against `transport`, returning
     /// the trail and the warning stream.
     fn run_repl(transport: &impl Transport, input: &[u8]) -> (String, String) {
+        let (trail, warning, _) = run_repl_with(&looped(transport), input);
+        (trail, warning)
+    }
+
+    /// Runs one REPL turn per line of `input` through `tool_loop`, returning
+    /// the trail, the warning stream, and stdout.
+    fn run_repl_with(
+        tool_loop: &ToolLoop<impl Transport>,
+        input: &[u8],
+    ) -> (String, String, String) {
         let mut trail = Vec::new();
         let mut warning = Vec::new();
+        let mut output = Vec::new();
         {
             let mut sink = WriterSink::new(&mut trail);
             run_session_repl_with_warning(
-                transport,
+                tool_loop,
                 &mut sink,
                 &meta(),
                 std::io::Cursor::new(input.to_vec()),
-                Vec::new(),
+                &mut output,
                 "sess-1".to_string(),
                 Conversation::new(),
                 0,
@@ -1792,47 +1850,166 @@ mod tests {
         (
             String::from_utf8(trail).unwrap(),
             String::from_utf8(warning).unwrap(),
+            String::from_utf8(output).unwrap(),
         )
     }
 
+    /// A stub `echo` tool loop over `transport`, counting handler calls.
+    fn echo_looped<T: Transport>(
+        transport: T,
+    ) -> (ToolLoop<T>, std::rc::Rc<std::cell::Cell<usize>>) {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let registry = crate::tools::tests::echo_registry(count.clone());
+        (ToolLoop::new(transport, registry), count)
+    }
+
+    fn echo_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "echo: hi".to_string(),
+            is_error: None,
+        }
+    }
+
     #[test]
-    fn session_repl_keeps_tool_use_blocks_in_history_and_trail() {
+    fn run_ask_iterates_tool_use_and_prints_only_the_final_text() {
+        let transport = CapturingTransport::new(vec![
+            crate::tools::tests::tool_use_reply("toolu_1", "echo"),
+            AssistantReply::new("final answer"),
+        ]);
+        let (tool_loop, count) = echo_looped(&transport);
+        let participant = LocalParticipant::new(tool_loop, meta());
+        let mut buf = Vec::new();
+        run_ask(&participant, &meta(), "hello", &mut buf, &mut NoopSink).expect("infallible");
+
+        assert_eq!(String::from_utf8(buf).unwrap(), "final answer\n");
+        assert_eq!(count.get(), 1);
+        let calls = transport.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1][2],
+            Message::new(Role::User, vec![echo_result("toolu_1")]),
+            "the stub handler's output is fed back as tool_result"
+        );
+    }
+
+    #[test]
+    fn execute_exchange_core_runs_the_loop_inside_one_envelope() {
+        let transport = CapturingTransport::new(vec![
+            crate::tools::tests::tool_use_reply("toolu_1", "echo"),
+            AssistantReply::new("final answer"),
+        ]);
+        let (tool_loop, count) = echo_looped(&transport);
+        let participant = LocalParticipant::new(tool_loop, meta());
+        let envelope = MessageEnvelope::new(
+            "m-1",
+            "c-1",
+            "user",
+            "assistant",
+            MessageKind::Request,
+            "hello",
+            1_700_000_000_000,
+        );
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let mut buf = Vec::new();
+        execute_exchange_core(&participant, &raw, &mut buf).expect("infallible");
+
+        let printed = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            printed.lines().count(),
+            1,
+            "exactly one envelope: {printed}"
+        );
+        let value: serde_json::Value = serde_json::from_str(printed.trim()).unwrap();
+        assert_eq!(value["kind"], "response");
+        assert_eq!(value["body"], "final answer");
+        assert_eq!(count.get(), 1);
+        assert_eq!(transport.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn session_repl_runs_the_tool_loop_and_keeps_its_rounds_in_history() {
         let tool_reply = AssistantReply::from_blocks(
             vec![ContentBlock::text("checking"), tool_use_block()],
             crate::model::TokenUsage::default(),
             Some(StopReason::ToolUse),
         );
-        let transport = CapturingTransport::new(vec![tool_reply, AssistantReply::new("done")]);
-        let (trail, warning) = run_repl(&transport, b"one\ntwo\n");
+        let transport = CapturingTransport::new(vec![
+            tool_reply,
+            AssistantReply::new("done"),
+            AssistantReply::new("again"),
+        ]);
+        let (tool_loop, _) = echo_looped(&transport);
+        let (trail, warning, output) = run_repl_with(&tool_loop, b"one\ntwo\n");
 
-        let calls = transport.calls.borrow();
         assert_eq!(
-            calls[1][1],
-            Message::new(
-                Role::Assistant,
-                vec![ContentBlock::text("checking"), tool_use_block()]
-            ),
-            "the resent history must keep the reply's tool_use block"
+            output, "done\nagain\n",
+            "only each turn's final text prints"
         );
-        assert_eq!(warning, "", "tool_use is not a truncation");
+        assert_eq!(warning, "");
+        let calls = transport.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        let unknown_result = ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".to_string(),
+            content: "unknown tool: read".to_string(),
+            is_error: Some(true),
+        };
+        assert_eq!(
+            calls[2],
+            vec![
+                Message::user("one"),
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::text("checking"), tool_use_block()]
+                ),
+                Message::new(Role::User, vec![unknown_result]),
+                Message::assistant("done"),
+                Message::user("two"),
+            ],
+            "the next turn resends the prior turn's tool rounds"
+        );
 
         let response: serde_json::Value =
             serde_json::from_str(trail.lines().nth(1).unwrap()).unwrap();
         assert_eq!(response["event"], "response_ok");
-        assert_eq!(response["reply"], "checking");
-        assert_eq!(response["stop_reason"], "tool_use");
-        assert_eq!(
-            response["content"],
-            serde_json::json!([
-                {"type": "text", "text": "checking"},
-                {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a.txt"}},
-            ])
-        );
-        let text_response: serde_json::Value =
-            serde_json::from_str(trail.lines().nth(3).unwrap()).unwrap();
+        assert_eq!(response["reply"], "done");
         assert!(
-            text_response.get("content").is_none(),
-            "a text-only reply omits content: {text_response}"
+            response.get("content").is_none(),
+            "final reply is text-only"
+        );
+    }
+
+    #[test]
+    fn session_repl_warns_and_drops_dangling_tool_use_when_capped() {
+        let mut replies: Vec<AssistantReply> = (0..=crate::tools::MAX_TOOL_ROUNDS)
+            .map(|i| crate::tools::tests::tool_use_reply(&format!("toolu_{i}"), "echo"))
+            .collect();
+        replies.push(AssistantReply::new("next"));
+        let transport = CapturingTransport::new(replies);
+        let (tool_loop, count) = echo_looped(&transport);
+        let (_, warning, _) = run_repl_with(&tool_loop, b"go\nnext\n");
+
+        assert_eq!(count.get(), crate::tools::MAX_TOOL_ROUNDS);
+        assert_eq!(warning, format!("{TOOL_ROUND_LIMIT_WARNING}\n"));
+        let calls = transport.calls.borrow();
+        assert_eq!(calls.len(), crate::tools::MAX_TOOL_ROUNDS + 2);
+        let last = calls.last().unwrap();
+        assert_eq!(
+            last[last.len() - 2],
+            Message::assistant("calling"),
+            "the capped reply's unanswered tool_use is stripped from history"
+        );
+    }
+
+    #[test]
+    fn session_reply_message_uses_placeholder_for_a_capped_tool_only_reply() {
+        assert_eq!(
+            session_reply_message(vec![tool_use_block()], true),
+            Message::assistant(TOOL_ROUND_LIMIT_PLACEHOLDER)
+        );
+        assert_eq!(
+            session_reply_message(vec![tool_use_block()], false),
+            Message::new(Role::Assistant, vec![tool_use_block()])
         );
     }
 

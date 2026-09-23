@@ -16,8 +16,9 @@ use crate::model::{AssistantReply, Message, Prompt};
 /// Sends a conversation and returns a single reply.
 ///
 /// Intentionally synchronous and single-call: no streaming, and no tool
-/// execution loop — a reply's `tool_use` blocks are returned to the caller, who
-/// may send `tool_result` blocks back on a later call. The primitive is
+/// execution — a reply's `tool_use` blocks are returned to the caller, who
+/// may send `tool_result` blocks back on a later call
+/// ([`crate::tools::ToolLoop`] does this). The primitive is
 /// [`Transport::send_conversation`], which maps the full message history onto a
 /// provider request — so a multi-turn session resends its accumulated turns on
 /// every call. [`Transport::send`] is a single-turn convenience wrapping one
@@ -34,5 +35,13 @@ pub trait Transport {
     /// unchanged by the multi-turn primitive.
     fn send(&self, prompt: &Prompt) -> Result<AssistantReply> {
         self.send_conversation(std::slice::from_ref(&Message::user(prompt.text.as_str())))
+    }
+}
+
+/// A shared reference to a transport is itself a transport, so a wrapper such
+/// as [`crate::tools::ToolLoop`] can borrow one.
+impl<T: Transport + ?Sized> Transport for &T {
+    fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
+        (**self).send_conversation(messages)
     }
 }

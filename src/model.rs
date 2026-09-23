@@ -7,8 +7,7 @@
 //! `tool_result` — so tool calls and their results round-trip through the
 //! transport, the trail, and `--resume`. [`ToolSpec`] declares a tool the
 //! provider may call and [`StopReason`] reports why a reply ended; executing
-//! tools and iterating on `tool_use` stop reasons (the agent loop) and
-//! streaming remain out of scope.
+//! tools and iterating on `tool_use` stop reasons is [`crate::tools`]' job.
 
 use serde::{Deserialize, Serialize};
 
