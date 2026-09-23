@@ -9,7 +9,8 @@ use std::time::Instant;
 use crate::config::LegConfig;
 use crate::error::{LegError, Result};
 use crate::events::{
-    EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, WriterSink, now_ms,
+    EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, ToolStatus, WriterSink,
+    now_ms,
 };
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
@@ -143,16 +144,7 @@ pub fn run() -> Result<()> {
         }
         Some(Command::LogReplay { file, index }) => {
             let report = read_log(file.as_deref())?;
-            let request = &select_exchange(&report.exchanges, index)?.request;
-
-            // Replay targets the logged exchange's model + base_url, but uses
-            // the *current* credential (and timeout / max_tokens / system
-            // prompt) from the environment — so a replay re-runs with today's
-            // auth, not a credential that was never recorded.
-            let mut config = LegConfig::from_env()?;
-            config.model = request.model.clone();
-            config.base_url = request.base_url.clone();
-            let prompt = request.prompt.clone();
+            let (config, prompt) = replay_target(&report, index, LegConfig::from_env()?)?;
 
             let stdout = std::io::stdout();
             execute_ask_with_config(config, &prompt, stdout.lock())
@@ -635,8 +627,7 @@ fn execute_session_resumed(
 ) -> Result<()> {
     eprintln!(
         "leg session — resumed {} ({} prior turn(s)); type a message and press enter, Ctrl-D or {SESSION_EXIT_COMMAND} to quit",
-        resumed.session_id,
-        resumed.conversation.len() / 2,
+        resumed.session_id, resumed.prior_turns,
     );
     run_session_repl(
         transport,
@@ -882,6 +873,8 @@ struct ResumedSession {
     session_id: String,
     /// History reconstructed from the trail's completed turns.
     conversation: Conversation,
+    /// How many completed turns `conversation` holds.
+    prior_turns: usize,
     /// The `turn_index` the first resumed turn will carry.
     next_turn_index: u64,
 }
@@ -909,9 +902,10 @@ fn load_resume(file: &str, session_id: Option<&str>) -> Result<ResumedSession> {
 /// With `session_id`, selects that id (a miss is a usage error). Without it,
 /// the file must hold exactly one session: zero is a usage error, more than
 /// one names the available ids and requires `--session`. The selected
-/// session's turns are replayed in order into a fresh [`Conversation`]: each
-/// turn whose outcome is `Ok` contributes a user + an assistant turn, rebuilt
-/// from the trail's `content` blocks when recorded (tool calls/results) and
+/// session's turns are replayed in order into a fresh [`Conversation`] by
+/// [`rehydrate_turn`]: each turn whose outcome is `Ok` contributes its user
+/// turn, its tool rounds (from `tool_round` + `tool_result` lines), and its
+/// final reply, rebuilt from the trail's `content` blocks when recorded and
 /// from the `prompt`/`reply` text otherwise (text-only and older trails). Turns
 /// with an `Error` or a torn (`None`) outcome contributed no assistant reply
 /// to the original in-memory history (the live loop rolls a failed user turn
@@ -947,14 +941,13 @@ fn select_and_rehydrate(
     };
 
     let mut conversation = Conversation::new();
+    let mut prior_turns = 0;
     for turn in &record.turns {
-        if let Some(Outcome::Ok { reply, content, .. }) = &turn.outcome {
-            conversation.push(rehydrate(
-                Role::User,
-                &turn.request.prompt,
-                &turn.request.content,
-            ));
-            conversation.push(rehydrate(Role::Assistant, reply, content));
+        if let Some(messages) = rehydrate_turn(turn) {
+            for message in messages {
+                conversation.push(message);
+            }
+            prior_turns += 1;
         }
     }
 
@@ -967,7 +960,70 @@ fn select_and_rehydrate(
     Ok(ResumedSession {
         session_id: record.session_id,
         conversation,
+        prior_turns,
         next_turn_index,
+    })
+}
+
+/// Rebuilds one trail turn as the history the live REPL appended for it: the
+/// user turn, each tool round's `tool_use` reply and its `tool_result` user
+/// turn, then the final reply (see [`run_session_repl_with_warning`]).
+///
+/// `None` for a turn that contributed nothing to the live history — an
+/// `Error` or torn outcome — or whose tool results never all landed, since a
+/// `tool_use` without its `tool_result` is a history the provider rejects.
+fn rehydrate_turn(turn: &crate::log::SessionTurn) -> Option<Vec<Message>> {
+    let Some(Outcome::Ok {
+        reply,
+        content,
+        stop_reason,
+        ..
+    }) = &turn.outcome
+    else {
+        return None;
+    };
+
+    let mut messages = vec![rehydrate(
+        Role::User,
+        &turn.request.prompt,
+        &turn.request.content,
+    )];
+    for round in &turn.rounds {
+        let results = round
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(rehydrate_tool_result(turn, id)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        messages.push(Message::new(Role::Assistant, round.clone()));
+        messages.push(Message::new(Role::User, results));
+    }
+    // A reply still requesting tools stopped at the round limit; the live
+    // loop kept it without its unanswered `tool_use` blocks.
+    let capped = !turn.rounds.is_empty() && stop_reason.as_deref() == Some("tool_use");
+    let reply = rehydrate(Role::Assistant, reply, content);
+    messages.push(session_reply_message(reply.content, capped));
+    Some(messages)
+}
+
+/// Rebuilds the `tool_result` block the loop sent for call `id`, from the
+/// turn's recorded result; `None` when that result never landed.
+fn rehydrate_tool_result(turn: &crate::log::SessionTurn, id: &str) -> Option<ContentBlock> {
+    let result = turn
+        .tools
+        .iter()
+        .find(|pair| pair.call.tool_use_id == id)?
+        .result
+        .as_ref()?;
+    let (content, is_error) = match result.status {
+        ToolStatus::Completed => (result.result.clone().unwrap_or_default(), None),
+        ToolStatus::Failed => (result.error.clone().unwrap_or_default(), Some(true)),
+    };
+    Some(ContentBlock::ToolResult {
+        tool_use_id: id.to_string(),
+        content,
+        is_error,
     })
 }
 
@@ -1042,6 +1098,25 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
             "no log file: pass --file <path> or set {EVENT_LOG_ENV}"
         ))),
     }
+}
+
+/// Resolves what `leg log replay` reruns: the selected exchange's user prompt
+/// against `config` retargeted at that exchange's model + base_url.
+///
+/// The rest of `config` — the credential, timeout, max_tokens, system prompt
+/// — is the *current* environment's, so a replay re-runs with today's auth,
+/// not a credential that was never recorded. A tool-bearing exchange reruns
+/// only its prompt: the current tool loop executes its tools afresh, and the
+/// stored tool results are never fed back.
+fn replay_target(
+    report: &crate::log::ParseReport,
+    index: Option<usize>,
+    mut config: LegConfig,
+) -> Result<(LegConfig, String)> {
+    let request = &select_exchange(&report.exchanges, index)?.request;
+    config.model = request.model.clone();
+    config.base_url = request.base_url.clone();
+    Ok((config, request.prompt.clone()))
 }
 
 /// Selects the exchange to replay: 1-based `index`, or the last when `None`.
@@ -1963,15 +2038,27 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            ["request", "tool_call", "tool_result", "response_ok"]
+            [
+                "request",
+                "tool_round",
+                "tool_call",
+                "tool_result",
+                "response_ok"
+            ]
         );
-        assert_eq!(events[1]["tool_use_id"], "toolu_1");
-        assert_eq!(events[1]["tool_name"], "echo");
-        assert_eq!(events[1]["input"], serde_json::json!({"text": "hi"}));
+        assert_eq!(
+            events[1]["content"],
+            serde_json::to_value(crate::tools::tests::tool_use_reply("toolu_1", "echo").content)
+                .unwrap()
+        );
         assert_eq!(events[2]["tool_use_id"], "toolu_1");
-        assert_eq!(events[2]["status"], "completed");
-        assert_eq!(events[2]["result"], "echo: hi");
+        assert_eq!(events[2]["tool_name"], "echo");
+        assert_eq!(events[2]["input"], serde_json::json!({"text": "hi"}));
+        assert_eq!(events[3]["tool_use_id"], "toolu_1");
+        assert_eq!(events[3]["status"], "completed");
+        assert_eq!(events[3]["result"], "echo: hi");
         assert!(events[1].get("session_id").is_none());
+        assert!(events[2].get("session_id").is_none());
     }
 
     #[test]
@@ -1995,21 +2082,24 @@ mod tests {
             kinds,
             [
                 "request",
+                "tool_round",
                 "tool_call",
                 "tool_result",
                 "response_ok",
                 "session_end"
             ]
         );
-        for tool_event in &events[1..3] {
+        assert_eq!(events[1]["session_id"], "sess-1");
+        assert_eq!(events[1]["turn_index"], 0);
+        for tool_event in &events[2..4] {
             assert_eq!(tool_event["tool_use_id"], "toolu_1");
             assert_eq!(tool_event["tool_name"], "missing");
             assert_eq!(tool_event["session_id"], "sess-1");
             assert_eq!(tool_event["turn_index"], 0);
         }
-        assert_eq!(events[2]["status"], "failed");
-        assert_eq!(events[2]["error"], "unknown tool: missing");
-        assert!(events[2].get("result").is_none());
+        assert_eq!(events[3]["status"], "failed");
+        assert_eq!(events[3]["error"], "unknown tool: missing");
+        assert!(events[3].get("result").is_none());
     }
 
     #[test]
@@ -2088,9 +2178,9 @@ mod tests {
             "the next turn resends the prior turn's tool rounds"
         );
 
-        // request, tool_call, tool_result, then the turn's outcome.
+        // request, tool_round, tool_call, tool_result, then the turn's outcome.
         let response: serde_json::Value =
-            serde_json::from_str(trail.lines().nth(3).unwrap()).unwrap();
+            serde_json::from_str(trail.lines().nth(4).unwrap()).unwrap();
         assert_eq!(response["event"], "response_ok");
         assert_eq!(response["reply"], "done");
         assert!(
@@ -2131,6 +2221,289 @@ mod tests {
             session_reply_message(vec![tool_use_block()], false),
             Message::new(Role::Assistant, vec![tool_use_block()])
         );
+    }
+
+    /// Runs `input` as REPL turns of session `session_id` through `tool_loop`,
+    /// appending the run's trail lines to `trail`.
+    fn append_session_run(
+        tool_loop: &ToolLoop<impl Transport>,
+        trail: &mut Vec<u8>,
+        session_id: &str,
+        input: &[u8],
+    ) {
+        let mut sink = WriterSink::new(trail);
+        run_session_repl_with_warning(
+            tool_loop,
+            &mut sink,
+            &meta(),
+            std::io::Cursor::new(input.to_vec()),
+            Vec::new(),
+            session_id.to_string(),
+            Conversation::new(),
+            0,
+            &mut Vec::new(),
+        )
+        .expect("session loop completes");
+    }
+
+    fn echo_use(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({"text": "hi"}),
+        }
+    }
+
+    fn tool_reply(content: Vec<ContentBlock>) -> AssistantReply {
+        AssistantReply::from_blocks(
+            content,
+            crate::model::TokenUsage::default(),
+            Some(StopReason::ToolUse),
+        )
+    }
+
+    /// A two-round tool turn (text beside two calls, one failing; then one
+    /// more call) followed by a text turn, all through the live REPL.
+    fn tool_session_replies() -> Vec<AssistantReply> {
+        vec![
+            tool_reply(vec![
+                ContentBlock::text("checking"),
+                echo_use("toolu_a", "echo"),
+                echo_use("toolu_b", "missing"),
+            ]),
+            tool_reply(vec![echo_use("toolu_c", "echo")]),
+            AssistantReply::new("done"),
+            AssistantReply::new("ok"),
+        ]
+    }
+
+    /// Resume rebuilds a tool turn exactly as the live REPL held it — each
+    /// round's reply, then one user turn with every result in `tool_use`
+    /// order — and the next turn continues at the next `turn_index`.
+    #[test]
+    fn session_resume_rehydrates_tool_rounds_exactly_as_the_live_history() {
+        let live = CapturingTransport::new(tool_session_replies());
+        let (tool_loop, _) = echo_looped(&live);
+        let mut trail = Vec::new();
+        append_session_run(&tool_loop, &mut trail, "sess-1", b"one\ntwo\n");
+
+        let report = crate::log::parse_sessions(std::io::Cursor::new(trail)).expect("parses");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates");
+
+        // The live turn-two request is the whole prior history plus "two".
+        let mut live_history = live.calls.borrow()[3].clone();
+        assert_eq!(
+            live_history[..4],
+            [
+                Message::user("one"),
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::text("checking"),
+                        echo_use("toolu_a", "echo"),
+                        echo_use("toolu_b", "missing"),
+                    ]
+                ),
+                Message::new(
+                    Role::User,
+                    vec![
+                        echo_result("toolu_a"),
+                        ContentBlock::ToolResult {
+                            tool_use_id: "toolu_b".to_string(),
+                            content: "unknown tool: missing".to_string(),
+                            is_error: Some(true),
+                        },
+                    ]
+                ),
+                Message::new(Role::Assistant, vec![echo_use("toolu_c", "echo")]),
+            ]
+        );
+        live_history.push(Message::assistant("ok"));
+        assert_eq!(resumed.conversation.messages(), &live_history[..]);
+        assert_eq!(resumed.prior_turns, 2);
+        assert_eq!(resumed.next_turn_index, 2);
+
+        let next = CapturingTransport::new(vec![AssistantReply::new("three-reply")]);
+        let mut resumed_trail = Vec::new();
+        {
+            let mut sink = WriterSink::new(&mut resumed_trail);
+            execute_session_resumed(
+                &echo_looped(&next).0,
+                &mut sink,
+                &meta(),
+                std::io::Cursor::new(b"three\n".to_vec()),
+                Vec::new(),
+                resumed,
+            )
+            .expect("resumed run completes");
+        }
+        live_history.push(Message::user("three"));
+        assert_eq!(next.calls.borrow()[0], live_history);
+        let request: serde_json::Value = serde_json::from_str(
+            String::from_utf8(resumed_trail)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request["turn_index"], 2);
+    }
+
+    /// A turn capped at the round limit resumes like the live history: every
+    /// round, then the capped reply without its unanswered `tool_use`.
+    #[test]
+    fn session_resume_strips_the_capped_replys_unanswered_tool_use() {
+        let replies = (0..=crate::tools::MAX_TOOL_ROUNDS)
+            .map(|i| crate::tools::tests::tool_use_reply(&format!("toolu_{i}"), "echo"))
+            .collect();
+        let (tool_loop, _) = echo_looped(CapturingTransport::new(replies));
+        let mut trail = Vec::new();
+        append_session_run(&tool_loop, &mut trail, "sess-1", b"go\n");
+
+        let report = crate::log::parse_sessions(std::io::Cursor::new(trail)).expect("parses");
+        let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates");
+        let messages = resumed.conversation.messages();
+        assert_eq!(messages.len(), 2 + 2 * crate::tools::MAX_TOOL_ROUNDS);
+        assert_eq!(messages.last().unwrap(), &Message::assistant("calling"));
+    }
+
+    /// With several tool-bearing sessions on one trail, `--session` resumes
+    /// only the selected one's history.
+    #[test]
+    fn session_resume_selects_the_named_session_among_tool_sessions() {
+        let mut trail = Vec::new();
+        let first = CapturingTransport::new(tool_session_replies());
+        append_session_run(&echo_looped(&first).0, &mut trail, "sess-1", b"one\ntwo\n");
+        let second = CapturingTransport::new(vec![
+            tool_reply(vec![echo_use("toolu_z", "echo")]),
+            AssistantReply::new("z-done"),
+        ]);
+        append_session_run(&echo_looped(&second).0, &mut trail, "sess-2", b"zed\n");
+
+        let report = crate::log::parse_sessions(std::io::Cursor::new(trail)).expect("parses");
+        let resumed = select_and_rehydrate(report.sessions, Some("sess-2")).expect("rehydrates");
+        assert_eq!(resumed.session_id, "sess-2");
+        assert_eq!(resumed.next_turn_index, 1);
+        assert_eq!(
+            resumed.conversation.messages(),
+            &[
+                Message::user("zed"),
+                Message::new(Role::Assistant, vec![echo_use("toolu_z", "echo")]),
+                Message::new(Role::User, vec![echo_result("toolu_z")]),
+                Message::assistant("z-done"),
+            ]
+        );
+    }
+
+    /// A tool-bearing trail written before `tool_round` existed carries no
+    /// round boundaries; it resumes as before — prompt and final reply only.
+    #[test]
+    fn session_resume_of_a_trail_without_tool_rounds_keeps_text_turns() {
+        let live = CapturingTransport::new(tool_session_replies());
+        let mut trail = Vec::new();
+        append_session_run(&echo_looped(&live).0, &mut trail, "sess-1", b"one\ntwo\n");
+        let legacy: String = String::from_utf8(trail)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains(r#""event":"tool_round""#))
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        let report =
+            crate::log::parse_sessions(std::io::Cursor::new(legacy.into_bytes())).expect("parses");
+        let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates");
+        assert_eq!(
+            resumed.conversation.messages(),
+            &[
+                Message::user("one"),
+                Message::assistant("done"),
+                Message::user("two"),
+                Message::assistant("ok"),
+            ]
+        );
+        assert_eq!(resumed.next_turn_index, 2);
+    }
+
+    /// `log replay --index` selects a tool-bearing exchange by its global
+    /// trail index and reruns only its prompt through the current tool loop,
+    /// appending fresh request/tool/outcome events — the stored tool results
+    /// are never fed back.
+    #[test]
+    fn log_replay_reruns_a_tool_bearing_prompt_through_the_loop() {
+        let recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record_ask = |replies: Vec<AssistantReply>, prompt: &str| {
+            let sink: Box<dyn EventSink> = Box::new(CollectingSink(recorded.clone()));
+            let mut sink = Rc::new(RefCell::new(sink));
+            let (tool_loop, _) = echo_looped(CapturingTransport::new(replies));
+            let participant = LocalParticipant::new(
+                tool_loop.with_observer(tool_trail_observer(sink.clone())),
+                meta(),
+            );
+            run_ask(&participant, &meta(), prompt, Vec::new(), &mut sink).expect("infallible");
+        };
+        let trail_text = |events: &[serde_json::Value]| -> Vec<u8> {
+            events
+                .iter()
+                .map(|e| format!("{e}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+
+        record_ask(
+            vec![
+                crate::tools::tests::tool_use_reply("toolu_1", "echo"),
+                AssistantReply::new("first"),
+            ],
+            "use a tool",
+        );
+        let mut trail = trail_text(&recorded.borrow());
+        let mut session = Vec::new();
+        append_session_run(
+            &looped(CapturingTransport::new(vec![AssistantReply::new("hi")])),
+            &mut session,
+            "sess-1",
+            b"later\n",
+        );
+        trail.extend(session);
+
+        let report = crate::log::parse_jsonl(std::io::Cursor::new(trail.clone())).expect("parses");
+        assert_eq!(report.exchanges.len(), 2, "global indexing spans sessions");
+        let config = LegConfig::from_lookup(|key| {
+            (key == "ANTHROPIC_API_KEY").then(|| "secret".to_string())
+        })
+        .expect("config loads");
+        let (config, prompt) = replay_target(&report, Some(1), config).expect("selects");
+        assert_eq!(prompt, "use a tool");
+        assert_eq!(config.model, "claude-test-model");
+        assert_eq!(config.base_url, "https://api.anthropic.com");
+
+        recorded.borrow_mut().clear();
+        let rerun = CapturingTransport::new(vec![
+            crate::tools::tests::tool_use_reply("toolu_9", "echo"),
+            AssistantReply::new("rerun"),
+        ]);
+        {
+            let sink: Box<dyn EventSink> = Box::new(CollectingSink(recorded.clone()));
+            let mut sink = Rc::new(RefCell::new(sink));
+            let (tool_loop, count) = echo_looped(&rerun);
+            let participant = LocalParticipant::new(
+                tool_loop.with_observer(tool_trail_observer(sink.clone())),
+                meta(),
+            );
+            run_ask(&participant, &meta(), &prompt, Vec::new(), &mut sink).expect("infallible");
+            assert_eq!(count.get(), 1, "the tool executes afresh");
+        }
+        assert_eq!(rerun.calls.borrow()[0], vec![Message::user("use a tool")]);
+
+        trail.extend(trail_text(&recorded.borrow()));
+        let report = crate::log::parse_jsonl(std::io::Cursor::new(trail)).expect("parses");
+        assert_eq!(report.exchanges.len(), 3);
+        assert_eq!(report.exchanges[2].request.prompt, "use a tool");
+        assert_eq!(report.tools[2].len(), 1);
+        assert_eq!(report.tools[2][0].call.tool_use_id, "toolu_9");
+        assert!(report.tools[2][0].result.is_some());
     }
 
     #[test]
@@ -2227,6 +2600,8 @@ mod tests {
                         session_id: Some("sess-1".to_string()),
                         turn_index: Some(0),
                     },
+                    rounds: vec![],
+                    tools: vec![],
                     outcome: Some(Outcome::Ok {
                         ts_ms: 2,
                         duration_ms: 1,
@@ -2249,6 +2624,8 @@ mod tests {
                         session_id: Some("sess-1".to_string()),
                         turn_index: Some(1),
                     },
+                    rounds: vec![],
+                    tools: vec![],
                     outcome: None,
                 },
             ],
@@ -2258,6 +2635,7 @@ mod tests {
         assert_eq!(resumed.session_id, "sess-1");
         assert_eq!(resumed.next_turn_index, 2);
         assert_eq!(resumed.conversation.len(), 2);
+        assert_eq!(resumed.prior_turns, 1);
     }
 
     #[test]

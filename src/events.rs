@@ -224,6 +224,23 @@ pub enum ExchangeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_index: Option<u64>,
     },
+    /// Emitted once per dispatched tool round, before that round's
+    /// `tool_call` lines: the `tool_use` reply's full content blocks, so a
+    /// resume can rebuild the round (its text and call grouping) verbatim.
+    ToolRound {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// The `tool_use` reply's content blocks, in reply order.
+        content: Vec<ContentBlock>,
+        /// Session this round belongs to, when emitted for a session turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Turn number of the session request this round runs within.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_index: Option<u64>,
+    },
     /// Emitted just before the tool loop dispatches one `tool_use` call,
     /// between the turn's `request` and its outcome.
     ToolCall {
@@ -301,6 +318,13 @@ pub enum ToolStatus {
     Failed,
 }
 
+/// Read-side mirror of a `tool_round` trail line.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ToolRoundRecord {
+    /// The `tool_use` reply's content blocks, in reply order.
+    pub content: Vec<ContentBlock>,
+}
+
 /// Read-side mirror of a `tool_call` trail line.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ToolCallRecord {
@@ -343,6 +367,13 @@ impl ExchangeEvent {
         let session_id = turn.map(|(id, _)| id.to_string());
         let turn_index = turn.map(|(_, index)| index);
         match event {
+            ToolEvent::Round { content } => ExchangeEvent::ToolRound {
+                schema: SCHEMA,
+                ts_ms,
+                content: content.to_vec(),
+                session_id,
+                turn_index,
+            },
             ToolEvent::Call { id, name, input } => ExchangeEvent::ToolCall {
                 schema: SCHEMA,
                 ts_ms,
@@ -764,6 +795,37 @@ mod tests {
         assert_eq!(first["event"], "request");
         let second: Value = serde_json::from_str(lines[1]).expect("json");
         assert_eq!(second["event"], "response_ok");
+    }
+
+    #[test]
+    fn tool_round_event_serializes_its_field_names() {
+        let content = [
+            ContentBlock::text("calling"),
+            ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "echo".to_string(),
+                input: serde_json::json!({"text": "hi"}),
+            },
+        ];
+        let event = ExchangeEvent::from_tool_event(
+            4,
+            ToolEvent::Round { content: &content },
+            Some(("sess-1", 3)),
+        );
+        assert_eq!(
+            serde_json::to_value(&event).expect("serializes"),
+            serde_json::json!({
+                "event": "tool_round",
+                "schema": SCHEMA,
+                "ts_ms": 4,
+                "content": [
+                    {"type": "text", "text": "calling"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "echo", "input": {"text": "hi"}},
+                ],
+                "session_id": "sess-1",
+                "turn_index": 3,
+            })
+        );
     }
 
     #[test]
