@@ -7,6 +7,8 @@
 //! for at most [`MAX_TOOL_ROUNDS`] rounds per user turn. `ToolLoop` is itself a
 //! [`Transport`], so every driver (`ask`, `session`, `exchange`) shares it.
 
+use std::cell::RefCell;
+
 use crate::error::Result;
 use crate::model::{AssistantReply, ContentBlock, Message, Role, StopReason, TokenUsage, ToolSpec};
 use crate::transport::Transport;
@@ -82,11 +84,45 @@ pub struct TurnOutcome {
     pub capped: bool,
 }
 
+/// An in-memory notification of one dispatched tool call's lifecycle.
+///
+/// Fired by [`ToolLoop::run_observed`]: `Call` just before a call is
+/// dispatched, then exactly one `Result` once it finishes. The persisted
+/// trail form is [`crate::events::ExchangeEvent::ToolCall`] /
+/// [`crate::events::ExchangeEvent::ToolResult`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEvent<'a> {
+    /// A `tool_use` call about to be dispatched.
+    Call {
+        /// Provider-assigned call id.
+        id: &'a str,
+        /// The called tool's name.
+        name: &'a str,
+        /// The call's JSON arguments.
+        input: &'a serde_json::Value,
+    },
+    /// The terminal result of the call with the same `id`.
+    Result {
+        /// Provider-assigned call id, matching the `Call`.
+        id: &'a str,
+        /// The called tool's name.
+        name: &'a str,
+        /// The tool's output, or its error message when `is_error`.
+        output: &'a str,
+        /// Whether the call failed (unknown tool or handler error).
+        is_error: bool,
+    },
+}
+
+/// A callback receiving each [`ToolEvent`] as it happens.
+pub type ToolObserver = Box<dyn FnMut(ToolEvent<'_>)>;
+
 /// A [`Transport`] that iterates on `tool_use` replies, executing tools via a
 /// [`ToolRegistry`].
 pub struct ToolLoop<T: Transport> {
     transport: T,
     registry: ToolRegistry,
+    observer: Option<RefCell<ToolObserver>>,
 }
 
 impl<T: Transport> ToolLoop<T> {
@@ -95,12 +131,31 @@ impl<T: Transport> ToolLoop<T> {
         Self {
             transport,
             registry,
+            observer: None,
         }
+    }
+
+    /// Notifies `observer` of every tool call made when this loop is driven
+    /// as a [`Transport`] (the participant-driven `ask` path).
+    pub fn with_observer(mut self, observer: ToolObserver) -> Self {
+        self.observer = Some(RefCell::new(observer));
+        self
     }
 
     /// Runs one user turn: sends `history` and iterates while the reply
     /// requests tools, for at most [`MAX_TOOL_ROUNDS`] rounds.
     pub fn run(&self, history: &[Message]) -> Result<TurnOutcome> {
+        self.run_observed(history, &mut |_| {})
+    }
+
+    /// [`ToolLoop::run`], notifying `observe` of each dispatched call and its
+    /// result, in call order. The capped reply's calls are not dispatched and
+    /// emit nothing.
+    pub fn run_observed(
+        &self,
+        history: &[Message],
+        observe: &mut dyn FnMut(ToolEvent<'_>),
+    ) -> Result<TurnOutcome> {
         let mut messages = history.to_vec();
         let mut reply = self.transport.send_conversation(&messages)?;
         let mut usage = reply.usage;
@@ -115,16 +170,25 @@ impl<T: Transport> ToolLoop<T> {
                     capped: true,
                 });
             }
-            let results = reply
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some(self.registry.dispatch(id, name, input))
+            let mut results = Vec::new();
+            for block in &reply.content {
+                if let ContentBlock::ToolUse { id, name, input } = block {
+                    observe(ToolEvent::Call { id, name, input });
+                    let result = self.registry.dispatch(id, name, input);
+                    if let ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } = &result
+                    {
+                        observe(ToolEvent::Result {
+                            id,
+                            name,
+                            output: content,
+                            is_error: is_error.unwrap_or(false),
+                        });
                     }
-                    _ => None,
-                })
-                .collect();
+                    results.push(result);
+                }
+            }
             messages.push(Message::new(Role::Assistant, reply.content));
             messages.push(Message::new(Role::User, results));
             rounds += 1;
@@ -146,7 +210,12 @@ impl<T: Transport> Transport for ToolLoop<T> {
     /// Runs the tool loop and returns only the final reply, warning on stderr
     /// when the turn hit [`MAX_TOOL_ROUNDS`].
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
-        let outcome = self.run(messages)?;
+        let outcome = match &self.observer {
+            Some(observer) => {
+                self.run_observed(messages, &mut |event| (observer.borrow_mut())(event))?
+            }
+            None => self.run(messages)?,
+        };
         if outcome.capped {
             eprintln!("{TOOL_ROUND_LIMIT_WARNING}");
         }
@@ -282,6 +351,44 @@ pub(crate) mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], vec![Message::user("go")]);
         assert_eq!(calls[1][1..], expected_transcript[..]);
+    }
+
+    #[test]
+    fn run_observed_reports_each_call_then_its_result_in_order() {
+        let count = std::rc::Rc::new(Cell::new(0));
+        let mut first = tool_use_reply("toolu_1", "echo");
+        first.content.push(ContentBlock::ToolUse {
+            id: "toolu_2".to_string(),
+            name: "missing".to_string(),
+            input: serde_json::json!({}),
+        });
+        let transport = ScriptedTransport::new(vec![first, AssistantReply::new("done")]);
+        let tool_loop = ToolLoop::new(transport, echo_registry(count));
+
+        let mut seen = Vec::new();
+        tool_loop
+            .run_observed(&[Message::user("go")], &mut |event| {
+                seen.push(match event {
+                    ToolEvent::Call { id, name, .. } => format!("call {id} {name}"),
+                    ToolEvent::Result {
+                        id,
+                        output,
+                        is_error,
+                        ..
+                    } => format!("result {id} {is_error} {output}"),
+                })
+            })
+            .unwrap();
+
+        assert_eq!(
+            seen,
+            [
+                "call toolu_1 echo",
+                "result toolu_1 false echo: hi",
+                "call toolu_2 missing",
+                "result toolu_2 true unknown tool: missing",
+            ]
+        );
     }
 
     #[test]

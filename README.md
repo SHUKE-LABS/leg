@@ -87,12 +87,20 @@ leg log replay [--file <path>] [--index <N>]
 ```
 
 `log show` prints every complete exchange in a JSONL trail (`--file`, or
-`LEG_EVENT_LOG` when omitted). `log replay` re-runs one logged exchange's
+`LEG_EVENT_LOG` when omitted), with each tool call made within it and that
+call's result. `log replay` re-runs one logged exchange's
 prompt — the last one, or `--index <N>` (1-based) — against the *current*
 environment's credential, model, and base URL taken from the log entry;
 timeout, max tokens, and system prompt still come from today's environment.
 The replay's own request and outcome are appended to `LEG_EVENT_LOG` like
 any other `ask`.
+
+Between a turn's `request` and its outcome, the trail records each tool call
+the loop dispatches as a `tool_call` line (`tool_use_id`, `tool_name`,
+`input`), followed by exactly one `tool_result` line with the same
+`tool_use_id`, a `status` of `completed` or `failed`, and the tool's `result`
+or `error`. Both carry `schema` and `ts_ms`, plus `session_id`/`turn_index`
+on session turns. `leg exchange` writes no trail.
 
 ### Exchange
 

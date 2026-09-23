@@ -1,7 +1,8 @@
 //! Reading and rendering the JSONL exchange-event trail.
 //!
 //! [`crate::events`] owns the write path: each `ask`/`session` exchange emits
-//! a `request` line followed by exactly one outcome line, with `session`
+//! a `request` line, any `tool_call`/`tool_result` lines for the tool calls it
+//! made, then exactly one outcome line, with `session`
 //! additionally framing its run between `session_start`/`session_end`
 //! markers. This module owns the read path — turning that trail back into
 //! typed, paired [`Exchange`] values (`leg log show`/`leg log replay`) or
@@ -24,7 +25,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{LegError, Result};
-use crate::events::{Exchange, Outcome, RequestRecord};
+use crate::events::{
+    Exchange, Outcome, RequestRecord, ToolCallRecord, ToolResultRecord, ToolStatus,
+};
 
 /// The outcome of parsing a JSONL exchange trail: the complete [`Exchange`]
 /// pairs and any non-fatal diagnostics collected along the way.
@@ -35,8 +38,21 @@ use crate::events::{Exchange, Outcome, RequestRecord};
 pub struct ParseReport {
     /// Complete request/outcome pairs, in file order.
     pub exchanges: Vec<Exchange>,
+    /// The tool calls made within each exchange, in call order;
+    /// `tools[i]` belongs to `exchanges[i]`.
+    pub tools: Vec<Vec<ToolPair>>,
     /// Non-fatal diagnostics, in the order they were encountered.
     pub warnings: Vec<String>,
+}
+
+/// One persisted tool call paired with its terminal result by `tool_use_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPair {
+    /// The `tool_call` line.
+    pub call: ToolCallRecord,
+    /// The matching `tool_result` line, or `None` when it never landed (a
+    /// torn tail or an in-flight call).
+    pub result: Option<ToolResultRecord>,
 }
 
 /// Parses a JSONL exchange trail into a [`ParseReport`] of paired [`Exchange`]
@@ -64,10 +80,14 @@ pub struct ParseReport {
 ///   records a [`ParseReport::warnings`] entry rather than dropping silently.
 /// - **Trailing request** with no outcome (a torn tail or an in-flight call):
 ///   not yielded and not warned — only complete pairs become an [`Exchange`].
+/// - **`tool_call` / `tool_result`**: attached to the pending request's
+///   [`ParseReport::tools`], a result paired to its call by `tool_use_id`. A
+///   tool line with no pending request, or a result with no matching call, is
+///   not shown and records a warning.
 pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
     let mut buffered = BufReader::new(reader);
     let mut report = ParseReport::default();
-    let mut pending: Option<RequestRecord> = None;
+    let mut pending: Option<(RequestRecord, Vec<ToolPair>)> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
 
@@ -101,7 +121,34 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
         match value.get("event").and_then(Value::as_str) {
             Some("request") => {
                 let record: RequestRecord = from_value(value, line_no, "request")?;
-                pending = Some(record);
+                pending = Some((record, Vec::new()));
+            }
+            Some("tool_call") => {
+                let call: ToolCallRecord = from_value(value, line_no, "tool_call")?;
+                match &mut pending {
+                    Some((_, tools)) => tools.push(ToolPair { call, result: None }),
+                    None => report.warnings.push(dangling_tool_warning(
+                        line_no,
+                        "tool_call",
+                        &call.tool_use_id,
+                    )),
+                }
+            }
+            Some("tool_result") => {
+                let result: ToolResultRecord = from_value(value, line_no, "tool_result")?;
+                let slot = pending.as_mut().and_then(|(_, tools)| {
+                    tools.iter_mut().find(|pair| {
+                        pair.call.tool_use_id == result.tool_use_id && pair.result.is_none()
+                    })
+                });
+                match slot {
+                    Some(pair) => pair.result = Some(result),
+                    None => report.warnings.push(dangling_tool_warning(
+                        line_no,
+                        "tool_result",
+                        &result.tool_use_id,
+                    )),
+                }
             }
             Some("response_ok") | Some("response_error") => {
                 let event = value
@@ -111,7 +158,10 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
                     .to_string();
                 let outcome: Outcome = from_value(value, line_no, &event)?;
                 match pending.take() {
-                    Some(request) => report.exchanges.push(Exchange { request, outcome }),
+                    Some((request, tools)) => {
+                        report.exchanges.push(Exchange { request, outcome });
+                        report.tools.push(tools);
+                    }
                     None => report
                         .warnings
                         .push(dangling_outcome_warning(line_no, &event)),
@@ -316,6 +366,15 @@ fn dangling_outcome_warning(line_no: usize, event: &str) -> String {
     )
 }
 
+/// Warning text for a tool line that cannot be placed: a `tool_call` with no
+/// pending request, or a `tool_result` with no unanswered matching call.
+fn dangling_tool_warning(line_no: usize, event: &str, tool_use_id: &str) -> String {
+    format!(
+        "line {line_no}: a {event} for {tool_use_id} had no matching pending request or \
+         call — it is not shown"
+    )
+}
+
 /// Deserializes a known event into `T`, mapping a shape mismatch onto a
 /// [`LegError::Log`] that names the line and event so a corrupt trail points
 /// at the offending entry.
@@ -339,10 +398,12 @@ fn parse_line_value(bytes: &[u8]) -> std::result::Result<Value, String> {
 ///
 /// `n` is the 1-based position shown to the user. The block carries the
 /// timestamp, model, and call duration on its header line, then a truncated
-/// prompt and either a truncated reply or the failure (`kind: message`).
-pub fn format_exchange(n: usize, exchange: &Exchange) -> String {
+/// prompt, each tool call made within the exchange (with its result), and
+/// either a truncated reply or the failure (`kind: message`).
+pub fn format_exchange(n: usize, exchange: &Exchange, tools: &[ToolPair]) -> String {
     const MAX: usize = 120;
     let request = &exchange.request;
+    let tool_lines: String = tools.iter().map(|pair| format_tool(pair, MAX)).collect();
     let mut out = match &exchange.outcome {
         Outcome::Ok {
             duration_ms,
@@ -351,7 +412,7 @@ pub fn format_exchange(n: usize, exchange: &Exchange) -> String {
             output_tokens,
             ..
         } => format!(
-            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n    reply:  {}\n    tokens: {}",
+            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{tool_lines}    reply:  {}\n    tokens: {}",
             format_ts(request.ts_ms),
             request.model,
             excerpt(&request.prompt, MAX),
@@ -364,7 +425,7 @@ pub fn format_exchange(n: usize, exchange: &Exchange) -> String {
             message,
             ..
         } => format!(
-            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n    error:  {kind}: {}",
+            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{tool_lines}    error:  {kind}: {}",
             format_ts(request.ts_ms),
             request.model,
             excerpt(&request.prompt, MAX),
@@ -373,6 +434,34 @@ pub fn format_exchange(n: usize, exchange: &Exchange) -> String {
     };
     out.push('\n');
     out
+}
+
+/// Renders one tool call and its result as two indented lines.
+fn format_tool(pair: &ToolPair, max: usize) -> String {
+    let call = &pair.call;
+    let result = match &pair.result {
+        Some(result) => match result.status {
+            ToolStatus::Completed => {
+                format!(
+                    "completed: {}",
+                    excerpt(result.result.as_deref().unwrap_or(""), max)
+                )
+            }
+            ToolStatus::Failed => {
+                format!(
+                    "failed: {}",
+                    excerpt(result.error.as_deref().unwrap_or(""), max)
+                )
+            }
+        },
+        None => "no result".to_string(),
+    };
+    format!(
+        "    tool:   {} [{}] {}\n            → {result}\n",
+        call.tool_name,
+        call.tool_use_id,
+        excerpt(&call.input.to_string(), max),
+    )
 }
 
 /// Formats the reported token counts for a `response_ok` block.
@@ -671,6 +760,131 @@ mod tests {
         );
     }
 
+    const REQUEST: &str =
+        r#"{"event":"request","ts_ms":1,"model":"m","base_url":"u","prompt":"p"}"#;
+    const RESPONSE: &str = r#"{"event":"response_ok","ts_ms":9,"duration_ms":1,"reply":"r"}"#;
+
+    #[test]
+    fn tool_events_pair_by_id_within_their_exchange() {
+        let log = [
+            REQUEST,
+            r#"{"event":"tool_call","ts_ms":2,"tool_use_id":"t1","tool_name":"echo","input":{"text":"hi"}}"#,
+            r#"{"event":"tool_call","ts_ms":3,"tool_use_id":"t2","tool_name":"fail","input":{}}"#,
+            r#"{"event":"tool_result","ts_ms":4,"tool_use_id":"t2","tool_name":"fail","status":"failed","error":"boom"}"#,
+            r#"{"event":"tool_result","ts_ms":5,"tool_use_id":"t1","tool_name":"echo","status":"completed","result":"echo: hi"}"#,
+            RESPONSE,
+            REQUEST,
+            RESPONSE,
+            "",
+        ]
+        .join("\n");
+        let report = parse_jsonl(Cursor::new(log)).expect("parses");
+
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.exchanges.len(), 2);
+        assert_eq!(report.tools.len(), 2);
+        assert!(report.tools[1].is_empty());
+        let tools = &report.tools[0];
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].call.tool_use_id, "t1");
+        assert_eq!(tools[0].call.input, serde_json::json!({"text": "hi"}));
+        let first = tools[0].result.as_ref().expect("t1 answered");
+        assert_eq!(first.status, ToolStatus::Completed);
+        assert_eq!(first.result.as_deref(), Some("echo: hi"));
+        let second = tools[1].result.as_ref().expect("t2 answered");
+        assert_eq!(second.tool_use_id, "t2");
+        assert_eq!(second.status, ToolStatus::Failed);
+        assert_eq!(second.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn tool_lines_that_cannot_be_placed_are_warned() {
+        let log = [
+            r#"{"event":"tool_call","ts_ms":1,"tool_use_id":"t0","tool_name":"echo","input":{}}"#,
+            REQUEST,
+            r#"{"event":"tool_result","ts_ms":2,"tool_use_id":"t9","status":"completed","result":"x"}"#,
+            RESPONSE,
+            "",
+        ]
+        .join("\n");
+        let report = parse_jsonl(Cursor::new(log)).expect("parses");
+
+        assert_eq!(report.exchanges.len(), 1);
+        assert!(report.tools[0].is_empty());
+        assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("line 1") && report.warnings[0].contains("t0"));
+        assert!(report.warnings[1].contains("line 3") && report.warnings[1].contains("t9"));
+    }
+
+    #[test]
+    fn legacy_tool_lines_without_a_tool_name_still_parse() {
+        let log = [
+            REQUEST,
+            r#"{"event":"tool_call","ts_ms":2,"tool_use_id":"t1","input":{}}"#,
+            r#"{"event":"tool_result","ts_ms":3,"tool_use_id":"t1","status":"completed","result":"ok"}"#,
+            RESPONSE,
+            "",
+        ]
+        .join("\n");
+        let report = parse_jsonl(Cursor::new(log)).expect("parses");
+
+        let pair = &report.tools[0][0];
+        assert_eq!(pair.call.tool_name, "");
+        assert_eq!(pair.result.as_ref().unwrap().tool_name, "");
+    }
+
+    #[test]
+    fn torn_tool_result_tail_is_tolerated() {
+        let log = format!(
+            "{REQUEST}\n{RESPONSE}\n{REQUEST}\n{}\n{}",
+            r#"{"event":"tool_call","ts_ms":2,"tool_use_id":"t1","tool_name":"echo","input":{}}"#,
+            r#"{"event":"tool_result","ts_ms":3,"tool_use_id":"t1","sta"#,
+        );
+        let report = parse_jsonl(Cursor::new(log)).expect("tolerates torn tail");
+
+        assert_eq!(report.exchanges.len(), 1);
+        assert_eq!(report.tools, vec![Vec::new()]);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(
+            report.warnings[0].contains("line 5"),
+            "{}",
+            report.warnings[0]
+        );
+    }
+
+    #[test]
+    fn format_exchange_renders_tool_pairs_between_prompt_and_reply() {
+        let log = [
+            REQUEST,
+            r#"{"event":"tool_call","ts_ms":2,"tool_use_id":"t1","tool_name":"echo","input":{"text":"hi"}}"#,
+            r#"{"event":"tool_result","ts_ms":3,"tool_use_id":"t1","tool_name":"echo","status":"completed","result":"echo: hi"}"#,
+            r#"{"event":"tool_call","ts_ms":4,"tool_use_id":"t2","tool_name":"fail","input":{}}"#,
+            r#"{"event":"tool_result","ts_ms":5,"tool_use_id":"t2","tool_name":"fail","status":"failed","error":"boom"}"#,
+            r#"{"event":"tool_call","ts_ms":6,"tool_use_id":"t3","tool_name":"slow","input":{}}"#,
+            RESPONSE,
+            "",
+        ]
+        .join("\n");
+        let report = parse_jsonl(Cursor::new(log)).expect("parses");
+
+        let rendered = format_exchange(1, &report.exchanges[0], &report.tools[0]);
+        let body: Vec<&str> = rendered.lines().skip(1).collect();
+        assert_eq!(
+            body,
+            [
+                "    prompt: p",
+                r#"    tool:   echo [t1] {"text":"hi"}"#,
+                "            → completed: echo: hi",
+                "    tool:   fail [t2] {}",
+                "            → failed: boom",
+                "    tool:   slow [t3] {}",
+                "            → no result",
+                "    reply:  r",
+                "    tokens: unknown",
+            ]
+        );
+    }
+
     #[test]
     fn dangling_outcome_with_no_pending_request_is_warned() {
         let log = concat!(
@@ -785,7 +999,7 @@ mod tests {
                 turn_index: None,
             },
         };
-        let rendered = format_exchange(1, &ok);
+        let rendered = format_exchange(1, &ok, &[]);
         assert!(rendered.contains("#1"));
         assert!(rendered.contains("hello"));
         assert!(rendered.contains("hi there"));

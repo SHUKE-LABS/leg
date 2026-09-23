@@ -21,6 +21,7 @@ use std::io::{self, Write};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ContentBlock, as_single_text};
+use crate::tools::ToolEvent;
 
 /// Schema discriminator stamped on the nested exchange record.
 pub const SCHEMA: &str = "baton.exchange/v1";
@@ -223,6 +224,51 @@ pub enum ExchangeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_index: Option<u64>,
     },
+    /// Emitted just before the tool loop dispatches one `tool_use` call,
+    /// between the turn's `request` and its outcome.
+    ToolCall {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// Provider-assigned call id, echoed by the matching `tool_result`.
+        tool_use_id: String,
+        /// The called tool's name.
+        tool_name: String,
+        /// The call's JSON arguments.
+        input: serde_json::Value,
+        /// Session this call belongs to, when emitted for a session turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Turn number of the session request this call runs within.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_index: Option<u64>,
+    },
+    /// Emitted exactly once per `tool_call`, when that call finishes.
+    ToolResult {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// The `tool_call` this result answers.
+        tool_use_id: String,
+        /// The called tool's name.
+        tool_name: String,
+        /// Whether the call completed or failed; the only error signal.
+        status: ToolStatus,
+        /// The tool's output; present only when `completed`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        /// The failure message; present only when `failed`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// Session this result belongs to, when emitted for a session turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Turn number of the session request this call runs within.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_index: Option<u64>,
+    },
     /// Emitted once by `leg session` at the start of a run, before any turn.
     SessionStart {
         /// Schema discriminator ([`SCHEMA`]).
@@ -245,7 +291,93 @@ pub enum ExchangeEvent {
     },
 }
 
+/// The terminal status of a persisted `tool_result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    /// The tool ran and returned output.
+    Completed,
+    /// The tool was unknown or its handler returned an error.
+    Failed,
+}
+
+/// Read-side mirror of a `tool_call` trail line.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ToolCallRecord {
+    /// Wall-clock emission time, Unix epoch milliseconds.
+    pub ts_ms: u64,
+    /// Provider-assigned call id.
+    pub tool_use_id: String,
+    /// The called tool's name; empty when a legacy line omits it.
+    #[serde(default)]
+    pub tool_name: String,
+    /// The call's JSON arguments.
+    #[serde(default)]
+    pub input: serde_json::Value,
+}
+
+/// Read-side mirror of a `tool_result` trail line.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ToolResultRecord {
+    /// Wall-clock emission time, Unix epoch milliseconds.
+    pub ts_ms: u64,
+    /// The `tool_call` this result answers.
+    pub tool_use_id: String,
+    /// The called tool's name; empty when a legacy line omits it.
+    #[serde(default)]
+    pub tool_name: String,
+    /// Whether the call completed or failed.
+    pub status: ToolStatus,
+    /// The tool's output, when `completed`.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// The failure message, when `failed`.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 impl ExchangeEvent {
+    /// Builds the persisted form of a tool-loop [`ToolEvent`], stamped with
+    /// the session turn's `(session_id, turn_index)` when there is one.
+    pub fn from_tool_event(ts_ms: u64, event: ToolEvent<'_>, turn: Option<(&str, u64)>) -> Self {
+        let session_id = turn.map(|(id, _)| id.to_string());
+        let turn_index = turn.map(|(_, index)| index);
+        match event {
+            ToolEvent::Call { id, name, input } => ExchangeEvent::ToolCall {
+                schema: SCHEMA,
+                ts_ms,
+                tool_use_id: id.to_string(),
+                tool_name: name.to_string(),
+                input: input.clone(),
+                session_id,
+                turn_index,
+            },
+            ToolEvent::Result {
+                id,
+                name,
+                output,
+                is_error,
+            } => {
+                let (status, result, error) = if is_error {
+                    (ToolStatus::Failed, None, Some(output.to_string()))
+                } else {
+                    (ToolStatus::Completed, Some(output.to_string()), None)
+                };
+                ExchangeEvent::ToolResult {
+                    schema: SCHEMA,
+                    ts_ms,
+                    tool_use_id: id.to_string(),
+                    tool_name: name.to_string(),
+                    status,
+                    result,
+                    error,
+                    session_id,
+                    turn_index,
+                }
+            }
+        }
+    }
+
     /// Builds the request event for the single-turn `ask` path (no session
     /// framing).
     pub fn request(ts_ms: u64, meta: &ExchangeMeta, prompt: &str) -> Self {
@@ -500,6 +632,20 @@ pub trait EventSink {
     fn record(&mut self, event: &ExchangeEvent) -> io::Result<()>;
 }
 
+/// A shared handle records through the sink it wraps, so one opened trail can
+/// be written by both a driver and the tool loop's observer.
+impl<S: EventSink + ?Sized> EventSink for std::rc::Rc<std::cell::RefCell<S>> {
+    fn record(&mut self, event: &ExchangeEvent) -> io::Result<()> {
+        self.borrow_mut().record(event)
+    }
+}
+
+impl<S: EventSink + ?Sized> EventSink for Box<S> {
+    fn record(&mut self, event: &ExchangeEvent) -> io::Result<()> {
+        (**self).record(event)
+    }
+}
+
 /// An [`EventSink`] that discards everything. Used when recording is disabled.
 pub struct NoopSink;
 
@@ -618,6 +764,83 @@ mod tests {
         assert_eq!(first["event"], "request");
         let second: Value = serde_json::from_str(lines[1]).expect("json");
         assert_eq!(second["event"], "response_ok");
+    }
+
+    #[test]
+    fn tool_call_event_serializes_its_field_names() {
+        let input = serde_json::json!({"text": "hi"});
+        let event = ExchangeEvent::from_tool_event(
+            5,
+            ToolEvent::Call {
+                id: "toolu_1",
+                name: "echo",
+                input: &input,
+            },
+            None,
+        );
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "event": "tool_call",
+                "schema": SCHEMA,
+                "ts_ms": 5,
+                "tool_use_id": "toolu_1",
+                "tool_name": "echo",
+                "input": {"text": "hi"},
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_event_serializes_completed_and_failed_payloads() {
+        let ok = ExchangeEvent::from_tool_event(
+            6,
+            ToolEvent::Result {
+                id: "toolu_1",
+                name: "echo",
+                output: "echo: hi",
+                is_error: false,
+            },
+            Some(("sess-1", 2)),
+        );
+        assert_eq!(
+            serde_json::to_value(&ok).expect("serializes"),
+            serde_json::json!({
+                "event": "tool_result",
+                "schema": SCHEMA,
+                "ts_ms": 6,
+                "tool_use_id": "toolu_1",
+                "tool_name": "echo",
+                "status": "completed",
+                "result": "echo: hi",
+                "session_id": "sess-1",
+                "turn_index": 2,
+            })
+        );
+
+        let failed = ExchangeEvent::from_tool_event(
+            7,
+            ToolEvent::Result {
+                id: "toolu_2",
+                name: "missing",
+                output: "unknown tool: missing",
+                is_error: true,
+            },
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(&failed).expect("serializes"),
+            serde_json::json!({
+                "event": "tool_result",
+                "schema": SCHEMA,
+                "ts_ms": 7,
+                "tool_use_id": "toolu_2",
+                "tool_name": "missing",
+                "status": "failed",
+                "error": "unknown tool: missing",
+            })
+        );
     }
 
     #[test]
