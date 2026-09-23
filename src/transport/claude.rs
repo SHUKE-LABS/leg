@@ -1,8 +1,9 @@
 //! A non-streaming Claude-compatible Messages client.
 //!
 //! [`ClaudeClient`] implements [`Transport`] against `POST /v1/messages`. It
-//! sends a full conversation history (one or more role-tagged turns) and decodes
-//! one assistant reply — no streaming or tool use (those remain out of scope).
+//! sends a full conversation history (one or more role-tagged turns), plus any
+//! declared [`ToolSpec`]s, and decodes one assistant reply. Streaming, tool-use
+//! response parsing, and tool execution remain out of scope.
 //! The request building and response parsing are pure functions so they can be
 //! tested without a network via a fake [`HttpClient`].
 
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Credential, LegConfig};
 use crate::error::{LegError, Result};
-use crate::model::{AssistantReply, Message, TokenUsage};
+use crate::model::{AssistantReply, Message, TokenUsage, ToolSpec};
 use crate::transport::Transport;
 use crate::transport::http::{HttpClient, UreqHttpClient};
 
@@ -21,6 +22,7 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct ClaudeClient<H: HttpClient> {
     config: LegConfig,
     http: H,
+    tools: Vec<ToolSpec>,
 }
 
 impl ClaudeClient<UreqHttpClient> {
@@ -28,7 +30,7 @@ impl ClaudeClient<UreqHttpClient> {
     /// timeout from `config`.
     pub fn from_config(config: LegConfig) -> Self {
         let http = UreqHttpClient::new(config.timeout);
-        Self { config, http }
+        Self::with_http(config, http)
     }
 }
 
@@ -38,7 +40,19 @@ impl<H: HttpClient> ClaudeClient<H> {
     /// Used by tests to inject a fake transport; production code uses
     /// [`ClaudeClient::from_config`].
     pub fn with_http(config: LegConfig, http: H) -> Self {
-        Self { config, http }
+        Self {
+            config,
+            http,
+            tools: Vec::new(),
+        }
+    }
+
+    /// Sets the static tool list advertised on every request.
+    ///
+    /// An empty list (the default) omits the request's `tools` key entirely.
+    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
+        self.tools = tools;
+        self
     }
 
     /// The full Messages endpoint URL for the configured base URL.
@@ -54,6 +68,7 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
             self.config.max_tokens,
             messages,
             self.config.system_prompt.as_deref(),
+            &self.tools,
         )?;
         let url = self.endpoint();
         // `auth_value` is bound to this stack frame so the array of header
@@ -93,12 +108,15 @@ fn auth_header(credential: &Credential) -> (&'static str, String) {
 /// Each turn's [`Role`](crate::model::Role) is emitted as its wire `role` value,
 /// preserving order so multi-turn history reaches the provider intact. When
 /// `system_prompt` is `Some`, it is emitted as the request's `system` field;
-/// `None` omits the field entirely.
+/// `None` omits the field entirely. Likewise `tools` is emitted only when
+/// non-empty, so a tool-less request is byte-identical to one built before tool
+/// declarations existed.
 fn build_request_body(
     model: &str,
     max_tokens: u32,
     messages: &[Message],
     system_prompt: Option<&str>,
+    tools: &[ToolSpec],
 ) -> Result<String> {
     let request = MessagesRequest {
         model,
@@ -111,6 +129,7 @@ fn build_request_body(
                 content: &message.content,
             })
             .collect(),
+        tools,
     };
     serde_json::to_string(&request)
         .map_err(|err| LegError::Transport(format!("failed to serialize request: {err}")))
@@ -195,6 +214,8 @@ struct MessagesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
     messages: Vec<RequestMessage<'a>>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    tools: &'a [ToolSpec],
 }
 
 #[derive(Serialize)]
@@ -531,6 +552,68 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
         assert_eq!(value["system"], "You are a terse agent.");
+    }
+
+    #[test]
+    fn text_only_request_body_is_byte_identical() {
+        let body =
+            build_request_body("m", 16, &[Message::user("hi")], None, &[]).expect("serializes");
+        assert_eq!(
+            body,
+            r#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#
+        );
+
+        let body = build_request_body("m", 16, &[Message::user("hi")], Some("sys"), &[])
+            .expect("serializes");
+        assert_eq!(
+            body,
+            r#"{"model":"m","max_tokens":16,"system":"sys","messages":[{"role":"user","content":"hi"}]}"#
+        );
+    }
+
+    #[test]
+    fn request_includes_tools_when_configured() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, SUCCESS_BODY),
+        )
+        .with_tools(vec![ToolSpec::new("read", "Read a file.", schema.clone())]);
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert_eq!(
+            value["tools"],
+            serde_json::json!([{
+                "name": "read",
+                "description": "Read a file.",
+                "input_schema": schema
+            }])
+        );
+    }
+
+    #[test]
+    fn request_omits_tools_key_when_list_is_empty() {
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, SUCCESS_BODY),
+        )
+        .with_tools(Vec::new());
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert!(
+            value.get("tools").is_none(),
+            "tools key must be absent when no tools are declared, got: {value}"
+        );
     }
 
     #[test]
