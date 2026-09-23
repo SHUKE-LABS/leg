@@ -49,6 +49,15 @@ Also accepts `ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`,
 `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`, `LEG_MAX_TOKENS`,
 `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
+### Tool loop
+
+`ask`, `session`, and `exchange` share one tool loop. It runs only when a
+reply requests tools (`stop_reason: tool_use`): each call is executed and
+its result sent back until the model answers, and only that final reply is
+printed. A user turn stops after 10 tool-use rounds; if the reply still
+requests tools, `leg` sends no further request and warns on stderr. No tools
+are registered yet, so a requested tool is answered with an error result.
+
 ### Sessions
 
 ```
@@ -84,6 +93,16 @@ environment's credential, model, and base URL taken from the log entry;
 timeout, max tokens, and system prompt still come from today's environment.
 The replay's own request and outcome are appended to `LEG_EVENT_LOG` like
 any other `ask`.
+
+### Exchange
+
+```
+leg exchange [--in <path>] [--out <path>]
+```
+
+Answers one `baton.message/v1` request (from `--in`, or stdin) with exactly
+one response (to `--out`, or stdout); a plain-text request gets the reply
+body alone. The tool loop runs inside that single exchange.
 
 ## CI-supported targets
 
