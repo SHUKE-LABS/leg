@@ -2,8 +2,11 @@
 //!
 //! [`Prompt`] and [`AssistantReply`] model the single-turn `ask` path. Multi-turn
 //! sessions build on [`Message`] (a role-tagged turn) and [`Conversation`] (the
-//! accumulated history that is resent with every request). Tool calling and
+//! accumulated history that is resent with every request). [`ToolSpec`] declares
+//! a tool the provider may call; tool execution, tool-bearing replies, and
 //! streaming remain out of scope, so a message is plain text with a [`Role`].
+
+use serde::Serialize;
 
 /// The author of a single conversation turn.
 ///
@@ -117,6 +120,37 @@ impl Prompt {
     /// Creates a prompt from anything string-like.
     pub fn new(text: impl Into<String>) -> Self {
         Self { text: text.into() }
+    }
+}
+
+/// A tool declaration advertised to the provider on each request.
+///
+/// Serializes directly to one entry of the Messages API `tools` array
+/// (`{name, description, input_schema}`), where `input_schema` is a JSON Schema
+/// object describing the tool's arguments. Declaring a tool only makes it
+/// visible to the model; nothing here executes it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolSpec {
+    /// The tool name the model uses to call it.
+    pub name: String,
+    /// What the tool does, shown to the model.
+    pub description: String,
+    /// JSON Schema for the tool's input object.
+    pub input_schema: serde_json::Value,
+}
+
+impl ToolSpec {
+    /// Creates a tool declaration.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
     }
 }
 
