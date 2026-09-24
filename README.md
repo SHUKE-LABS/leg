@@ -68,6 +68,12 @@ to an unregistered tool is answered with an error result.
   `[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]` (or
   `[N more lines in file. Use offset=M to continue.]` when `limit` stopped
   early); a result reaching end of file carries no notice.
+- `write` — writes `content` to a file as UTF-8. Args: `path` (relative to
+  the working directory, or absolute) and `content`. Missing parent
+  directories are created. A new file can always be written, but an existing
+  file can be overwritten only after `read` has read it successfully in the
+  same run; otherwise the call fails and the file is left untouched. On
+  success it returns `Successfully wrote to <path>`.
 
 ### Sessions
 
