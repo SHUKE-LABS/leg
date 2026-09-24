@@ -158,7 +158,7 @@ fn optional_count(input: &serde_json::Value, key: &str) -> Result<Option<u64>, S
 }
 
 /// `err` prefixed with its errno name where one is known.
-fn os_error(err: &io::Error) -> String {
+pub(crate) fn os_error(err: &io::Error) -> String {
     match err.kind() {
         io::ErrorKind::NotFound => format!("ENOENT: {err}"),
         io::ErrorKind::PermissionDenied => format!("EACCES: {err}"),
