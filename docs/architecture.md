@@ -25,10 +25,10 @@ caller's working directory and OS identity. Its timeout defaults to 10 seconds;
 timeout results retain partial stdout/stderr, report exit code 124, and
 terminate the shell and descendants after a 50 ms graceful period (Windows
 uses a job object). It stops draining inherited output pipes after a 2-second
-guard. Each output stream is
-capped at 2000 lines or 50 KB with head/tail truncation and an omitted-byte
-count. The JSON tool result includes wall time, status, exit code, and separate
-stdout/stderr fields. The tool loop persists each dispatched round on the trail
+guard. Each output stream is capped at 2000 lines or 50 KB with head/tail
+truncation and an omitted-byte count. The JSON tool result includes wall time,
+status, exit code, and separate stdout/stderr fields. The tool loop persists
+each dispatched round on the trail
 as a `tool_round` line (the `tool_use` reply's blocks), then per
 call a `tool_call` line and one matching `tool_result` line — enough for
 `--resume` to rebuild the turn's history verbatim.

@@ -7,7 +7,7 @@
 //! for at most [`MAX_TOOL_ROUNDS`] rounds per user turn. `ToolLoop` is itself a
 //! [`Transport`], so every driver (`ask`, `session`, `exchange`) shares it.
 //!
-//! Registered tools: [`ReadTool`] (`read`), [`WriteTool`] (`write`) and
+//! Registered tools are [`ReadTool`] (`read`), [`WriteTool`] (`write`),
 //! [`EditTool`] (`edit`), and [`BashTool`] (`bash`).
 
 use std::cell::RefCell;

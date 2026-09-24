@@ -93,12 +93,13 @@ to an unregistered tool is answered with an error result.
   `timed_out` and exit code `124`, retains output captured before termination,
   and terminates the shell and descendants (50 ms graceful period, then force
   termination; Windows uses a job object). It stops draining inherited output
-  pipes after a 2-second guard. Each output stream is captured separately and capped at 2000 lines
-  or 50 KB, whichever comes first, keeping its head and tail and showing the
-  omitted-byte count. The tool result is JSON with `wall_time_seconds`,
-  `status` (`exited` or `timed_out`), `exit_code`, `stdout`, `stderr`,
-  `stdout_omitted_bytes`, and `stderr_omitted_bytes`. A non-zero command exit
-  is returned as `exit_code`; a missing `bash` executable is a tool error.
+  pipes after a 2-second guard. Each output stream is captured separately and
+  capped at 2000 lines or 50 KB, whichever comes first, keeping its head and
+  tail and showing the omitted-byte count. The tool result is JSON with
+  `wall_time_seconds`, `status` (`exited` or `timed_out`), `exit_code`, `stdout`,
+  `stderr`, `stdout_omitted_bytes`, and `stderr_omitted_bytes`. A non-zero
+  command exit is returned as `exit_code`; a missing `bash` executable is a
+  tool error.
 
 ### Sessions
 
