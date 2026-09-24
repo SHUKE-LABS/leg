@@ -236,10 +236,13 @@ enum Truncation {
 /// joining newline.
 fn truncate_head(content: &str) -> Truncation {
     let mut lines: Vec<&str> = content.split('\n').collect();
+    let mut budgeted = content.len();
     if content.ends_with('\n') {
+        // A trailing file newline is neither a line nor a charged byte.
         lines.pop();
+        budgeted -= 1;
     }
-    if lines.len() <= MAX_LINES && content.len() <= MAX_BYTES {
+    if lines.len() <= MAX_LINES && budgeted <= MAX_BYTES {
         return Truncation::Whole;
     }
     if lines.first().is_some_and(|line| line.len() > MAX_BYTES) {
@@ -447,6 +450,12 @@ mod tests {
             notice,
             Some("[Showing lines 1-2000 of 3001. Use offset=2001 to continue.]")
         );
+    }
+
+    #[test]
+    fn trailing_newline_is_not_charged_to_the_byte_cap() {
+        let file = format!("{}\n", "x".repeat(MAX_BYTES));
+        assert_eq!(read(&file, serde_json::json!({})).unwrap(), file);
     }
 
     #[test]
