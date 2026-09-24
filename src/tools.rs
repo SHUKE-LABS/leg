@@ -7,8 +7,8 @@
 //! for at most [`MAX_TOOL_ROUNDS`] rounds per user turn. `ToolLoop` is itself a
 //! [`Transport`], so every driver (`ask`, `session`, `exchange`) shares it.
 //!
-//! Registered tools: [`ReadTool`] (`read`), [`WriteTool`] (`write`) and
-//! [`EditTool`] (`edit`).
+//! Registered tools are [`ReadTool`] (`read`), [`WriteTool`] (`write`),
+//! [`EditTool`] (`edit`), and [`BashTool`] (`bash`).
 
 use std::cell::RefCell;
 
@@ -16,10 +16,12 @@ use crate::error::Result;
 use crate::model::{AssistantReply, ContentBlock, Message, Role, StopReason, TokenUsage, ToolSpec};
 use crate::transport::Transport;
 
+mod bash;
 mod edit;
 mod read;
 mod write;
 
+pub use bash::BashTool;
 pub use edit::EditTool;
 pub use read::{ReadSet, ReadTool};
 pub use write::WriteTool;
