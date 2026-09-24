@@ -74,6 +74,15 @@ to an unregistered tool is answered with an error result.
   file can be overwritten only after `read` has read it successfully in the
   same run; otherwise the call fails and the file is left untouched. On
   success it returns `Successfully wrote to <path>`.
+- `edit` — replaces an exact string in a UTF-8 file. Args: `path`,
+  `oldString`, `newString`, and optional `replaceAll` (default `false`).
+  Matching is exact byte-for-byte text: no regex, no fuzzy or
+  whitespace-tolerant fallback. The call fails, leaving the file untouched,
+  when `oldString` is empty, equals `newString`, is not found, or matches more
+  than once (overlapping occurrences count) without `replaceAll`. On success
+  it returns `Successfully replaced N occurrence(s) in <path>.` followed by a
+  unified diff (one line of context) capped at 32 rows; a longer diff ends with
+  `... [diff truncated: N more lines]`.
 
 ### Sessions
 
