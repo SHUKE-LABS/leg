@@ -101,6 +101,18 @@ to an unregistered tool is answered with an error result.
   command exit is returned as `exit_code`; a missing `bash` executable is a
   tool error.
 
+#### Headless contract for agent callers
+
+A caller driving `leg ask` or `leg exchange` sets the working directory:
+every tool resolves relative paths against, and `bash` runs in, the process
+cwd. The whole tool loop runs inside the one invocation — tool calls and
+results are never written to stdout, so `ask` prints only the final reply
+and `exchange` writes exactly one response envelope. To observe the tool
+steps, set `LEG_EVENT_LOG` on `ask` and read the trail back with
+`leg log show`. The `bash` tool needs `bash` on `PATH` (Git Bash on
+Windows). `tests/headless_e2e.rs` exercises this contract end to end
+against a fake provider.
+
 ### Sessions
 
 ```
