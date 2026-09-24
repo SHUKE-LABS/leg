@@ -55,8 +55,19 @@ Also accepts `ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`,
 reply requests tools (`stop_reason: tool_use`): each call is executed and
 its result sent back until the model answers, and only that final reply is
 printed. A user turn stops after 10 tool-use rounds; if the reply still
-requests tools, `leg` sends no further request and warns on stderr. No tools
-are registered yet, so a requested tool is answered with an error result.
+requests tools, `leg` sends no further request and warns on stderr. A call
+to an unregistered tool is answered with an error result.
+
+### Tools
+
+- `read` — returns a UTF-8 text file's contents. Args: `path` (relative to
+  the working directory, or absolute), `offset` (1-indexed start line), and
+  `limit` (max lines). Output is capped at 2000 lines or 50 KB, whichever
+  comes first, keeping whole lines only. When content is withheld, the result
+  ends with a continuation notice such as
+  `[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]` (or
+  `[N more lines in file. Use offset=M to continue.]` when `limit` stopped
+  early); a result reaching end of file carries no notice.
 
 ### Sessions
 

@@ -18,8 +18,9 @@ Text-only traffic stays byte-identical to the plain-string format. A tool
 loop (`src/tools.rs`) wraps the transport: while a reply's `stop_reason` is
 `tool_use`, it runs each call through a registry of synchronous handlers and
 sends the `tool_result` blocks back, stopping after 10 tool-use rounds per
-user turn. No tools are registered yet. Each dispatched round is persisted on
-the trail as a `tool_round` line (the `tool_use` reply's blocks), then per
+user turn. The registered tool is `read` (`src/tools/read.rs`), which also
+records each successfully read path in an in-process read-set. Each
+dispatched round is persisted on the trail as a `tool_round` line (the `tool_use` reply's blocks), then per
 call a `tool_call` line and one matching `tool_result` line — enough for
 `--resume` to rebuild the turn's history verbatim.
 

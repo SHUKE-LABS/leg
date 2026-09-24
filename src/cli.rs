@@ -15,7 +15,9 @@ use crate::events::{
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant};
-use crate::tools::{TOOL_ROUND_LIMIT_WARNING, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome};
+use crate::tools::{
+    ReadSet, ReadTool, TOOL_ROUND_LIMIT_WARNING, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome,
+};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 use crate::transport::http::UreqHttpClient;
@@ -839,9 +841,10 @@ const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]"
 /// Builds the provider transport every command runs through: a
 /// [`ClaudeClient`] advertising the registry's tools, wrapped in the tool loop.
 ///
-/// The registry is empty at this slice; the real tools land in Phase 3.
+/// Registers `read`, recording into a read-set that lives for this process.
 fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> {
-    let registry = ToolRegistry::new();
+    let mut registry = ToolRegistry::new();
+    registry.register(ReadTool::spec(), Box::new(ReadTool::new(ReadSet::new())));
     let client = ClaudeClient::from_config(config).with_tools(registry.specs());
     ToolLoop::new(client, registry)
 }

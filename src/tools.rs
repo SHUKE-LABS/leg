@@ -6,12 +6,18 @@
 //! registry (serially, in call order) and sends the `tool_result` blocks back,
 //! for at most [`MAX_TOOL_ROUNDS`] rounds per user turn. `ToolLoop` is itself a
 //! [`Transport`], so every driver (`ask`, `session`, `exchange`) shares it.
+//!
+//! Registered tools: [`ReadTool`] (`read`).
 
 use std::cell::RefCell;
 
 use crate::error::Result;
 use crate::model::{AssistantReply, ContentBlock, Message, Role, StopReason, TokenUsage, ToolSpec};
 use crate::transport::Transport;
+
+mod read;
+
+pub use read::{ReadSet, ReadTool};
 
 /// The most tool-use rounds one user turn may run; the initial provider
 /// request does not count.
