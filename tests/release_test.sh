@@ -204,6 +204,16 @@ NODE
 platform not supported (linux/ppc64)" "${resolved}" \
         "unsupported npm platforms fail clearly"
 
+    # The shim fixture's node_modules would otherwise fail the root package's
+    # file count and mask which check rejects the cases below.
+    rm -rf "${repo}/npm-packages/leg/node_modules"
+    release_npm_validate_package_set "${version}" "${repo}/npm-packages"
+    mv "${repo}/npm-packages/leg-darwin-arm64/THIRD_PARTY_NOTICES.txt" "${repo}/notice-backup"
+    status=0
+    release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    mv "${repo}/notice-backup" "${repo}/npm-packages/leg-darwin-arm64/THIRD_PARTY_NOTICES.txt"
+
     printf '%s\n' '{"name":"@shukelabs/leg-linux-x64","version":"0.0.1"}' \
         >"${repo}/npm-packages/leg-linux-x64/package.json"
     status=0
@@ -229,6 +239,201 @@ test_npm_pack_checksums() (
     (cd "${repo}/npm-tarballs" && release_sha256_check ../npm-SHA256SUMS)
     assert_eq "7" "$(find "${repo}/npm-tarballs" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" \
         "one npm tarball per package"
+
+    release_npm_verify_tarballs "${repo}/npm-tarballs"
+    for tarball in "${repo}"/npm-tarballs/*.tgz; do
+        tar -xzOf "${tarball}" package/THIRD_PARTY_NOTICES.txt | cmp -s - "${ROOT}/THIRD_PARTY_NOTICES.txt" || \
+            fail "${tarball##*/} carries the generated notice"
+        ! tar -tzf "${tarball}" | grep -qx 'package/LICENSE' || \
+            fail "${tarball##*/} excludes the proprietary LICENSE"
+    done
+
+    tarball="${repo}/npm-tarballs/shukelabs-leg-linux-arm-${version}.tgz"
+    cp "${tarball}" "${repo}/tarball-backup"
+    mkdir "${repo}/repack"
+    tar -xzf "${tarball}" -C "${repo}/repack"
+    rm "${repo}/repack/package/THIRD_PARTY_NOTICES.txt"
+    tar -C "${repo}/repack" -czf "${tarball}" package
+    status=0
+    release_npm_verify_tarballs "${repo}/npm-tarballs" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
+    cp "${ROOT}/THIRD_PARTY_NOTICES.txt" "${repo}/repack/package/THIRD_PARTY_NOTICES.txt"
+    cp "${ROOT}/LICENSE" "${repo}/repack/package/LICENSE"
+    tar -C "${repo}/repack" -czf "${tarball}" package
+    status=0
+    release_npm_verify_tarballs "${repo}/npm-tarballs" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
+    cp "${repo}/tarball-backup" "${tarball}"
+    release_npm_verify_tarballs "${repo}/npm-tarballs"
+)
+
+# Writes cargo-metadata-shaped JSON for a root crate with one normal, one build,
+# and one dev-only dependency. `alpha` takes the license expression under test.
+make_notice_fixture() {
+    local dir="${1}" alpha_license="${2}" name
+
+    for name in alpha beta devonly; do
+        mkdir -p "${dir}/crates/${name}"
+        : >"${dir}/crates/${name}/Cargo.toml"
+    done
+    printf 'alpha MIT text\r\nsecond line\r\n' >"${dir}/crates/alpha/LICENSE-MIT"
+    printf 'alpha readme\n' >"${dir}/crates/alpha/README.md"
+    printf 'beta Apache text' >"${dir}/crates/beta/LICENSE"
+    printf 'devonly MIT text\n' >"${dir}/crates/devonly/LICENSE"
+    mkdir -p "${dir}/third-party/vendor"
+    printf 'vendor license\n' >"${dir}/third-party/vendor/LICENSE"
+    node - "${dir}" "${alpha_license}" >"${dir}/metadata.json" <<'NODE'
+const path = require('node:path');
+const [, , dir, alphaLicense] = process.argv;
+const pkg = (name, license) => ({
+  id: `${name}-id`, name, version: '1.0.0', license,
+  source: 'registry+https://github.com/rust-lang/crates.io-index',
+  manifest_path: path.join(dir, 'crates', name, 'Cargo.toml'),
+});
+const dep = (name, kind) => ({ pkg: `${name}-id`, dep_kinds: [{ kind, target: null }] });
+console.log(JSON.stringify({
+  packages: [
+    { ...pkg('root', null), source: null, manifest_path: path.join(dir, 'Cargo.toml') },
+    pkg('alpha', alphaLicense === 'null' ? null : alphaLicense),
+    pkg('beta', 'Apache-2.0'),
+    pkg('devonly', 'MIT'),
+  ],
+  resolve: {
+    root: 'root-id',
+    nodes: [
+      { id: 'root-id', deps: [dep('alpha', null), dep('beta', 'build'), dep('devonly', 'dev')] },
+      { id: 'alpha-id', deps: [] },
+      { id: 'beta-id', deps: [] },
+      { id: 'devonly-id', deps: [] },
+    ],
+  },
+}));
+NODE
+}
+
+# Prints each expected fragment that is missing from the file; empty on success.
+missing_fragments() {
+    node - "$@" <<'NODE'
+const fs = require('node:fs');
+const [, , filePath, ...fragments] = process.argv;
+const text = fs.readFileSync(filePath, 'utf8');
+for (const fragment of fragments) if (!text.includes(fragment)) console.log(JSON.stringify(fragment));
+NODE
+}
+
+test_third_party_notices_fixture_rendering() (
+    set -euo pipefail
+    local dir status license missing
+    dir="$(mktemp -d)"
+    trap 'rm -rf "${dir}"' EXIT
+
+    make_notice_fixture "${dir}" 'MIT OR (Apache-2.0 AND ISC)'
+    release_third_party_notices_render "${dir}/third-party" "${dir}/metadata.json" "${dir}/metadata.json" \
+        >"${dir}/notice.txt"
+    missing="$(missing_fragments "${dir}/notice.txt" \
+        $'Crate: alpha 1.0.0\nLicense: MIT OR (Apache-2.0 AND ISC)\n' \
+        $'--- alpha 1.0.0: LICENSE-MIT ---\nalpha MIT text\nsecond line\n' \
+        $'Crate: beta 1.0.0\nLicense: Apache-2.0\n' \
+        $'--- beta 1.0.0: LICENSE ---\nbeta Apache text\n' \
+        $'Bundled material: THIRD_PARTY_LICENSES/vendor/LICENSE\n\nvendor license\n')" || \
+        fail "fragment check ran"
+    assert_eq "" "${missing}" \
+        "normal and build dependency license texts and bundled material are rendered"
+    assert_eq "1" "$(grep -c '^Crate: alpha ' "${dir}/notice.txt")" "duplicate metadata inputs are unioned"
+    ! grep -Eq 'devonly|alpha readme|root|'$'\r' "${dir}/notice.txt" || \
+        fail "dev-only dependency, non-license files, root crate, and CR bytes are excluded"
+
+    for license in null 'GPL-3.0-only' 'MIT OR GPL-3.0-only' 'MIT WITH LLVM-exception' \
+        'MIT OR' '(MIT AND)' 'AND MIT' '(MIT OR Apache-2.0' 'MIT)' 'MIT Apache-2.0' '()'; do
+        make_notice_fixture "${dir}" "${license}"
+        status=0
+        release_third_party_notices_render "${dir}/third-party" "${dir}/metadata.json" \
+            >/dev/null 2>&1 || status="$?"
+        assert_rc_nonzero "${status}" || fail "license '${license}' is rejected"
+    done
+
+    make_notice_fixture "${dir}" 'MIT'
+    rm "${dir}/crates/alpha/LICENSE-MIT"
+    status=0
+    release_third_party_notices_render "${dir}/third-party" "${dir}/metadata.json" \
+        >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}" || fail "a crate without a license file is rejected"
+)
+
+test_third_party_notices_cover_release_graph() (
+    set -euo pipefail
+    local dir target status missing
+    local -a fragments=()
+    dir="$(mktemp -d)"
+    trap 'rm -rf "${dir}"' EXIT
+
+    release_third_party_notices_generate "${ROOT}" >"${dir}/first.txt"
+    release_third_party_notices_generate "${ROOT}" >"${dir}/second.txt"
+    cmp -s "${dir}/first.txt" "${dir}/second.txt" || fail "notice generation is reproducible"
+    release_third_party_notices_check "${ROOT}"
+
+    # Cross-check the crate set with cargo tree rather than the generator's
+    # own cargo metadata walk. Coverage is one-way: cargo metadata's resolve
+    # also keeps optional deps named only by weak `dep?/feature` entries
+    # (zlib-rs via flate2 today), so the notice may list a few crates that are
+    # never compiled.
+    while IFS='|' read -r _key target _os _cpu _archive _binary; do
+        cargo tree --locked --manifest-path "${ROOT}/Cargo.toml" -e normal,build \
+            --target "${target}" --prefix none --format '{p}'
+    done < <(release_npm_platform_rows) | awk '$1 != "leg" { sub(/^v/, "", $2); print $1, $2 }' | \
+        sort -u >"${dir}/expected"
+    grep '^Crate: ' "${ROOT}/THIRD_PARTY_NOTICES.txt" | sed 's/^Crate: //' | sort -u >"${dir}/actual"
+    [[ -s "${dir}/expected" ]] || fail "cargo tree reported release dependencies"
+    assert_eq "" "$(comm -23 "${dir}/expected" "${dir}/actual")" \
+        "notice covers every resolved runtime dependency"
+
+    cargo metadata --locked --format-version 1 --manifest-path "${ROOT}/Cargo.toml" >"${dir}/metadata.json"
+    node - "${dir}/metadata.json" "${ROOT}/THIRD_PARTY_NOTICES.txt" "${dir}/actual" \
+        >"${dir}/unrendered" <<'NODE' || fail "dependency license text check ran"
+const fs = require('node:fs');
+const path = require('node:path');
+const [, , metadataPath, noticePath, cratesPath] = process.argv;
+const notice = fs.readFileSync(noticePath, 'utf8');
+const packages = JSON.parse(fs.readFileSync(metadataPath, 'utf8')).packages;
+let checked = 0;
+for (const line of fs.readFileSync(cratesPath, 'utf8').trim().split('\n')) {
+  const [name, version] = line.split(' ');
+  const pkg = packages.find((p) => p.name === name && p.version === version);
+  if (!pkg) throw new Error(`no cargo metadata package for ${line}`);
+  const dir = path.dirname(pkg.manifest_path);
+  for (const file of fs.readdirSync(dir)) {
+    if (!/^(licen[cs]e|copying|notice|unlicense|copyright)/i.test(file)) continue;
+    let text = fs.readFileSync(path.join(dir, file), 'utf8').replace(/\r\n?/g, '\n');
+    if (!text.endsWith('\n')) text += '\n';
+    checked++;
+    if (!notice.includes(`--- ${name} ${version}: ${file} ---\n${text}`)) console.log(`${line}: ${file}`);
+  }
+}
+if (checked === 0) throw new Error('no dependency license files were checked');
+NODE
+    assert_eq "" "$(cat "${dir}/unrendered")" "every dependency license file is rendered verbatim"
+
+    while IFS= read -r file; do
+        fragments+=("Bundled material: ${file#"${ROOT}/"}"$'
+
+'"$(cat "${file}")"$'
+')
+    done < <(find "${ROOT}/THIRD_PARTY_LICENSES" -type f | sort)
+    (( ${#fragments[@]} > 0 )) || fail "THIRD_PARTY_LICENSES has material"
+    missing="$(missing_fragments "${ROOT}/THIRD_PARTY_NOTICES.txt" "${fragments[@]}")" || \
+        fail "fragment check ran"
+    assert_eq "" "${missing}" "notice embeds all THIRD_PARTY_LICENSES material"
+    missing="$(missing_fragments "${ROOT}/THIRD_PARTY_NOTICES.txt" "$(cat "${ROOT}/LICENSE")")" || \
+        fail "fragment check ran"
+    [[ -n "${missing}" ]] || fail "notice excludes the proprietary repository LICENSE"
+
+    cp "${ROOT}/THIRD_PARTY_NOTICES.txt" "${dir}/stale.txt"
+    printf 'stale\n' >>"${dir}/stale.txt"
+    status=0
+    release_third_party_notices_check "${ROOT}" "${dir}/stale.txt" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}" || fail "stale notice is rejected"
 )
 
 tests=(
@@ -236,6 +441,8 @@ tests=(
     test_verify_tag_matches_manifest
     test_npm_platform_matrix_and_staging
     test_npm_pack_checksums
+    test_third_party_notices_fixture_rendering
+    test_third_party_notices_cover_release_graph
 )
 
 for test_name in "${tests[@]}"; do

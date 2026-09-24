@@ -35,6 +35,9 @@ Per-platform archives for every CI-supported target (`.tar.gz` on
 Unix, `.zip` on Windows) are attached to each
 [GitHub Release](https://github.com/SHUKE-LABS/leg/releases).
 
+Every published npm package includes `THIRD_PARTY_NOTICES.txt` with the
+licenses of the bundled third-party Rust crates and vendored material.
+
 ## Usage
 
 ```
