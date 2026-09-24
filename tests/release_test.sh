@@ -204,6 +204,10 @@ NODE
 platform not supported (linux/ppc64)" "${resolved}" \
         "unsupported npm platforms fail clearly"
 
+    # The shim fixture's node_modules would otherwise fail the root package's
+    # file count and mask which check rejects the cases below.
+    rm -rf "${repo}/npm-packages/leg/node_modules"
+    release_npm_validate_package_set "${version}" "${repo}/npm-packages"
     mv "${repo}/npm-packages/leg-darwin-arm64/THIRD_PARTY_NOTICES.txt" "${repo}/notice-backup"
     status=0
     release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
@@ -321,25 +325,28 @@ NODE
 
 test_third_party_notices_fixture_rendering() (
     set -euo pipefail
-    local dir status license
+    local dir status license missing
     dir="$(mktemp -d)"
     trap 'rm -rf "${dir}"' EXIT
 
     make_notice_fixture "${dir}" 'MIT OR (Apache-2.0 AND ISC)'
     release_third_party_notices_render "${dir}/third-party" "${dir}/metadata.json" "${dir}/metadata.json" \
         >"${dir}/notice.txt"
-    assert_eq "" "$(missing_fragments "${dir}/notice.txt" \
+    missing="$(missing_fragments "${dir}/notice.txt" \
         $'Crate: alpha 1.0.0\nLicense: MIT OR (Apache-2.0 AND ISC)\n' \
         $'--- alpha 1.0.0: LICENSE-MIT ---\nalpha MIT text\nsecond line\n' \
         $'Crate: beta 1.0.0\nLicense: Apache-2.0\n' \
         $'--- beta 1.0.0: LICENSE ---\nbeta Apache text\n' \
-        $'Bundled material: THIRD_PARTY_LICENSES/vendor/LICENSE\n\nvendor license\n')" \
+        $'Bundled material: THIRD_PARTY_LICENSES/vendor/LICENSE\n\nvendor license\n')" || \
+        fail "fragment check ran"
+    assert_eq "" "${missing}" \
         "normal and build dependency license texts and bundled material are rendered"
     assert_eq "1" "$(grep -c '^Crate: alpha ' "${dir}/notice.txt")" "duplicate metadata inputs are unioned"
     ! grep -Eq 'devonly|alpha readme|root|'$'\r' "${dir}/notice.txt" || \
         fail "dev-only dependency, non-license files, root crate, and CR bytes are excluded"
 
-    for license in null 'GPL-3.0-only' 'MIT OR GPL-3.0-only' 'MIT WITH LLVM-exception'; do
+    for license in null 'GPL-3.0-only' 'MIT OR GPL-3.0-only' 'MIT WITH LLVM-exception' \
+        'MIT OR' '(MIT AND)' 'AND MIT' '(MIT OR Apache-2.0' 'MIT)' 'MIT Apache-2.0' '()'; do
         make_notice_fixture "${dir}" "${license}"
         status=0
         release_third_party_notices_render "${dir}/third-party" "${dir}/metadata.json" \
@@ -357,7 +364,7 @@ test_third_party_notices_fixture_rendering() (
 
 test_third_party_notices_cover_release_graph() (
     set -euo pipefail
-    local dir target status
+    local dir target status missing
     local -a fragments=()
     dir="$(mktemp -d)"
     trap 'rm -rf "${dir}"' EXIT
@@ -383,31 +390,30 @@ test_third_party_notices_cover_release_graph() (
         "notice covers every resolved runtime dependency"
 
     cargo metadata --locked --format-version 1 --manifest-path "${ROOT}/Cargo.toml" >"${dir}/metadata.json"
-    assert_eq "" "$(node - "${dir}/metadata.json" "${ROOT}/THIRD_PARTY_NOTICES.txt" "${dir}/actual" <<'NODE'
+    node - "${dir}/metadata.json" "${ROOT}/THIRD_PARTY_NOTICES.txt" "${dir}/actual" \
+        >"${dir}/unrendered" <<'NODE' || fail "dependency license text check ran"
 const fs = require('node:fs');
 const path = require('node:path');
 const [, , metadataPath, noticePath, cratesPath] = process.argv;
 const notice = fs.readFileSync(noticePath, 'utf8');
 const packages = JSON.parse(fs.readFileSync(metadataPath, 'utf8')).packages;
-for (const line of fs.readFileSync(cratesPath, 'utf8').trim().split('
-')) {
+let checked = 0;
+for (const line of fs.readFileSync(cratesPath, 'utf8').trim().split('\n')) {
   const [name, version] = line.split(' ');
   const pkg = packages.find((p) => p.name === name && p.version === version);
+  if (!pkg) throw new Error(`no cargo metadata package for ${line}`);
   const dir = path.dirname(pkg.manifest_path);
   for (const file of fs.readdirSync(dir)) {
     if (!/^(licen[cs]e|copying|notice|unlicense|copyright)/i.test(file)) continue;
-    let text = fs.readFileSync(path.join(dir, file), 'utf8').replace(/
-?/g, '
-');
-    if (!text.endsWith('
-')) text += '
-';
-    if (!notice.includes(`--- ${name} ${version}: ${file} ---
-${text}`)) console.log(`${line}: ${file}`);
+    let text = fs.readFileSync(path.join(dir, file), 'utf8').replace(/\r\n?/g, '\n');
+    if (!text.endsWith('\n')) text += '\n';
+    checked++;
+    if (!notice.includes(`--- ${name} ${version}: ${file} ---\n${text}`)) console.log(`${line}: ${file}`);
   }
 }
+if (checked === 0) throw new Error('no dependency license files were checked');
 NODE
-)" "every dependency license file is rendered verbatim"
+    assert_eq "" "$(cat "${dir}/unrendered")" "every dependency license file is rendered verbatim"
 
     while IFS= read -r file; do
         fragments+=("Bundled material: ${file#"${ROOT}/"}"$'
@@ -416,10 +422,12 @@ NODE
 ')
     done < <(find "${ROOT}/THIRD_PARTY_LICENSES" -type f | sort)
     (( ${#fragments[@]} > 0 )) || fail "THIRD_PARTY_LICENSES has material"
-    assert_eq "" "$(missing_fragments "${ROOT}/THIRD_PARTY_NOTICES.txt" "${fragments[@]}")" \
-        "notice embeds all THIRD_PARTY_LICENSES material"
-    [[ -n "$(missing_fragments "${ROOT}/THIRD_PARTY_NOTICES.txt" "$(cat "${ROOT}/LICENSE")")" ]] || \
-        fail "notice excludes the proprietary repository LICENSE"
+    missing="$(missing_fragments "${ROOT}/THIRD_PARTY_NOTICES.txt" "${fragments[@]}")" || \
+        fail "fragment check ran"
+    assert_eq "" "${missing}" "notice embeds all THIRD_PARTY_LICENSES material"
+    missing="$(missing_fragments "${ROOT}/THIRD_PARTY_NOTICES.txt" "$(cat "${ROOT}/LICENSE")")" || \
+        fail "fragment check ran"
+    [[ -n "${missing}" ]] || fail "notice excludes the proprietary repository LICENSE"
 
     cp "${ROOT}/THIRD_PARTY_NOTICES.txt" "${dir}/stale.txt"
     printf 'stale\n' >>"${dir}/stale.txt"

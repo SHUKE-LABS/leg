@@ -197,17 +197,37 @@ function byCodePoint(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+// Validates the SPDX expression grammar used by Cargo (`OR` binds looser than
+// `AND`, parentheses group) and requires every license id to be allowlisted.
 function checkLicense(pkg) {
   const label = `${pkg.name} ${pkg.version}`;
   if (typeof pkg.license !== 'string' || pkg.license.trim() === '') {
     fail(`${label} has no SPDX license expression`);
   }
-  for (const token of pkg.license.split(/[\s()]+/).filter(Boolean)) {
-    if (token === 'AND' || token === 'OR') continue;
-    if (!SUPPORTED_LICENSES.has(token)) {
+  const tokens = pkg.license.match(/[()]|[^\s()]+/g);
+  let index = 0;
+  const malformed = () => fail(`${label} has malformed license expression '${pkg.license}'`);
+  function atom() {
+    const token = tokens[index++];
+    if (token === '(') {
+      disjunction();
+      if (tokens[index++] !== ')') malformed();
+    } else if (token === undefined || token === ')' || token === 'AND' || token === 'OR') {
+      malformed();
+    } else if (!SUPPORTED_LICENSES.has(token)) {
       fail(`${label} uses unsupported license term '${token}' in '${pkg.license}'`);
     }
   }
+  function conjunction() {
+    atom();
+    while (tokens[index] === 'AND') { index++; atom(); }
+  }
+  function disjunction() {
+    conjunction();
+    while (tokens[index] === 'OR') { index++; conjunction(); }
+  }
+  disjunction();
+  if (index !== tokens.length) malformed();
 }
 
 const crates = new Map();
