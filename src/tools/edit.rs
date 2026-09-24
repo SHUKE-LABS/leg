@@ -80,9 +80,9 @@ impl ToolHandler for EditTool {
         let new_string = input["newString"]
             .as_str()
             .ok_or("edit: `newString` must be a string")?;
-        let replace_all = match &input["replaceAll"] {
-            serde_json::Value::Null => false,
-            value => value
+        let replace_all = match input.get("replaceAll") {
+            None => false,
+            Some(value) => value
                 .as_bool()
                 .ok_or("edit: `replaceAll` must be a boolean")?,
         };
@@ -311,6 +311,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, "oldString not found in f.txt");
         assert_eq!(std::fs::read(&file).unwrap(), b"  indented\n");
+    }
+
+    #[test]
+    fn non_boolean_replace_all_is_rejected() {
+        // A unique match, so a flag misread as `false` would edit the file.
+        let (dir, file) = file_with("bad-flag", "dup\n");
+        for flag in [serde_json::Value::Null, serde_json::json!("true")] {
+            let err = edit(
+                &dir,
+                serde_json::json!({"oldString": "dup", "newString": "x", "replaceAll": flag}),
+            )
+            .unwrap_err();
+            assert_eq!(err, "edit: `replaceAll` must be a boolean");
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"dup\n");
     }
 
     #[test]
