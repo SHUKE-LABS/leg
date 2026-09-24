@@ -135,11 +135,196 @@ release_npm_package_directories() {
     done < <(release_npm_platform_rows)
 }
 
-release_npm_shim_path() {
+release_repo_root() {
     local release_script_path="${BASH_SOURCE[0]}"
 
-    printf '%s/../packaging/npm/leg.js\n' \
-        "$(cd -- "$(dirname -- "${release_script_path}")" && pwd)"
+    (cd -- "$(dirname -- "${release_script_path}")/.." && pwd)
+}
+
+release_npm_shim_path() {
+    printf '%s/packaging/npm/leg.js\n' "$(release_repo_root)"
+}
+
+release_third_party_notices_path() {
+    printf '%s/THIRD_PARTY_NOTICES.txt\n' "$(release_repo_root)"
+}
+
+# Render THIRD_PARTY_NOTICES.txt from one `cargo metadata` JSON document per
+# release target plus the vendored material under THIRD_PARTY_LICENSES/. The
+# crate set is the union of non-dev (normal and build) dependencies reachable
+# from the workspace root; the root crate itself is proprietary and excluded.
+# cargo metadata's resolve can be a superset of what is compiled (it keeps
+# optional deps named only by weak `dep?/feature` entries); over-listing a
+# crate is harmless, missing one is not.
+# Output is deterministic: sorted, LF-only, and free of local paths. Missing or
+# unsupported license metadata fails instead of producing a partial bundle.
+release_third_party_notices_render() {
+    local third_party_dir="${1:-}"
+    shift || true
+
+    [[ -d "${third_party_dir}" && "$#" -gt 0 ]] || {
+        printf 'release: third-party notice inputs are incomplete\n' >&2
+        return 1
+    }
+    command -v node >/dev/null 2>&1 || {
+        printf 'release: node is required to render third-party notices\n' >&2
+        return 1
+    }
+
+    node - "${third_party_dir}" "$@" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const [, , thirdPartyDir, ...metadataPaths] = process.argv;
+const SUPPORTED_LICENSES = new Set([
+  '0BSD', 'Apache-2.0', 'BSD-3-Clause', 'CDLA-Permissive-2.0', 'ISC', 'MIT',
+  'Unicode-3.0', 'Unlicense', 'Zlib',
+]);
+const LICENSE_FILE = /^(licen[cs]e|copying|notice|unlicense|copyright)/i;
+const RULE = '='.repeat(79);
+
+function fail(message) {
+  console.error(`release: third-party notices: ${message}`);
+  process.exit(1);
+}
+
+function readText(filePath) {
+  const text = fs.readFileSync(filePath, 'utf8').replace(/\r\n?/g, '\n');
+  return text.endsWith('\n') ? text : `${text}\n`;
+}
+
+function byCodePoint(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function checkLicense(pkg) {
+  const label = `${pkg.name} ${pkg.version}`;
+  if (typeof pkg.license !== 'string' || pkg.license.trim() === '') {
+    fail(`${label} has no SPDX license expression`);
+  }
+  for (const token of pkg.license.split(/[\s()]+/).filter(Boolean)) {
+    if (token === 'AND' || token === 'OR') continue;
+    if (!SUPPORTED_LICENSES.has(token)) {
+      fail(`${label} uses unsupported license term '${token}' in '${pkg.license}'`);
+    }
+  }
+}
+
+const crates = new Map();
+for (const metadataPath of metadataPaths) {
+  let metadata;
+  try {
+    metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+  } catch (error) {
+    fail(`invalid cargo metadata ${metadataPath}: ${error.message}`);
+  }
+  const root = metadata.resolve?.root;
+  if (!root) fail(`${metadataPath} has no resolved root package`);
+  const packages = new Map(metadata.packages.map((pkg) => [pkg.id, pkg]));
+  const nodes = new Map(metadata.resolve.nodes.map((node) => [node.id, node]));
+  const pending = [root];
+  const seen = new Set();
+  while (pending.length > 0) {
+    const id = pending.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = nodes.get(id);
+    if (!node) fail(`${metadataPath} has no resolve node for ${id}`);
+    for (const dep of node.deps) {
+      if (dep.dep_kinds.some((kind) => kind.kind !== 'dev')) pending.push(dep.pkg);
+    }
+  }
+  seen.delete(root);
+  for (const id of seen) {
+    const pkg = packages.get(id);
+    if (!pkg) fail(`${metadataPath} has no package entry for ${id}`);
+    crates.set(id, pkg);
+  }
+}
+
+const sections = [];
+const ordered = [...crates.values()].sort((a, b) =>
+  byCodePoint(a.name, b.name) || byCodePoint(a.version, b.version) || byCodePoint(a.id, b.id));
+for (const pkg of ordered) {
+  checkLicense(pkg);
+  const crateDir = path.dirname(pkg.manifest_path);
+  const licenseFiles = fs.readdirSync(crateDir)
+    .filter((name) => LICENSE_FILE.test(name) && fs.statSync(path.join(crateDir, name)).isFile())
+    .sort(byCodePoint);
+  if (licenseFiles.length === 0) fail(`${pkg.name} ${pkg.version} ships no license file`);
+  let section = `${RULE}\nCrate: ${pkg.name} ${pkg.version}\nLicense: ${pkg.license}\n` +
+    `Source: ${pkg.source ?? 'path'}\n`;
+  for (const name of licenseFiles) {
+    section += `\n--- ${pkg.name} ${pkg.version}: ${name} ---\n${readText(path.join(crateDir, name))}`;
+  }
+  sections.push(section);
+}
+
+function walk(dir, prefix) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) return walk(path.join(dir, entry.name), relative);
+    if (entry.isFile()) return [relative];
+    fail(`unsupported entry THIRD_PARTY_LICENSES/${relative}`);
+  });
+}
+const bundled = walk(thirdPartyDir, '').sort(byCodePoint);
+if (bundled.length === 0) fail('THIRD_PARTY_LICENSES/ is empty');
+for (const relative of bundled) {
+  sections.push(`${RULE}\nBundled material: THIRD_PARTY_LICENSES/${relative}\n\n` +
+    readText(path.join(thirdPartyDir, ...relative.split('/'))));
+}
+
+process.stdout.write(
+  'THIRD-PARTY NOTICES FOR leg\n\n' +
+  'Generated by `scripts/release.sh third-party-notices`; do not edit by hand.\n' +
+  'Lists every third-party Rust crate built into the leg release binaries with\n' +
+  'its license expression and shipped license texts, followed by the bundled\n' +
+  'third-party material from THIRD_PARTY_LICENSES/.\n\n' +
+  sections.join('\n'));
+NODE
+}
+
+release_third_party_notices_generate() {
+    local repo_root="${1:-$(release_repo_root)}"
+    local metadata_dir="" package_key target _os _cpu _archive _binary status=0
+    local -a metadata_paths=()
+
+    metadata_dir="$(mktemp -d)" || return 1
+    while IFS='|' read -r package_key target _os _cpu _archive _binary; do
+        cargo metadata --locked --format-version 1 --filter-platform "${target}" \
+            --manifest-path "${repo_root}/Cargo.toml" \
+            >"${metadata_dir}/${package_key}.json" || status="$?"
+        (( status == 0 )) || break
+        metadata_paths+=("${metadata_dir}/${package_key}.json")
+    done < <(release_npm_platform_rows)
+    if (( status == 0 )); then
+        release_third_party_notices_render "${repo_root}/THIRD_PARTY_LICENSES" \
+            "${metadata_paths[@]}" || status="$?"
+    else
+        printf 'release: cargo metadata failed\n' >&2
+    fi
+    rm -rf -- "${metadata_dir}"
+    return "${status}"
+}
+
+release_third_party_notices_check() {
+    local repo_root="${1:-$(release_repo_root)}"
+    local notice_path="${2:-${repo_root}/THIRD_PARTY_NOTICES.txt}" generated="" status=0
+
+    [[ -f "${notice_path}" ]] || {
+        printf "release: third-party notices not found '%s'\n" "${notice_path}" >&2
+        return 1
+    }
+    generated="$(mktemp)" || return 1
+    release_third_party_notices_generate "${repo_root}" >"${generated}" || status="$?"
+    if (( status == 0 )) && ! cmp -s "${generated}" "${notice_path}"; then
+        printf "release: '%s' is stale; run: bash scripts/release.sh third-party-notices > THIRD_PARTY_NOTICES.txt\n" \
+            "${notice_path}" >&2
+        status=1
+    fi
+    rm -f -- "${generated}"
+    return "${status}"
 }
 
 release_npm_write_root_manifest() {
@@ -156,7 +341,8 @@ release_npm_write_root_manifest() {
     "leg": "bin/leg.js"
   },
   "files": [
-    "bin"
+    "bin",
+    "THIRD_PARTY_NOTICES.txt"
   ],
   "os": [
     "darwin",
@@ -198,7 +384,8 @@ release_npm_write_platform_manifest() {
   "description": "Native leg binary for ${npm_os}/${npm_cpu}.",
   "license": "UNLICENSED",
   "files": [
-    "bin"
+    "bin",
+    "THIRD_PARTY_NOTICES.txt"
   ],
   "os": [
     "${npm_os}"
@@ -248,8 +435,8 @@ if (manifest.name !== expectedName) fail(`name '${manifest.name}' does not match
 if (manifest.version !== expectedVersion) fail(`version '${manifest.version}' does not match '${expectedVersion}'`);
 if (manifest.license !== 'UNLICENSED') fail("license must be UNLICENSED");
 if (manifest.scripts) fail('scripts are not allowed in registry packages');
-if (!Array.isArray(manifest.files) || manifest.files.length !== 1 || manifest.files[0] !== 'bin') {
-  fail('files must contain only bin');
+if (JSON.stringify(manifest.files) !== JSON.stringify(['bin', 'THIRD_PARTY_NOTICES.txt'])) {
+  fail('files must contain only bin and THIRD_PARTY_NOTICES.txt');
 }
 if (manifest.publishConfig?.access !== 'public') fail('publishConfig.access must be public');
 function sameObject(actual, expected) {
@@ -288,6 +475,15 @@ if (kind === 'root') {
 NODE
 }
 
+release_npm_validate_notice() {
+    local package_dir="${1:-}"
+
+    cmp -s "${package_dir}/THIRD_PARTY_NOTICES.txt" "$(release_third_party_notices_path)" || {
+        printf "release: '%s' lacks the generated THIRD_PARTY_NOTICES.txt\n" "${package_dir}" >&2
+        return 1
+    }
+}
+
 release_npm_validate_package_set() {
     local version="${1:-}" package_root="${2:-}"
     local package_key target npm_os npm_cpu archive binary package_dir
@@ -310,9 +506,10 @@ release_npm_validate_package_set() {
         printf "release: staged npm shim differs from packaging/npm/leg.js\n" >&2
         return 1
     }
+    release_npm_validate_notice "${package_dir}" || return 1
     file_count="$(find "${package_dir}" -type f | wc -l | tr -d ' ')"
-    [[ "${file_count}" == 2 ]] || {
-        printf "release: root npm package must contain exactly package.json and bin/leg.js\n" >&2
+    [[ "${file_count}" == 3 ]] || {
+        printf "release: root npm package must contain exactly package.json, bin/leg.js, and THIRD_PARTY_NOTICES.txt\n" >&2
         return 1
     }
 
@@ -325,8 +522,9 @@ release_npm_validate_package_set() {
             printf "release: native binary missing from '%s'\n" "${package_dir}" >&2
             return 1
         }
+        release_npm_validate_notice "${package_dir}" || return 1
         file_count="$(find "${package_dir}" -type f | wc -l | tr -d ' ')"
-        [[ "${file_count}" == 2 ]] || {
+        [[ "${file_count}" == 3 ]] || {
             printf "release: npm package '%s' contains unexpected files\n" "${package_dir}" >&2
             return 1
         }
@@ -366,6 +564,10 @@ release_npm_stage_packages() {
         printf 'release: npm shim source is missing\n' >&2
         return 1
     }
+    [[ -f "$(release_third_party_notices_path)" ]] || {
+        printf 'release: THIRD_PARTY_NOTICES.txt is missing\n' >&2
+        return 1
+    }
 
     mkdir -p -- "$(dirname -- "${output_dir}")"
     staging="$(mktemp -d "${output_dir}.XXXXXX")" || return 1
@@ -373,6 +575,7 @@ release_npm_stage_packages() {
     cp -- "$(release_npm_shim_path)" "${staging}/leg/bin/leg.js"
     chmod +x "${staging}/leg/bin/leg.js"
     release_npm_write_root_manifest "${version}" >"${staging}/leg/package.json"
+    cp -- "$(release_third_party_notices_path)" "${staging}/leg/THIRD_PARTY_NOTICES.txt"
 
     while IFS='|' read -r package_key target npm_os npm_cpu archive binary; do
         archive_path="${archive_dir}/leg-${version}-${target}.${archive}"
@@ -407,6 +610,7 @@ release_npm_stage_packages() {
         [[ "${npm_os}" == 'win32' ]] || chmod +x "${package_dir}/bin/${binary}"
         release_npm_write_platform_manifest "${version}" "${package_key}" \
             "${npm_os}" "${npm_cpu}" >"${package_dir}/package.json"
+        cp -- "$(release_third_party_notices_path)" "${package_dir}/THIRD_PARTY_NOTICES.txt"
         rm -rf -- "${extract_dir}"
     done < <(release_npm_platform_rows)
 
@@ -415,6 +619,37 @@ release_npm_stage_packages() {
         return 1
     fi
     mv -- "${staging}" "${output_dir}"
+}
+
+# Check the packed artifacts themselves, not only the staging tree: every npm
+# tarball must carry the generated notice and never the proprietary LICENSE.
+release_npm_verify_tarballs() {
+    local tarball_dir="${1:-}" notice_path="" tarball="" entries="" expected_count=0
+    local -a tarballs=()
+
+    [[ -d "${tarball_dir}" ]] || {
+        printf "release: npm tarball directory not found '%s'\n" "${tarball_dir}" >&2
+        return 1
+    }
+    notice_path="$(release_third_party_notices_path)"
+    expected_count="$(release_npm_package_directories | wc -l | tr -d ' ')"
+    tarballs=("${tarball_dir}"/*.tgz)
+    [[ -f "${tarballs[0]}" && "${#tarballs[@]}" == "${expected_count}" ]] || {
+        printf "release: expected %s npm tarballs in '%s'\n" "${expected_count}" "${tarball_dir}" >&2
+        return 1
+    }
+    for tarball in "${tarballs[@]}"; do
+        entries="$(tar -tzf "${tarball}")" || return 1
+        if ! grep -qx 'package/THIRD_PARTY_NOTICES.txt' <<<"${entries}" ||
+            ! tar -xzOf "${tarball}" package/THIRD_PARTY_NOTICES.txt | cmp -s - "${notice_path}"; then
+            printf "release: '%s' lacks the generated THIRD_PARTY_NOTICES.txt\n" "${tarball}" >&2
+            return 1
+        fi
+        if grep -Eiq '^package/licen[cs]e' <<<"${entries}"; then
+            printf "release: '%s' must not contain a LICENSE file\n" "${tarball}" >&2
+            return 1
+        fi
+    done
 }
 
 release_sha256_sum() {
@@ -478,7 +713,10 @@ usage:
   scripts/release.sh npm-package-directories
   scripts/release.sh stage-npm-packages <version> <archive-dir> <output-dir>
   scripts/release.sh verify-npm-packages <version> <package-dir>
+  scripts/release.sh verify-npm-tarballs <tarball-dir>
   scripts/release.sh npm-checksums <tarball-dir> <checksum-path>
+  scripts/release.sh third-party-notices
+  scripts/release.sh verify-third-party-notices
 EOF
 }
 
@@ -505,8 +743,17 @@ release_main() {
         verify-npm-packages)
             release_npm_validate_package_set "${1:-}" "${2:-}"
             ;;
+        verify-npm-tarballs)
+            release_npm_verify_tarballs "${1:-}"
+            ;;
         npm-checksums)
             release_npm_write_checksums "${1:-}" "${2:-}"
+            ;;
+        third-party-notices)
+            release_third_party_notices_generate
+            ;;
+        verify-third-party-notices)
+            release_third_party_notices_check
             ;;
         *)
             release_usage

@@ -25,6 +25,13 @@ jobs:
           bash scripts/release.sh verify-tag-matches-manifest "${tag}"
           printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Verify THIRD_PARTY_NOTICES.txt is current
+        shell: bash
+        run: bash scripts/release.sh verify-third-party-notices
+
   build:
     needs: verify-tag
     strategy:
@@ -280,6 +287,7 @@ jobs:
             cd npm-tarballs
             sha256sum --check ../npm-SHA256SUMS
           )
+          bash scripts/release.sh verify-npm-tarballs npm-tarballs
 
       - name: Publish npm packages
         shell: bash
