@@ -18,9 +18,18 @@ Text-only traffic stays byte-identical to the plain-string format. A tool
 loop (`src/tools.rs`) wraps the transport: while a reply's `stop_reason` is
 `tool_use`, it runs each call through a registry of synchronous handlers and
 sends the `tool_result` blocks back, stopping after 10 tool-use rounds per
-user turn. The registered tool is `read` (`src/tools/read.rs`), which also
-records each successfully read path in an in-process read-set. Each
-dispatched round is persisted on the trail as a `tool_round` line (the `tool_use` reply's blocks), then per
+user turn. The registered tools are `read`, `write`, `edit`, and `bash`.
+`read` and `write` share an in-process read-set. The `bash` tool
+(`src/tools/bash.rs`) runs one `bash -lc <command>` synchronously in the
+caller's working directory and OS identity. Its timeout defaults to 10 seconds;
+timeout results retain partial stdout/stderr, report exit code 124, and
+terminate the shell and descendants after a 50 ms graceful period (Windows
+uses a job object). It stops draining inherited output pipes after a 2-second
+guard. Each output stream is
+capped at 2000 lines or 50 KB with head/tail truncation and an omitted-byte
+count. The JSON tool result includes wall time, status, exit code, and separate
+stdout/stderr fields. The tool loop persists each dispatched round on the trail
+as a `tool_round` line (the `tool_use` reply's blocks), then per
 call a `tool_call` line and one matching `tool_result` line — enough for
 `--resume` to rebuild the turn's history verbatim.
 
