@@ -80,9 +80,8 @@ to an unregistered tool is answered with an error result.
   whitespace-tolerant fallback. The call fails, leaving the file untouched,
   when `oldString` is empty, equals `newString`, is not found, or matches more
   than once (overlapping occurrences count) without `replaceAll`. On success
-  it returns
-  `Successfully replaced N occurrence(s) in <path>.` followed by a unified diff
-  (one line of context) capped at 32 rows; a longer diff ends with
+  it returns `Successfully replaced N occurrence(s) in <path>.` followed by a
+  unified diff (one line of context) capped at 32 rows; a longer diff ends with
   `... [diff truncated: N more lines]`.
 
 ### Sessions
