@@ -164,7 +164,13 @@ mod tests {
     }
 
     fn bash_available() -> bool {
-        Command::new("bash")
+        let mut probe = Command::new("bash");
+        // Resolve `bash` the way `process::run` does (see its Windows note).
+        #[cfg(windows)]
+        if let Some(path) = std::env::var_os("PATH") {
+            probe.env("PATH", path);
+        }
+        probe
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

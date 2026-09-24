@@ -42,6 +42,14 @@ pub(super) fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // On Windows, Rust searches the system directory before the parent's
+    // `PATH` unless the child's `PATH` is set explicitly, so a bare `bash`
+    // would resolve to the WSL launcher in System32 ahead of Git Bash.
+    // Re-setting the inherited `PATH` makes the `PATH` search come first.
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("PATH") {
+        command_builder.env("PATH", path);
+    }
     command_builder.envs(env.iter().map(|(key, value)| (key, value)));
 
     #[cfg(unix)]

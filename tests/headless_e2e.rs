@@ -151,21 +151,10 @@ fn run(mut cmd: Command, stdin: Option<&str>) -> Output {
         .expect("wait for leg")
 }
 
-/// Asserts the on-disk effects of the scripted chain and the four requests
-/// leg sent: tools advertised on the first, and each later request carrying
-/// the previous call's `tool_result`.
+/// Asserts the four requests leg sent — tools advertised on the first, each
+/// later one carrying the previous call's `tool_result` — then the on-disk
+/// effects. Requests are checked first so a failing tool reports its result.
 fn assert_chain_effects(cwd: &Path, requests: &Mutex<Vec<String>>) {
-    assert_eq!(
-        std::fs::read_to_string(cwd.join("notes.txt")).unwrap(),
-        "DONE\n",
-        "edit must rewrite the file"
-    );
-    assert_eq!(
-        std::fs::read_to_string(cwd.join("ran.txt")).unwrap().trim(),
-        "1",
-        "bash must run after the edit and see its result"
-    );
-
     let requests: Vec<Value> = requests
         .lock()
         .unwrap()
@@ -205,6 +194,17 @@ fn assert_chain_effects(cwd: &Path, requests: &Mutex<Vec<String>>) {
             "{id} result lacks {expect:?}: {result}"
         );
     }
+
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("notes.txt")).unwrap(),
+        "DONE\n",
+        "edit must rewrite the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("ran.txt")).unwrap().trim(),
+        "1",
+        "bash must run after the edit and see its result"
+    );
 }
 
 #[test]
