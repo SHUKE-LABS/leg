@@ -147,12 +147,12 @@ impl ToolHandler for ReadTool {
 }
 
 /// An optional non-negative integer argument.
-fn optional_count(input: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+fn optional_count(input: &serde_json::Value, key: &str) -> Result<Option<u64>, String> {
     match &input[key] {
         serde_json::Value::Null => Ok(None),
         value => value
             .as_u64()
-            .map(|n| Some(n as usize))
+            .map(Some)
             .ok_or_else(|| format!("read: `{key}` must be a non-negative integer")),
     }
 }
@@ -168,20 +168,26 @@ fn os_error(err: &io::Error) -> String {
 
 /// Selects the `offset`/`limit` window of `text`, caps it, and appends the
 /// continuation notice when content was withheld.
-fn read_window(text: &str, offset: Option<usize>, limit: Option<usize>) -> Result<String, String> {
+///
+/// `offset`/`limit` stay `u64` until bounded by the line count, so a huge
+/// value cannot wrap on a 32-bit target.
+fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> Result<String, String> {
     // Offset counting keeps a trailing empty element; cap counting (in
     // `truncate_head`) pops it. The two are deliberately not unified.
     let all_lines: Vec<&str> = text.split('\n').collect();
     let total = all_lines.len();
     let start = offset.map_or(0, |o| o.saturating_sub(1));
-    if start >= total {
+    if start >= total as u64 {
         return Err(format!(
             "Offset {} is beyond end of file ({total} lines total)",
             offset.unwrap_or(0)
         ));
     }
+    let end = limit.map_or(total, |l| {
+        start.saturating_add(l).min(total as u64) as usize
+    });
+    let start = start as usize;
     let first_display = start + 1;
-    let end = limit.map_or(total, |l| start.saturating_add(l).min(total));
     let selected = all_lines[start..end].join("\n");
 
     let output = match truncate_head(&selected) {
@@ -408,6 +414,28 @@ mod tests {
         assert_eq!(
             read(without, serde_json::json!({"limit": 1})).unwrap(),
             "a\n\n[2 more lines in file. Use offset=2 to continue.]"
+        );
+    }
+
+    #[test]
+    fn huge_offset_and_limit_do_not_wrap() {
+        // 2^32 + 1 would narrow to 1 as a 32-bit `usize`.
+        let huge = (1u64 << 32) + 1;
+        assert_eq!(
+            read("a\nb", serde_json::json!({"offset": huge})).unwrap_err(),
+            format!("Offset {huge} is beyond end of file (2 lines total)")
+        );
+        assert_eq!(
+            read("a\nb", serde_json::json!({"offset": u64::MAX})).unwrap_err(),
+            format!("Offset {} is beyond end of file (2 lines total)", u64::MAX)
+        );
+        assert_eq!(
+            read("a\nb", serde_json::json!({"limit": huge})).unwrap(),
+            "a\nb"
+        );
+        assert_eq!(
+            read("a\nb", serde_json::json!({"offset": 2, "limit": u64::MAX})).unwrap(),
+            "b"
         );
     }
 
