@@ -168,11 +168,14 @@ fn help_text() -> String {
          LEG_EVENT_LOG names a JSONL file that `ask` and a fresh `session`\n\
          append an exchange trail to (unset/blank disables recording); `leg\n\
          log show`/`leg log replay` read it back (or `--file <path>`).\n\n\
-         `leg exchange` reads a `baton.message/v1` envelope on --in/stdin and\n\
-         writes the response envelope on --out/stdout; given plain text\n\
-         instead, it writes just the reply body (or nothing, on failure) —\n\
-         the shape `baton serve --agent-cmd <path> --agent-arg exchange`\n\
-         expects."
+         `leg exchange` is the headless entry point for adapters; it reads a\n\
+         `baton.message/v1` envelope on --in/stdin and writes the response\n\
+         envelope on --out/stdout; given plain text instead, it writes just\n\
+         the reply body. Provider/delivery failures exit non-zero: `ask` and\n\
+         plain-text `exchange` leave stdout empty and report an error on\n\
+         stderr; envelope `exchange` writes its `kind:\"error\"` response\n\
+         before reporting the failure. `baton serve --agent-cmd <path>\n\
+         --agent-arg exchange` expects this protocol."
     )
 }
 
@@ -420,9 +423,8 @@ fn parse_exchange_request(raw: &str) -> (MessageEnvelope, ExchangeMode) {
 /// Runs one `leg exchange` request/response round-trip: reads `in_path`
 /// (stdin when absent), and writes to `out_path` (stdout when absent).
 ///
-/// Config-load and `--in`/`--out` I/O failures propagate as `Err`; once a
-/// [`LocalParticipant`] answers, [`execute_exchange_core`] is infallible —
-/// see its doc for the per-mode output shape.
+/// Config-load, `--in`/`--out` I/O, and delivered turn failures propagate as
+/// `Err`; see [`execute_exchange_core`] for the per-mode failure output.
 fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()> {
     let config = LegConfig::from_env()?;
     let meta = exchange_meta(&config);
@@ -441,18 +443,15 @@ fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()>
 /// so the per-mode output contract is exercisable without a network.
 ///
 /// - [`ExchangeMode::Envelope`]: writes the full response envelope as one
-///   JSON line, whatever `kind` it carries (mirrors `baton exchange`).
+///   JSON line; a `kind: "error"` response is then returned as a failure
+///   (mirrors `baton exchange`'s output shape).
 /// - [`ExchangeMode::PlainText`] + [`MessageKind::Response`]: writes just
 ///   `response.body`.
-/// - [`ExchangeMode::PlainText`] + a delivered error kind: writes nothing to
-///   `output` and prints the message to stderr. Baton's own
-///   `ExternalAgentParticipant` treats exit-0-with-empty-stdout as a
-///   machinery failure and synthesizes its own delivered `kind: "error"`
-///   envelope — this is what makes AC3 observable for the external-agent
-///   path, since a plain-text reply carries no `kind` field of its own.
+/// - [`ExchangeMode::PlainText`] + [`MessageKind::Error`]: writes nothing to
+///   `output` and returns a failure for `main` to report on stderr.
 ///
-/// Every branch returns `Ok(())`: a participant-delivered outcome — success
-/// or error, either mode — never becomes a process `Err` here.
+/// Successful responses return `Ok(())`. A delivered error returns `Err`
+/// after preserving the mode-specific output.
 fn execute_exchange_core(
     participant: &impl Participant,
     raw: &str,
@@ -464,15 +463,28 @@ fn execute_exchange_core(
     match (mode, response.kind) {
         (ExchangeMode::Envelope, _) => {
             let json = serde_json::to_string(&response).expect("MessageEnvelope always serializes");
-            writeln!(output, "{json}").map_err(io_err)
+            writeln!(output, "{json}").map_err(io_err)?;
+            if response.kind == MessageKind::Error {
+                Err(delivered_turn_failure(&response))
+            } else {
+                Ok(())
+            }
         }
         (ExchangeMode::PlainText, MessageKind::Response) => {
             writeln!(output, "{}", response.body).map_err(io_err)
         }
+        (ExchangeMode::PlainText, MessageKind::Error) => Err(delivered_turn_failure(&response)),
         (ExchangeMode::PlainText, _) => {
             eprintln!("{}", response.body);
             Ok(())
         }
+    }
+}
+
+fn delivered_turn_failure(response: &MessageEnvelope) -> LegError {
+    LegError::TurnFailure {
+        message_kind: "error".to_string(),
+        message: response.body.clone(),
     }
 }
 
@@ -505,11 +517,9 @@ fn open_output(path: Option<&str>) -> Result<Box<dyn Write>> {
 /// Runs one single-turn exchange and writes its result to `output`.
 ///
 /// Config-load failures (bad/missing credential, malformed env values)
-/// propagate as `Err` — nothing has been sent to the provider yet. Once a
-/// [`LocalParticipant`] answers, the result is infallible per the
-/// [`Participant`] contract: a success prints the reply text; a provider or
-/// delivery failure prints the response `MessageEnvelope` as JSON
-/// (`"kind":"error"`) instead — both exit 0.
+/// propagate as `Err` — nothing has been sent to the provider yet. A
+/// successful response prints the reply text; a delivered error leaves
+/// stdout empty and propagates a failure for `main` to report on stderr.
 fn execute_ask(prompt: &str, model: Option<String>, output: impl Write) -> Result<()> {
     let mut config = LegConfig::from_env()?;
     apply_model_override(&mut config, model);
@@ -541,7 +551,7 @@ fn tool_trail_observer(mut sink: Rc<RefCell<Box<dyn EventSink>>>) -> ToolObserve
 }
 
 /// Testable core of [`execute_ask_with_config`], parameterised over a
-/// [`Participant`] so the success/error stdout contract is exercisable
+/// [`Participant`] so the success and delivered-error behavior is exercisable
 /// without a network.
 ///
 /// The `request` event is recorded *before* the provider call — matching
@@ -580,6 +590,7 @@ fn run_ask(
 
     match response.kind {
         MessageKind::Response => writeln!(output, "{}", response.body).map_err(io_err),
+        MessageKind::Error => Err(delivered_turn_failure(&response)),
         _ => {
             let json = serde_json::to_string(&response).expect("MessageEnvelope always serializes");
             writeln!(output, "{json}").map_err(io_err)
@@ -1267,19 +1278,21 @@ mod tests {
     }
 
     #[test]
-    fn run_ask_prints_error_envelope_json_on_delivery_failure_and_does_not_err() {
+    fn run_ask_propagates_delivery_failure_without_writing_stdout() {
         let participant = LocalParticipant::new(
             FakeTransport(Err(LegError::Auth("bad credentials".to_string()))),
             meta(),
         );
         let mut buf = Vec::new();
         let mut sink = NoopSink;
-        run_ask(&participant, &meta(), "hello", &mut buf, &mut sink)
-            .expect("infallible per Participant contract");
-        let printed = String::from_utf8(buf).unwrap();
-        let value: serde_json::Value = serde_json::from_str(printed.trim()).expect("valid json");
-        assert_eq!(value["kind"], "error");
-        assert_eq!(value["body"], "authentication error: bad credentials");
+        let err = run_ask(&participant, &meta(), "hello", &mut buf, &mut sink)
+            .expect_err("delivered errors must fail the command");
+        assert_eq!(err.kind(), "turn_failure");
+        assert_eq!(
+            err.to_string(),
+            "turn failed (kind: error): authentication error: bad credentials"
+        );
+        assert!(buf.is_empty(), "failed ask must leave stdout empty");
     }
 
     #[test]
@@ -1427,12 +1440,15 @@ mod tests {
     }
 
     #[test]
-    fn help_text_mentions_ask_usage_and_env_vars() {
+    fn help_text_documents_usage_env_and_failure_contract() {
         let text = help_text();
         assert!(text.contains("leg ask [--model <model>] <prompt>"));
         assert!(text.contains("ANTHROPIC_API_KEY"));
         assert!(text.contains("LEG_MODEL"));
         assert!(text.contains("LEG_EVENT_LOG"));
+        assert!(text.contains("headless entry point"));
+        assert!(text.contains("exit non-zero"));
+        assert!(text.contains("kind:\"error\""));
     }
 
     #[test]
@@ -2902,7 +2918,9 @@ mod tests {
         );
         let raw = serde_json::to_string(&envelope).unwrap();
         let mut buf = Vec::new();
-        execute_exchange_core(&participant, &raw, &mut buf).expect("infallible");
+        let err = execute_exchange_core(&participant, &raw, &mut buf)
+            .expect_err("delivered errors must fail the command");
+        assert_eq!(err.kind(), "turn_failure");
         let printed = String::from_utf8(buf).unwrap();
         let value: serde_json::Value = serde_json::from_str(printed.trim()).expect("valid json");
         assert_eq!(value["kind"], "error");
@@ -2919,17 +2937,15 @@ mod tests {
     }
 
     #[test]
-    fn execute_exchange_core_plain_text_failure_writes_nothing_and_still_returns_ok() {
+    fn execute_exchange_core_plain_text_failure_writes_nothing_and_returns_error() {
         let participant = LocalParticipant::new(
             FakeTransport(Err(LegError::Auth("bad credentials".to_string()))),
             meta(),
         );
         let mut buf = Vec::new();
-        execute_exchange_core(&participant, "hello", &mut buf)
-            .expect("delivered errors never propagate as Err");
-        assert!(
-            buf.is_empty(),
-            "plain-text failure must leave stdout empty so baton's machinery-error path fires"
-        );
+        let err = execute_exchange_core(&participant, "hello", &mut buf)
+            .expect_err("delivered errors must fail the command");
+        assert_eq!(err.kind(), "turn_failure");
+        assert!(buf.is_empty(), "plain-text failure must leave stdout empty");
     }
 }

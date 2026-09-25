@@ -53,6 +53,13 @@ pub enum LegError {
     /// A JSONL exchange trail (`LEG_EVENT_LOG` or a `--resume` file) could not
     /// be parsed: a malformed line, or a known event missing required fields.
     Log(String),
+    /// A provider turn returned a delivered error response.
+    TurnFailure {
+        /// The `baton.message/v1` response kind.
+        message_kind: String,
+        /// The response's human-readable failure detail.
+        message: String,
+    },
 }
 
 impl LegError {
@@ -72,6 +79,7 @@ impl LegError {
             LegError::Decode(_) => "decode",
             LegError::Io(_) => "io",
             LegError::Log(_) => "log",
+            LegError::TurnFailure { .. } => "turn_failure",
         }
     }
 }
@@ -93,6 +101,10 @@ impl fmt::Display for LegError {
             LegError::Decode(msg) => write!(f, "response decode error: {msg}"),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
             LegError::Log(msg) => write!(f, "log error: {msg}"),
+            LegError::TurnFailure {
+                message_kind,
+                message,
+            } => write!(f, "turn failed (kind: {message_kind}): {message}"),
         }
     }
 }

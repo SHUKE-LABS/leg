@@ -63,6 +63,30 @@ fn spawn_sequence_server(rounds: &'static [&'static str]) -> (String, Arc<Mutex<
     (format!("http://{addr}"), requests)
 }
 
+/// Starts a one-shot fake provider that rejects the request with bad credentials.
+fn spawn_auth_failure_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        if read_request_body(&mut stream).is_none() {
+            return;
+        }
+        let body = r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+
+    format!("http://{addr}")
+}
+
 /// Reads one HTTP/1.1 request and returns its `Content-Length` body.
 fn read_request_body(stream: &mut impl Read) -> Option<String> {
     let mut buf = [0u8; 8192];
@@ -272,6 +296,33 @@ fn ask_drives_read_edit_bash_and_records_the_tool_trail() {
     }
     assert_eq!(shown.matches("→ completed: ").count(), 3, "{shown}");
     assert!(shown.contains("reply:  all done"), "{shown}");
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn ask_provider_failure_leaves_stdout_empty_and_exits_nonzero() {
+    let base_url = spawn_auth_failure_server();
+    let cwd = fixture_dir("ask-failure");
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.args(["ask", "hello"]);
+    let output = run(cmd, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "failed ask must exit non-zero");
+    assert!(
+        output.stdout.is_empty(),
+        "failed ask must leave stdout empty"
+    );
+    assert!(
+        stderr.contains("kind: error"),
+        "stderr must identify the failed message kind; got {stderr:?}"
+    );
+    assert!(
+        stderr.contains("invalid x-api-key"),
+        "stderr must include the provider diagnostic; got {stderr:?}"
+    );
 
     std::fs::remove_dir_all(&cwd).ok();
 }

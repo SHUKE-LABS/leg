@@ -231,7 +231,7 @@ fn plain_text_success_writes_only_the_raw_reply_body() {
 }
 
 #[test]
-fn plain_text_provider_failure_leaves_stdout_empty_for_batons_machinery_error_path() {
+fn plain_text_provider_failure_leaves_stdout_empty_and_exits_nonzero() {
     let base_url = spawn_mock_server(
         401,
         r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
@@ -240,17 +240,55 @@ fn plain_text_provider_failure_leaves_stdout_empty_for_batons_machinery_error_pa
     let (success, stdout, stderr) = run_leg_exchange(&base_url, "hello");
 
     assert!(
-        success,
-        "a provider failure must still exit 0 — it is a delivered outcome, not a process error"
+        !success,
+        "a provider failure must exit non-zero so callers can detect it"
     );
     assert!(
         stdout.is_empty(),
-        "empty stdout on exit 0 is what makes ExternalAgentParticipant synthesize its own \
-         kind:\"error\" envelope; got {stdout:?}"
+        "plain-text failure must leave stdout empty; got {stdout:?}"
     );
     assert!(
         stderr.contains("invalid x-api-key"),
         "the diagnostic must still be observable on stderr; got {stderr:?}"
+    );
+    assert!(
+        stderr.contains("kind: error"),
+        "stderr must identify the failed message kind; got {stderr:?}"
+    );
+}
+
+#[test]
+fn envelope_mode_provider_failure_preserves_error_envelope_and_exits_nonzero() {
+    let base_url = spawn_mock_server(
+        401,
+        r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+    );
+    let request = r#"{
+        "schema": "baton.message/v1",
+        "message_id": "m-1",
+        "conversation_id": "c-1",
+        "from": "external",
+        "to": "leg",
+        "in_reply_to": null,
+        "kind": "request",
+        "body": "hello",
+        "ts_ms": 1700000000000,
+        "exchange": null
+    }"#;
+
+    let (success, stdout, stderr) = run_leg_exchange(&base_url, request);
+
+    assert!(
+        !success,
+        "an envelope-mode provider failure must exit non-zero; stderr: {stderr}"
+    );
+    let response: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("error response envelope is JSON");
+    assert_eq!(response["kind"], "error");
+    assert_eq!(response["body"], "authentication error: invalid x-api-key");
+    assert!(
+        stderr.contains("kind: error"),
+        "stderr must identify the failed message kind; got {stderr:?}"
     );
 }
 

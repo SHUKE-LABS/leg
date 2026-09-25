@@ -45,9 +45,9 @@ ANTHROPIC_API_KEY=sk-... leg ask [--model <model>] "prompt"
 ```
 
 Prints the assistant reply on success. A provider or delivery failure
-(bad credentials, unreachable base URL, etc.) prints a `baton.message/v1`
-envelope with `"kind":"error"` instead of exiting non-zero — only a
-configuration failure (missing/malformed env vars) exits non-zero.
+(bad credentials, unreachable base URL, etc.) leaves stdout empty, reports an
+error including `kind: error` on stderr, and exits non-zero. Configuration
+failures (missing/malformed env vars) also exit non-zero.
 Also accepts `ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`,
 `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`, `LEG_MAX_TOKENS`,
 `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
@@ -106,12 +106,14 @@ to an unregistered tool is answered with an error result.
 A caller driving `leg ask` or `leg exchange` sets the working directory:
 every tool resolves relative paths against, and `bash` runs in, the process
 cwd. The whole tool loop runs inside the one invocation — tool calls and
-results are never written to stdout, so `ask` prints only the final reply
-and `exchange` writes exactly one response envelope. To observe the tool
-steps, set `LEG_EVENT_LOG` on `ask` and read the trail back with
-`leg log show`. The `bash` tool needs `bash` on `PATH` (Git Bash on
-Windows). `tests/headless_e2e.rs` exercises this contract end to end
-against a fake provider.
+results are never written to stdout. On success, `ask` prints only the final
+reply and `exchange` writes one response. On provider/delivery failure, both
+exit non-zero: `ask` and plain-text `exchange` leave stdout empty and report
+an error on stderr; envelope `exchange` writes its `kind:"error"` response
+before reporting the failure. To observe tool steps, set `LEG_EVENT_LOG` on
+`ask` and read the trail back with `leg log show`. The `bash` tool needs
+`bash` on `PATH` (Git Bash on Windows). `tests/headless_e2e.rs` exercises
+this contract end to end against a fake provider.
 
 ### Sessions
 
@@ -169,7 +171,8 @@ leg exchange [--in <path>] [--out <path>]
 
 Answers one `baton.message/v1` request (from `--in`, or stdin) with exactly
 one response (to `--out`, or stdout); a plain-text request gets the reply
-body alone. The tool loop runs inside that single exchange.
+body alone. The tool loop runs inside that single exchange. `leg exchange`
+is the headless entry point for adapters.
 
 ## CI-supported targets
 
