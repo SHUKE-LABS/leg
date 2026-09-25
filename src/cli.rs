@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -10,11 +11,11 @@ use crate::config::LegConfig;
 use crate::error::{LegError, Result};
 use crate::events::{
     EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, ToolStatus, WriterSink,
-    now_ms,
+    now_ms, trail_content,
 };
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
-use crate::participant::{LocalParticipant, Participant};
+use crate::participant::{LocalParticipant, Participant, fresh_message_id};
 use crate::tools::{
     BashTool, EditTool, ReadSet, ReadTool, TOOL_ROUND_LIMIT_WARNING, ToolLoop, ToolObserver,
     ToolRegistry, TurnOutcome, WriteTool,
@@ -24,12 +25,13 @@ use crate::transport::claude::ClaudeClient;
 use crate::transport::http::UreqHttpClient;
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
-const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>]";
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
-/// to. An unset or blank value disables recording for `ask`, `exchange`, and
-/// fresh `session` runs (a `--resume` run instead appends to the trail it read
-/// from).
+/// to. An unset or blank value disables recording for `ask`, cold `exchange`,
+/// and fresh `session` runs. Named exchange sessions always append to their
+/// own trail and also write here when configured; `--resume` appends to the
+/// trail it read from.
 const EVENT_LOG_ENV: &str = "LEG_EVENT_LOG";
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
@@ -72,7 +74,20 @@ enum Command {
         in_path: Option<String>,
         /// `--out <path>`; falls back to stdout when absent.
         out_path: Option<String>,
+        /// Existing named session, or a newly created session.
+        session: Option<ExchangeSession>,
+        /// Writes the selected session id after the turn.
+        session_id_out: Option<String>,
     },
+}
+
+/// The session mode selected for one headless exchange.
+#[derive(Debug, PartialEq, Eq)]
+enum ExchangeSession {
+    /// Continue the session stored under this id.
+    Existing(String),
+    /// Create a new session with a generated id.
+    New,
 }
 
 /// Selects the session trail to rehydrate for `leg session --resume`.
@@ -153,9 +168,17 @@ pub fn run() -> Result<()> {
             let stdout = std::io::stdout();
             execute_ask_with_config(config, &prompt, stdout.lock())
         }
-        Some(Command::Exchange { in_path, out_path }) => {
-            execute_exchange(in_path.as_deref(), out_path.as_deref())
-        }
+        Some(Command::Exchange {
+            in_path,
+            out_path,
+            session,
+            session_id_out,
+        }) => execute_exchange(
+            in_path.as_deref(),
+            out_path.as_deref(),
+            session,
+            session_id_out.as_deref(),
+        ),
     }
 }
 
@@ -166,16 +189,23 @@ fn help_text() -> String {
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
          CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
          LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, and LEG_SYSTEM_PROMPT.\n\n\
-         LEG_EVENT_LOG names a JSONL file that `ask`, `exchange`, and a fresh `session`\n\
-         append an exchange trail to (unset/blank disables recording); `leg\n\
-         log show`/`leg log replay` read it back (or `--file <path>`).\n\n\
+         LEG_EVENT_LOG names an optional JSONL trail for `ask`, cold `exchange`,\n\
+         and a fresh `session`; named exchange sessions always write their\n\
+         session store and also append here when this variable is non-blank.\n\
+         `leg log show`/`leg log replay` read it back (or `--file <path>`).\n\n\
          `leg exchange` is the headless entry point for adapters; it reads a\n\
          `baton.message/v1` envelope on --in/stdin and writes the response\n\
          envelope on --out/stdout; given plain text instead, it writes just\n\
          the reply body. Provider/delivery failures exit non-zero: `ask` and\n\
          plain-text `exchange` leave stdout empty and report an error on\n\
          stderr; envelope `exchange` writes its `kind:\"error\"` response\n\
-         before reporting the failure. `baton serve --agent-cmd <path>\n\
+         before reporting the failure. `--session <id>` continues a named\n\
+         exchange session; `--new-session` creates one. These flags are\n\
+         mutually exclusive, and `--session-id-out <path>` writes the id and a\n\
+         newline after\n\
+         the turn when either is used. The session store is\n\
+         LEG_SESSION_DIR, else XDG_STATE_HOME/leg/sessions, else\n\
+         ~/.local/state/leg/sessions. `baton serve --agent-cmd <path>\n\
          --agent-arg exchange` expects this protocol."
     )
 }
@@ -353,6 +383,8 @@ fn parse_index(raw: &str) -> Result<usize> {
 fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut in_path: Option<String> = None;
     let mut out_path: Option<String> = None;
+    let mut session: Option<ExchangeSession> = None;
+    let mut session_id_out: Option<String> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -368,13 +400,55 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
                     .ok_or_else(|| LegError::Usage("--out requires a value".to_string()))?;
                 out_path = Some(value.clone());
             }
+            "--session" => {
+                if session.is_some() {
+                    return Err(LegError::Usage(
+                        "exchange accepts only one of --session and --new-session".to_string(),
+                    ));
+                }
+                let value = iter
+                    .next()
+                    .ok_or_else(|| LegError::Usage("--session requires a value".to_string()))?;
+                if matches!(
+                    value.as_str(),
+                    "--in" | "--out" | "--session" | "--new-session" | "--session-id-out"
+                ) {
+                    return Err(LegError::Usage("--session requires a value".to_string()));
+                }
+                session = Some(ExchangeSession::Existing(value.clone()));
+            }
+            "--new-session" => {
+                if session.is_some() {
+                    return Err(LegError::Usage(
+                        "exchange accepts only one of --session and --new-session".to_string(),
+                    ));
+                }
+                session = Some(ExchangeSession::New);
+            }
+            "--session-id-out" => {
+                let value = iter.next().ok_or_else(|| {
+                    LegError::Usage("--session-id-out requires a value".to_string())
+                })?;
+                session_id_out = Some(value.clone());
+            }
             other => {
                 return Err(LegError::Usage(format!("unexpected argument {other:?}")));
             }
         }
     }
 
-    Ok(Command::Exchange { in_path, out_path })
+    if session_id_out.is_some() && session.is_none() {
+        return Err(LegError::Usage(
+            "--session-id-out requires --session or --new-session".to_string(),
+        ));
+    }
+
+    Ok(Command::Exchange {
+        in_path,
+        out_path,
+        session,
+        session_id_out,
+    })
 }
 
 /// Which protocol `leg exchange`'s input was, and therefore what shape its
@@ -426,7 +500,16 @@ fn parse_exchange_request(raw: &str) -> (MessageEnvelope, ExchangeMode) {
 ///
 /// Config-load, `--in`/`--out` I/O, and delivered turn failures propagate as
 /// `Err`; see [`execute_exchange_core`] for the per-mode failure output.
-fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()> {
+fn execute_exchange(
+    in_path: Option<&str>,
+    out_path: Option<&str>,
+    session: Option<ExchangeSession>,
+    session_id_out: Option<&str>,
+) -> Result<()> {
+    if let Some(session) = session {
+        return execute_exchange_session(in_path, out_path, session, session_id_out);
+    }
+
     let config = LegConfig::from_env()?;
     let meta = exchange_meta(&config);
 
@@ -440,6 +523,82 @@ fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()>
     let transport = build_transport(config).with_observer(tool_trail_observer(sink.clone()));
     let participant = LocalParticipant::new(transport, meta.clone());
     execute_exchange_core(&participant, &meta, &raw, output, &mut sink)
+}
+
+/// Runs one exchange against a named session, restoring its conversation and
+/// appending the turn to that session's JSONL trail.
+fn execute_exchange_session(
+    in_path: Option<&str>,
+    out_path: Option<&str>,
+    session: ExchangeSession,
+    session_id_out: Option<&str>,
+) -> Result<()> {
+    let store_dir = session_store_dir()?;
+    let (mut resumed, session_path, create_new) = match session {
+        ExchangeSession::Existing(session_id) => {
+            let path = exchange_session_path(&store_dir, &session_id)
+                .ok_or_else(|| LegError::SessionNotFound(session_id.clone()))?;
+            let resumed = load_exchange_session(&path, &session_id)?;
+            (resumed, path, false)
+        }
+        ExchangeSession::New => {
+            let session_id = new_session_id();
+            let path = exchange_session_path(&store_dir, &session_id)
+                .ok_or_else(|| LegError::Config("generated an invalid session id".to_string()))?;
+            (
+                ResumedSession {
+                    session_id,
+                    conversation: Conversation::new(),
+                    prior_turns: 0,
+                    next_turn_index: 0,
+                },
+                path,
+                true,
+            )
+        }
+    };
+
+    let config = LegConfig::from_env()?;
+    let meta = exchange_meta(&config);
+    let mut raw = String::new();
+    open_input(in_path)?
+        .read_to_string(&mut raw)
+        .map_err(io_err)?;
+
+    let mut output = open_output(out_path)?;
+    if create_new {
+        std::fs::create_dir_all(&store_dir).map_err(|err| {
+            LegError::Io(format!(
+                "failed to create session store {:?}: {err}",
+                store_dir
+            ))
+        })?;
+    }
+
+    let (event_sink, session_write_error) = open_session_event_sink(&session_path, create_new)?;
+    let mut sink = Rc::new(RefCell::new(event_sink));
+    let transport = build_transport(config);
+    let mut response_output = Vec::new();
+    let result = execute_exchange_session_core(
+        &transport,
+        &meta,
+        &raw,
+        &mut response_output,
+        &mut sink,
+        &mut resumed,
+    );
+    let session_write_error = session_write_error.borrow().clone();
+
+    if let Some(path) = session_id_out {
+        write_session_id_out(path, &resumed.session_id)?;
+    }
+    output.write_all(&response_output).map_err(io_err)?;
+    match (result, session_write_error) {
+        (Ok(()), Some(error)) => Err(LegError::Io(format!(
+            "failed to record session trail: {error}"
+        ))),
+        (result, _) => result,
+    }
 }
 
 /// Testable core of [`execute_exchange`], parameterised over a [`Participant`]
@@ -459,12 +618,125 @@ fn execute_exchange_core(
     participant: &impl Participant,
     meta: &ExchangeMeta,
     raw: &str,
-    mut output: impl Write,
+    output: impl Write,
     sink: &mut dyn EventSink,
 ) -> Result<()> {
     let (request, mode) = parse_exchange_request(raw);
     let response = respond_with_trail(participant, meta, &request, sink);
 
+    write_exchange_response(mode, &response, output)
+}
+
+/// Session-backed counterpart to [`execute_exchange_core`].
+fn execute_exchange_session_core(
+    transport: &ToolLoop<impl Transport>,
+    meta: &ExchangeMeta,
+    raw: &str,
+    output: impl Write,
+    sink: &mut dyn EventSink,
+    resumed: &mut ResumedSession,
+) -> Result<()> {
+    let (request, mode) = parse_exchange_request(raw);
+    let session_id = resumed.session_id.clone();
+    let turn_index = resumed.next_turn_index;
+    let request_ts_ms = now_ms();
+    resumed.conversation.push_user(request.body.as_str());
+
+    let stderr = std::io::stderr();
+    let mut warning = stderr.lock();
+    let call_start = Instant::now();
+    let result = timed_session_exchange(
+        sink,
+        meta,
+        &request.body,
+        &session_id,
+        turn_index,
+        &mut warning,
+        |sink| {
+            transport.run_observed(resumed.conversation.messages(), &mut |event| {
+                let turn = Some((session_id.as_str(), turn_index));
+                emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
+            })
+        },
+    );
+    let duration_ms = call_start.elapsed().as_millis() as u64;
+    resumed.next_turn_index += 1;
+
+    let outcome_ts_ms = now_ms();
+    let (kind, body, outcome) = match result {
+        Ok(turn) => {
+            for message in turn.transcript {
+                resumed.conversation.push(message);
+            }
+            resumed.conversation.push(session_reply_message(
+                turn.reply.content.clone(),
+                turn.capped,
+            ));
+            let outcome = Outcome::Ok {
+                ts_ms: outcome_ts_ms,
+                duration_ms,
+                reply: turn.reply.text.clone(),
+                content: trail_content(&turn.reply.content),
+                input_tokens: turn.reply.usage.input_tokens,
+                output_tokens: turn.reply.usage.output_tokens,
+                stop_reason: turn
+                    .reply
+                    .stop_reason
+                    .as_ref()
+                    .map(|reason| reason.as_str().to_string()),
+                session_id: Some(session_id.clone()),
+                turn_index: Some(turn_index),
+            };
+            (MessageKind::Response, turn.reply.text, outcome)
+        }
+        Err(err) => {
+            resumed.conversation.pop();
+            let body = err.to_string();
+            let outcome = Outcome::Error {
+                ts_ms: outcome_ts_ms,
+                duration_ms,
+                kind: err.kind().to_string(),
+                message: body.clone(),
+                session_id: Some(session_id.clone()),
+                turn_index: Some(turn_index),
+            };
+            (MessageKind::Error, body, outcome)
+        }
+    };
+
+    let request_record = crate::events::RequestRecord {
+        ts_ms: request_ts_ms,
+        model: meta.model.clone(),
+        base_url: meta.base_url.clone(),
+        prompt: request.body.clone(),
+        content: None,
+        session_id: Some(session_id),
+        turn_index: Some(turn_index),
+    };
+    let mut response = MessageEnvelope::new(
+        fresh_message_id(&request.conversation_id, outcome_ts_ms),
+        request.conversation_id.clone(),
+        request.to.clone(),
+        request.from.clone(),
+        kind,
+        body,
+        outcome_ts_ms,
+    );
+    response.in_reply_to = Some(request.message_id.clone());
+    response.exchange = Some(crate::message::WrappedExchange::new(Exchange {
+        request: request_record,
+        outcome,
+    }));
+
+    write_exchange_response(mode, &response, output)
+}
+
+/// Writes an exchange response according to the input protocol.
+fn write_exchange_response(
+    mode: ExchangeMode,
+    response: &MessageEnvelope,
+    mut output: impl Write,
+) -> Result<()> {
     match (mode, response.kind) {
         (ExchangeMode::Envelope, _) => {
             let json = serde_json::to_string(&response).expect("MessageEnvelope always serializes");
@@ -1105,6 +1377,164 @@ fn open_append_sink(path: &str) -> Box<dyn EventSink> {
     }
 }
 
+/// Resolves the named-session directory using the documented environment
+/// precedence.
+fn session_store_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("LEG_SESSION_DIR") {
+        if path.is_empty() {
+            return Err(LegError::Config(
+                "LEG_SESSION_DIR must not be blank".to_string(),
+            ));
+        }
+        return Ok(PathBuf::from(path));
+    }
+
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME")
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path).join("leg").join("sessions"));
+    }
+
+    let home = std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|path| !path.is_empty()))
+        .ok_or_else(|| {
+            LegError::Config("could not determine home directory for session store".to_string())
+        })?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("leg")
+        .join("sessions"))
+}
+
+/// Returns the JSONL path for a safe session id. IDs emitted by
+/// `new_session_id` use only these filename-safe characters.
+fn exchange_session_path(store_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return None;
+    }
+    Some(store_dir.join(format!("{session_id}.jsonl")))
+}
+
+/// Loads and rehydrates one id-addressed session trail.
+fn load_exchange_session(path: &Path, session_id: &str) -> Result<ResumedSession> {
+    let handle = File::open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            LegError::SessionNotFound(session_id.to_string())
+        } else {
+            LegError::Io(format!("failed to open session trail {:?}: {err}", path))
+        }
+    })?;
+    let report = crate::log::parse_sessions(handle)?;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if !report
+        .sessions
+        .iter()
+        .any(|record| record.session_id == session_id)
+    {
+        return Err(LegError::SessionNotFound(session_id.to_string()));
+    }
+    select_and_rehydrate(report.sessions, Some(session_id))
+}
+
+/// Opens the required session trail and the optional `LEG_EVENT_LOG` sink.
+fn open_session_event_sink(
+    path: &Path,
+    create_new: bool,
+) -> Result<(Box<dyn EventSink>, Rc<RefCell<Option<String>>>)> {
+    let mut options = OpenOptions::new();
+    options.write(true).append(true);
+    if create_new {
+        options.create_new(true);
+    }
+    let file = options.open(path).map_err(|err| {
+        LegError::Io(format!(
+            "failed to open session trail {:?} for recording: {err}",
+            path
+        ))
+    })?;
+    let event_log = open_event_sink_excluding(path);
+    let session_write_error = Rc::new(RefCell::new(None));
+    Ok((
+        Box::new(CompositeEventSink {
+            session: Box::new(WriterSink::new(file)),
+            event_log,
+            session_write_error: Rc::clone(&session_write_error),
+        }),
+        session_write_error,
+    ))
+}
+
+/// Opens `LEG_EVENT_LOG` unless it points at the session store file itself.
+fn open_event_sink_excluding(session_path: &Path) -> Box<dyn EventSink> {
+    match std::env::var(EVENT_LOG_ENV) {
+        Ok(path) if !path.trim().is_empty() => {
+            let event_path = Path::new(&path);
+            if same_file_path(event_path, session_path) {
+                Box::new(NoopSink)
+            } else {
+                open_append_sink(&path)
+            }
+        }
+        _ => Box::new(NoopSink),
+    }
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (std::fs::canonicalize(left), std::fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// Writes each session event to its durable trail and the optional legacy
+/// event log.
+struct CompositeEventSink {
+    session: Box<dyn EventSink>,
+    event_log: Box<dyn EventSink>,
+    session_write_error: Rc<RefCell<Option<String>>>,
+}
+
+impl EventSink for CompositeEventSink {
+    fn record(&mut self, event: &ExchangeEvent) -> std::io::Result<()> {
+        let session_result = self.session.record(event);
+        if let Err(err) = &session_result {
+            let mut write_error = self.session_write_error.borrow_mut();
+            if write_error.is_none() {
+                *write_error = Some(err.to_string());
+            }
+        }
+        let event_log_result = self.event_log.record(event);
+        session_result.and(event_log_result)
+    }
+}
+
+fn write_session_id_out(path: &str, session_id: &str) -> Result<()> {
+    let mut file = File::create(path).map_err(|err| {
+        LegError::Io(format!(
+            "failed to create --session-id-out file {path:?}: {err}"
+        ))
+    })?;
+    writeln!(file, "{session_id}").map_err(|err| {
+        LegError::Io(format!(
+            "failed to write --session-id-out file {path:?}: {err}"
+        ))
+    })?;
+    file.flush().map_err(|err| {
+        LegError::Io(format!(
+            "failed to flush --session-id-out file {path:?}: {err}"
+        ))
+    })
+}
+
 /// Resolves the log path and parses it into exchanges.
 ///
 /// The path is `--file` when given, else [`EVENT_LOG_ENV`]; with neither set,
@@ -1461,10 +1891,15 @@ mod tests {
         assert!(text.contains("ANTHROPIC_API_KEY"));
         assert!(text.contains("LEG_MODEL"));
         assert!(text.contains("LEG_EVENT_LOG"));
-        assert!(text.contains("`ask`, `exchange`, and a fresh `session`"));
+        assert!(text.contains("`ask`, cold `exchange`"));
+        assert!(text.contains("named exchange sessions always write their"));
         assert!(text.contains("headless entry point"));
         assert!(text.contains("exit non-zero"));
         assert!(text.contains("kind:\"error\""));
+        assert!(text.contains("--session <id>"));
+        assert!(text.contains("--new-session"));
+        assert!(text.contains("--session-id-out"));
+        assert!(text.contains("XDG_STATE_HOME/leg/sessions"));
     }
 
     #[test]
@@ -2839,6 +3274,8 @@ mod tests {
             Some(Command::Exchange {
                 in_path: None,
                 out_path: None,
+                session: None,
+                session_id_out: None,
             })
         );
     }
@@ -2850,8 +3287,68 @@ mod tests {
             Some(Command::Exchange {
                 in_path: Some("/tmp/a".to_string()),
                 out_path: Some("/tmp/b".to_string()),
+                session: None,
+                session_id_out: None,
             })
         );
+    }
+
+    #[test]
+    fn parse_args_exchange_accepts_session_flags_in_either_order() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "exchange",
+                "--session-id-out",
+                "/tmp/id",
+                "--session",
+                "sess-1",
+            ]))
+            .unwrap(),
+            Some(Command::Exchange {
+                in_path: None,
+                out_path: None,
+                session: Some(ExchangeSession::Existing("sess-1".to_string())),
+                session_id_out: Some("/tmp/id".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_args(&argv(&[
+                "exchange",
+                "--new-session",
+                "--session-id-out",
+                "/tmp/id",
+            ]))
+            .unwrap(),
+            Some(Command::Exchange {
+                in_path: None,
+                out_path: None,
+                session: Some(ExchangeSession::New),
+                session_id_out: Some("/tmp/id".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_args_exchange_rejects_conflicting_or_incomplete_session_flags() {
+        assert!(
+            parse_args(&argv(
+                &["exchange", "--session", "sess-1", "--new-session",]
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_args(&argv(
+                &["exchange", "--new-session", "--session", "sess-1",]
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_args(&argv(&["exchange", "--session", "--new-session"])).is_err(),
+            "--new-session must not be consumed as the --session id"
+        );
+        assert!(parse_args(&argv(&["exchange", "--session-id-out", "/tmp/id"])).is_err());
+        assert!(parse_args(&argv(&["exchange", "--session"])).is_err());
+        assert!(parse_args(&argv(&["exchange", "--session-id-out"])).is_err());
     }
 
     #[test]
