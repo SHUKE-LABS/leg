@@ -3,8 +3,9 @@
 //! [`ToolRegistry`] maps a tool name to its [`ToolSpec`] and a synchronous
 //! [`ToolHandler`]. [`ToolLoop`] wraps a [`Transport`]: while a reply's
 //! `stop_reason` is `tool_use`, it executes each `tool_use` block through the
-//! registry (serially, in call order) and sends the `tool_result` blocks back,
-//! for at most [`MAX_TOOL_ROUNDS`] rounds per user turn. `ToolLoop` is itself a
+//! registry (serially, in call order) and sends the `tool_result` blocks back.
+//! A configured round limit caps the loop; otherwise it continues until the
+//! provider replies without requesting tools. `ToolLoop` is itself a
 //! [`Transport`], so every driver (`ask`, `session`, `exchange`) shares it.
 //!
 //! Registered tools are [`ReadTool`] (`read`), [`WriteTool`] (`write`),
@@ -26,13 +27,10 @@ pub use edit::EditTool;
 pub use read::{ReadSet, ReadTool};
 pub use write::WriteTool;
 
-/// The most tool-use rounds one user turn may run; the initial provider
-/// request does not count.
-pub const MAX_TOOL_ROUNDS: usize = 10;
-
-/// The warning surfaced when a turn stops at [`MAX_TOOL_ROUNDS`].
-pub const TOOL_ROUND_LIMIT_WARNING: &str =
-    "warning: stopped after 10 tool-use rounds; reply still requests tools";
+/// Formats the warning surfaced when a turn stops at a configured round limit.
+pub fn tool_round_limit_warning(max_tool_rounds: usize) -> String {
+    format!("warning: stopped after {max_tool_rounds} tool-use rounds; reply still requests tools")
+}
 
 /// Executes one tool call synchronously.
 pub trait ToolHandler {
@@ -92,8 +90,8 @@ pub struct TurnOutcome {
     /// `tool_use` reply followed by its `tool_result` user turn — excluding
     /// the final reply.
     pub transcript: Vec<Message>,
-    /// Whether the turn stopped at [`MAX_TOOL_ROUNDS`] with the final reply
-    /// still requesting tools (which were not executed).
+    /// Whether the turn stopped at its configured round limit with the final
+    /// reply still requesting tools (which were not executed).
     pub capped: bool,
 }
 
@@ -143,17 +141,26 @@ pub type ToolObserver = Box<dyn FnMut(ToolEvent<'_>)>;
 pub struct ToolLoop<T: Transport> {
     transport: T,
     registry: ToolRegistry,
+    max_tool_rounds: Option<usize>,
     observer: Option<RefCell<ToolObserver>>,
 }
 
 impl<T: Transport> ToolLoop<T> {
     /// Wraps `transport`, executing tool calls through `registry`.
-    pub fn new(transport: T, registry: ToolRegistry) -> Self {
+    ///
+    /// When `max_tool_rounds` is `None`, tool-use rounds are unbounded.
+    pub fn new(transport: T, registry: ToolRegistry, max_tool_rounds: Option<usize>) -> Self {
         Self {
             transport,
             registry,
+            max_tool_rounds,
             observer: None,
         }
+    }
+
+    /// The configured maximum tool-use rounds, or `None` when unbounded.
+    pub fn max_tool_rounds(&self) -> Option<usize> {
+        self.max_tool_rounds
     }
 
     /// Notifies `observer` of every tool call made when this loop is driven
@@ -164,7 +171,7 @@ impl<T: Transport> ToolLoop<T> {
     }
 
     /// Runs one user turn: sends `history` and iterates while the reply
-    /// requests tools, for at most [`MAX_TOOL_ROUNDS`] rounds.
+    /// requests tools, stopping at the configured limit if one is set.
     pub fn run(&self, history: &[Message]) -> Result<TurnOutcome> {
         self.run_observed(history, &mut |_| {})
     }
@@ -183,13 +190,15 @@ impl<T: Transport> ToolLoop<T> {
         let mut rounds = 0;
 
         while reply.stop_reason == Some(StopReason::ToolUse) {
-            if rounds == MAX_TOOL_ROUNDS {
-                reply.usage = usage;
-                return Ok(TurnOutcome {
-                    reply,
-                    transcript: messages.split_off(history.len()),
-                    capped: true,
-                });
+            if let Some(max_tool_rounds) = self.max_tool_rounds {
+                if rounds >= max_tool_rounds {
+                    reply.usage = usage;
+                    return Ok(TurnOutcome {
+                        reply,
+                        transcript: messages.split_off(history.len()),
+                        capped: true,
+                    });
+                }
             }
             observe(ToolEvent::Round {
                 content: &reply.content,
@@ -215,7 +224,7 @@ impl<T: Transport> ToolLoop<T> {
             }
             messages.push(Message::new(Role::Assistant, reply.content));
             messages.push(Message::new(Role::User, results));
-            rounds += 1;
+            rounds = rounds.saturating_add(1);
 
             reply = self.transport.send_conversation(&messages)?;
             usage = add_usage(usage, reply.usage);
@@ -232,7 +241,7 @@ impl<T: Transport> ToolLoop<T> {
 
 impl<T: Transport> Transport for ToolLoop<T> {
     /// Runs the tool loop and returns only the final reply, warning on stderr
-    /// when the turn hit [`MAX_TOOL_ROUNDS`].
+    /// when the turn hit its configured round limit.
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
         let outcome = match &self.observer {
             Some(observer) => {
@@ -241,7 +250,10 @@ impl<T: Transport> Transport for ToolLoop<T> {
             None => self.run(messages)?,
         };
         if outcome.capped {
-            eprintln!("{TOOL_ROUND_LIMIT_WARNING}");
+            let max_tool_rounds = self
+                .max_tool_rounds
+                .expect("a capped turn has a configured round limit");
+            eprintln!("{}", tool_round_limit_warning(max_tool_rounds));
         }
         Ok(outcome.reply)
     }
@@ -342,7 +354,7 @@ pub(crate) mod tests {
                 Some(StopReason::EndTurn),
             ),
         ]);
-        let tool_loop = ToolLoop::new(transport, echo_registry(count.clone()));
+        let tool_loop = ToolLoop::new(transport, echo_registry(count.clone()), None);
 
         let outcome = tool_loop.run(&[Message::user("go")]).unwrap();
 
@@ -387,7 +399,7 @@ pub(crate) mod tests {
             input: serde_json::json!({}),
         });
         let transport = ScriptedTransport::new(vec![first, AssistantReply::new("done")]);
-        let tool_loop = ToolLoop::new(transport, echo_registry(count));
+        let tool_loop = ToolLoop::new(transport, echo_registry(count), None);
 
         let mut seen = Vec::new();
         tool_loop
@@ -420,7 +432,7 @@ pub(crate) mod tests {
     #[test]
     fn loop_without_tool_use_makes_a_single_call() {
         let transport = ScriptedTransport::new(vec![AssistantReply::new("hi")]);
-        let tool_loop = ToolLoop::new(transport, ToolRegistry::new());
+        let tool_loop = ToolLoop::new(transport, ToolRegistry::new(), None);
 
         let outcome = tool_loop.run(&[Message::user("go")]).unwrap();
 
@@ -430,14 +442,39 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn loop_stops_after_max_rounds_without_another_request() {
+    fn loop_runs_more_than_fifty_rounds_when_uncapped() {
+        const ROUNDS: usize = 50;
         let count = std::rc::Rc::new(Cell::new(0));
-        let replies = (0..=MAX_TOOL_ROUNDS)
+        let mut replies: Vec<_> = (0..ROUNDS)
+            .map(|i| tool_use_reply(&format!("toolu_{i}"), "echo"))
+            .collect();
+        replies.push(AssistantReply::new("done"));
+        let tool_loop = ToolLoop::new(
+            ScriptedTransport::new(replies),
+            echo_registry(count.clone()),
+            None,
+        );
+
+        let outcome = tool_loop.run(&[Message::user("go")]).unwrap();
+
+        assert_eq!(outcome.reply.text, "done");
+        assert!(!outcome.capped);
+        assert_eq!(count.get(), ROUNDS);
+        assert_eq!(tool_loop.transport.calls.borrow().len(), ROUNDS + 1);
+        assert_eq!(outcome.transcript.len(), 2 * ROUNDS);
+    }
+
+    #[test]
+    fn loop_stops_after_configured_round_limit_without_another_request() {
+        const MAX_ROUNDS: usize = 3;
+        let count = std::rc::Rc::new(Cell::new(0));
+        let replies = (0..=MAX_ROUNDS)
             .map(|i| tool_use_reply(&format!("toolu_{i}"), "echo"))
             .collect();
         let tool_loop = ToolLoop::new(
             ScriptedTransport::new(replies),
             echo_registry(count.clone()),
+            Some(MAX_ROUNDS),
         );
 
         let outcome = tool_loop.run(&[Message::user("go")]).unwrap();
@@ -445,17 +482,20 @@ pub(crate) mod tests {
         assert!(outcome.capped);
         assert_eq!(
             count.get(),
-            MAX_TOOL_ROUNDS,
+            MAX_ROUNDS,
             "the capped reply's tools are not run"
         );
         assert_eq!(
             tool_loop.transport.calls.borrow().len(),
-            MAX_TOOL_ROUNDS + 1,
+            MAX_ROUNDS + 1,
             "the initial request plus one per round"
         );
-        assert_eq!(outcome.transcript.len(), 2 * MAX_TOOL_ROUNDS);
+        assert_eq!(outcome.transcript.len(), 2 * MAX_ROUNDS);
         assert_eq!(outcome.reply.stop_reason, Some(StopReason::ToolUse));
-        assert_eq!(outcome.reply.usage.input_tokens, Some(11));
+        assert_eq!(
+            outcome.reply.usage.input_tokens,
+            Some((MAX_ROUNDS + 1) as u64)
+        );
     }
 
     #[test]

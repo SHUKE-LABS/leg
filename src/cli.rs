@@ -17,8 +17,8 @@ use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant, fresh_message_id};
 use crate::tools::{
-    BashTool, EditTool, ReadSet, ReadTool, TOOL_ROUND_LIMIT_WARNING, ToolLoop, ToolObserver,
-    ToolRegistry, TurnOutcome, WriteTool,
+    BashTool, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome,
+    WriteTool, tool_round_limit_warning,
 };
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
@@ -188,7 +188,8 @@ fn help_text() -> String {
         "{USAGE}\n\n\
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
          CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
-         LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, and LEG_SYSTEM_PROMPT.\n\n\
+         LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS, and\n\
+         LEG_SYSTEM_PROMPT.\n\n\
          LEG_EVENT_LOG names an optional JSONL trail for `ask`, cold `exchange`,\n\
          and a fresh `session`; named exchange sessions always write their\n\
          session store and also append here when this variable is non-blank.\n\
@@ -651,6 +652,7 @@ fn execute_exchange_session_core(
         &request.body,
         &session_id,
         turn_index,
+        transport.max_tool_rounds(),
         &mut warning,
         |sink| {
             transport.run_observed(resumed.conversation.messages(), &mut |event| {
@@ -1014,6 +1016,7 @@ fn run_session_repl_with_warning(
             &line,
             &session_id,
             turn_index,
+            transport.max_tool_rounds(),
             warning,
             |sink| {
                 transport.run_observed(conversation.messages(), &mut |event| {
@@ -1065,6 +1068,7 @@ fn timed_session_exchange(
     prompt: &str,
     session_id: &str,
     turn_index: u64,
+    max_tool_rounds: Option<usize>,
     warning: &mut dyn Write,
     call: impl FnOnce(&mut dyn EventSink) -> Result<TurnOutcome>,
 ) -> Result<TurnOutcome> {
@@ -1084,7 +1088,9 @@ fn timed_session_exchange(
             );
         }
         if outcome.capped {
-            let _ = writeln!(warning, "{TOOL_ROUND_LIMIT_WARNING}");
+            let max_tool_rounds =
+                max_tool_rounds.expect("a capped turn has a configured round limit");
+            let _ = writeln!(warning, "{}", tool_round_limit_warning(max_tool_rounds));
         }
     }
 
@@ -1144,6 +1150,7 @@ const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]"
 /// that lives for this process: `read` records into it and `write` gates
 /// overwrites on it.
 fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> {
+    let max_tool_rounds = config.max_tool_rounds;
     let reads = ReadSet::new();
     let mut registry = ToolRegistry::new();
     registry.register(ReadTool::spec(), Box::new(ReadTool::new(reads.clone())));
@@ -1151,7 +1158,7 @@ fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> 
     registry.register(EditTool::spec(), Box::new(EditTool::new()));
     registry.register(BashTool::spec(), Box::new(BashTool::new()));
     let client = ClaudeClient::from_config(config).with_tools(registry.specs());
-    ToolLoop::new(client, registry)
+    ToolLoop::new(client, registry, max_tool_rounds)
 }
 
 /// Records `event`, downgrading a persistence failure to a stderr warning.
@@ -1701,7 +1708,7 @@ mod tests {
 
     /// Wraps a test transport in a tool loop with no registered tools.
     fn looped<T: Transport>(transport: T) -> ToolLoop<T> {
-        ToolLoop::new(transport, ToolRegistry::new())
+        ToolLoop::new(transport, ToolRegistry::new(), None)
     }
 
     fn meta() -> ExchangeMeta {
@@ -1890,6 +1897,7 @@ mod tests {
         assert!(text.contains("leg ask [--model <model>] <prompt>"));
         assert!(text.contains("ANTHROPIC_API_KEY"));
         assert!(text.contains("LEG_MODEL"));
+        assert!(text.contains("LEG_MAX_TOOL_ROUNDS"));
         assert!(text.contains("LEG_EVENT_LOG"));
         assert!(text.contains("`ask`, cold `exchange`"));
         assert!(text.contains("named exchange sessions always write their"));
@@ -2449,8 +2457,13 @@ mod tests {
     ) -> (ToolLoop<T>, std::rc::Rc<std::cell::Cell<usize>>) {
         let count = std::rc::Rc::new(std::cell::Cell::new(0));
         let registry = crate::tools::tests::echo_registry(count.clone());
-        (ToolLoop::new(transport, registry), count)
+        (
+            ToolLoop::new(transport, registry, Some(TEST_TOOL_ROUND_LIMIT)),
+            count,
+        )
     }
+
+    const TEST_TOOL_ROUND_LIMIT: usize = 3;
 
     fn echo_result(id: &str) -> ContentBlock {
         ContentBlock::ToolResult {
@@ -2672,7 +2685,7 @@ mod tests {
 
     #[test]
     fn session_repl_warns_and_drops_dangling_tool_use_when_capped() {
-        let mut replies: Vec<AssistantReply> = (0..=crate::tools::MAX_TOOL_ROUNDS)
+        let mut replies: Vec<AssistantReply> = (0..=TEST_TOOL_ROUND_LIMIT)
             .map(|i| crate::tools::tests::tool_use_reply(&format!("toolu_{i}"), "echo"))
             .collect();
         replies.push(AssistantReply::new("next"));
@@ -2680,10 +2693,13 @@ mod tests {
         let (tool_loop, count) = echo_looped(&transport);
         let (_, warning, _) = run_repl_with(&tool_loop, b"go\nnext\n");
 
-        assert_eq!(count.get(), crate::tools::MAX_TOOL_ROUNDS);
-        assert_eq!(warning, format!("{TOOL_ROUND_LIMIT_WARNING}\n"));
+        assert_eq!(count.get(), TEST_TOOL_ROUND_LIMIT);
+        assert_eq!(
+            warning,
+            format!("{}\n", tool_round_limit_warning(TEST_TOOL_ROUND_LIMIT))
+        );
         let calls = transport.calls.borrow();
-        assert_eq!(calls.len(), crate::tools::MAX_TOOL_ROUNDS + 2);
+        assert_eq!(calls.len(), TEST_TOOL_ROUND_LIMIT + 2);
         let last = calls.last().unwrap();
         assert_eq!(
             last[last.len() - 2],
@@ -2836,7 +2852,7 @@ mod tests {
     /// round, then the capped reply without its unanswered `tool_use`.
     #[test]
     fn session_resume_strips_the_capped_replys_unanswered_tool_use() {
-        let replies = (0..=crate::tools::MAX_TOOL_ROUNDS)
+        let replies = (0..=TEST_TOOL_ROUND_LIMIT)
             .map(|i| crate::tools::tests::tool_use_reply(&format!("toolu_{i}"), "echo"))
             .collect();
         let (tool_loop, _) = echo_looped(CapturingTransport::new(replies));
@@ -2846,7 +2862,7 @@ mod tests {
         let report = crate::log::parse_sessions(std::io::Cursor::new(trail)).expect("parses");
         let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates");
         let messages = resumed.conversation.messages();
-        assert_eq!(messages.len(), 2 + 2 * crate::tools::MAX_TOOL_ROUNDS);
+        assert_eq!(messages.len(), 2 + 2 * TEST_TOOL_ROUND_LIMIT);
         assert_eq!(messages.last().unwrap(), &Message::assistant("calling"));
     }
 
