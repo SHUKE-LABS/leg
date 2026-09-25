@@ -48,14 +48,18 @@ pub enum LegError {
     /// A transport-level failure with no HTTP response: connection refused,
     /// DNS failure, TLS error, timeout, etc.
     Transport(String),
-    /// The provider rejected the credentials (HTTP 401).
+    /// The provider rejected the credentials (HTTP 401). The message includes
+    /// the provider error type when supplied.
     Auth(String),
-    /// The provider rate-limited the request (HTTP 429).
+    /// The provider rate-limited the request (HTTP 429 or `rate_limit_error`).
+    /// The message includes the provider error type when supplied.
     RateLimited(String),
     /// The provider returned a server-side failure (HTTP 5xx).
     Server {
         /// The HTTP status code.
         status: u16,
+        /// The optional provider error type from `error.type`.
+        error_type: Option<String>,
         /// The provider's error message, or the raw body when it could not be
         /// parsed.
         message: String,
@@ -65,6 +69,8 @@ pub enum LegError {
     Api {
         /// The HTTP status code.
         status: u16,
+        /// The optional provider error type from `error.type`.
+        error_type: Option<String>,
         /// The provider's error message, or the raw body when it could not be
         /// parsed.
         message: String,
@@ -127,11 +133,27 @@ impl fmt::Display for LegError {
             LegError::Transport(msg) => write!(f, "transport error: {msg}"),
             LegError::Auth(msg) => write!(f, "authentication error: {msg}"),
             LegError::RateLimited(msg) => write!(f, "rate limited: {msg}"),
-            LegError::Server { status, message } => {
-                write!(f, "provider server error ({status}): {message}")
+            LegError::Server {
+                status,
+                error_type,
+                message,
+            } => {
+                write!(f, "provider server error ({status}")?;
+                if let Some(error_type) = error_type {
+                    write!(f, ", {error_type}")?;
+                }
+                write!(f, "): {message}")
             }
-            LegError::Api { status, message } => {
-                write!(f, "provider error ({status}): {message}")
+            LegError::Api {
+                status,
+                error_type,
+                message,
+            } => {
+                write!(f, "provider error ({status}")?;
+                if let Some(error_type) = error_type {
+                    write!(f, ", {error_type}")?;
+                }
+                write!(f, "): {message}")
             }
             LegError::Decode(msg) => write!(f, "response decode error: {msg}"),
             LegError::Io(msg) => write!(f, "io error: {msg}"),

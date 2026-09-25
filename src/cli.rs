@@ -1718,6 +1718,15 @@ mod tests {
             match &self.0 {
                 Ok(reply) => Ok(reply.clone()),
                 Err(LegError::Auth(msg)) => Err(LegError::Auth(msg.clone())),
+                Err(LegError::Server {
+                    status,
+                    error_type,
+                    message,
+                }) => Err(LegError::Server {
+                    status: *status,
+                    error_type: error_type.clone(),
+                    message: message.clone(),
+                }),
                 Err(other) => Err(LegError::Transport(other.to_string())),
             }
         }
@@ -1777,7 +1786,11 @@ mod tests {
     #[test]
     fn run_ask_propagates_delivery_failure_without_writing_stdout() {
         let participant = LocalParticipant::new(
-            FakeTransport(Err(LegError::Auth("bad credentials".to_string()))),
+            FakeTransport(Err(LegError::Server {
+                status: 503,
+                error_type: Some("api_error".to_string()),
+                message: "overloaded".to_string(),
+            })),
             meta(),
         );
         let mut buf = Vec::new();
@@ -1787,7 +1800,7 @@ mod tests {
         assert_eq!(err.kind(), "turn_failure");
         assert_eq!(
             err.to_string(),
-            "turn failed (kind: error): authentication error: bad credentials"
+            "turn failed (kind: error): provider server error (503, api_error): overloaded"
         );
         assert!(buf.is_empty(), "failed ask must leave stdout empty");
     }

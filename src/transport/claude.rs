@@ -148,19 +148,34 @@ fn build_request_body(
 /// Maps an HTTP status and body onto an [`AssistantReply`] or [`LegError`].
 ///
 /// 2xx responses are decoded into a reply; non-2xx statuses become the matching
-/// explicit error variant, surfacing the provider's message rather than hiding
-/// the failure.
+/// explicit error variant, surfacing the provider's message and optional
+/// error type rather than hiding the failure. A `rate_limit_error` is
+/// rate-limited regardless of HTTP status.
 fn parse_response(status: u16, body: &str) -> Result<AssistantReply> {
     if (200..300).contains(&status) {
         return parse_success(body);
     }
 
-    let message = extract_error_message(body);
+    let (error_type, message) = extract_error_details(body);
+    if error_type.as_deref() == Some("rate_limit_error") || status == 429 {
+        return Err(LegError::RateLimited(error_message_with_type(
+            error_type.as_deref(),
+            message,
+        )));
+    }
+
     Err(match status {
-        401 => LegError::Auth(message),
-        429 => LegError::RateLimited(message),
-        500..=599 => LegError::Server { status, message },
-        _ => LegError::Api { status, message },
+        401 => LegError::Auth(error_message_with_type(error_type.as_deref(), message)),
+        500..=599 => LegError::Server {
+            status,
+            error_type,
+            message,
+        },
+        _ => LegError::Api {
+            status,
+            error_type,
+            message,
+        },
     })
 }
 
@@ -217,17 +232,25 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
     ))
 }
 
-/// Pulls `error.message` out of a Claude error body, falling back to the raw
-/// body (trimmed) when it is absent or unparseable.
-fn extract_error_message(body: &str) -> String {
+/// Pulls the provider error type and `error.message` out of a Claude error
+/// body, falling back to the raw body (trimmed) when it is unparseable.
+fn extract_error_details(body: &str) -> (Option<String>, String) {
     if let Ok(parsed) = serde_json::from_str::<ErrorResponse>(body) {
-        return parsed.error.message;
+        return (parsed.error.error_type, parsed.error.message);
     }
     let trimmed = body.trim();
-    if trimmed.is_empty() {
+    let message = if trimmed.is_empty() {
         "no response body".to_string()
     } else {
         trimmed.to_string()
+    };
+    (None, message)
+}
+
+fn error_message_with_type(error_type: Option<&str>, message: String) -> String {
+    match error_type {
+        Some(error_type) => format!("{error_type}: {message}"),
+        None => message,
     }
 }
 
@@ -287,6 +310,8 @@ struct ErrorResponse {
 
 #[derive(Deserialize)]
 struct ErrorDetail {
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
     message: String,
 }
 
@@ -799,7 +824,9 @@ mod tests {
             FakeHttp::new(401, body),
         );
         match client.send(&Prompt::new("hi")).unwrap_err() {
-            LegError::Auth(msg) => assert_eq!(msg, "invalid x-api-key"),
+            LegError::Auth(msg) => {
+                assert_eq!(msg, "authentication_error: invalid x-api-key")
+            }
             other => panic!("expected Auth, got {other:?}"),
         }
     }
@@ -812,22 +839,74 @@ mod tests {
             FakeHttp::new(429, body),
         );
         match client.send(&Prompt::new("hi")).unwrap_err() {
-            LegError::RateLimited(msg) => assert_eq!(msg, "slow down"),
+            LegError::RateLimited(msg) => {
+                assert_eq!(msg, "rate_limit_error: slow down")
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_error_type_overrides_server_status() {
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(503, body),
+        );
+        let err = client.send(&Prompt::new("hi")).unwrap_err();
+        assert_eq!(err.kind(), "rate_limited");
+        assert!(err.to_string().contains("rate_limit_error"));
+        match err {
+            LegError::RateLimited(message) => {
+                assert_eq!(message, "rate_limit_error: Error")
+            }
             other => panic!("expected RateLimited, got {other:?}"),
         }
     }
 
     #[test]
     fn server_error_maps_to_server_variant_with_status() {
-        let body = r#"{"type":"error","error":{"type":"api_error","message":"overloaded"}}"#;
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#;
         let client = ClaudeClient::with_http(
             config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
             FakeHttp::new(503, body),
         );
         match client.send(&Prompt::new("hi")).unwrap_err() {
-            LegError::Server { status, message } => {
+            LegError::Server {
+                status,
+                error_type,
+                message,
+            } => {
                 assert_eq!(status, 503);
+                assert_eq!(error_type.as_deref(), Some("overloaded_error"));
                 assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_error_type_on_server_status_stays_server_and_is_displayed() {
+        let body = r#"{"type":"error","error":{"type":"api_error","message":"Error"}}"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(500, body),
+        );
+        let err = client.send(&Prompt::new("hi")).unwrap_err();
+        assert_eq!(err.kind(), "server");
+        assert_eq!(
+            err.to_string(),
+            "provider server error (500, api_error): Error"
+        );
+        match err {
+            LegError::Server {
+                status,
+                error_type,
+                message,
+            } => {
+                assert_eq!(status, 500);
+                assert_eq!(error_type.as_deref(), Some("api_error"));
+                assert_eq!(message, "Error");
             }
             other => panic!("expected Server, got {other:?}"),
         }
@@ -842,8 +921,13 @@ mod tests {
             FakeHttp::new(400, body),
         );
         match client.send(&Prompt::new("hi")).unwrap_err() {
-            LegError::Api { status, message } => {
+            LegError::Api {
+                status,
+                error_type,
+                message,
+            } => {
                 assert_eq!(status, 400);
+                assert_eq!(error_type.as_deref(), Some("invalid_request_error"));
                 assert_eq!(message, "bad model");
             }
             other => panic!("expected Api, got {other:?}"),
@@ -905,7 +989,10 @@ mod tests {
         let response = participant.respond(&request);
 
         assert_eq!(response.kind, MessageKind::Error);
-        assert_eq!(response.body, "provider error (400): prompt is too long");
+        assert_eq!(
+            response.body,
+            "provider error (400, invalid_request_error): prompt is too long"
+        );
         assert_eq!(tool_calls.get(), 1);
         assert_eq!(http_calls.get(), 2);
         match &response
@@ -916,7 +1003,10 @@ mod tests {
         {
             Outcome::Error { kind, message, .. } => {
                 assert_eq!(kind, "api");
-                assert_eq!(message, "provider error (400): prompt is too long");
+                assert_eq!(
+                    message,
+                    "provider error (400, invalid_request_error): prompt is too long"
+                );
             }
             other => panic!("expected delivered error outcome, got {other:?}"),
         }
@@ -929,8 +1019,13 @@ mod tests {
             FakeHttp::new(502, "  upstream timeout  "),
         );
         match client.send(&Prompt::new("hi")).unwrap_err() {
-            LegError::Server { status, message } => {
+            LegError::Server {
+                status,
+                error_type,
+                message,
+            } => {
                 assert_eq!(status, 502);
+                assert_eq!(error_type, None);
                 assert_eq!(message, "upstream timeout");
             }
             other => panic!("expected Server, got {other:?}"),
