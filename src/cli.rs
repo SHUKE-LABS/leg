@@ -199,7 +199,8 @@ fn help_text() -> String {
         "{USAGE}\n\n\
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
          CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
-         LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS, and\n\
+         LEG_TIMEOUT_SECS, LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS,\n\
+         LEG_MAX_TOOL_ROUNDS, and\n\
          LEG_SYSTEM_PROMPT.\n\n\
          LEG_EVENT_LOG names an optional JSONL trail for `ask`, cold `exchange`,\n\
          and a fresh `session`; named exchange sessions always write their\n\
@@ -1196,12 +1197,16 @@ const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]"
 /// overwrites on it.
 fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> {
     let max_tool_rounds = config.max_tool_rounds;
+    let bash_timeout_secs = config.bash_timeout_secs;
     let reads = ReadSet::new();
     let mut registry = ToolRegistry::new();
     registry.register(ReadTool::spec(), Box::new(ReadTool::new(reads.clone())));
     registry.register(WriteTool::spec(), Box::new(WriteTool::new(reads)));
     registry.register(EditTool::spec(), Box::new(EditTool::new()));
-    registry.register(BashTool::spec(), Box::new(BashTool::new()));
+    registry.register(
+        BashTool::spec_with_default_timeout_secs(bash_timeout_secs),
+        Box::new(BashTool::with_default_timeout_secs(bash_timeout_secs)),
+    );
     let client = ClaudeClient::from_config(config).with_tools(registry.specs());
     ToolLoop::new(client, registry, max_tool_rounds)
 }
@@ -1623,11 +1628,11 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
 /// base_url. The exchange is selected first, so a bad `--index` reports its
 /// usage error even when the environment's config would not load.
 ///
-/// The rest of the config — the credential, timeout, max_tokens, system prompt
-/// — is the *current* environment's, so a replay re-runs with today's auth,
-/// not a credential that was never recorded. A tool-bearing exchange reruns
-/// only its prompt: the current tool loop executes its tools afresh, and the
-/// stored tool results are never fed back.
+/// The rest of the config — the credential, timeouts, max_tokens, system
+/// prompt — is the *current* environment's, so a replay re-runs with today's
+/// auth, not a credential that was never recorded. A tool-bearing exchange
+/// reruns only its prompt: the current tool loop executes its tools afresh,
+/// and the stored tool results are never fed back.
 fn replay_target(
     report: &crate::log::ParseReport,
     index: Option<usize>,
@@ -1955,6 +1960,7 @@ mod tests {
         assert!(text.contains("leg ask [--model <model>] <prompt>"));
         assert!(text.contains("ANTHROPIC_API_KEY"));
         assert!(text.contains("LEG_MODEL"));
+        assert!(text.contains("LEG_BASH_TIMEOUT_SECS"));
         assert!(text.contains("LEG_MAX_TOOL_ROUNDS"));
         assert!(text.contains("LEG_EVENT_LOG"));
         assert!(text.contains("`ask`, cold `exchange`"));
