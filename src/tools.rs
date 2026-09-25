@@ -14,12 +14,16 @@
 use std::cell::RefCell;
 
 use crate::error::Result;
+use crate::events::ToolStatus;
 use crate::interrupt;
 use crate::model::{AssistantReply, ContentBlock, Message, Role, StopReason, TokenUsage, ToolSpec};
 use crate::transport::Transport;
+use pretool::PreToolHook;
 
 mod bash;
 mod edit;
+mod pretool;
+mod process;
 mod read;
 mod write;
 
@@ -44,6 +48,7 @@ pub trait ToolHandler {
 #[derive(Default)]
 pub struct ToolRegistry {
     entries: Vec<(ToolSpec, Box<dyn ToolHandler>)>,
+    pre_tool_hook: Option<PreToolHook>,
 }
 
 impl ToolRegistry {
@@ -57,28 +62,55 @@ impl ToolRegistry {
         self.entries.push((spec, handler));
     }
 
+    pub(crate) fn with_pre_tool_hook(mut self, executable: impl Into<std::path::PathBuf>) -> Self {
+        self.pre_tool_hook = Some(PreToolHook::new(executable.into()));
+        self
+    }
+
     /// The declarations to advertise on each provider request.
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.entries.iter().map(|(spec, _)| spec.clone()).collect()
     }
 
     /// Runs the handler named by a `tool_use` call and returns its
-    /// `tool_result`. An unknown tool, or a failing handler, yields an
-    /// `is_error` result rather than aborting the turn.
+    /// `tool_result`. An unknown tool, failing handler, or hook denial yields
+    /// an error result rather than aborting the turn.
     pub fn dispatch(&self, id: &str, name: &str, input: &serde_json::Value) -> ContentBlock {
-        let result = match self.entries.iter().find(|(spec, _)| spec.name == name) {
-            Some((_, handler)) => handler.call(input),
-            None => Err(format!("unknown tool: {name}")),
+        self.dispatch_with_status(id, name, input).0
+    }
+
+    fn dispatch_with_status(
+        &self,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> (ContentBlock, ToolStatus) {
+        let result = match self
+            .pre_tool_hook
+            .as_ref()
+            .map(|hook| hook.authorize(name, input))
+        {
+            Some(Err(message)) => Err((message, ToolStatus::Denied)),
+            Some(Ok(())) | None => match self.entries.iter().find(|(spec, _)| spec.name == name) {
+                Some((_, handler)) => handler
+                    .call(input)
+                    .map_err(|message| (message, ToolStatus::Failed)),
+                None => Err((format!("unknown tool: {name}"), ToolStatus::Failed)),
+            },
         };
-        let (content, is_error) = match result {
-            Ok(output) => (output, None),
-            Err(message) => (message, Some(true)),
+        let (content, status) = match result {
+            Ok(output) => (output, ToolStatus::Completed),
+            Err((message, status)) => (message, status),
         };
-        ContentBlock::ToolResult {
-            tool_use_id: id.to_string(),
-            content,
-            is_error,
-        }
+        let is_error = (status != ToolStatus::Completed).then_some(true);
+        (
+            ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content,
+                is_error,
+            },
+            status,
+        )
     }
 }
 
@@ -127,10 +159,10 @@ pub enum ToolEvent<'a> {
         id: &'a str,
         /// The called tool's name.
         name: &'a str,
-        /// The tool's output, or its error message when `is_error`.
+        /// The tool's output or the failure/denial message.
         output: &'a str,
-        /// Whether the call failed (including interruption).
-        is_error: bool,
+        /// Whether the call completed, failed, or was denied by the hook.
+        status: ToolStatus,
     },
 }
 
@@ -218,20 +250,17 @@ impl<T: Transport> ToolLoop<T> {
                         observe_interrupted_result(observe, id, name, &error);
                         return Err(error);
                     }
-                    let result = self.registry.dispatch(id, name, input);
+                    let (result, status) = self.registry.dispatch_with_status(id, name, input);
                     if let Some(error) = interrupt::error() {
                         observe_interrupted_result(observe, id, name, &error);
                         return Err(error);
                     }
-                    if let ContentBlock::ToolResult {
-                        content, is_error, ..
-                    } = &result
-                    {
+                    if let ContentBlock::ToolResult { content, .. } = &result {
                         observe(ToolEvent::Result {
                             id,
                             name,
                             output: content,
-                            is_error: is_error.unwrap_or(false),
+                            status,
                         });
                     }
                     results.push(result);
@@ -267,7 +296,7 @@ fn observe_interrupted_result(
         id,
         name,
         output: &output,
-        is_error: true,
+        status: ToolStatus::Failed,
     });
 }
 
@@ -422,6 +451,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn registry_without_pre_tool_hook_preserves_dispatch() {
+        let count = std::rc::Rc::new(Cell::new(0));
+        let registry = echo_registry(count.clone());
+
+        let result = registry.dispatch("toolu_1", "echo", &serde_json::json!({"text": "hi"}));
+
+        assert_eq!(count.get(), 1);
+        assert_eq!(
+            result,
+            ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: "echo: hi".to_string(),
+                is_error: None,
+            }
+        );
+    }
+
+    #[test]
     fn run_observed_reports_each_call_then_its_result_in_order() {
         let count = std::rc::Rc::new(Cell::new(0));
         let mut first = tool_use_reply("toolu_1", "echo");
@@ -440,11 +487,8 @@ pub(crate) mod tests {
                     ToolEvent::Round { content } => format!("round {}", content.len()),
                     ToolEvent::Call { id, name, .. } => format!("call {id} {name}"),
                     ToolEvent::Result {
-                        id,
-                        output,
-                        is_error,
-                        ..
-                    } => format!("result {id} {is_error} {output}"),
+                        id, output, status, ..
+                    } => format!("result {id} {status:?} {output}"),
                 })
             })
             .unwrap();
@@ -454,9 +498,9 @@ pub(crate) mod tests {
             [
                 "round 3",
                 "call toolu_1 echo",
-                "result toolu_1 false echo: hi",
+                "result toolu_1 Completed echo: hi",
                 "call toolu_2 missing",
-                "result toolu_2 true unknown tool: missing",
+                "result toolu_2 Failed unknown tool: missing",
             ]
         );
     }

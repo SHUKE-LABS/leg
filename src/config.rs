@@ -12,6 +12,7 @@
 //! transport then picks the matching `x-api-key` or `Authorization: Bearer`
 //! header from the variant.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{LegError, Result};
@@ -74,6 +75,9 @@ pub struct LegConfig {
     /// this holds its content; the transport then sends it as the request's
     /// `system` field. Unset or blank leaves this `None` and omits the field.
     pub system_prompt: Option<String>,
+    /// Optional executable run before every tool dispatch. From
+    /// `LEG_PRETOOL_HOOK`; unset or blank disables the hook.
+    pub pre_tool_hook: Option<PathBuf>,
 }
 
 impl LegConfig {
@@ -162,6 +166,7 @@ impl LegConfig {
         };
 
         let system_prompt = resolve_system_prompt(non_empty(lookup("LEG_SYSTEM_PROMPT")))?;
+        let pre_tool_hook = non_empty(lookup("LEG_PRETOOL_HOOK")).map(PathBuf::from);
 
         Ok(Self {
             credential,
@@ -172,6 +177,7 @@ impl LegConfig {
             max_tokens,
             max_tool_rounds,
             system_prompt,
+            pre_tool_hook,
         })
     }
 }
@@ -263,6 +269,7 @@ mod tests {
         assert_eq!(cfg.max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(cfg.max_tool_rounds, None);
         assert_eq!(cfg.system_prompt, None);
+        assert_eq!(cfg.pre_tool_hook, None);
     }
 
     #[test]
@@ -275,6 +282,7 @@ mod tests {
             ("LEG_BASH_TIMEOUT_SECS", "30"),
             ("LEG_MAX_TOKENS", "42"),
             ("LEG_MAX_TOOL_ROUNDS", "3"),
+            ("LEG_PRETOOL_HOOK", "/tmp/pre-tool-hook"),
         ]))
         .expect("config should load");
         assert_eq!(cfg.base_url, "https://proxy.example");
@@ -283,6 +291,10 @@ mod tests {
         assert_eq!(cfg.bash_timeout_secs, 30);
         assert_eq!(cfg.max_tokens, 42);
         assert_eq!(cfg.max_tool_rounds, Some(3));
+        assert_eq!(
+            cfg.pre_tool_hook.as_deref(),
+            Some(std::path::Path::new("/tmp/pre-tool-hook"))
+        );
     }
 
     #[test]
@@ -366,11 +378,13 @@ mod tests {
             ("ANTHROPIC_BASE_URL", ""),
             ("LEG_BASH_TIMEOUT_SECS", "  "),
             ("LEG_MAX_TOOL_ROUNDS", "  "),
+            ("LEG_PRETOOL_HOOK", "  "),
         ]))
         .expect("config should load");
         assert_eq!(cfg.model, DEFAULT_MODEL);
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
         assert_eq!(cfg.bash_timeout_secs, DEFAULT_BASH_TIMEOUT_SECS);
         assert_eq!(cfg.max_tool_rounds, None);
+        assert_eq!(cfg.pre_tool_hook, None);
     }
 }

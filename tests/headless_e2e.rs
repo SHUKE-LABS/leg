@@ -36,6 +36,23 @@ const ROUNDS: [&str; 4] = [
 const ONE_TEXT_REPLY: [&str; 1] =
     [r#"{"content":[{"type":"text","text":"hi there"}],"stop_reason":"end_turn"}"#];
 
+#[cfg(unix)]
+const PRETOOL_DENY_ROUNDS: [&str; 2] = [
+    r#"{"content":[{"type":"tool_use","id":"toolu_denied","name":"bash","input":{"command":"touch blocked.txt"}}],"stop_reason":"tool_use"}"#,
+    r#"{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}"#,
+];
+
+#[cfg(unix)]
+const PRETOOL_ALLOW_ROUNDS: [&str; 2] = [
+    r#"{"content":[{"type":"tool_use","id":"toolu_allowed","name":"bash","input":{"command":"touch allowed.txt"}}],"stop_reason":"tool_use"}"#,
+    r#"{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}"#,
+];
+
+const PRETOOL_UNSET_ROUNDS: [&str; 2] = [
+    r#"{"content":[{"type":"tool_use","id":"toolu_unset","name":"bash","input":{"command":"touch unguarded.txt"}}],"stop_reason":"tool_use"}"#,
+    r#"{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}"#,
+];
+
 const SESSION_ROUNDS: [&str; 3] = [
     r#"{"content":[{"type":"tool_use","id":"toolu_session","name":"read","input":{"path":"notes.txt"}}],"stop_reason":"tool_use"}"#,
     r#"{"content":[{"type":"text","text":"first turn remembered"}],"stop_reason":"end_turn"}"#,
@@ -200,6 +217,20 @@ fn fixture_dir(tag: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
+fn write_pretool_hook(cwd: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = cwd.join("pretool-hook");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write pre-tool hook");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("pre-tool hook metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&path, permissions).expect("make pre-tool hook executable");
+    path
+}
+
 /// A `leg` command running in `cwd` against the fake provider at `base_url`.
 fn leg(cwd: &Path, base_url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_leg"));
@@ -209,7 +240,8 @@ fn leg(cwd: &Path, base_url: &str) -> Command {
         .env("LEG_MODEL", "claude-test-model")
         .env("LEG_TIMEOUT_SECS", "5")
         .env_remove("LEG_EVENT_LOG")
-        .env_remove("LEG_SYSTEM_PROMPT");
+        .env_remove("LEG_SYSTEM_PROMPT")
+        .env_remove("LEG_PRETOOL_HOOK");
     cmd
 }
 
@@ -617,6 +649,130 @@ fn ask_drives_read_edit_bash_and_records_the_tool_trail() {
     }
     assert_eq!(shown.matches("→ completed: ").count(), 3, "{shown}");
     assert!(shown.contains("reply:  all done"), "{shown}");
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn pretool_hook_deny_skips_bash_and_records_denied_result() {
+    let (base_url, requests) = spawn_sequence_server(&PRETOOL_DENY_ROUNDS);
+    let cwd = fixture_dir("pretool-deny");
+    let trail = cwd.join("trail.jsonl");
+    let hook = write_pretool_hook(
+        &cwd,
+        r#"payload="$(cat)"
+printf '%s' "$payload" | grep -Fq '"hook_event_name":"PreToolUse"' || exit 2
+printf '%s' "$payload" | grep -Fq '"tool_name":"bash"' || exit 3
+printf '%s' "$payload" | grep -Fq '"tool_input":{"command":"touch blocked.txt"}' || exit 4
+current_dir="$(pwd)"
+printf '%s' "$payload" | grep -Fq "\"cwd\":\"$current_dir\"" || exit 5
+printf '{"decision":"deny","reason":"bash is forbidden"}'
+"#,
+    );
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_PRETOOL_HOOK", &hook)
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["ask", "try a forbidden command"]);
+    let output = run(cmd, None);
+    assert!(
+        output.status.success(),
+        "leg ask failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+    assert!(
+        !cwd.join("blocked.txt").exists(),
+        "denied bash must not run"
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "denied result is sent to the provider");
+    let second: Value = serde_json::from_str(&requests[1]).expect("request body is JSON");
+    let result = second["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find_map(|message| {
+            message["content"].as_array()?.iter().find(|block| {
+                block["type"] == "tool_result" && block["tool_use_id"] == "toolu_denied"
+            })
+        })
+        .expect("follow-up request carries the denied tool result");
+    assert_eq!(result["is_error"], true);
+    assert_eq!(
+        result["content"],
+        "denied by pre-tool hook: bash is forbidden"
+    );
+    drop(requests);
+
+    let events = read_events(&trail);
+    let denied = events
+        .iter()
+        .find(|event| event["event"] == "tool_result")
+        .expect("denial is recorded");
+    assert_eq!(denied["status"], "denied");
+    assert_eq!(
+        denied["error"],
+        "denied by pre-tool hook: bash is forbidden"
+    );
+
+    let mut show = leg(&cwd, &base_url);
+    show.arg("log").arg("show").arg("--file").arg(&trail);
+    let shown = run(show, None);
+    assert!(shown.status.success(), "log show failed");
+    assert!(
+        String::from_utf8_lossy(&shown.stdout)
+            .contains("→ denied: denied by pre-tool hook: bash is forbidden")
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn pretool_hook_allow_runs_bash() {
+    let (base_url, requests) = spawn_sequence_server(&PRETOOL_ALLOW_ROUNDS);
+    let cwd = fixture_dir("pretool-allow");
+    let hook = write_pretool_hook(
+        &cwd,
+        r#"cat >/dev/null
+printf '{"decision":"allow"}'
+"#,
+    );
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_PRETOOL_HOOK", &hook)
+        .args(["ask", "run an allowed command"]);
+    let output = run(cmd, None);
+    assert!(
+        output.status.success(),
+        "leg ask failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(cwd.join("allowed.txt").is_file());
+    assert_eq!(requests.lock().unwrap().len(), 2);
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn unset_pretool_hook_preserves_normal_tool_dispatch() {
+    let (base_url, requests) = spawn_sequence_server(&PRETOOL_UNSET_ROUNDS);
+    let cwd = fixture_dir("pretool-unset");
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env_remove("LEG_PRETOOL_HOOK")
+        .args(["ask", "run without a pre-tool hook"]);
+    let output = run(cmd, None);
+    assert!(
+        output.status.success(),
+        "leg ask failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(cwd.join("unguarded.txt").is_file());
+    assert_eq!(requests.lock().unwrap().len(), 2);
 
     std::fs::remove_dir_all(&cwd).ok();
 }

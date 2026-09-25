@@ -316,6 +316,8 @@ pub enum ToolStatus {
     Completed,
     /// The tool was unknown or its handler returned an error.
     Failed,
+    /// The pre-tool hook vetoed the call before its handler ran.
+    Denied,
 }
 
 /// Read-side mirror of a `tool_round` trail line.
@@ -387,12 +389,11 @@ impl ExchangeEvent {
                 id,
                 name,
                 output,
-                is_error,
+                status,
             } => {
-                let (status, result, error) = if is_error {
-                    (ToolStatus::Failed, None, Some(output.to_string()))
-                } else {
-                    (ToolStatus::Completed, Some(output.to_string()), None)
+                let (result, error) = match status {
+                    ToolStatus::Completed => (Some(output.to_string()), None),
+                    ToolStatus::Failed | ToolStatus::Denied => (None, Some(output.to_string())),
                 };
                 ExchangeEvent::ToolResult {
                     schema: SCHEMA,
@@ -855,14 +856,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_event_serializes_completed_and_failed_payloads() {
+    fn tool_result_event_serializes_completed_failed_and_denied_payloads() {
         let ok = ExchangeEvent::from_tool_event(
             6,
             ToolEvent::Result {
                 id: "toolu_1",
                 name: "echo",
                 output: "echo: hi",
-                is_error: false,
+                status: ToolStatus::Completed,
             },
             Some(("sess-1", 2)),
         );
@@ -887,7 +888,7 @@ mod tests {
                 id: "toolu_2",
                 name: "missing",
                 output: "unknown tool: missing",
-                is_error: true,
+                status: ToolStatus::Failed,
             },
             None,
         );
@@ -901,6 +902,29 @@ mod tests {
                 "tool_name": "missing",
                 "status": "failed",
                 "error": "unknown tool: missing",
+            })
+        );
+
+        let denied = ExchangeEvent::from_tool_event(
+            8,
+            ToolEvent::Result {
+                id: "toolu_3",
+                name: "bash",
+                output: "denied by pre-tool hook: role policy",
+                status: ToolStatus::Denied,
+            },
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(&denied).expect("serializes"),
+            serde_json::json!({
+                "event": "tool_result",
+                "schema": SCHEMA,
+                "ts_ms": 8,
+                "tool_use_id": "toolu_3",
+                "tool_name": "bash",
+                "status": "denied",
+                "error": "denied by pre-tool hook: role policy",
             })
         );
     }

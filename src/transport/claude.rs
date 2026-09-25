@@ -420,6 +420,7 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             max_tool_rounds: None,
             system_prompt: None,
+            pre_tool_hook: None,
         }
     }
 

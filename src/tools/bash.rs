@@ -4,10 +4,9 @@ use std::ffi::OsString;
 use std::time::Duration;
 
 use super::ToolHandler;
+use super::process;
 use crate::config::DEFAULT_BASH_TIMEOUT_SECS;
 use crate::model::ToolSpec;
-
-mod process;
 
 const DESCRIPTION: &str = "Run a shell command with Bash in the current working directory. \
 The command runs as the current OS user. Leg's provider credential variables are removed from \
