@@ -229,7 +229,16 @@ fn resolve_credential(lookup: &impl Fn(&str) -> Option<String>) -> Result<Creden
         if raw.trim().is_empty() {
             return Err(LegError::Config(format!("{var} is set but empty")));
         }
-        return Ok(make(raw));
+        let credential = make(raw);
+        if matches!(
+            &credential,
+            Credential::OAuth(token) if token.trim_start().starts_with("sk-ant-oat")
+        ) {
+            return Err(LegError::Config(format!(
+                "{var} contains a Claude subscription OAuth token (from claude setup-token); these tokens are unsupported outside Claude Code. Set ANTHROPIC_API_KEY to an Anthropic Console API key instead."
+            )));
+        }
+        return Ok(credential);
     }
 
     let candidates = credential_env_vars().collect::<Vec<_>>().join(", ");
@@ -305,10 +314,30 @@ mod tests {
     }
 
     #[test]
-    fn api_key_takes_precedence_over_oauth_vars() {
+    fn rejects_subscription_oauth_tokens() {
+        for (var, token) in [
+            ("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat01-x"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-x"),
+            ("ANTHROPIC_AUTH_TOKEN", " \tsk-ant-oat01-x"),
+        ] {
+            let err = LegConfig::from_lookup(lookup_from(&[(var, token)])).unwrap_err();
+            let message = match err {
+                LegError::Config(message) => message,
+                other => panic!("expected configuration error, got {other:?}"),
+            };
+            assert!(message.contains(var));
+            assert!(message.contains("ANTHROPIC_API_KEY"));
+            assert!(message.contains("Claude subscription OAuth token"));
+            assert!(message.contains("claude setup-token"));
+            assert!(message.contains("unsupported outside Claude Code"));
+        }
+    }
+
+    #[test]
+    fn api_key_takes_precedence_over_subscription_oauth_token() {
         let cfg = LegConfig::from_lookup(lookup_from(&[
             ("ANTHROPIC_API_KEY", "secret"),
-            ("ANTHROPIC_AUTH_TOKEN", "tok"),
+            ("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat01-x"),
         ]))
         .expect("config should load");
         assert_eq!(cfg.credential, Credential::ApiKey("secret".to_string()));

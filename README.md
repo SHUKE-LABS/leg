@@ -53,8 +53,11 @@ Prints the assistant reply on success. A provider or delivery failure
 (bad credentials, unreachable base URL, etc.) leaves stdout empty, reports an
 error including `kind: error` on stderr, and exits non-zero. Configuration
 failures (missing/malformed env vars) also exit non-zero.
-Also accepts `ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`,
-`ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
+Also accepts `ANTHROPIC_AUTH_TOKEN` for bearer keys of Anthropic-compatible
+endpoints, and `CLAUDE_CODE_OAUTH_TOKEN`. Claude subscription OAuth tokens
+(including `claude setup-token`) are unsupported outside Claude Code; use an
+Anthropic Console API key with `ANTHROPIC_API_KEY` instead. Other settings
+include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_BASH_TIMEOUT_SECS`, `LEG_MAX_TOKENS`, `LEG_MAX_TOOL_ROUNDS`,
 `LEG_PRETOOL_HOOK`, `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 

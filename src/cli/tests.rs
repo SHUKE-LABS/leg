@@ -272,6 +272,11 @@ fn help_text_documents_usage_env_and_failure_contract() {
     let text = help_text();
     assert!(text.contains("leg ask [--model <model>] <prompt>"));
     assert!(text.contains("ANTHROPIC_API_KEY"));
+    assert!(text.contains("ANTHROPIC_AUTH_TOKEN is for bearer keys"));
+    assert!(text.contains("Anthropic-compatible endpoints"));
+    assert!(text.contains("Claude subscription OAuth tokens"));
+    assert!(text.contains("`claude setup-token`"));
+    assert!(text.contains("unsupported outside Claude Code"));
     assert!(text.contains("LEG_MODEL"));
     assert!(text.contains("LEG_BASH_TIMEOUT_SECS"));
     assert!(text.contains("LEG_MAX_TOOL_ROUNDS"));

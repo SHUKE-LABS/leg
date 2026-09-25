@@ -198,10 +198,13 @@ fn help_text() -> String {
     format!(
         "{USAGE}\n\n\
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
-         CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
-         LEG_TIMEOUT_SECS, LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS,\n\
-         LEG_MAX_TOOL_ROUNDS, LEG_PRETOOL_HOOK, and\n\
-         LEG_SYSTEM_PROMPT.\n\n\
+         CLAUDE_CODE_OAUTH_TOKEN). ANTHROPIC_AUTH_TOKEN is for bearer keys of\n\
+         Anthropic-compatible endpoints. Claude subscription OAuth tokens\n\
+         (including `claude setup-token`) are unsupported outside Claude Code;\n\
+         use an Anthropic Console API key with ANTHROPIC_API_KEY instead.\n\
+         Also honours ANTHROPIC_BASE_URL, LEG_MODEL, LEG_TIMEOUT_SECS,\n\
+         LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS,\n\
+         LEG_PRETOOL_HOOK, and LEG_SYSTEM_PROMPT.\n\n\
          LEG_EVENT_LOG names an optional JSONL trail for `ask`, cold `exchange`,\n\
          and a fresh `session`; named exchange sessions always write their\n\
          session store and also append here when this variable is non-blank.\n\
