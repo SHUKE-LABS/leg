@@ -2,28 +2,33 @@ name: release
 
 on:
   push:
-    tags: ['v*.*.*']
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  verify-tag:
+  tag:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - name: Verify tag matches Cargo.toml/Cargo.lock
-        id: tag
-        shell: bash
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+
+      - name: Configure release identity
         run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          bash scripts/release.sh verify-tag-matches-manifest "${tag}"
-          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.89.0
@@ -32,8 +37,50 @@ jobs:
         shell: bash
         run: bash scripts/release.sh verify-third-party-notices
 
+      - name: Calculate and apply release version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(bash scripts/release.sh create-tag)"
+          version="${tag#v}"
+          bash scripts/release.sh verify-tag-matches-manifest "${tag}"
+          test "$(bash scripts/release.sh manifest-version)" = "${version}"
+          test "$(bash scripts/release.sh lockfile-version)" = "${version}"
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Regenerate changelog and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          diff_status=0
+          bash scripts/release.sh generate-changelog CHANGELOG.md
+          bash scripts/release.sh generate-release-notes "${tag}" > release-notes.md
+          if git diff --quiet -- CHANGELOG.md; then
+            :
+          else
+            diff_status=$?
+            if (( diff_status != 1 )); then
+              exit "${diff_status}"
+            fi
+            git add CHANGELOG.md
+            git commit -m "docs: regenerate changelog [skip ci]" >/dev/null
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+      - name: Push release commit and tag
+        run: git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/${{ steps.release.outputs.tag }}"
+
   build:
-    needs: verify-tag
+    needs: tag
     strategy:
       fail-fast: false
       matrix:
@@ -65,12 +112,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
-      RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.verify-tag.outputs.tag }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.89.0
@@ -148,15 +195,21 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [verify-tag, build]
+    needs: [tag, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.verify-tag.outputs.tag }}
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Download release notes
+        uses: actions/download-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes
 
       - name: Download target archives
         uses: actions/download-artifact@v7
@@ -231,7 +284,7 @@ jobs:
             --verify-tag \
             --draft \
             --title "leg ${RELEASE_TAG}" \
-            --generate-notes \
+            --notes-file release-notes/release-notes.md \
             "${upload_paths[@]}"
           gh release edit "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \

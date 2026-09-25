@@ -42,6 +42,56 @@ make_fixture() {
         >"${repo}/Cargo.lock"
 }
 
+make_git_fixture() {
+    local repo="${1}" subject="${2:-chore: release baseline}"
+    local date="${3:-2026-01-01}" version="${4:-0.1.0}"
+
+    make_fixture "${repo}" "${version}"
+    git -C "${repo}" init -q
+    git -C "${repo}" config user.email "release-test@leg.local"
+    git -C "${repo}" config user.name "leg release test"
+    git -C "${repo}" add Cargo.toml Cargo.lock
+    GIT_AUTHOR_DATE="${date}T12:00:00+0000" GIT_COMMITTER_DATE="${date}T12:00:00+0000" \
+        git -C "${repo}" commit -q -m "${subject}"
+}
+
+changelog_commit() {
+    local repo="${1}" date="${2}" subject="${3}"
+
+    printf '%s\n' "${subject}" >>"${repo}/log.txt"
+    git -C "${repo}" add log.txt
+    GIT_AUTHOR_DATE="${date}T12:00:00+0000" GIT_COMMITTER_DATE="${date}T12:00:00+0000" \
+        git -C "${repo}" commit -q -m "${subject}"
+}
+
+changelog_tag() {
+    local repo="${1}" date="${2}" tag="${3}"
+
+    GIT_COMMITTER_DATE="${date}T12:00:00+0000" git -C "${repo}" tag -f "${tag}" >/dev/null
+}
+
+make_changelog_fixture() {
+    local repo="${1}"
+
+    make_git_fixture "${repo}" "chore: release baseline" "2026-01-01"
+    changelog_tag "${repo}" 2026-01-01 v0.1.0
+
+    changelog_commit "${repo}" 2026-02-01 "docs: describe the first feature"
+    changelog_commit "${repo}" 2026-02-01 "feat: add the first feature"
+    changelog_commit "${repo}" 2026-02-01 "feat: add the second feature"
+    changelog_commit "${repo}" 2026-02-01 "chore(release): v0.2.0 [skip ci]"
+    changelog_tag "${repo}" 2026-02-01 v0.2.0
+    changelog_commit "${repo}" 2026-02-01 "unconventional subject line"
+    changelog_commit "${repo}" 2026-02-01 "perf: speed up the first feature"
+    changelog_commit "${repo}" 2026-02-01 "fix: correct the first feature"
+    changelog_commit "${repo}" 2026-02-01 "refactor: tidy the first feature"
+    changelog_commit "${repo}" 2026-02-01 "docs: regenerate changelog [skip ci]"
+    changelog_tag "${repo}" 2026-02-01 v0.2.1
+
+    changelog_commit "${repo}" 2026-03-05 "fix: adjust after the release"
+    changelog_tag "${repo}" 2026-03-05 v0.2.2
+}
+
 make_npm_archive_fixture() {
     local repo="${1}" version="${2}" package_key target _npm_os _npm_cpu archive binary
     local archive_dir staging archive_path source_windows archive_windows
@@ -122,6 +172,221 @@ test_verify_tag_matches_manifest() (
     release_verify_tag_matches_manifest "not-a-tag" "${repo}/Cargo.toml" "${repo}/Cargo.lock" \
         >/dev/null 2>&1 || status="$?"
     assert_rc_nonzero "${status}"
+)
+
+test_release_bump_rules() (
+    set -euo pipefail
+    assert_eq "minor" "$(release_bump_kind_for_subject 'feat(core): add a feature')" \
+        "feature subjects bump minor"
+    assert_eq "patch" "$(release_bump_kind_for_subject 'fix: correct a bug')" \
+        "fix subjects bump patch"
+    assert_eq "patch" "$(release_bump_kind_for_subject 'maintenance update')" \
+        "other subjects bump patch"
+    assert_eq "0.2.0" "$(release_next_version v0.1.7 minor)" \
+        "minor bump resets patch"
+    assert_eq "v0.1.1" "$(release_next_tag v0.1.0 patch)" \
+        "patch bump increments patch"
+)
+
+test_first_release_uses_current_manifest_version() (
+    set -euo pipefail
+    local repo before_head tag
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_git_fixture "${repo}" "fix: prepare first release"
+    before_head="$(git -C "${repo}" rev-parse HEAD)"
+
+    tag="$(cd "${repo}" && release_create_tag)"
+
+    assert_eq "v0.1.0" "${tag}" "first release uses the current version"
+    assert_eq "0.1.0" "$(cd "${repo}" && release_manifest_version)" \
+        "first release leaves the manifest version unchanged"
+    assert_eq "0.1.0" "$(cd "${repo}" && release_lockfile_version)" \
+        "first release leaves the lockfile version unchanged"
+    assert_eq "${before_head}" "$(git -C "${repo}" rev-parse "${tag}^{commit}")" \
+        "first release tags the existing commit"
+)
+
+test_first_release_commits_generated_changelog_after_tag() (
+    set -euo pipefail
+    local repo tag notes
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_git_fixture "${repo}" "fix: prepare first release"
+
+    tag="$(cd "${repo}" && release_create_tag)"
+    (
+        cd "${repo}"
+        release_generate_changelog CHANGELOG.md
+        release_generate_release_notes "${tag}" >release-notes.md
+        git add CHANGELOG.md
+        git commit -q -m "docs: regenerate changelog [skip ci]"
+    )
+    notes="$(<"${repo}/release-notes.md")"
+
+    assert_eq "v0.1.0" "${tag}" "first release tag"
+    assert_eq "docs: regenerate changelog [skip ci]" \
+        "$(git -C "${repo}" log -1 --format=%s)" \
+        "changelog is committed separately after tagging"
+    assert_eq "$(git -C "${repo}" rev-parse "${tag}^{commit}")" \
+        "$(git -C "${repo}" rev-parse HEAD^)" \
+        "release tag remains on the pre-changelog commit"
+    grep -F "## ${tag}" "${repo}/CHANGELOG.md" >/dev/null
+    grep -F "fix: prepare first release" "${repo}/CHANGELOG.md" >/dev/null
+    grep -F "fix: prepare first release" <<<"${notes}" >/dev/null
+)
+
+test_feature_release_updates_manifest_and_lockfile() (
+    set -euo pipefail
+    local repo tag version
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_git_fixture "${repo}"
+    git -C "${repo}" tag v0.1.0
+    printf 'feature\n' >"${repo}/feature.txt"
+    git -C "${repo}" add feature.txt
+    git -C "${repo}" commit -q -m "feat: add release behavior"
+
+    tag="$(cd "${repo}" && release_create_tag)"
+    version="${tag#v}"
+
+    assert_eq "v0.2.0" "${tag}" "feature commit creates a minor release"
+    assert_eq "${version}" "$(cd "${repo}" && release_manifest_version)" \
+        "manifest matches the feature tag"
+    assert_eq "${version}" "$(cd "${repo}" && release_lockfile_version)" \
+        "lockfile matches the feature tag"
+    assert_eq "$(git -C "${repo}" rev-parse HEAD)" \
+        "$(git -C "${repo}" rev-parse "${tag}^{commit}")" \
+        "feature tag points at the version update commit"
+    assert_eq "chore(release): ${tag} [skip ci]" \
+        "$(git -C "${repo}" log -1 --format=%s "${tag}")" \
+        "version update commit is excluded from the next release"
+)
+
+test_patch_release_updates_manifest_and_lockfile() (
+    set -euo pipefail
+    local repo tag version
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_git_fixture "${repo}"
+    git -C "${repo}" tag v0.1.0
+    printf 'fix\n' >"${repo}/fix.txt"
+    git -C "${repo}" add fix.txt
+    git -C "${repo}" commit -q -m "fix: repair release behavior"
+
+    tag="$(cd "${repo}" && release_create_tag)"
+    version="${tag#v}"
+
+    assert_eq "v0.1.1" "${tag}" "fix commit creates a patch release"
+    assert_eq "${version}" "$(cd "${repo}" && release_manifest_version)" \
+        "patch manifest matches tag"
+    assert_eq "${version}" "$(cd "${repo}" && release_lockfile_version)" \
+        "patch lockfile matches tag"
+)
+
+test_changelog_groups_tags_and_filters_skip_ci_commits() (
+    set -euo pipefail
+    local repo generated group
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+
+    generated="$(cd "${repo}" && release_generate_changelog -)"
+    assert_eq "_Generated from release tags with \`bash scripts/release.sh generate-changelog\`._" \
+        "$(printf '%s\n' "${generated}" | grep -F 'Generated from release tags')" \
+        "generated-from-tags header"
+    assert_eq "## v0.2.2 (2026-03-05)
+## v0.2.1 … v0.2.0 (2026-02-01)
+## v0.1.0 (2026-01-01)" \
+        "$(printf '%s\n' "${generated}" | grep '^## ')" \
+        "same-day release tags are grouped"
+
+    group="$(printf '%s\n' "${generated}" | sed -n '/^## v0.2.1 /,/^## v0.1.0 /p')"
+    assert_eq "### Features
+### Fixes
+### Refactors
+### Performance
+### Docs
+### Other Changes" \
+        "$(printf '%s\n' "${group}" | grep '^### ')" \
+        "changelog buckets use a fixed order"
+    assert_eq "- feat: add the first feature
+- feat: add the second feature" \
+        "$(printf '%s\n' "${group}" | sed -n '/^### Features$/,/^$/p' | grep '^- ')" \
+        "feature commits are listed in commit order"
+    assert_eq "- unconventional subject line" \
+        "$(printf '%s\n' "${group}" | sed -n '/^### Other Changes$/,/^$/p' | grep '^- ')" \
+        "unconventional subjects are retained"
+    assert_eq "" "$(printf '%s\n' "${generated}" | grep -F '[skip ci]' || true)" \
+        "release and changelog commits are omitted"
+)
+
+test_release_notes_cover_only_requested_tag() (
+    set -euo pipefail
+    local repo generated
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+
+    generated="$(cd "${repo}" && release_generate_release_notes v0.2.1)"
+
+    assert_eq "## v0.2.1 (2026-02-01)" \
+        "$(printf '%s\n' "${generated}" | grep '^## ')" \
+        "release notes name the requested tag"
+    assert_eq "- fix: correct the first feature
+- refactor: tidy the first feature
+- perf: speed up the first feature
+- unconventional subject line" \
+        "$(printf '%s\n' "${generated}" | grep '^- ')" \
+        "release notes include only commits between tags"
+    assert_eq "" "$(printf '%s\n' "${generated}" | grep -F 'fix: adjust after the release' || true)" \
+        "later commits are excluded"
+    assert_eq "" "$(printf '%s\n' "${generated}" | grep -F '[skip ci]' || true)" \
+        "release commits are excluded"
+)
+
+test_changelog_writes_idempotently_and_preserves_existing_file_on_error() (
+    set -euo pipefail
+    local repo generated status
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+
+    generated="$(cd "${repo}" && release_generate_changelog -)"
+    (cd "${repo}" && release_generate_changelog CHANGELOG.md)
+    assert_eq "${generated}" "$(cat "${repo}/CHANGELOG.md")" \
+        "file output matches generated output"
+    (cd "${repo}" && release_generate_changelog CHANGELOG.md)
+    assert_eq "${generated}" "$(cat "${repo}/CHANGELOG.md")" \
+        "a second run leaves the changelog unchanged"
+
+    printf 'sentinel\n' >"${repo}/CHANGELOG.md"
+    status=0
+    (
+        cd "${repo}"
+        # shellcheck disable=SC2329  # invoked indirectly by the changelog writer
+        release_tags_desc() { return 1; }
+        release_generate_changelog CHANGELOG.md
+    ) >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    assert_eq "sentinel" "$(cat "${repo}/CHANGELOG.md")" \
+        "a failed tag lookup does not replace the changelog"
+    assert_eq "" "$(cd "${repo}" && find . -maxdepth 1 -name 'CHANGELOG.md.*' -print)" \
+        "a failed generation leaves no temporary file"
+)
+
+test_changelog_without_release_tags() (
+    set -euo pipefail
+    local repo generated
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_git_fixture "${repo}" "feat: untagged work"
+
+    generated="$(cd "${repo}" && release_generate_changelog -)"
+
+    assert_eq "No release tags yet." \
+        "$(printf '%s\n' "${generated}" | grep -F 'No release tags')" \
+        "an untagged repository renders the empty-changelog notice"
 )
 
 test_npm_platform_matrix_and_staging() (
@@ -439,6 +704,15 @@ NODE
 tests=(
     test_manifest_and_lockfile_version_reads
     test_verify_tag_matches_manifest
+    test_release_bump_rules
+    test_first_release_uses_current_manifest_version
+    test_first_release_commits_generated_changelog_after_tag
+    test_feature_release_updates_manifest_and_lockfile
+    test_patch_release_updates_manifest_and_lockfile
+    test_changelog_groups_tags_and_filters_skip_ci_commits
+    test_release_notes_cover_only_requested_tag
+    test_changelog_writes_idempotently_and_preserves_existing_file_on_error
+    test_changelog_without_release_tags
     test_npm_platform_matrix_and_staging
     test_npm_pack_checksums
     test_third_party_notices_fixture_rendering

@@ -41,6 +41,11 @@ jobs:
         shell: bash
         run: cargo test --locked --verbose --target "${TARGET}"
 
+      - name: Test release helpers
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        shell: bash
+        run: bash tests/release_test.sh
+
       - name: Verify binary version
         shell: bash
         run: |
