@@ -200,7 +200,7 @@ fn help_text() -> String {
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
          CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
          LEG_TIMEOUT_SECS, LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS,\n\
-         LEG_MAX_TOOL_ROUNDS, and\n\
+         LEG_MAX_TOOL_ROUNDS, LEG_PRETOOL_HOOK, and\n\
          LEG_SYSTEM_PROMPT.\n\n\
          LEG_EVENT_LOG names an optional JSONL trail for `ask`, cold `exchange`,\n\
          and a fresh `session`; named exchange sessions always write their\n\
@@ -1204,6 +1204,9 @@ fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> 
 fn build_tool_registry(config: &LegConfig) -> ToolRegistry {
     let reads = ReadSet::new();
     let mut registry = ToolRegistry::new();
+    if let Some(path) = &config.pre_tool_hook {
+        registry = registry.with_pre_tool_hook(path.clone());
+    }
     registry.register(ReadTool::spec(), Box::new(ReadTool::new(reads.clone())));
     registry.register(WriteTool::spec(), Box::new(WriteTool::new(reads)));
     registry.register(EditTool::spec(), Box::new(EditTool::new()));
@@ -1388,7 +1391,9 @@ fn rehydrate_tool_result(turn: &crate::log::SessionTurn, id: &str) -> Option<Con
         .as_ref()?;
     let (content, is_error) = match result.status {
         ToolStatus::Completed => (result.result.clone().unwrap_or_default(), None),
-        ToolStatus::Failed => (result.error.clone().unwrap_or_default(), Some(true)),
+        ToolStatus::Failed | ToolStatus::Denied => {
+            (result.error.clone().unwrap_or_default(), Some(true))
+        }
     };
     Some(ContentBlock::ToolResult {
         tool_use_id: id.to_string(),
@@ -2577,6 +2582,49 @@ mod tests {
             content: "hello".to_string(),
             is_error: None,
         }
+    }
+
+    #[test]
+    fn rehydrate_denied_tool_result_as_an_error() {
+        let error = "denied by pre-tool hook: role policy".to_string();
+        let turn = crate::log::SessionTurn {
+            request: crate::events::RequestRecord {
+                ts_ms: 0,
+                model: String::new(),
+                base_url: String::new(),
+                prompt: String::new(),
+                content: None,
+                session_id: Some("sess-1".to_string()),
+                turn_index: Some(0),
+            },
+            rounds: Vec::new(),
+            tools: vec![crate::log::ToolPair {
+                call: crate::events::ToolCallRecord {
+                    ts_ms: 1,
+                    tool_use_id: "toolu_1".to_string(),
+                    tool_name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+                result: Some(crate::events::ToolResultRecord {
+                    ts_ms: 2,
+                    tool_use_id: "toolu_1".to_string(),
+                    tool_name: "bash".to_string(),
+                    status: ToolStatus::Denied,
+                    result: None,
+                    error: Some(error.clone()),
+                }),
+            }],
+            outcome: None,
+        };
+
+        assert_eq!(
+            rehydrate_tool_result(&turn, "toolu_1"),
+            Some(ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: error,
+                is_error: Some(true),
+            })
+        );
     }
 
     /// Runs one REPL turn per line of `input` against `transport`, returning

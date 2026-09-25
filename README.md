@@ -51,7 +51,7 @@ failures (missing/malformed env vars) also exit non-zero.
 Also accepts `ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`,
 `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_BASH_TIMEOUT_SECS`, `LEG_MAX_TOKENS`, `LEG_MAX_TOOL_ROUNDS`,
-`LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
+`LEG_PRETOOL_HOOK`, `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
 ### Tool loop
 
@@ -62,6 +62,17 @@ printed. `LEG_MAX_TOOL_ROUNDS` optionally sets a positive round limit; unset
 or blank is unbounded. With a configured limit, if the reply still requests
 tools after that many rounds, `leg` sends no further request and warns on
 stderr. A call to an unregistered tool is answered with an error result.
+
+`LEG_PRETOOL_HOOK` optionally names an executable to run before every tool
+dispatch; unset or blank leaves dispatch unchanged. The hook receives this
+JSON object on stdin:
+`{"hook_event_name":"PreToolUse","tool_name":"<name>","tool_input":{...},"cwd":"<cwd>"}`.
+Exit 0 with empty or whitespace-only stdout, or `{"decision":"allow"}`,
+allows the call. Exit 0 with
+`{"decision":"deny","reason":"..."}` denies it and returns that reason to the
+model. A non-zero exit, spawn failure, 30-second timeout, or invalid output
+denies with a generic reason. Hook denials are recorded in the trail with
+`status: "denied"`.
 
 ### Tools
 
@@ -172,10 +183,10 @@ Between a turn's `request` and its outcome, the trail records each dispatched
 tool round as a `tool_round` line (`content`: the `tool_use` reply's blocks,
 text included), then each of that round's calls as a `tool_call` line
 (`tool_use_id`, `tool_name`, `input`), followed by exactly one `tool_result`
-line with the same `tool_use_id`, a `status` of `completed` or `failed`, and
-the tool's `result` or `error`. All three carry `schema` and `ts_ms`, plus
-`session_id`/`turn_index` on session turns; sessionless `ask`/`exchange`
-events omit those fields.
+line with the same `tool_use_id`, a `status` of `completed`, `failed`, or
+`denied`, and the tool's `result` or `error`. All three carry `schema` and
+`ts_ms`, plus `session_id`/`turn_index` on session turns; sessionless
+`ask`/`exchange` events omit those fields.
 
 On a first-signal interruption, an active tool call gets a failed
 `tool_result` before the turn's `response_error` outcome; the interrupted

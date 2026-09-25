@@ -533,6 +533,12 @@ fn format_tool(pair: &ToolPair, max: usize) -> String {
                     excerpt(result.error.as_deref().unwrap_or(""), max)
                 )
             }
+            ToolStatus::Denied => {
+                format!(
+                    "denied: {}",
+                    excerpt(result.error.as_deref().unwrap_or(""), max)
+                )
+            }
         },
         None => "no result".to_string(),
     };
@@ -941,6 +947,8 @@ mod tests {
             r#"{"event":"tool_call","ts_ms":4,"tool_use_id":"t2","tool_name":"fail","input":{}}"#,
             r#"{"event":"tool_result","ts_ms":5,"tool_use_id":"t2","tool_name":"fail","status":"failed","error":"boom"}"#,
             r#"{"event":"tool_call","ts_ms":6,"tool_use_id":"t3","tool_name":"slow","input":{}}"#,
+            r#"{"event":"tool_call","ts_ms":7,"tool_use_id":"t4","tool_name":"guarded","input":{}}"#,
+            r#"{"event":"tool_result","ts_ms":8,"tool_use_id":"t4","tool_name":"guarded","status":"denied","error":"policy"}"#,
             RESPONSE,
             "",
         ]
@@ -959,6 +967,8 @@ mod tests {
                 "            → failed: boom",
                 "    tool:   slow [t3] {}",
                 "            → no result",
+                "    tool:   guarded [t4] {}",
+                "            → denied: policy",
                 "    reply:  r",
                 "    tokens: unknown",
             ]

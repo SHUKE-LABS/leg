@@ -67,7 +67,7 @@ extern "C" fn handle_signal(signal: libc::c_int) {
     {
         let process_group = ACTIVE_PROCESS_GROUP.load(Ordering::Relaxed);
         if process_group > 0 {
-            // A forced exit must not orphan a running Bash command.
+            // A forced exit must not orphan an active tool process group.
             unsafe {
                 libc::kill(-process_group, libc::SIGKILL);
             }

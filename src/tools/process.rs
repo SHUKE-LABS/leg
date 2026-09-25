@@ -1,7 +1,7 @@
-//! Bounded synchronous subprocess execution and output capture for `bash`.
+//! Bounded synchronous subprocess execution and output capture for tools.
 
-use std::ffi::OsStr;
-use std::io::{self, Read};
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,20 +29,45 @@ pub(super) struct ProcessOutput {
 pub(super) struct CappedOutput {
     pub(super) text: String,
     pub(super) omitted_bytes: u64,
+    pub(super) valid_utf8: bool,
 }
 
 pub(super) fn run(
     shell: &OsStr,
     command: &str,
     timeout: Duration,
-    env: &[(std::ffi::OsString, std::ffi::OsString)],
+    env: &[(OsString, OsString)],
+) -> io::Result<ProcessOutput> {
+    let args = [OsString::from("-lc"), OsString::from(command)];
+    run_command(shell, &args, None, timeout, env, true)
+}
+
+pub(super) fn run_executable(
+    program: &OsStr,
+    stdin: Vec<u8>,
+    timeout: Duration,
+) -> io::Result<ProcessOutput> {
+    run_command(program, &[], Some(stdin), timeout, &[], false)
+}
+
+fn run_command(
+    program: &OsStr,
+    args: &[OsString],
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    env: &[(OsString, OsString)],
+    remove_credentials: bool,
 ) -> io::Result<ProcessOutput> {
     let started = Instant::now();
-    let mut command_builder = Command::new(shell);
+    let has_stdin = stdin.is_some();
+    let mut command_builder = Command::new(program);
     command_builder
-        .arg("-lc")
-        .arg(command)
-        .stdin(Stdio::null())
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // On Windows, Rust searches the system directory before the parent's
@@ -54,8 +79,10 @@ pub(super) fn run(
         command_builder.env("PATH", path);
     }
     command_builder.envs(env.iter().map(|(key, value)| (key, value)));
-    for var in credential_env_vars() {
-        command_builder.env_remove(var);
+    if remove_credentials {
+        for var in credential_env_vars() {
+            command_builder.env_remove(var);
+        }
     }
 
     #[cfg(unix)]
@@ -95,6 +122,27 @@ pub(super) fn run(
 
     let mut stdout = CapturedPipe::new(stdout);
     let mut stderr = CapturedPipe::new(stderr);
+    let mut input_writer = if let Some(input) = stdin {
+        let child_stdin = child.stdin.take().expect("stdin was configured as piped");
+        match thread::Builder::new()
+            .name("tool-process-stdin".to_string())
+            .spawn(move || {
+                let mut child_stdin = child_stdin;
+                child_stdin.write_all(&input)
+            }) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                #[cfg(unix)]
+                terminate_force(&mut child);
+                #[cfg(windows)]
+                terminate_force(&mut child, &job);
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let mut exit_status = None;
     let mut exited_at = None;
     let mut timed_out = false;
@@ -118,6 +166,9 @@ pub(super) fn run(
                     #[cfg(windows)]
                     terminate_force(&mut child, &job);
                     let _ = child.wait();
+                    if let Some(writer) = input_writer.take() {
+                        let _ = writer.join();
+                    }
                     return Err(error);
                 }
             }
@@ -157,6 +208,12 @@ pub(super) fn run(
         if drain_started.is_some_and(|at| now.duration_since(at) >= PIPE_DRAIN_GUARD) {
             stdout.close();
             stderr.close();
+            if has_stdin {
+                #[cfg(unix)]
+                terminate_force(&mut child);
+                #[cfg(windows)]
+                terminate_force(&mut child, &job);
+            }
             if exit_status.is_none() {
                 #[cfg(unix)]
                 terminate_force(&mut child);
@@ -164,7 +221,12 @@ pub(super) fn run(
                 terminate_force(&mut child, &job);
                 match child.wait() {
                     Ok(status) => exit_status = Some(status),
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if let Some(writer) = input_writer.take() {
+                            let _ = writer.join();
+                        }
+                        return Err(error);
+                    }
                 }
             }
             break;
@@ -174,6 +236,14 @@ pub(super) fn run(
     }
 
     let status = exit_status.expect("the process is reaped before returning");
+    if let Some(writer) = input_writer {
+        let result = writer
+            .join()
+            .map_err(|_| io::Error::other("tool process stdin writer panicked"))?;
+        if !timed_out {
+            result?;
+        }
+    }
     let exit_code = if timed_out { 124 } else { exit_code(status) };
     Ok(ProcessOutput {
         wall_time_seconds: started.elapsed().as_secs_f64(),
@@ -422,6 +492,7 @@ impl Capture {
     fn finish(self) -> CappedOutput {
         match self.state {
             CaptureState::Full { bytes, .. } => CappedOutput {
+                valid_utf8: std::str::from_utf8(&bytes).is_ok(),
                 text: String::from_utf8_lossy(&bytes).into_owned(),
                 omitted_bytes: 0,
             },
@@ -440,6 +511,7 @@ impl Capture {
                 CappedOutput {
                     text,
                     omitted_bytes,
+                    valid_utf8: false,
                 }
             }
         }
