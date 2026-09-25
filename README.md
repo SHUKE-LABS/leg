@@ -35,6 +35,11 @@ Per-platform archives for every CI-supported target (`.tar.gz` on
 Unix, `.zip` on Windows) are attached to each
 [GitHub Release](https://github.com/SHUKE-LABS/leg/releases).
 
+Releases are created automatically when changes land on `main`. A
+Conventional Commit subject of type `feat` bumps the minor version; every
+other subject bumps patch. The first release uses the current Cargo version
+(`0.1.0`) unchanged.
+
 Every published npm package includes `THIRD_PARTY_NOTICES.txt` with the
 licenses of the bundled third-party Rust crates and vendored material.
 
