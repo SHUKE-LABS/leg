@@ -27,8 +27,9 @@ use crate::transport::http::UreqHttpClient;
 const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
-/// to. An unset or blank value disables recording for `ask`/fresh `session`
-/// runs (a `--resume` run instead appends to the trail it read from).
+/// to. An unset or blank value disables recording for `ask`, `exchange`, and
+/// fresh `session` runs (a `--resume` run instead appends to the trail it read
+/// from).
 const EVENT_LOG_ENV: &str = "LEG_EVENT_LOG";
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
@@ -158,14 +159,14 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// The full `--help` body: the usage summary plus the env vars `ask` reads.
+/// The full `--help` body: the provider environment variables and trail behavior.
 fn help_text() -> String {
     format!(
         "{USAGE}\n\n\
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
          CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
          LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, and LEG_SYSTEM_PROMPT.\n\n\
-         LEG_EVENT_LOG names a JSONL file that `ask` and a fresh `session`\n\
+         LEG_EVENT_LOG names a JSONL file that `ask`, `exchange`, and a fresh `session`\n\
          append an exchange trail to (unset/blank disables recording); `leg\n\
          log show`/`leg log replay` read it back (or `--file <path>`).\n\n\
          `leg exchange` is the headless entry point for adapters; it reads a\n\
@@ -428,7 +429,6 @@ fn parse_exchange_request(raw: &str) -> (MessageEnvelope, ExchangeMode) {
 fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()> {
     let config = LegConfig::from_env()?;
     let meta = exchange_meta(&config);
-    let participant = LocalParticipant::new(build_transport(config), meta);
 
     let mut raw = String::new();
     open_input(in_path)?
@@ -436,7 +436,10 @@ fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()>
         .map_err(io_err)?;
 
     let output = open_output(out_path)?;
-    execute_exchange_core(&participant, &raw, output)
+    let mut sink = Rc::new(RefCell::new(open_event_sink()));
+    let transport = build_transport(config).with_observer(tool_trail_observer(sink.clone()));
+    let participant = LocalParticipant::new(transport, meta.clone());
+    execute_exchange_core(&participant, &meta, &raw, output, &mut sink)
 }
 
 /// Testable core of [`execute_exchange`], parameterised over a [`Participant`]
@@ -454,11 +457,13 @@ fn execute_exchange(in_path: Option<&str>, out_path: Option<&str>) -> Result<()>
 /// after preserving the mode-specific output.
 fn execute_exchange_core(
     participant: &impl Participant,
+    meta: &ExchangeMeta,
     raw: &str,
     mut output: impl Write,
+    sink: &mut dyn EventSink,
 ) -> Result<()> {
     let (request, mode) = parse_exchange_request(raw);
-    let response = participant.respond(&request);
+    let response = respond_with_trail(participant, meta, &request, sink);
 
     match (mode, response.kind) {
         (ExchangeMode::Envelope, _) => {
@@ -550,6 +555,25 @@ fn tool_trail_observer(mut sink: Rc<RefCell<Box<dyn EventSink>>>) -> ToolObserve
     })
 }
 
+/// Emits the sessionless request and outcome around one participant call.
+fn respond_with_trail(
+    participant: &impl Participant,
+    meta: &ExchangeMeta,
+    request: &MessageEnvelope,
+    sink: &mut dyn EventSink,
+) -> MessageEnvelope {
+    emit(sink, &ExchangeEvent::request(now_ms(), meta, &request.body));
+
+    let response = participant.respond(request);
+    if let Some(wrapped) = &response.exchange {
+        emit(
+            sink,
+            &ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
+        );
+    }
+    response
+}
+
 /// Testable core of [`execute_ask_with_config`], parameterised over a
 /// [`Participant`] so the success and delivered-error behavior is exercisable
 /// without a network.
@@ -568,8 +592,6 @@ fn run_ask(
     mut output: impl Write,
     sink: &mut dyn EventSink,
 ) -> Result<()> {
-    emit(sink, &ExchangeEvent::request(now_ms(), meta, prompt));
-
     let request = MessageEnvelope::new(
         "ask-1",
         "ask",
@@ -579,14 +601,7 @@ fn run_ask(
         prompt,
         crate::events::now_ms(),
     );
-    let response = participant.respond(&request);
-
-    if let Some(wrapped) = &response.exchange {
-        emit(
-            sink,
-            &ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
-        );
-    }
+    let response = respond_with_trail(participant, meta, &request, sink);
 
     match response.kind {
         MessageKind::Response => writeln!(output, "{}", response.body).map_err(io_err),
@@ -1446,6 +1461,7 @@ mod tests {
         assert!(text.contains("ANTHROPIC_API_KEY"));
         assert!(text.contains("LEG_MODEL"));
         assert!(text.contains("LEG_EVENT_LOG"));
+        assert!(text.contains("`ask`, `exchange`, and a fresh `session`"));
         assert!(text.contains("headless entry point"));
         assert!(text.contains("exit non-zero"));
         assert!(text.contains("kind:\"error\""));
@@ -2150,7 +2166,8 @@ mod tests {
         );
         let raw = serde_json::to_string(&envelope).unwrap();
         let mut buf = Vec::new();
-        execute_exchange_core(&participant, &raw, &mut buf).expect("infallible");
+        execute_exchange_core(&participant, &meta(), &raw, &mut buf, &mut NoopSink)
+            .expect("infallible");
 
         let printed = String::from_utf8(buf).unwrap();
         assert_eq!(
@@ -2893,7 +2910,8 @@ mod tests {
         );
         let raw = serde_json::to_string(&envelope).unwrap();
         let mut buf = Vec::new();
-        execute_exchange_core(&participant, &raw, &mut buf).expect("infallible");
+        execute_exchange_core(&participant, &meta(), &raw, &mut buf, &mut NoopSink)
+            .expect("infallible");
         let printed = String::from_utf8(buf).unwrap();
         let value: serde_json::Value = serde_json::from_str(printed.trim()).expect("valid json");
         assert_eq!(value["kind"], "response");
@@ -2918,7 +2936,7 @@ mod tests {
         );
         let raw = serde_json::to_string(&envelope).unwrap();
         let mut buf = Vec::new();
-        let err = execute_exchange_core(&participant, &raw, &mut buf)
+        let err = execute_exchange_core(&participant, &meta(), &raw, &mut buf, &mut NoopSink)
             .expect_err("delivered errors must fail the command");
         assert_eq!(err.kind(), "turn_failure");
         let printed = String::from_utf8(buf).unwrap();
@@ -2932,7 +2950,8 @@ mod tests {
         let participant =
             LocalParticipant::new(FakeTransport(Ok(AssistantReply::new("hi there"))), meta());
         let mut buf = Vec::new();
-        execute_exchange_core(&participant, "hello", &mut buf).expect("infallible");
+        execute_exchange_core(&participant, &meta(), "hello", &mut buf, &mut NoopSink)
+            .expect("infallible");
         assert_eq!(String::from_utf8(buf).unwrap(), "hi there\n");
     }
 
@@ -2943,7 +2962,7 @@ mod tests {
             meta(),
         );
         let mut buf = Vec::new();
-        let err = execute_exchange_core(&participant, "hello", &mut buf)
+        let err = execute_exchange_core(&participant, &meta(), "hello", &mut buf, &mut NoopSink)
             .expect_err("delivered errors must fail the command");
         assert_eq!(err.kind(), "turn_failure");
         assert!(buf.is_empty(), "plain-text failure must leave stdout empty");

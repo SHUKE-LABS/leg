@@ -1,11 +1,11 @@
 //! Typed data structures for the prompt/reply and multi-turn session flows.
 //!
-//! [`Prompt`] and [`AssistantReply`] model the single-turn `ask` path. Multi-turn
-//! sessions build on [`Message`] (a role-tagged turn) and [`Conversation`] (the
-//! accumulated history that is resent with every request). A message's content
-//! is an ordered list of [`ContentBlock`]s — `text`, `tool_use`, and
-//! `tool_result` — so tool calls and their results round-trip through the
-//! transport, the trail, and `--resume`. [`ToolSpec`] declares a tool the
+//! [`Prompt`] and [`AssistantReply`] model the single-turn `ask`/`exchange`
+//! path. Multi-turn sessions build on [`Message`] (a role-tagged turn) and
+//! [`Conversation`] (the accumulated history resent with every request).
+//! A message's content is an ordered list of [`ContentBlock`]s — `text`,
+//! `tool_use`, and `tool_result` — so tool calls and their results round-trip
+//! through the transport, the trail, and `--resume`. [`ToolSpec`] declares a tool the
 //! provider may call and [`StopReason`] reports why a reply ended; executing
 //! tools and iterating on `tool_use` stop reasons is [`crate::tools`]' job.
 
