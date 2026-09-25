@@ -252,6 +252,10 @@ fn plain_text_provider_failure_leaves_stdout_empty_and_exits_nonzero() {
         "the diagnostic must still be observable on stderr; got {stderr:?}"
     );
     assert!(
+        stderr.contains("authentication_error"),
+        "stderr must include the provider error type; got {stderr:?}"
+    );
+    assert!(
         stderr.contains("kind: error"),
         "stderr must identify the failed message kind; got {stderr:?}"
     );
@@ -285,7 +289,10 @@ fn envelope_mode_provider_failure_preserves_error_envelope_and_exits_nonzero() {
     let response: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("error response envelope is JSON");
     assert_eq!(response["kind"], "error");
-    assert_eq!(response["body"], "authentication error: invalid x-api-key");
+    assert_eq!(
+        response["body"],
+        "authentication error: authentication_error: invalid x-api-key"
+    );
     assert!(
         stderr.contains("kind: error"),
         "stderr must identify the failed message kind; got {stderr:?}"
