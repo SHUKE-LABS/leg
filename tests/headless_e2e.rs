@@ -721,7 +721,7 @@ fn exchange_unknown_session_fails_before_any_provider_request() {
     cmd.env("LEG_SESSION_DIR", &store)
         .args(["exchange", "--session", unknown_id, "--session-id-out"])
         .arg(&id_out);
-    let output = run(cmd, Some("hello"));
+    let output = run(cmd, None);
     stop.send(()).expect("stop request probe");
     server.join().expect("join request probe");
 
