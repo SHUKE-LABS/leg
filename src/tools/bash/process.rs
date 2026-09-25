@@ -6,6 +6,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::credential_env_vars;
 use crate::interrupt;
 
 const MAX_LINES: usize = 2000;
@@ -53,6 +54,9 @@ pub(super) fn run(
         command_builder.env("PATH", path);
     }
     command_builder.envs(env.iter().map(|(key, value)| (key, value)));
+    for var in credential_env_vars() {
+        command_builder.env_remove(var);
+    }
 
     #[cfg(unix)]
     {

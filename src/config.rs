@@ -180,14 +180,18 @@ fn resolve_system_prompt(path: Option<String>) -> Result<Option<String>> {
 /// variable is present at all, that is also an error.
 type CredentialBuilder = fn(String) -> Credential;
 
-fn resolve_credential(lookup: &impl Fn(&str) -> Option<String>) -> Result<Credential> {
-    let candidates: [(&str, CredentialBuilder); 3] = [
-        ("ANTHROPIC_API_KEY", Credential::ApiKey),
-        ("ANTHROPIC_AUTH_TOKEN", Credential::OAuth),
-        ("CLAUDE_CODE_OAUTH_TOKEN", Credential::OAuth),
-    ];
+static CREDENTIAL_CANDIDATES: [(&str, CredentialBuilder); 3] = [
+    ("ANTHROPIC_API_KEY", Credential::ApiKey),
+    ("ANTHROPIC_AUTH_TOKEN", Credential::OAuth),
+    ("CLAUDE_CODE_OAUTH_TOKEN", Credential::OAuth),
+];
 
-    for (var, make) in candidates {
+pub(crate) fn credential_env_vars() -> impl Iterator<Item = &'static str> {
+    CREDENTIAL_CANDIDATES.iter().map(|(var, _)| *var)
+}
+
+fn resolve_credential(lookup: &impl Fn(&str) -> Option<String>) -> Result<Credential> {
+    for &(var, make) in &CREDENTIAL_CANDIDATES {
         let Some(raw) = lookup(var) else {
             continue;
         };
@@ -197,9 +201,10 @@ fn resolve_credential(lookup: &impl Fn(&str) -> Option<String>) -> Result<Creden
         return Ok(make(raw));
     }
 
-    Err(LegError::Config(
-        "no Anthropic credential set: set one of ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN".to_string(),
-    ))
+    let candidates = credential_env_vars().collect::<Vec<_>>().join(", ");
+    Err(LegError::Config(format!(
+        "no Anthropic credential set: set one of {candidates}"
+    )))
 }
 
 /// Treats a present-but-blank value as absent so a defaulted variable that is

@@ -98,9 +98,10 @@ stderr. A call to an unregistered tool is answered with an error result.
   capped at 2000 lines or 50 KB, whichever comes first, keeping its head and
   tail and showing the omitted-byte count. The tool result is JSON with
   `wall_time_seconds`, `status` (`exited` or `timed_out`), `exit_code`, `stdout`,
-  `stderr`, `stdout_omitted_bytes`, and `stderr_omitted_bytes`. A non-zero
-  command exit is returned as `exit_code`; a missing `bash` executable is a
-  tool error.
+  `stderr`, `stdout_omitted_bytes`, and `stderr_omitted_bytes`. Leg's provider
+  credential variables are removed from the child environment; login-shell
+  startup files may re-export them. A non-zero command exit is returned as
+  `exit_code`; a missing `bash` executable is a tool error.
 
 #### Headless contract for agent callers
 
