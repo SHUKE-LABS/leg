@@ -33,6 +33,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build (locked)
         shell: bash
         run: cargo build --locked --verbose --target "${TARGET}"
@@ -68,6 +70,8 @@ jobs:
         with:
           targets: armv7-unknown-linux-musleabihf
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install cross
         uses: taiki-e/install-action@v2
         with:
@@ -75,3 +79,21 @@ jobs:
 
       - name: Cross-build (locked)
         run: cross build --locked --verbose --target "${TARGET}"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings

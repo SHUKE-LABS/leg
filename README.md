@@ -218,6 +218,17 @@ the session id plus a newline after the turn. Each session is stored as
 is created when a new session is started. A missing id fails before contacting
 the provider with `leg: no session found: <id>`.
 
+## Development checks
+
+CI uses Rust 1.89.0 with the `rustfmt` and `clippy` components. Install that
+toolchain and run the same lint checks locally:
+
+```
+rustup toolchain install 1.89.0 --component rustfmt --component clippy
+cargo +1.89.0 fmt --all -- --check
+cargo +1.89.0 clippy --locked --all-targets -- -D warnings
+```
+
 ## CI-supported targets
 
 - x86_64-unknown-linux-gnu

@@ -228,15 +228,15 @@ impl<T: Transport> ToolLoop<T> {
 
         while reply.stop_reason == Some(StopReason::ToolUse) {
             interrupt::check()?;
-            if let Some(max_tool_rounds) = self.max_tool_rounds {
-                if rounds >= max_tool_rounds {
-                    reply.usage = usage;
-                    return Ok(TurnOutcome {
-                        reply,
-                        transcript: messages.split_off(history.len()),
-                        capped: true,
-                    });
-                }
+            if let Some(max_tool_rounds) = self.max_tool_rounds
+                && rounds >= max_tool_rounds
+            {
+                reply.usage = usage;
+                return Ok(TurnOutcome {
+                    reply,
+                    transcript: messages.split_off(history.len()),
+                    capped: true,
+                });
             }
             observe(ToolEvent::Round {
                 content: &reply.content,

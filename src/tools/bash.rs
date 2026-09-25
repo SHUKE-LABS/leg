@@ -505,12 +505,12 @@ mod tests {
         let output = call(&command, serde_json::json!({"timeout": timeout})).unwrap();
         assert_eq!(output["status"], "timed_out");
         assert_eq!(output["stdout"], "launched");
-        thread::sleep(Duration::from_secs((sleep + 1) as u64));
+        thread::sleep(Duration::from_secs(sleep + 1));
         assert!(
             !dir.join("survived").exists(),
             "background process survived timeout"
         );
-        assert!(started.elapsed() < Duration::from_secs((timeout + sleep + 4) as u64));
+        assert!(started.elapsed() < Duration::from_secs(timeout + sleep + 4));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
