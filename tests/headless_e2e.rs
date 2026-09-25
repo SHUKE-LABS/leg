@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::time::Instant;
+
 use serde_json::Value;
 
 /// The scripted rounds: read the file, edit it, run a command that observes
@@ -37,6 +40,16 @@ const SESSION_ROUNDS: [&str; 3] = [
     r#"{"content":[{"type":"tool_use","id":"toolu_session","name":"read","input":{"path":"notes.txt"}}],"stop_reason":"tool_use"}"#,
     r#"{"content":[{"type":"text","text":"first turn remembered"}],"stop_reason":"end_turn"}"#,
     r#"{"content":[{"type":"text","text":"history restored"}],"stop_reason":"end_turn"}"#,
+];
+
+#[cfg(unix)]
+const SLEEP_TOOL_ROUNDS: [&str; 1] = [
+    r#"{"content":[{"type":"tool_use","id":"toolu_sleep","name":"bash","input":{"command":"echo $$ > shell.pid; sleep 60 & echo $! > sleep.pid; wait","timeout":60}}],"stop_reason":"tool_use"}"#,
+];
+
+#[cfg(unix)]
+const SECOND_SIGNAL_ROUNDS: [&str; 1] = [
+    r#"{"content":[{"type":"tool_use","id":"toolu_second_signal","name":"bash","input":{"command":"trap '' TERM; echo $$ > shell.pid; echo $$ > sleep.pid; exec sleep 60","timeout":60}}],"stop_reason":"tool_use"}"#,
 ];
 
 /// Starts a sequence mock server on an OS-assigned port, returning its base
@@ -230,6 +243,182 @@ fn run(mut cmd: Command, stdin: Option<&str>) -> Output {
     rx.recv_timeout(Duration::from_secs(120))
         .expect("leg did not exit within the deadline")
         .expect("wait for leg")
+}
+
+#[cfg(unix)]
+struct SignalTestCleanup {
+    leg_pid: libc::pid_t,
+    shell_pid_file: PathBuf,
+    sleep_pid_file: PathBuf,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl Drop for SignalTestCleanup {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(shell_pid) = read_pid_file(&self.shell_pid_file) {
+            unsafe {
+                libc::kill(-shell_pid, libc::SIGKILL);
+            }
+        }
+        if let Some(sleep_pid) = read_pid_file(&self.sleep_pid_file) {
+            unsafe {
+                libc::kill(sleep_pid, libc::SIGKILL);
+            }
+        }
+        unsafe {
+            libc::kill(self.leg_pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_pid_file(path: &Path) -> Option<libc::pid_t> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(unix)]
+fn run_until_bash_signal(
+    mut command: Command,
+    cwd: &Path,
+    input: Option<&str>,
+    keep_stdin_open: bool,
+    signal: libc::c_int,
+) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let leg_pid = child.id().try_into().expect("leg pid fits pid_t");
+    let shell_pid_file = cwd.join("shell.pid");
+    let sleep_pid_file = cwd.join("sleep.pid");
+    let mut cleanup = SignalTestCleanup {
+        leg_pid,
+        shell_pid_file: shell_pid_file.clone(),
+        sleep_pid_file: sleep_pid_file.clone(),
+        active: true,
+    };
+    let mut stdin = child.stdin.take();
+    if let Some(input) = input {
+        stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .expect("write leg input");
+    }
+    if !keep_stdin_open {
+        stdin.take();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let sleep_pid = loop {
+        if let Some(pid) = read_pid_file(&sleep_pid_file) {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bash did not start the sleep process"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let started = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(leg_pid, signal) },
+        0,
+        "send signal to leg"
+    );
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("leg did not stop within five seconds")
+        .expect("wait for leg");
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(sleep_pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_is_running(sleep_pid),
+        "sleep process {sleep_pid} survived the interrupt"
+    );
+    assert!(
+        started.elapsed() <= Duration::from_secs(5),
+        "leg exceeded the interrupt deadline"
+    );
+    cleanup.active = false;
+    output
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: libc::pid_t) -> bool {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps to check child process");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+#[cfg(unix)]
+struct StalledServer {
+    release: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for StalledServer {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_stalled_server() -> (String, mpsc::Receiver<()>, StalledServer) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let (received, request_received) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        if read_request_body(&mut stream).is_none() {
+            return;
+        }
+        let _ = received.send(());
+        if released.recv_timeout(Duration::from_secs(10)).is_err() {
+            return;
+        }
+        let reply = ONE_TEXT_REPLY[0];
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+    (
+        format!("http://{addr}"),
+        request_received,
+        StalledServer {
+            release,
+            worker: Some(server),
+        },
+    )
 }
 
 /// Asserts the four requests leg sent — tools advertised on the first, each
@@ -890,5 +1079,381 @@ fn exchange_event_log_write_failure_warns_without_changing_the_reply() {
         "log write failure must warn on stderr"
     );
 
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+fn assert_exchange_interrupt(signal: libc::c_int, exit_code: i32, signal_name: &str, tag: &str) {
+    let (base_url, requests) = spawn_sequence_server(&SLEEP_TOOL_ROUNDS);
+    let cwd = fixture_dir(tag);
+    let trail = cwd.join("trail.jsonl");
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("exchange");
+    let request = serde_json::json!({
+        "schema": "baton.message/v1",
+        "message_id": "m-interrupt",
+        "conversation_id": "c-interrupt",
+        "from": "external",
+        "to": "leg",
+        "in_reply_to": null,
+        "kind": "request",
+        "body": "run the long command",
+        "ts_ms": 1_700_000_000_000_u64,
+        "exchange": null
+    })
+    .to_string();
+    let output = run_until_bash_signal(cmd, &cwd, Some(&request), false, signal);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(exit_code));
+    assert!(
+        output.stdout.is_empty(),
+        "interrupted exchange wrote stdout"
+    );
+    assert!(
+        stderr.contains(&format!("interrupted by {signal_name}")),
+        "missing interruption diagnostic: {stderr}"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    let events = read_events(&trail);
+    let outcome = events.last().expect("interrupted outcome event");
+    assert_eq!(outcome["event"], "response_error");
+    assert_eq!(outcome["kind"], "interrupted");
+    let tool_result = events
+        .iter()
+        .find(|event| event["event"] == "tool_result")
+        .expect("interrupted bash result");
+    assert_eq!(tool_result["status"], "failed");
+    assert!(
+        tool_result["error"]
+            .as_str()
+            .expect("tool error")
+            .contains(&format!("interrupted by {signal_name}"))
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_bash_and_records_interrupted_outcome() {
+    assert_exchange_interrupt(libc::SIGTERM, 143, "SIGTERM", "exchange-sigterm");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_stops_bash_and_records_interrupted_outcome() {
+    assert_exchange_interrupt(libc::SIGINT, 130, "SIGINT", "exchange-sigint");
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_session_trail_can_be_resumed() {
+    let (base_url, _) = spawn_sequence_server(&SLEEP_TOOL_ROUNDS);
+    let cwd = fixture_dir("session-interrupted");
+    let trail = cwd.join("session.jsonl");
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("session");
+    let output = run_until_bash_signal(
+        cmd,
+        &cwd,
+        Some("run the long command\n"),
+        true,
+        libc::SIGTERM,
+    );
+    assert_eq!(output.status.code(), Some(143));
+    assert!(output.stdout.is_empty(), "interrupted session wrote stdout");
+
+    let initial_events = read_events(&trail);
+    assert_eq!(
+        initial_events.last().expect("interrupted outcome")["kind"],
+        "interrupted"
+    );
+    assert!(
+        !initial_events
+            .iter()
+            .any(|event| event["event"] == "session_end"),
+        "interrupted session must not be marked cleanly ended"
+    );
+    let session_id = initial_events[0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let (resume_url, requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
+    let mut resume = leg(&cwd, &resume_url);
+    resume.args(["session", "--resume"]).arg(&trail);
+    let resumed = run(resume, Some("continue after interrupt\n/exit\n"));
+    assert!(
+        resumed.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&resumed.stdout), "hi there\n");
+
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"].as_array().expect("message history");
+    assert_eq!(messages.len(), 1, "interrupted turn must not enter history");
+    assert_eq!(messages[0]["content"], "continue after interrupt");
+
+    let events = read_events(&trail);
+    assert!(events.iter().any(|event| {
+        event["event"] == "response_error"
+            && event["kind"] == "interrupted"
+            && event["session_id"] == session_id
+            && event["turn_index"] == 0
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "request" && event["session_id"] == session_id && event["turn_index"] == 1
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["event"] == "session_end" && event["session_id"] == session_id })
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_exits_session_while_waiting_for_input() {
+    let (base_url, requests, stop, server) = spawn_request_probe();
+    let cwd = fixture_dir("session-idle-sigterm");
+    let trail = cwd.join("session.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("session");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let leg_pid = child.id().try_into().expect("leg pid fits pid_t");
+    let mut cleanup = SignalTestCleanup {
+        leg_pid,
+        shell_pid_file: cwd.join("shell.pid"),
+        sleep_pid_file: cwd.join("sleep.pid"),
+        active: true,
+    };
+    let stdin = child.stdin.take().expect("piped stdin");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(&trail)
+            .is_ok_and(|contents| contents.contains("\"event\":\"session_start\""))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session did not start before the deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(50));
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    assert_eq!(
+        unsafe { libc::kill(leg_pid, libc::SIGTERM) },
+        0,
+        "send SIGTERM to leg"
+    );
+    let output = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("idle session did not stop within five seconds")
+        .expect("wait for leg");
+    drop(stdin);
+    stop.send(()).expect("stop request probe");
+    server.join().expect("join request probe");
+    cleanup.active = false;
+
+    assert_eq!(output.status.code(), Some(143));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted by SIGTERM"));
+    assert!(requests.lock().unwrap().is_empty());
+    let events = read_events(&trail);
+    assert!(
+        !events.iter().any(|event| event["event"] == "session_end"),
+        "interrupted session must not be marked cleanly ended"
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_abandons_an_in_flight_provider_request() {
+    let cwd = fixture_dir("provider-sigterm");
+    let trail = cwd.join("trail.jsonl");
+    let (base_url, request_received, server) = spawn_stalled_server();
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail)
+        .args(["ask", "wait for the provider"]);
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let leg_pid = child.id().try_into().expect("leg pid fits pid_t");
+    let mut cleanup = SignalTestCleanup {
+        leg_pid,
+        shell_pid_file: cwd.join("shell.pid"),
+        sleep_pid_file: cwd.join("sleep.pid"),
+        active: true,
+    };
+    request_received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("provider request did not arrive");
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    assert_eq!(
+        unsafe { libc::kill(leg_pid, libc::SIGTERM) },
+        0,
+        "send SIGTERM to leg"
+    );
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    drop(server);
+    let output = result
+        .expect("provider request was not abandoned within five seconds")
+        .expect("wait for leg");
+    cleanup.active = false;
+
+    assert_eq!(output.status.code(), Some(143));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted by SIGTERM"));
+    let events = read_events(&trail);
+    assert_eq!(
+        events.last().expect("interrupted outcome")["event"],
+        "response_error"
+    );
+    assert_eq!(events.last().unwrap()["kind"], "interrupted");
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn second_signal_exits_immediately_and_kills_bash_process_group() {
+    let (base_url, requests) = spawn_sequence_server(&SECOND_SIGNAL_ROUNDS);
+    let cwd = fixture_dir("exchange-second-signal");
+    let trail = cwd.join("trail.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("exchange");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let leg_pid = child.id().try_into().expect("leg pid fits pid_t");
+    let shell_pid_file = cwd.join("shell.pid");
+    let sleep_pid_file = cwd.join("sleep.pid");
+    let mut cleanup = SignalTestCleanup {
+        leg_pid,
+        shell_pid_file: shell_pid_file.clone(),
+        sleep_pid_file: sleep_pid_file.clone(),
+        active: true,
+    };
+    let request = serde_json::json!({
+        "schema": "baton.message/v1",
+        "message_id": "m-second-signal",
+        "conversation_id": "c-second-signal",
+        "from": "external",
+        "to": "leg",
+        "in_reply_to": null,
+        "kind": "request",
+        "body": "run the long command",
+        "ts_ms": 1_700_000_000_000_u64,
+        "exchange": null
+    })
+    .to_string();
+    let mut stdin = child.stdin.take();
+    stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(request.as_bytes())
+        .expect("write leg input");
+    stdin.take();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let shell_pid = loop {
+        if let (Some(shell_pid), Some(sleep_pid)) = (
+            read_pid_file(&shell_pid_file),
+            read_pid_file(&sleep_pid_file),
+        ) && shell_pid == sleep_pid
+            && process_is_running(sleep_pid)
+        {
+            break shell_pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bash did not start the SIGTERM-ignoring sleep"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    assert_eq!(
+        unsafe { libc::kill(leg_pid, libc::SIGTERM) },
+        0,
+        "send first signal to leg"
+    );
+    let second_signal_started = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(leg_pid, libc::SIGINT) },
+        0,
+        "send second signal to leg"
+    );
+    let output = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second signal did not exit immediately")
+        .expect("wait for leg");
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(shell_pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_is_running(shell_pid),
+        "SIGTERM-ignoring sleep process {shell_pid} survived the second signal"
+    );
+    assert!(
+        second_signal_started.elapsed() <= Duration::from_secs(1),
+        "second signal did not exit immediately"
+    );
+    assert!(
+        [130, 143].contains(&output.status.code().expect("signal exit code")),
+        "expected signal-specific exit code, got {:?}",
+        output.status.code()
+    );
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "immediate exit should bypass diagnostics"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    cleanup.active = false;
     std::fs::remove_dir_all(&cwd).ok();
 }

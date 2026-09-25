@@ -14,6 +14,7 @@
 use std::cell::RefCell;
 
 use crate::error::Result;
+use crate::interrupt;
 use crate::model::{AssistantReply, ContentBlock, Message, Role, StopReason, TokenUsage, ToolSpec};
 use crate::transport::Transport;
 
@@ -98,8 +99,8 @@ pub struct TurnOutcome {
 /// An in-memory notification of one dispatched tool call's lifecycle.
 ///
 /// Fired by [`ToolLoop::run_observed`]: one `Round` per dispatched tool round,
-/// then per call a `Call` just before it is dispatched and exactly one
-/// `Result` once it finishes. The persisted trail form is
+/// then per call a `Call` just before dispatch and one `Result` when it
+/// finishes or is interrupted. The persisted trail form is
 /// [`crate::events::ExchangeEvent::ToolRound`] /
 /// [`crate::events::ExchangeEvent::ToolCall`] /
 /// [`crate::events::ExchangeEvent::ToolResult`].
@@ -128,7 +129,7 @@ pub enum ToolEvent<'a> {
         name: &'a str,
         /// The tool's output, or its error message when `is_error`.
         output: &'a str,
-        /// Whether the call failed (unknown tool or handler error).
+        /// Whether the call failed (including interruption).
         is_error: bool,
     },
 }
@@ -177,19 +178,24 @@ impl<T: Transport> ToolLoop<T> {
     }
 
     /// [`ToolLoop::run`], notifying `observe` of each dispatched round, then
-    /// each of its calls and their results, in call order. The capped reply's
-    /// calls are not dispatched and emit nothing.
+    /// each of its calls and their results, in call order. An interrupted call
+    /// emits a failed result before the turn returns its interruption error. The
+    /// capped reply's calls are not dispatched and emit nothing.
     pub fn run_observed(
         &self,
         history: &[Message],
         observe: &mut dyn FnMut(ToolEvent<'_>),
     ) -> Result<TurnOutcome> {
+        interrupt::check()?;
         let mut messages = history.to_vec();
-        let mut reply = self.transport.send_conversation(&messages)?;
+        let result = self.transport.send_conversation(&messages);
+        interrupt::check()?;
+        let mut reply = result?;
         let mut usage = reply.usage;
         let mut rounds = 0;
 
         while reply.stop_reason == Some(StopReason::ToolUse) {
+            interrupt::check()?;
             if let Some(max_tool_rounds) = self.max_tool_rounds {
                 if rounds >= max_tool_rounds {
                     reply.usage = usage;
@@ -206,8 +212,17 @@ impl<T: Transport> ToolLoop<T> {
             let mut results = Vec::new();
             for block in &reply.content {
                 if let ContentBlock::ToolUse { id, name, input } = block {
+                    interrupt::check()?;
                     observe(ToolEvent::Call { id, name, input });
+                    if let Some(error) = interrupt::error() {
+                        observe_interrupted_result(observe, id, name, &error);
+                        return Err(error);
+                    }
                     let result = self.registry.dispatch(id, name, input);
+                    if let Some(error) = interrupt::error() {
+                        observe_interrupted_result(observe, id, name, &error);
+                        return Err(error);
+                    }
                     if let ContentBlock::ToolResult {
                         content, is_error, ..
                     } = &result
@@ -226,7 +241,9 @@ impl<T: Transport> ToolLoop<T> {
             messages.push(Message::new(Role::User, results));
             rounds = rounds.saturating_add(1);
 
-            reply = self.transport.send_conversation(&messages)?;
+            let result = self.transport.send_conversation(&messages);
+            interrupt::check()?;
+            reply = result?;
             usage = add_usage(usage, reply.usage);
         }
 
@@ -237,6 +254,21 @@ impl<T: Transport> ToolLoop<T> {
             capped: false,
         })
     }
+}
+
+fn observe_interrupted_result(
+    observe: &mut dyn FnMut(ToolEvent<'_>),
+    id: &str,
+    name: &str,
+    error: &crate::error::LegError,
+) {
+    let output = error.to_string();
+    observe(ToolEvent::Result {
+        id,
+        name,
+        output: &output,
+        is_error: true,
+    });
 }
 
 impl<T: Transport> Transport for ToolLoop<T> {

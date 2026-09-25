@@ -10,6 +10,32 @@ use std::fmt;
 /// Convenience alias for results produced by leg's runtime.
 pub type Result<T> = std::result::Result<T, LegError>;
 
+/// A Unix signal that interrupts an active turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptSignal {
+    /// `SIGINT`.
+    Interrupt,
+    /// `SIGTERM`.
+    Terminate,
+}
+
+impl InterruptSignal {
+    /// The conventional shell exit status for this signal.
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            InterruptSignal::Interrupt => 130,
+            InterruptSignal::Terminate => 143,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            InterruptSignal::Interrupt => "SIGINT",
+            InterruptSignal::Terminate => "SIGTERM",
+        }
+    }
+}
+
 /// Top-level error type for leg.
 #[derive(Debug)]
 pub enum LegError {
@@ -50,6 +76,11 @@ pub enum LegError {
     Decode(String),
     /// A local I/O operation failed.
     Io(String),
+    /// The active turn was interrupted by a Unix signal.
+    Interrupted {
+        /// The signal that requested the interruption.
+        signal: InterruptSignal,
+    },
     /// A JSONL exchange trail (`LEG_EVENT_LOG` or a `--resume` file) could not
     /// be parsed: a malformed line, or a known event missing required fields.
     Log(String),
@@ -80,6 +111,7 @@ impl LegError {
             LegError::Api { .. } => "api",
             LegError::Decode(_) => "decode",
             LegError::Io(_) => "io",
+            LegError::Interrupted { .. } => "interrupted",
             LegError::Log(_) => "log",
             LegError::SessionNotFound(_) => "session_not_found",
             LegError::TurnFailure { .. } => "turn_failure",
@@ -103,6 +135,9 @@ impl fmt::Display for LegError {
             }
             LegError::Decode(msg) => write!(f, "response decode error: {msg}"),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
+            LegError::Interrupted { signal } => {
+                write!(f, "interrupted by {}", signal.name())
+            }
             LegError::Log(msg) => write!(f, "log error: {msg}"),
             LegError::SessionNotFound(session_id) => {
                 write!(f, "no session found: {session_id}")

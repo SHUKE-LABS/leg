@@ -117,6 +117,13 @@ tool needs `bash` on `PATH` (Git Bash on Windows).
 `tests/headless_e2e.rs` exercises this contract end to end against a fake
 provider.
 
+On Unix, SIGINT or SIGTERM during `ask`, `exchange`, or `session` interrupts
+the active turn, terminates a running `bash` process group, records an
+`interrupted` outcome in any enabled trail, writes no further stdout, and
+exits 130 or 143 respectively. A second signal exits immediately. An
+interrupted session trail can be resumed with `leg session --resume`; Windows
+keeps its default console-control behavior.
+
 ### Sessions
 
 ```
@@ -165,6 +172,10 @@ line with the same `tool_use_id`, a `status` of `completed` or `failed`, and
 the tool's `result` or `error`. All three carry `schema` and `ts_ms`, plus
 `session_id`/`turn_index` on session turns; sessionless `ask`/`exchange`
 events omit those fields.
+
+On a first-signal interruption, an active tool call gets a failed
+`tool_result` before the turn's `response_error` outcome; the interrupted
+session trail can therefore be resumed without reusing the failed turn.
 
 ### Exchange
 

@@ -14,6 +14,7 @@
 use std::time::Duration;
 
 use crate::error::{LegError, Result};
+use crate::interrupt;
 
 /// A completed HTTP response: the status code and the raw body text.
 #[derive(Debug, Clone)]
@@ -61,21 +62,30 @@ impl UreqHttpClient {
 
 impl HttpClient for UreqHttpClient {
     fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<HttpResponse> {
-        let mut request = self.agent.post(url);
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
+        let agent = self.agent.clone();
+        let url = url.to_string();
+        let headers: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        let body = body.to_string();
 
-        let mut response = request
-            .send(body)
-            .map_err(|err| LegError::Transport(err.to_string()))?;
+        interrupt::run_cancellable(move || {
+            let mut request = agent.post(&url);
+            for (name, value) in &headers {
+                request = request.header(name, value);
+            }
 
-        let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|err| LegError::Transport(format!("failed to read response body: {err}")))?;
+            let mut response = request
+                .send(&body)
+                .map_err(|err| LegError::Transport(err.to_string()))?;
 
-        Ok(HttpResponse { status, body })
+            let status = response.status().as_u16();
+            let body = response.body_mut().read_to_string().map_err(|err| {
+                LegError::Transport(format!("failed to read response body: {err}"))
+            })?;
+
+            Ok(HttpResponse { status, body })
+        })
     }
 }
