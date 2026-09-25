@@ -409,6 +409,12 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
                 let value = iter
                     .next()
                     .ok_or_else(|| LegError::Usage("--session requires a value".to_string()))?;
+                if matches!(
+                    value.as_str(),
+                    "--in" | "--out" | "--session" | "--new-session" | "--session-id-out"
+                ) {
+                    return Err(LegError::Usage("--session requires a value".to_string()));
+                }
                 session = Some(ExchangeSession::Existing(value.clone()));
             }
             "--new-session" => {
@@ -3335,6 +3341,10 @@ mod tests {
                 &["exchange", "--new-session", "--session", "sess-1",]
             ))
             .is_err()
+        );
+        assert!(
+            parse_args(&argv(&["exchange", "--session", "--new-session"])).is_err(),
+            "--new-session must not be consumed as the --session id"
         );
         assert!(parse_args(&argv(&["exchange", "--session-id-out", "/tmp/id"])).is_err());
         assert!(parse_args(&argv(&["exchange", "--session"])).is_err());
