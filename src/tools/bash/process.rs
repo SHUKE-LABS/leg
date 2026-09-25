@@ -6,6 +6,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::interrupt;
+
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
 const HALF_LINES: usize = MAX_LINES / 2;
@@ -68,6 +70,8 @@ pub(super) fn run(
     let job = windows::JobObject::new()?;
 
     let mut child = command_builder.spawn()?;
+    #[cfg(unix)]
+    let _active_process_group = interrupt::ActiveProcessGroup::new(child.id());
 
     #[cfg(windows)]
     if let Err(error) = job.assign(&child) {
@@ -116,14 +120,22 @@ pub(super) fn run(
         }
 
         let now = Instant::now();
-        if !timed_out && exit_status.is_none() && now.duration_since(started) >= timeout {
+        if interrupt::is_signaled() && graceful_at.is_none() {
+            graceful_at = Some(now);
+            terminate_gracefully(&child);
+        }
+
+        if !timed_out
+            && graceful_at.is_none()
+            && exit_status.is_none()
+            && now.duration_since(started) >= timeout
+        {
             timed_out = true;
             graceful_at = Some(now);
             terminate_gracefully(&child);
         }
 
-        if timed_out
-            && forced_at.is_none()
+        if forced_at.is_none()
             && graceful_at.is_some_and(|sent| now.duration_since(sent) >= TERMINATION_GRACE)
         {
             #[cfg(unix)]

@@ -13,6 +13,7 @@ use crate::events::{
     EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, ToolStatus, WriterSink,
     now_ms, trail_content,
 };
+use crate::interrupt;
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant, fresh_message_id};
@@ -114,11 +115,18 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Ask { prompt, model }) => {
+            interrupt::install()?;
             let stdout = std::io::stdout();
             execute_ask(&prompt, model, stdout.lock())
         }
         Some(Command::Session { resume }) => {
+            interrupt::install()?;
+            #[cfg(unix)]
+            let input = interrupt::SignalAwareStdin::stdin();
+            #[cfg(not(unix))]
             let stdin = std::io::stdin();
+            #[cfg(not(unix))]
+            let input = stdin.lock();
             let stdout = std::io::stdout();
             match resume {
                 None => {
@@ -131,7 +139,7 @@ pub fn run() -> Result<()> {
                         &client,
                         sink.as_mut(),
                         &meta,
-                        stdin.lock(),
+                        input,
                         stdout.lock(),
                         session_id,
                     )
@@ -149,7 +157,7 @@ pub fn run() -> Result<()> {
                         &client,
                         sink.as_mut(),
                         &meta,
-                        stdin.lock(),
+                        input,
                         stdout.lock(),
                         resumed,
                     )
@@ -173,12 +181,15 @@ pub fn run() -> Result<()> {
             out_path,
             session,
             session_id_out,
-        }) => execute_exchange(
-            in_path.as_deref(),
-            out_path.as_deref(),
-            session,
-            session_id_out.as_deref(),
-        ),
+        }) => {
+            interrupt::install()?;
+            execute_exchange(
+                in_path.as_deref(),
+                out_path.as_deref(),
+                session,
+                session_id_out.as_deref(),
+            )
+        }
     }
 }
 
@@ -514,10 +525,7 @@ fn execute_exchange(
     let config = LegConfig::from_env()?;
     let meta = exchange_meta(&config);
 
-    let mut raw = String::new();
-    open_input(in_path)?
-        .read_to_string(&mut raw)
-        .map_err(io_err)?;
+    let raw = read_exchange_input(in_path)?;
 
     let output = open_output(out_path)?;
     let mut sink = Rc::new(RefCell::new(open_event_sink()));
@@ -561,10 +569,7 @@ fn execute_exchange_session(
 
     let config = LegConfig::from_env()?;
     let meta = exchange_meta(&config);
-    let mut raw = String::new();
-    open_input(in_path)?
-        .read_to_string(&mut raw)
-        .map_err(io_err)?;
+    let raw = read_exchange_input(in_path)?;
 
     let mut output = open_output(out_path)?;
     if create_new {
@@ -593,6 +598,7 @@ fn execute_exchange_session(
     if let Some(path) = session_id_out {
         write_session_id_out(path, &resumed.session_id)?;
     }
+    interrupt::check()?;
     output.write_all(&response_output).map_err(io_err)?;
     match (result, session_write_error) {
         (Ok(()), Some(error)) => Err(LegError::Io(format!(
@@ -623,7 +629,7 @@ fn execute_exchange_core(
     sink: &mut dyn EventSink,
 ) -> Result<()> {
     let (request, mode) = parse_exchange_request(raw);
-    let response = respond_with_trail(participant, meta, &request, sink);
+    let response = respond_with_trail(participant, meta, &request, sink)?;
 
     write_exchange_response(mode, &response, output)
 }
@@ -739,6 +745,7 @@ fn write_exchange_response(
     response: &MessageEnvelope,
     mut output: impl Write,
 ) -> Result<()> {
+    interrupt::check()?;
     match (mode, response.kind) {
         (ExchangeMode::Envelope, _) => {
             let json = serde_json::to_string(&response).expect("MessageEnvelope always serializes");
@@ -775,8 +782,26 @@ fn open_input(path: Option<&str>) -> Result<Box<dyn Read>> {
                 .map_err(|err| LegError::Io(format!("failed to open --in file {path:?}: {err}")))?;
             Ok(Box::new(file))
         }
-        None => Ok(Box::new(std::io::stdin())),
+        None => {
+            #[cfg(unix)]
+            {
+                Ok(Box::new(interrupt::SignalAwareStdin::stdin()))
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(Box::new(std::io::stdin()))
+            }
+        }
     }
+}
+
+fn read_exchange_input(path: Option<&str>) -> Result<String> {
+    let mut raw = String::new();
+    if let Err(error) = open_input(path)?.read_to_string(&mut raw) {
+        return Err(interrupt::error().unwrap_or_else(|| io_err(error)));
+    }
+    interrupt::check()?;
+    Ok(raw)
 }
 
 /// Opens `leg exchange`'s response sink: `path` when given (created,
@@ -835,17 +860,26 @@ fn respond_with_trail(
     meta: &ExchangeMeta,
     request: &MessageEnvelope,
     sink: &mut dyn EventSink,
-) -> MessageEnvelope {
+) -> Result<MessageEnvelope> {
     emit(sink, &ExchangeEvent::request(now_ms(), meta, &request.body));
 
+    let start = Instant::now();
     let response = participant.respond(request);
+    let duration_ms = start.elapsed().as_millis() as u64;
+    if let Some(error) = interrupt::error() {
+        emit(
+            sink,
+            &ExchangeEvent::response_error(now_ms(), duration_ms, &error),
+        );
+        return Err(error);
+    }
     if let Some(wrapped) = &response.exchange {
         emit(
             sink,
             &ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
         );
     }
-    response
+    Ok(response)
 }
 
 /// Testable core of [`execute_ask_with_config`], parameterised over a
@@ -857,8 +891,8 @@ fn respond_with_trail(
 /// contract, so a process killed mid-call still leaves a torn-but-present
 /// request line (the trail's documented in-flight/torn-request behaviour;
 /// see [`crate::log::parse_jsonl`]'s trailing-request handling). The
-/// [`Participant`]'s own nested exchange still supplies the terminal outcome
-/// (already timed against its own call), mirrored onto `sink` afterwards.
+/// [`Participant`]'s nested outcome is mirrored onto `sink` unless an
+/// interrupt is pending, in which case the trail gets an `interrupted` error.
 fn run_ask(
     participant: &impl Participant,
     meta: &ExchangeMeta,
@@ -875,7 +909,8 @@ fn run_ask(
         prompt,
         crate::events::now_ms(),
     );
-    let response = respond_with_trail(participant, meta, &request, sink);
+    let response = respond_with_trail(participant, meta, &request, sink)?;
+    interrupt::check()?;
 
     match response.kind {
         MessageKind::Response => writeln!(output, "{}", response.body).map_err(io_err),
@@ -1000,7 +1035,11 @@ fn run_session_repl_with_warning(
     warning: &mut dyn Write,
 ) -> Result<()> {
     for line in input.lines() {
-        let line = line.map_err(io_err)?;
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => return Err(interrupt::error().unwrap_or_else(|| io_err(error))),
+        };
+        interrupt::check()?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -1029,6 +1068,7 @@ fn run_session_repl_with_warning(
 
         match result {
             Ok(outcome) => {
+                interrupt::check()?;
                 writeln!(output, "{}", outcome.reply.text).map_err(io_err)?;
                 // Keep the turn's tool rounds and the reply's full blocks so
                 // the resent history matches what the provider returned.
@@ -1037,6 +1077,7 @@ fn run_session_repl_with_warning(
                 }
                 conversation.push(session_reply_message(outcome.reply.content, outcome.capped));
             }
+            Err(err @ LegError::Interrupted { .. }) => return Err(err),
             Err(err) => {
                 // Roll the failed user turn back out so the next request does
                 // not send two consecutive user turns. The loop continues —
@@ -1078,6 +1119,10 @@ fn timed_session_exchange(
     let start = Instant::now();
     let result = call(sink);
     let duration_ms = start.elapsed().as_millis() as u64;
+    let result = match interrupt::error() {
+        Some(error) => Err(error),
+        None => result,
+    };
 
     if let Ok(outcome) = &result {
         if outcome.reply.stop_reason == Some(StopReason::MaxTokens) {

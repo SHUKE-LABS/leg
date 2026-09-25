@@ -23,6 +23,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod events;
+mod interrupt;
 pub mod log;
 pub mod message;
 pub mod model;
