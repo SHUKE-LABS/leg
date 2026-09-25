@@ -582,7 +582,10 @@ fn execute_exchange_session(
         })?;
     }
 
-    let (event_sink, session_write_error) = open_session_event_sink(&session_path, create_new)?;
+    let SessionEventSink {
+        sink: event_sink,
+        session_write_error,
+    } = open_session_event_sink(&session_path, create_new)?;
     let mut sink = Rc::new(RefCell::new(event_sink));
     let transport = build_transport(config);
     let mut response_output = Vec::new();
@@ -655,11 +658,13 @@ fn execute_exchange_session_core(
     let call_start = Instant::now();
     let result = timed_session_exchange(
         sink,
-        meta,
-        &request.body,
-        &session_id,
-        turn_index,
-        transport.max_tool_rounds(),
+        TimedSessionExchangeContext {
+            meta,
+            prompt: &request.body,
+            session_id: &session_id,
+            turn_index,
+            max_tool_rounds: transport.max_tool_rounds(),
+        },
         &mut warning,
         |sink| {
             transport.run_observed(resumed.conversation.messages(), &mut |event| {
@@ -752,7 +757,7 @@ fn write_exchange_response(
             let json = serde_json::to_string(&response).expect("MessageEnvelope always serializes");
             writeln!(output, "{json}").map_err(io_err)?;
             if response.kind == MessageKind::Error {
-                Err(delivered_turn_failure(&response))
+                Err(delivered_turn_failure(response))
             } else {
                 Ok(())
             }
@@ -760,7 +765,7 @@ fn write_exchange_response(
         (ExchangeMode::PlainText, MessageKind::Response) => {
             writeln!(output, "{}", response.body).map_err(io_err)
         }
-        (ExchangeMode::PlainText, MessageKind::Error) => Err(delivered_turn_failure(&response)),
+        (ExchangeMode::PlainText, MessageKind::Error) => Err(delivered_turn_failure(response)),
         (ExchangeMode::PlainText, _) => {
             eprintln!("{}", response.body);
             Ok(())
@@ -1052,11 +1057,13 @@ fn run_session_repl_with_warning(
         conversation.push_user(line.as_str());
         let result = timed_session_exchange(
             sink,
-            meta,
-            &line,
-            &session_id,
-            turn_index,
-            transport.max_tool_rounds(),
+            TimedSessionExchangeContext {
+                meta,
+                prompt: &line,
+                session_id: &session_id,
+                turn_index,
+                max_tool_rounds: transport.max_tool_rounds(),
+            },
             warning,
             |sink| {
                 transport.run_observed(conversation.messages(), &mut |event| {
@@ -1101,19 +1108,30 @@ fn run_session_repl_with_warning(
     Ok(())
 }
 
+struct TimedSessionExchangeContext<'a> {
+    meta: &'a ExchangeMeta,
+    prompt: &'a str,
+    session_id: &'a str,
+    turn_index: u64,
+    max_tool_rounds: Option<usize>,
+}
+
 /// Times one session turn's provider call, recording its `request` and
 /// terminal outcome on `sink` before returning the call's result. `call`
 /// gets the sink so the turn's tool events land between the two.
 fn timed_session_exchange(
     sink: &mut dyn EventSink,
-    meta: &ExchangeMeta,
-    prompt: &str,
-    session_id: &str,
-    turn_index: u64,
-    max_tool_rounds: Option<usize>,
+    context: TimedSessionExchangeContext<'_>,
     warning: &mut dyn Write,
     call: impl FnOnce(&mut dyn EventSink) -> Result<TurnOutcome>,
 ) -> Result<TurnOutcome> {
+    let TimedSessionExchangeContext {
+        meta,
+        prompt,
+        session_id,
+        turn_index,
+        max_tool_rounds,
+    } = context;
     let request = ExchangeEvent::session_request(now_ms(), meta, prompt, session_id, turn_index);
     emit(sink, &request);
 
@@ -1511,11 +1529,13 @@ fn load_exchange_session(path: &Path, session_id: &str) -> Result<ResumedSession
     select_and_rehydrate(report.sessions, Some(session_id))
 }
 
+struct SessionEventSink {
+    sink: Box<dyn EventSink>,
+    session_write_error: Rc<RefCell<Option<String>>>,
+}
+
 /// Opens the required session trail and the optional `LEG_EVENT_LOG` sink.
-fn open_session_event_sink(
-    path: &Path,
-    create_new: bool,
-) -> Result<(Box<dyn EventSink>, Rc<RefCell<Option<String>>>)> {
+fn open_session_event_sink(path: &Path, create_new: bool) -> Result<SessionEventSink> {
     let mut options = OpenOptions::new();
     options.write(true).append(true);
     if create_new {
@@ -1529,14 +1549,14 @@ fn open_session_event_sink(
     })?;
     let event_log = open_event_sink_excluding(path);
     let session_write_error = Rc::new(RefCell::new(None));
-    Ok((
-        Box::new(CompositeEventSink {
+    Ok(SessionEventSink {
+        sink: Box::new(CompositeEventSink {
             session: Box::new(WriterSink::new(file)),
             event_log,
             session_write_error: Rc::clone(&session_write_error),
         }),
         session_write_error,
-    ))
+    })
 }
 
 /// Opens `LEG_EVENT_LOG` unless it points at the session store file itself.

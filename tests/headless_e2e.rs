@@ -128,12 +128,14 @@ fn spawn_auth_failure_server() -> String {
 
 /// Starts a stoppable provider probe. Every received request is captured and
 /// answered, allowing tests to prove a command made no network call.
-fn spawn_request_probe() -> (
+type RequestProbe = (
     String,
     Arc<Mutex<Vec<String>>>,
     mpsc::Sender<()>,
     thread::JoinHandle<()>,
-) {
+);
+
+fn spawn_request_probe() -> RequestProbe {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     listener
         .set_nonblocking(true)
