@@ -12,7 +12,9 @@ mod process;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 const DESCRIPTION: &str = "Run a shell command with Bash in the current working directory. \
-The command runs as the current OS user. Each output stream is capped at 2000 lines or 50 KB. \
+The command runs as the current OS user. Leg's provider credential variables are removed from \
+the command environment; login-shell startup files may re-export them. Each output stream is \
+capped at 2000 lines or 50 KB. \
 Commands time out after 10 seconds by default; set timeout to change the limit.";
 
 /// The `bash` tool handler.
@@ -233,6 +235,51 @@ mod tests {
         );
         assert_eq!(spec.input_schema["properties"]["timeout"]["default"], 10);
         assert!(spec.description.contains("2000 lines or 50 KB"));
+        assert!(
+            spec.description
+                .contains("provider credential variables are removed")
+        );
+        assert!(
+            spec.description
+                .contains("startup files may re-export them")
+        );
+    }
+
+    #[test]
+    fn removes_leg_credentials_but_preserves_other_environment_variables() {
+        if !bash_available() {
+            return;
+        }
+        let home = temp_dir("credentials");
+        let tool = BashTool::new()
+            .with_env("HOME", home.as_os_str().to_os_string())
+            .with_env("ANTHROPIC_API_KEY", "test-api-key")
+            .with_env("ANTHROPIC_AUTH_TOKEN", "test-auth-token")
+            .with_env("CLAUDE_CODE_OAUTH_TOKEN", "test-oauth-token")
+            .with_env("MAT_TEST_MARKER", "visible");
+        let result = tool
+            .call(&serde_json::json!({
+                "command": "env | while IFS= read -r line; do case \"$line\" in ANTHROPIC_API_KEY=*|ANTHROPIC_AUTH_TOKEN=*|CLAUDE_CODE_OAUTH_TOKEN=*|MAT_TEST_MARKER=*) printf '%s\\n' \"$line\";; esac; done"
+            }))
+            .map(|output| serde_json::from_str::<Value>(&output).unwrap());
+        std::fs::remove_dir_all(home).unwrap();
+
+        let output = result.unwrap();
+        assert_eq!(output["exit_code"], 0);
+        let stdout = output["stdout"].as_str().unwrap();
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ] {
+            assert!(
+                !stdout
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{var}="))),
+                "{var} was present in the command environment: {stdout}"
+            );
+        }
+        assert!(stdout.lines().any(|line| line == "MAT_TEST_MARKER=visible"));
     }
 
     #[test]
