@@ -47,6 +47,11 @@ const SLEEP_TOOL_ROUNDS: [&str; 1] = [
     r#"{"content":[{"type":"tool_use","id":"toolu_sleep","name":"bash","input":{"command":"echo $$ > shell.pid; sleep 60 & echo $! > sleep.pid; wait","timeout":60}}],"stop_reason":"tool_use"}"#,
 ];
 
+#[cfg(unix)]
+const SECOND_SIGNAL_ROUNDS: [&str; 1] = [
+    r#"{"content":[{"type":"tool_use","id":"toolu_second_signal","name":"bash","input":{"command":"trap '' TERM; echo $$ > shell.pid; echo $$ > sleep.pid; exec sleep 60","timeout":60}}],"stop_reason":"tool_use"}"#,
+];
+
 /// Starts a sequence mock server on an OS-assigned port, returning its base
 /// URL and the request bodies it receives. It answers one connection per
 /// scripted round, in order, then stops accepting — so a request beyond the
@@ -1340,5 +1345,115 @@ fn sigterm_abandons_an_in_flight_provider_request() {
     );
     assert_eq!(events.last().unwrap()["kind"], "interrupted");
 
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn second_signal_exits_immediately_and_kills_bash_process_group() {
+    let (base_url, requests) = spawn_sequence_server(&SECOND_SIGNAL_ROUNDS);
+    let cwd = fixture_dir("exchange-second-signal");
+    let trail = cwd.join("trail.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("exchange");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let leg_pid = child.id().try_into().expect("leg pid fits pid_t");
+    let shell_pid_file = cwd.join("shell.pid");
+    let sleep_pid_file = cwd.join("sleep.pid");
+    let mut cleanup = SignalTestCleanup {
+        leg_pid,
+        shell_pid_file: shell_pid_file.clone(),
+        sleep_pid_file: sleep_pid_file.clone(),
+        active: true,
+    };
+    let request = serde_json::json!({
+        "schema": "baton.message/v1",
+        "message_id": "m-second-signal",
+        "conversation_id": "c-second-signal",
+        "from": "external",
+        "to": "leg",
+        "in_reply_to": null,
+        "kind": "request",
+        "body": "run the long command",
+        "ts_ms": 1_700_000_000_000_u64,
+        "exchange": null
+    })
+    .to_string();
+    let mut stdin = child.stdin.take();
+    stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(request.as_bytes())
+        .expect("write leg input");
+    stdin.take();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let shell_pid = loop {
+        if let (Some(shell_pid), Some(sleep_pid)) = (
+            read_pid_file(&shell_pid_file),
+            read_pid_file(&sleep_pid_file),
+        ) && shell_pid == sleep_pid
+            && process_is_running(sleep_pid)
+        {
+            break shell_pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bash did not start the SIGTERM-ignoring sleep"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    assert_eq!(
+        unsafe { libc::kill(leg_pid, libc::SIGTERM) },
+        0,
+        "send first signal to leg"
+    );
+    let second_signal_started = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(leg_pid, libc::SIGINT) },
+        0,
+        "send second signal to leg"
+    );
+    let output = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second signal did not exit immediately")
+        .expect("wait for leg");
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(shell_pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_is_running(shell_pid),
+        "SIGTERM-ignoring sleep process {shell_pid} survived the second signal"
+    );
+    assert!(
+        second_signal_started.elapsed() <= Duration::from_secs(1),
+        "second signal did not exit immediately"
+    );
+    assert!(
+        [130, 143].contains(&output.status.code().expect("signal exit code")),
+        "expected signal-specific exit code, got {:?}",
+        output.status.code()
+    );
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "immediate exit should bypass diagnostics"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    cleanup.active = false;
     std::fs::remove_dir_all(&cwd).ok();
 }
