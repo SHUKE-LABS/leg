@@ -30,6 +30,9 @@ const ROUNDS: [&str; 4] = [
     r#"{"content":[{"type":"text","text":"all done"}],"stop_reason":"end_turn"}"#,
 ];
 
+const ONE_TEXT_REPLY: [&str; 1] =
+    [r#"{"content":[{"type":"text","text":"hi there"}],"stop_reason":"end_turn"}"#];
+
 /// Starts a sequence mock server on an OS-assigned port, returning its base
 /// URL and the request bodies it receives. It answers one connection per
 /// scripted round, in order, then stops accepting — so a request beyond the
@@ -231,6 +234,73 @@ fn assert_chain_effects(cwd: &Path, requests: &Mutex<Vec<String>>) {
     );
 }
 
+fn assert_exchange_trail(cwd: &Path, base_url: &str, trail: &Path, prompt: &str) {
+    let events: Vec<Value> = std::fs::read_to_string(trail)
+        .expect("trail written")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("trail line is JSON"))
+        .collect();
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| event["event"].as_str().expect("event kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "request",
+            "tool_round",
+            "tool_call",
+            "tool_result",
+            "tool_round",
+            "tool_call",
+            "tool_result",
+            "tool_round",
+            "tool_call",
+            "tool_result",
+            "response_ok",
+        ]
+    );
+
+    let request = &events[0];
+    assert_eq!(request["schema"], "baton.exchange/v1");
+    assert_eq!(request["model"], "claude-test-model");
+    assert_eq!(request["base_url"], base_url);
+    assert_eq!(request["prompt"], prompt);
+    assert!(request.get("session_id").is_none());
+    assert!(request.get("turn_index").is_none());
+
+    let tool_names: Vec<&str> = events
+        .iter()
+        .filter(|event| event["event"] == "tool_call")
+        .map(|event| event["tool_name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(tool_names, ["read", "edit", "bash"]);
+    let outcome = events.last().expect("outcome event");
+    assert_eq!(outcome["reply"], "all done");
+
+    let mut show = leg(cwd, base_url);
+    show.arg("log").arg("show").arg("--file").arg(trail);
+    let shown = run(show, None);
+    assert!(
+        shown.status.success(),
+        "leg log show failed; stderr: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    for (name, id) in [
+        ("read", "toolu_1"),
+        ("edit", "toolu_2"),
+        ("bash", "toolu_3"),
+    ] {
+        assert!(
+            shown.contains(&format!("tool:   {name} [{id}]")),
+            "log show lacks the {name} call:\n{shown}"
+        );
+    }
+    assert_eq!(shown.matches("→ completed: ").count(), 3, "{shown}");
+    assert!(shown.contains("reply:  all done"), "{shown}");
+}
+
 #[test]
 fn ask_drives_read_edit_bash_and_records_the_tool_trail() {
     let (base_url, requests) = spawn_sequence_server(&ROUNDS);
@@ -331,6 +401,7 @@ fn ask_provider_failure_leaves_stdout_empty_and_exits_nonzero() {
 fn exchange_drives_read_edit_bash_and_emits_one_envelope() {
     let (base_url, requests) = spawn_sequence_server(&ROUNDS);
     let cwd = fixture_dir("exchange");
+    let trail = cwd.join("trail.jsonl");
 
     let request = serde_json::json!({
         "schema": "baton.message/v1",
@@ -345,7 +416,7 @@ fn exchange_drives_read_edit_bash_and_emits_one_envelope() {
         "exchange": null
     });
     let mut cmd = leg(&cwd, &base_url);
-    cmd.arg("exchange");
+    cmd.env("LEG_EVENT_LOG", &trail).arg("exchange");
     let output = run(cmd, Some(&request.to_string()));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -362,6 +433,105 @@ fn exchange_drives_read_edit_bash_and_emits_one_envelope() {
     assert_eq!(response["in_reply_to"], "m-1");
     assert_eq!(response["body"], "all done");
     assert_chain_effects(&cwd, &requests);
+    assert_exchange_trail(&cwd, &base_url, &trail, "mark the TODO done and verify it");
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn plain_text_exchange_drives_read_edit_bash_and_records_the_trail() {
+    let (base_url, requests) = spawn_sequence_server(&ROUNDS);
+    let cwd = fixture_dir("exchange-plain-text");
+    let trail = cwd.join("trail.jsonl");
+    let prompt = "mark the TODO done and verify it";
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("exchange");
+    let output = run(cmd, Some(prompt));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "leg exchange failed; stderr: {stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "all done\n");
+    assert_chain_effects(&cwd, &requests);
+    assert_exchange_trail(&cwd, &base_url, &trail, prompt);
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_does_not_create_a_trail_when_event_log_is_unset_or_blank() {
+    for (tag, value) in [("unset", None), ("blank", Some("  "))] {
+        let (base_url, _) = spawn_sequence_server(&ONE_TEXT_REPLY);
+        let cwd = fixture_dir(&format!("exchange-log-{tag}"));
+        let trail = cwd.join("trail.jsonl");
+
+        let mut cmd = leg(&cwd, &base_url);
+        if let Some(value) = value {
+            cmd.env("LEG_EVENT_LOG", value);
+        }
+        cmd.arg("exchange");
+        let output = run(cmd, Some("hello"));
+
+        assert!(
+            output.status.success(),
+            "leg exchange failed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hi there\n");
+        assert!(!trail.exists(), "disabled logging must not create a trail");
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+}
+
+#[test]
+fn exchange_event_log_open_failure_warns_without_changing_the_reply() {
+    let (base_url, _) = spawn_sequence_server(&ONE_TEXT_REPLY);
+    let cwd = fixture_dir("exchange-log-open-failure");
+    let missing_parent = cwd.join("missing").join("trail.jsonl");
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &missing_parent).arg("exchange");
+    let output = run(cmd, Some("hello"));
+
+    assert!(
+        output.status.success(),
+        "log open failure changed the exit status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hi there\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("warning: failed to open"),
+        "log open failure must warn on stderr"
+    );
+    assert!(!missing_parent.exists());
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exchange_event_log_write_failure_warns_without_changing_the_reply() {
+    let (base_url, _) = spawn_sequence_server(&ONE_TEXT_REPLY);
+    let cwd = fixture_dir("exchange-log-write-failure");
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", "/dev/full").arg("exchange");
+    let output = run(cmd, Some("hello"));
+
+    assert!(
+        output.status.success(),
+        "log write failure changed the exit status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hi there\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("warning: failed to record exchange event"),
+        "log write failure must warn on stderr"
+    );
 
     std::fs::remove_dir_all(&cwd).ok();
 }

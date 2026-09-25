@@ -111,9 +111,10 @@ reply and `exchange` writes one response. On provider/delivery failure, both
 exit non-zero: `ask` and plain-text `exchange` leave stdout empty and report
 an error on stderr; envelope `exchange` writes its `kind:"error"` response
 before reporting the failure. To observe tool steps, set `LEG_EVENT_LOG` on
-`ask` and read the trail back with `leg log show`. The `bash` tool needs
-`bash` on `PATH` (Git Bash on Windows). `tests/headless_e2e.rs` exercises
-this contract end to end against a fake provider.
+`ask` or `exchange` and read the trail back with `leg log show`. The `bash`
+tool needs `bash` on `PATH` (Git Bash on Windows).
+`tests/headless_e2e.rs` exercises this contract end to end against a fake
+provider.
 
 ### Sessions
 
@@ -161,7 +162,8 @@ text included), then each of that round's calls as a `tool_call` line
 (`tool_use_id`, `tool_name`, `input`), followed by exactly one `tool_result`
 line with the same `tool_use_id`, a `status` of `completed` or `failed`, and
 the tool's `result` or `error`. All three carry `schema` and `ts_ms`, plus
-`session_id`/`turn_index` on session turns. `leg exchange` writes no trail.
+`session_id`/`turn_index` on session turns; sessionless `ask`/`exchange`
+events omit those fields.
 
 ### Exchange
 
@@ -172,7 +174,8 @@ leg exchange [--in <path>] [--out <path>]
 Answers one `baton.message/v1` request (from `--in`, or stdin) with exactly
 one response (to `--out`, or stdout); a plain-text request gets the reply
 body alone. The tool loop runs inside that single exchange. `leg exchange`
-is the headless entry point for adapters.
+is the headless entry point for adapters. If `LEG_EVENT_LOG` is non-blank,
+it appends request, tool, and outcome events to the trail for `leg log show`.
 
 ## CI-supported targets
 

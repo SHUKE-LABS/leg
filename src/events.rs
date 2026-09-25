@@ -59,10 +59,10 @@ pub struct RequestRecord {
     /// results, multiple blocks); absent for a text-only prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentBlock>>,
-    /// Session this turn belongs to; absent on the single-turn `ask` path.
+    /// Session this turn belongs to; absent on single-turn `ask`/`exchange`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Monotonic turn number within the session; absent on the `ask` path.
+    /// Monotonic turn number within the session; absent on `ask`/`exchange`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_index: Option<u64>,
 }
@@ -93,7 +93,7 @@ pub enum Outcome {
         /// Provider-reported terminal reason; omitted when unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
-        /// Session this outcome belongs to; absent on the `ask` path.
+        /// Session this outcome belongs to; absent on `ask`/`exchange`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         /// Monotonic turn number matching the session request; absent when
@@ -112,7 +112,7 @@ pub enum Outcome {
         kind: String,
         /// Human-readable error description.
         message: String,
-        /// Session this outcome belongs to; absent on the `ask` path.
+        /// Session this outcome belongs to; absent on `ask`/`exchange`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         /// Monotonic turn number matching the session request; absent when
@@ -409,8 +409,8 @@ impl ExchangeEvent {
         }
     }
 
-    /// Builds the request event for the single-turn `ask` path (no session
-    /// framing).
+    /// Builds the request event for a single-turn `ask`/`exchange` (no
+    /// session framing).
     pub fn request(ts_ms: u64, meta: &ExchangeMeta, prompt: &str) -> Self {
         ExchangeEvent::Request {
             schema: SCHEMA,
@@ -465,8 +465,8 @@ impl ExchangeEvent {
         }
     }
 
-    /// Builds the success outcome event for the single-turn `ask` path (no
-    /// session framing).
+    /// Builds the success outcome event for a single-turn `ask`/`exchange`
+    /// (no session framing).
     pub fn response_ok(
         ts_ms: u64,
         duration_ms: u64,
@@ -537,8 +537,8 @@ impl ExchangeEvent {
         }
     }
 
-    /// Builds the failure outcome event for the single-turn `ask` path (no
-    /// session framing).
+    /// Builds the failure outcome event for a single-turn `ask`/`exchange`
+    /// (no session framing).
     pub fn response_error(ts_ms: u64, duration_ms: u64, err: &crate::error::LegError) -> Self {
         Self::response_error_inner(ts_ms, duration_ms, err, None, None)
     }
@@ -587,9 +587,9 @@ impl ExchangeEvent {
     }
 
     /// Mirrors an already-recorded [`RequestRecord`] (from a [`Participant`]'s
-    /// in-band [`Exchange`]) onto the flat JSONL trail, so `ask`'s single call
-    /// through [`crate::participant::LocalParticipant`] and `session`'s direct
-    /// calls emit exactly the same wire shape.
+    /// in-band [`Exchange`]) onto the flat JSONL trail, so `ask`/`exchange`'s
+    /// single call through [`crate::participant::LocalParticipant`] and
+    /// `session`'s direct calls emit exactly the same wire shape.
     ///
     /// [`Participant`]: crate::participant::Participant
     pub fn from_request_record(request: &RequestRecord) -> Self {

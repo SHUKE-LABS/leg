@@ -1,9 +1,9 @@
 //! The participant seam: an envelope-in / envelope-out boundary.
 //!
-//! [`Participant`] is the `ask` driver's infallible contract: a provider (or
-//! delivery) failure is a *delivered* `kind: "error"` response, never a
-//! propagated `Err`. [`LocalParticipant`] is the only implementation ported at
-//! this slice — an in-process, LLM-backed participant that is a
+//! [`Participant`] is the infallible contract used by `ask` and `exchange`: a
+//! provider (or delivery) failure is a *delivered* `kind: "error"` response,
+//! never a propagated `Err`. [`LocalParticipant`] is the only implementation
+//! ported at this slice — an in-process, LLM-backed participant that is a
 //! [`crate::transport::Transport`] plus the metadata stamped on its nested
 //! exchange record. Subprocess/mailbox/external-agent participants (baton's
 //! `SubprocessParticipant`/`MailboxParticipant`/`ExternalAgentParticipant`) are

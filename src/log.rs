@@ -1,8 +1,8 @@
 //! Reading and rendering the JSONL exchange-event trail.
 //!
-//! [`crate::events`] owns the write path: each `ask`/`session` exchange emits
-//! a `request` line, any `tool_call`/`tool_result` lines for the tool calls it
-//! made, then exactly one outcome line, with `session`
+//! [`crate::events`] owns the write path: each `ask`/`exchange` turn or
+//! `session` turn emits a `request` line, any `tool_call`/`tool_result` lines
+//! for the tool calls it made, then exactly one outcome line, with `session`
 //! additionally framing its run between `session_start`/`session_end`
 //! markers. This module owns the read path — turning that trail back into
 //! typed, paired [`Exchange`] values (`leg log show`/`leg log replay`) or
@@ -15,9 +15,10 @@
 //!
 //! Unknown `event` tags are skipped (forward-compatibility with a newer
 //! writer). A line that is not valid JSON is a hard parse error — except a
-//! trailing partial line, one with no terminating newline left behind when a
-//! `leg ask`/`session` process is killed mid-write: that is tolerated and
-//! reported as a warning, so an unclean shutdown never bricks the whole trail.
+//! trailing partial line, one with no terminating newline left behind when an
+//! `ask`, `exchange`, or `session` process is killed mid-write: that is
+//! tolerated and reported as a warning, so an unclean shutdown never bricks
+//! the whole trail.
 
 use std::io::{BufRead, BufReader, Read};
 
@@ -244,9 +245,9 @@ struct SessionEndRecord {
 /// Reads the same trail as [`parse_jsonl`], but groups by session framing
 /// rather than pairing bare exchanges: `session_start` / `session_end`
 /// markers bound a session, and each session turn's `request` carries the
-/// `session_id` + `turn_index` that place it. A sessionless (`ask`) request
-/// carries neither and is skipped — it belongs to no session. Behaviour at
-/// the edges mirrors [`parse_jsonl`]: a trailing partial line is tolerated
+/// `session_id` + `turn_index` that place it. A sessionless request (`ask` or
+/// `exchange`) carries neither and is skipped — it belongs to no session.
+/// Behaviour at the edges mirrors [`parse_jsonl`]: a trailing partial line is tolerated
 /// with a warning; any other malformed known event is a hard error.
 pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
     let mut buffered = BufReader::new(reader);
@@ -305,8 +306,8 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                         outcome: None,
                     });
                 }
-                // A sessionless (`ask`) request carries no session_id and is
-                // skipped — it belongs to no session.
+                // A sessionless `ask`/`exchange` request carries no session_id
+                // and is skipped — it belongs to no session.
             }
             Some("tool_round") => {
                 let turn = session_turn(&report.sessions, &index, &value);
@@ -370,8 +371,8 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                     .map(str::to_string);
                 let turn_index = value.get("turn_index").and_then(Value::as_u64);
                 let outcome: Outcome = from_value(value, line_no, &event)?;
-                // A sessionless (`ask`) outcome carries neither field and is
-                // skipped — it belongs to no session.
+                // A sessionless `ask`/`exchange` outcome carries neither field
+                // and is skipped — it belongs to no session.
                 if let (Some(session_id), Some(turn_index)) = (session_id, turn_index) {
                     if let Some(&idx) = index.get(&session_id)
                         && let Some(turn) = report.sessions[idx]
@@ -397,8 +398,8 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
 /// Locates the session turn a tool line belongs to, by its `session_id` +
 /// `turn_index`, as `(session, turn)` indexes.
 ///
-/// `None` for a sessionless (`ask`) line, which belongs to no session and is
-/// skipped; `Some(None)` for a session-stamped line with no matching turn.
+/// `None` for a sessionless `ask`/`exchange` line, which belongs to no session
+/// and is skipped; `Some(None)` for a session-stamped line with no matching turn.
 fn session_turn(
     sessions: &[SessionRecord],
     index: &std::collections::HashMap<String, usize>,
@@ -639,8 +640,8 @@ mod tests {
     /// baton's own `parses_valid_two_line_exchange` test
     /// (`baton/src/log.rs`) — is both (a) parsed correctly by `leg`'s
     /// [`parse_jsonl`], and (b) exactly what `leg`'s own
-    /// [`crate::events::ExchangeEvent`] serializes for a sessionless `ask`
-    /// exchange with no token/stop-reason data. Field names, order, and the
+    /// [`crate::events::ExchangeEvent`] serializes for a sessionless `ask` or
+    /// `exchange` turn with no token/stop-reason data. Field names, order, and the
     /// absence of unset optional fields must all match, since baton's own
     /// `log` reads leg's trail (and vice versa) for this ask/exchange subset.
     #[test]
