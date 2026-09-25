@@ -50,16 +50,17 @@ error including `kind: error` on stderr, and exits non-zero. Configuration
 failures (missing/malformed env vars) also exit non-zero.
 Also accepts `ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`,
 `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`, `LEG_MAX_TOKENS`,
-`LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
+`LEG_MAX_TOOL_ROUNDS`, `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
 ### Tool loop
 
 `ask`, `session`, and `exchange` share one tool loop. It runs only when a
 reply requests tools (`stop_reason: tool_use`): each call is executed and
 its result sent back until the model answers, and only that final reply is
-printed. A user turn stops after 10 tool-use rounds; if the reply still
-requests tools, `leg` sends no further request and warns on stderr. A call
-to an unregistered tool is answered with an error result.
+printed. `LEG_MAX_TOOL_ROUNDS` optionally sets a positive round limit; unset
+or blank is unbounded. With a configured limit, if the reply still requests
+tools after that many rounds, `leg` sends no further request and warns on
+stderr. A call to an unregistered tool is answered with an error result.
 
 ### Tools
 

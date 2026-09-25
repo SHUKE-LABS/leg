@@ -600,7 +600,7 @@ mod tests {
         ]);
         let mut registry = ToolRegistry::new();
         registry.register(ReadTool::spec(), Box::new(ReadTool::new(ReadSet::new())));
-        let tool_loop = ToolLoop::new(transport, registry);
+        let tool_loop = ToolLoop::new(transport, registry, None);
 
         tool_loop.run(&[Message::user("go")]).unwrap();
 

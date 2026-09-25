@@ -59,6 +59,10 @@ pub struct LegConfig {
     /// defaulting to [`DEFAULT_MAX_TOKENS`]. Must be a positive integer; zero is
     /// rejected because the API rejects it.
     pub max_tokens: u32,
+    /// Optional maximum tool-use rounds per turn. From `LEG_MAX_TOOL_ROUNDS`;
+    /// unset or blank means unbounded, while a configured value must be a
+    /// positive integer.
+    pub max_tool_rounds: Option<usize>,
     /// Optional system prompt. When `LEG_SYSTEM_PROMPT` names a readable file,
     /// this holds its content; the transport then sends it as the request's
     /// `system` field. Unset or blank leaves this `None` and omits the field.
@@ -116,6 +120,23 @@ impl LegConfig {
             None => DEFAULT_MAX_TOKENS,
         };
 
+        let max_tool_rounds = match non_empty(lookup("LEG_MAX_TOOL_ROUNDS")) {
+            Some(raw) => {
+                let parsed = raw.parse::<usize>().map_err(|_| {
+                    LegError::Config(format!(
+                        "LEG_MAX_TOOL_ROUNDS must be a positive integer, got {raw:?}"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(LegError::Config(
+                        "LEG_MAX_TOOL_ROUNDS must be greater than zero".to_string(),
+                    ));
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+
         let system_prompt = resolve_system_prompt(non_empty(lookup("LEG_SYSTEM_PROMPT")))?;
 
         Ok(Self {
@@ -124,6 +145,7 @@ impl LegConfig {
             model,
             timeout: Duration::from_secs(timeout_secs),
             max_tokens,
+            max_tool_rounds,
             system_prompt,
         })
     }
@@ -208,6 +230,7 @@ mod tests {
         assert_eq!(cfg.model, DEFAULT_MODEL);
         assert_eq!(cfg.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         assert_eq!(cfg.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(cfg.max_tool_rounds, None);
         assert_eq!(cfg.system_prompt, None);
     }
 
@@ -219,12 +242,14 @@ mod tests {
             ("LEG_MODEL", "claude-opus-4-8"),
             ("LEG_TIMEOUT_SECS", "5"),
             ("LEG_MAX_TOKENS", "42"),
+            ("LEG_MAX_TOOL_ROUNDS", "3"),
         ]))
         .expect("config should load");
         assert_eq!(cfg.base_url, "https://proxy.example");
         assert_eq!(cfg.model, "claude-opus-4-8");
         assert_eq!(cfg.timeout, Duration::from_secs(5));
         assert_eq!(cfg.max_tokens, 42);
+        assert_eq!(cfg.max_tool_rounds, Some(3));
     }
 
     #[test]
@@ -277,14 +302,28 @@ mod tests {
     }
 
     #[test]
+    fn zero_or_non_integer_max_tool_rounds_are_rejected() {
+        for raw in ["0", "abc"] {
+            let err = LegConfig::from_lookup(lookup_from(&[
+                ("ANTHROPIC_API_KEY", "secret"),
+                ("LEG_MAX_TOOL_ROUNDS", raw),
+            ]))
+            .unwrap_err();
+            assert!(matches!(err, LegError::Config(_)), "{raw}");
+        }
+    }
+
+    #[test]
     fn blank_optional_vars_fall_back_to_defaults() {
         let cfg = LegConfig::from_lookup(lookup_from(&[
             ("ANTHROPIC_API_KEY", "secret"),
             ("LEG_MODEL", "  "),
             ("ANTHROPIC_BASE_URL", ""),
+            ("LEG_MAX_TOOL_ROUNDS", "  "),
         ]))
         .expect("config should load");
         assert_eq!(cfg.model, DEFAULT_MODEL);
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+        assert_eq!(cfg.max_tool_rounds, None);
     }
 }

@@ -425,7 +425,7 @@ mod tests {
         ]);
         let mut registry = ToolRegistry::new();
         registry.register(EditTool::spec(), Box::new(EditTool::new()));
-        let tool_loop = ToolLoop::new(transport, registry);
+        let tool_loop = ToolLoop::new(transport, registry, None);
 
         tool_loop.run(&[Message::user("go")]).unwrap();
 

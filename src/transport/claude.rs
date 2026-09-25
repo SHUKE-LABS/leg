@@ -294,8 +294,14 @@ struct ErrorDetail {
 mod tests {
     use super::*;
     use crate::config::{Credential, DEFAULT_MAX_TOKENS};
+    use crate::events::{ExchangeMeta, Outcome};
+    use crate::message::{MessageEnvelope, MessageKind};
     use crate::model::{Prompt, Role};
-    use std::cell::RefCell;
+    use crate::participant::{LocalParticipant, Participant};
+    use crate::tools::ToolLoop;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
     use std::time::Duration;
 
     /// A fake transport that records the last request and returns a canned
@@ -340,6 +346,37 @@ mod tests {
         }
     }
 
+    struct ScriptedHttp {
+        responses: RefCell<VecDeque<(u16, String)>>,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl ScriptedHttp {
+        fn new(responses: Vec<(u16, String)>, calls: Rc<Cell<usize>>) -> Self {
+            Self {
+                responses: RefCell::new(responses.into()),
+                calls,
+            }
+        }
+    }
+
+    impl HttpClient for ScriptedHttp {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &str,
+        ) -> Result<crate::transport::http::HttpResponse> {
+            self.calls.set(self.calls.get() + 1);
+            let Some((status, body)) = self.responses.borrow_mut().pop_front() else {
+                return Err(LegError::Transport(
+                    "scripted HTTP response queue exhausted".to_string(),
+                ));
+            };
+            Ok(crate::transport::http::HttpResponse { status, body })
+        }
+    }
+
     fn config_with(base_url: &str, model: &str) -> LegConfig {
         config_with_credential(
             base_url,
@@ -355,6 +392,7 @@ mod tests {
             model: model.to_string(),
             timeout: Duration::from_secs(60),
             max_tokens: DEFAULT_MAX_TOKENS,
+            max_tool_rounds: None,
             system_prompt: None,
         }
     }
@@ -809,6 +847,78 @@ mod tests {
                 assert_eq!(message, "bad model");
             }
             other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn later_round_bad_request_is_delivered_without_retry() {
+        const TOOL_USE_BODY: &str = r#"{
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "echo",
+                "input": {"text": "hi"}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        }"#;
+        const ERROR_BODY: &str = r#"{
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "prompt is too long"
+            }
+        }"#;
+
+        let http_calls = Rc::new(Cell::new(0));
+        let tool_calls = Rc::new(Cell::new(0));
+        let registry = crate::tools::tests::echo_registry(tool_calls.clone());
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            ScriptedHttp::new(
+                vec![
+                    (200, TOOL_USE_BODY.to_string()),
+                    (400, ERROR_BODY.to_string()),
+                ],
+                http_calls.clone(),
+            ),
+        )
+        .with_tools(registry.specs());
+        let transport = ToolLoop::new(client, registry, None);
+        let participant = LocalParticipant::new(
+            transport,
+            ExchangeMeta {
+                model: "claude-sonnet-4-6".to_string(),
+                base_url: "https://api.anthropic.com".to_string(),
+            },
+        );
+        let request = MessageEnvelope::new(
+            "m-1",
+            "c-1",
+            "user",
+            "assistant",
+            MessageKind::Request,
+            "hello",
+            1_700_000_000_000,
+        );
+
+        let response = participant.respond(&request);
+
+        assert_eq!(response.kind, MessageKind::Error);
+        assert_eq!(response.body, "provider error (400): prompt is too long");
+        assert_eq!(tool_calls.get(), 1);
+        assert_eq!(http_calls.get(), 2);
+        match &response
+            .exchange
+            .expect("wrapped exchange")
+            .exchange
+            .outcome
+        {
+            Outcome::Error { kind, message, .. } => {
+                assert_eq!(kind, "api");
+                assert_eq!(message, "provider error (400): prompt is too long");
+            }
+            other => panic!("expected delivered error outcome, got {other:?}"),
         }
     }
 
