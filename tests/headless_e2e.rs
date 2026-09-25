@@ -33,6 +33,12 @@ const ROUNDS: [&str; 4] = [
 const ONE_TEXT_REPLY: [&str; 1] =
     [r#"{"content":[{"type":"text","text":"hi there"}],"stop_reason":"end_turn"}"#];
 
+const SESSION_ROUNDS: [&str; 3] = [
+    r#"{"content":[{"type":"tool_use","id":"toolu_session","name":"read","input":{"path":"notes.txt"}}],"stop_reason":"tool_use"}"#,
+    r#"{"content":[{"type":"text","text":"first turn remembered"}],"stop_reason":"end_turn"}"#,
+    r#"{"content":[{"type":"text","text":"history restored"}],"stop_reason":"end_turn"}"#,
+];
+
 /// Starts a sequence mock server on an OS-assigned port, returning its base
 /// URL and the request bodies it receives. It answers one connection per
 /// scripted round, in order, then stops accepting — so a request beyond the
@@ -88,6 +94,54 @@ fn spawn_auth_failure_server() -> String {
     });
 
     format!("http://{addr}")
+}
+
+/// Starts a stoppable provider probe. Every received request is captured and
+/// answered, allowing tests to prove a command made no network call.
+fn spawn_request_probe() -> (
+    String,
+    Arc<Mutex<Vec<String>>>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    listener
+        .set_nonblocking(true)
+        .expect("set mock server nonblocking");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let (stop, stopped) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        loop {
+            match stopped.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let Some(body) = read_request_body(&mut stream) else {
+                        break;
+                    };
+                    captured.lock().unwrap().push(body);
+                    let reply = ONE_TEXT_REPLY[0];
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (format!("http://{addr}"), requests, stop, server)
 }
 
 /// Reads one HTTP/1.1 request and returns its `Content-Length` body.
@@ -232,6 +286,14 @@ fn assert_chain_effects(cwd: &Path, requests: &Mutex<Vec<String>>) {
         "1",
         "bash must run after the edit and see its result"
     );
+}
+
+fn read_events(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .expect("trail written")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("trail line is JSON"))
+        .collect()
 }
 
 fn assert_exchange_trail(cwd: &Path, base_url: &str, trail: &Path, prompt: &str) {
@@ -456,6 +518,301 @@ fn plain_text_exchange_drives_read_edit_bash_and_records_the_trail() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "all done\n");
     assert_chain_effects(&cwd, &requests);
     assert_exchange_trail(&cwd, &base_url, &trail, prompt);
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_named_session_restores_tool_history_and_writes_its_id() {
+    let (base_url, requests) = spawn_sequence_server(&SESSION_ROUNDS);
+    let cwd = fixture_dir("exchange-named-session");
+    let store = cwd.join("sessions");
+    let event_log = cwd.join("legacy-events.jsonl");
+    let id_out = cwd.join("session-id.txt");
+    let continued_id_out = cwd.join("continued-session-id.txt");
+
+    let mut first = leg(&cwd, &base_url);
+    first
+        .env("LEG_SESSION_DIR", &store)
+        .env("LEG_EVENT_LOG", &event_log)
+        .args(["exchange", "--new-session", "--session-id-out"])
+        .arg(&id_out);
+    let request = serde_json::json!({
+        "schema": "baton.message/v1",
+        "message_id": "m-session-1",
+        "conversation_id": "c-session-1",
+        "from": "external",
+        "to": "leg",
+        "in_reply_to": null,
+        "kind": "request",
+        "body": "read notes.txt",
+        "ts_ms": 1_700_000_000_000_u64,
+        "exchange": null
+    })
+    .to_string();
+    let first_output = run(first, Some(&request));
+    assert!(
+        first_output.status.success(),
+        "first session exchange failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let first_response: Value =
+        serde_json::from_slice(&first_output.stdout).expect("response envelope is JSON");
+    assert_eq!(first_response["kind"], "response");
+    assert_eq!(first_response["body"], "first turn remembered");
+
+    let id_line = std::fs::read_to_string(&id_out).expect("new session id written");
+    let session_id = id_line.trim_end_matches('\n');
+    assert!(!session_id.is_empty());
+    assert_eq!(id_line, format!("{session_id}\n"));
+    assert_eq!(
+        first_response["exchange"]["exchange"]["request"]["session_id"],
+        session_id
+    );
+    let session_trail = store.join(format!("{session_id}.jsonl"));
+    assert!(session_trail.is_file(), "session trail created");
+
+    let mut continued = leg(&cwd, &base_url);
+    continued
+        .env("LEG_SESSION_DIR", &store)
+        .env("LEG_EVENT_LOG", &event_log)
+        .args(["exchange", "--session", session_id, "--session-id-out"])
+        .arg(&continued_id_out);
+    let continued_output = run(continued, Some("what should I do next?"));
+    assert!(
+        continued_output.status.success(),
+        "continued session exchange failed: {}",
+        String::from_utf8_lossy(&continued_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&continued_output.stdout),
+        "history restored\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&continued_id_out).expect("continued id written"),
+        format!("{session_id}\n")
+    );
+
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect();
+    assert_eq!(requests.len(), 3, "two tool-loop calls and one later turn");
+    let messages = requests[2]["messages"]
+        .as_array()
+        .expect("conversation history");
+    assert_eq!(messages.len(), 5, "prior turn plus new user message");
+    assert_eq!(messages[0]["content"], "read notes.txt");
+    assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+    assert_eq!(messages[1]["content"][0]["id"], "toolu_session");
+    assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_session");
+    assert_eq!(messages[3]["content"], "first turn remembered");
+    assert_eq!(messages[4]["content"], "what should I do next?");
+
+    let events = read_events(&session_trail);
+    let request_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"] == "request")
+        .collect();
+    assert_eq!(request_events.len(), 2);
+    assert_eq!(request_events[0]["session_id"], session_id);
+    assert_eq!(request_events[0]["turn_index"], 0);
+    assert_eq!(request_events[1]["session_id"], session_id);
+    assert_eq!(request_events[1]["turn_index"], 1);
+    assert!(events.iter().any(|event| {
+        event["event"] == "tool_result"
+            && event["session_id"] == session_id
+            && event["turn_index"] == 0
+    }));
+    assert_eq!(
+        read_events(&event_log),
+        events,
+        "LEG_EVENT_LOG receives the same session events additively"
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_new_session_resolves_store_directory_precedence() {
+    for (tag, explicit_dir, xdg_dir) in [
+        ("explicit", true, true),
+        ("xdg", false, true),
+        ("home", false, false),
+    ] {
+        let (base_url, _) = spawn_sequence_server(&ONE_TEXT_REPLY);
+        let cwd = fixture_dir(&format!("exchange-session-store-{tag}"));
+        let explicit_store = cwd.join("explicit-store");
+        let xdg_state = cwd.join("xdg-state");
+        let home = cwd.join("home");
+        let expected_store = if explicit_dir {
+            explicit_store.clone()
+        } else if xdg_dir {
+            xdg_state.join("leg").join("sessions")
+        } else {
+            home.join(".local")
+                .join("state")
+                .join("leg")
+                .join("sessions")
+        };
+        let id_out = cwd.join("session-id.txt");
+
+        let mut cmd = leg(&cwd, &base_url);
+        cmd.env("HOME", &home)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .arg("exchange")
+            .arg("--new-session")
+            .arg("--session-id-out")
+            .arg(&id_out);
+        if explicit_dir {
+            cmd.env("LEG_SESSION_DIR", &explicit_store);
+        } else {
+            cmd.env_remove("LEG_SESSION_DIR");
+        }
+        if !xdg_dir {
+            cmd.env_remove("XDG_STATE_HOME");
+        }
+
+        let output = run(cmd, Some("hello"));
+        assert!(
+            output.status.success(),
+            "new session failed for {tag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let session_id = std::fs::read_to_string(&id_out)
+            .expect("session id written")
+            .trim_end()
+            .to_string();
+        let trail = expected_store.join(format!("{session_id}.jsonl"));
+        assert!(trail.is_file(), "{tag} precedence chose {trail:?}");
+        assert_eq!(
+            [
+                explicit_store.exists(),
+                xdg_state.join("leg").join("sessions").exists(),
+                home.join(".local")
+                    .join("state")
+                    .join("leg")
+                    .join("sessions")
+                    .exists(),
+            ]
+            .into_iter()
+            .filter(|exists| *exists)
+            .count(),
+            1,
+            "only the selected store directory is created for {tag}"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+}
+
+#[test]
+fn exchange_unknown_session_fails_before_any_provider_request() {
+    let (base_url, requests, stop, server) = spawn_request_probe();
+    let cwd = fixture_dir("exchange-unknown-session");
+    let store = cwd.join("sessions");
+    let id_out = cwd.join("should-not-exist.txt");
+    let unknown_id = "missing-session";
+
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_SESSION_DIR", &store)
+        .args(["exchange", "--session", unknown_id, "--session-id-out"])
+        .arg(&id_out);
+    let output = run(cmd, Some("hello"));
+    stop.send(()).expect("stop request probe");
+    server.join().expect("join request probe");
+
+    assert!(!output.status.success(), "unknown session must fail");
+    assert!(
+        output.stdout.is_empty(),
+        "unknown session leaves stdout empty"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("leg: no session found: {unknown_id}\n")
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "unknown session must not contact the provider"
+    );
+    assert!(!id_out.exists(), "unknown session does not write an id");
+    assert!(
+        !store.exists(),
+        "reading an unknown session does not create a store"
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_failed_named_session_turn_is_stored_and_resumable() {
+    let cwd = fixture_dir("exchange-session-failure");
+    let store = cwd.join("sessions");
+    let id_out = cwd.join("session-id.txt");
+    let failure_url = spawn_auth_failure_server();
+
+    let mut first = leg(&cwd, &failure_url);
+    first
+        .env("LEG_SESSION_DIR", &store)
+        .args(["exchange", "--new-session", "--session-id-out"])
+        .arg(&id_out);
+    let first_output = run(first, Some("this turn fails"));
+    assert!(!first_output.status.success(), "failed turn exits non-zero");
+    assert!(
+        first_output.stdout.is_empty(),
+        "plain-text failure has no stdout"
+    );
+    let session_id = std::fs::read_to_string(&id_out)
+        .expect("session id written even after failed turn")
+        .trim_end()
+        .to_string();
+    let session_trail = store.join(format!("{session_id}.jsonl"));
+    let initial_events = read_events(&session_trail);
+    assert_eq!(initial_events.len(), 2);
+    assert_eq!(initial_events[0]["event"], "request");
+    assert_eq!(initial_events[0]["turn_index"], 0);
+    assert_eq!(initial_events[1]["event"], "response_error");
+    assert_eq!(initial_events[1]["session_id"], session_id);
+    assert_eq!(initial_events[1]["turn_index"], 0);
+    assert_eq!(initial_events[1]["kind"], "auth");
+
+    let (base_url, requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
+    let mut continued = leg(&cwd, &base_url);
+    continued
+        .env("LEG_SESSION_DIR", &store)
+        .args(["exchange", "--session", &session_id]);
+    let continued_output = run(continued, Some("continue after failure"));
+    assert!(
+        continued_output.status.success(),
+        "session was not resumable: {}",
+        String::from_utf8_lossy(&continued_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&continued_output.stdout),
+        "hi there\n"
+    );
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        requests[0]["messages"][0]["content"],
+        "continue after failure"
+    );
+
+    let events = read_events(&session_trail);
+    assert_eq!(events[2]["event"], "request");
+    assert_eq!(events[2]["session_id"], session_id);
+    assert_eq!(events[2]["turn_index"], 1);
+    assert_eq!(events[3]["event"], "response_ok");
+    assert_eq!(events[3]["turn_index"], 1);
 
     std::fs::remove_dir_all(&cwd).ok();
 }

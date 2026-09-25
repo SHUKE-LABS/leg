@@ -168,7 +168,7 @@ events omit those fields.
 ### Exchange
 
 ```
-leg exchange [--in <path>] [--out <path>]
+leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]
 ```
 
 Answers one `baton.message/v1` request (from `--in`, or stdin) with exactly
@@ -176,6 +176,15 @@ one response (to `--out`, or stdout); a plain-text request gets the reply
 body alone. The tool loop runs inside that single exchange. `leg exchange`
 is the headless entry point for adapters. If `LEG_EVENT_LOG` is non-blank,
 it appends request, tool, and outcome events to the trail for `leg log show`.
+
+By default, each exchange is cold and independent. Use `--new-session` to
+create a persistent session or `--session <id>` to continue one; the flags are
+mutually exclusive. `--session-id-out <path>` may accompany either and writes
+the session id plus a newline after the turn. Each session is stored as
+`<id>.jsonl` in `$LEG_SESSION_DIR`, or `$XDG_STATE_HOME/leg/sessions`, or
+`~/.local/state/leg/sessions` when neither variable is set. The store directory
+is created when a new session is started. A missing id fails before contacting
+the provider with `leg: no session found: <id>`.
 
 ## CI-supported targets
 

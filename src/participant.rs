@@ -124,7 +124,7 @@ static RESPONSE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Derived from the conversation id, the response timestamp, and a draw from
 /// [`RESPONSE_SEQ`]: each call takes a value no other call in this process
 /// takes, so two replies emitted within the same millisecond still differ.
-fn fresh_message_id(conversation_id: &str, ts_ms: u64) -> String {
+pub(crate) fn fresh_message_id(conversation_id: &str, ts_ms: u64) -> String {
     let seq = RESPONSE_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{conversation_id}-r-{ts_ms}-{seq}")
 }
