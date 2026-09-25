@@ -49,8 +49,9 @@ Prints the assistant reply on success. A provider or delivery failure
 error including `kind: error` on stderr, and exits non-zero. Configuration
 failures (missing/malformed env vars) also exit non-zero.
 Also accepts `ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`,
-`ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`, `LEG_MAX_TOKENS`,
-`LEG_MAX_TOOL_ROUNDS`, `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
+`ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
+`LEG_BASH_TIMEOUT_SECS`, `LEG_MAX_TOKENS`, `LEG_MAX_TOOL_ROUNDS`,
+`LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
 ### Tool loop
 
@@ -90,8 +91,10 @@ stderr. A call to an unregistered tool is answered with an error result.
 - `bash` — runs `command` using `bash -lc` in the process working directory,
   as the caller's OS user. Optional `description` records a short explanation
   with the tool call. Optional `timeout` is a non-negative integer number of
-  seconds, defaulting to 10. It runs synchronously; a timeout reports status
-  `timed_out` and exit code `124`, retains output captured before termination,
+  seconds, defaulting to 120. `LEG_BASH_TIMEOUT_SECS` sets this default to a
+  positive integer; an explicit per-call `timeout` takes precedence. It runs
+  synchronously; a timeout reports status `timed_out` and exit code `124`,
+  retains output captured before termination,
   and terminates the shell and descendants (50 ms graceful period, then force
   termination; Windows uses a job object). It stops draining inherited output
   pipes after a 2-second guard. Each output stream is captured separately and

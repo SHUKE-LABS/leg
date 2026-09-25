@@ -416,6 +416,7 @@ mod tests {
             base_url: base_url.to_string(),
             model: model.to_string(),
             timeout: Duration::from_secs(60),
+            bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
             max_tool_rounds: None,
             system_prompt: None,

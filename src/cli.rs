@@ -199,7 +199,8 @@ fn help_text() -> String {
         "{USAGE}\n\n\
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
          CLAUDE_CODE_OAUTH_TOKEN). Also honours ANTHROPIC_BASE_URL, LEG_MODEL,\n\
-         LEG_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS, and\n\
+         LEG_TIMEOUT_SECS, LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS,\n\
+         LEG_MAX_TOOL_ROUNDS, and\n\
          LEG_SYSTEM_PROMPT.\n\n\
          LEG_EVENT_LOG names an optional JSONL trail for `ask`, cold `exchange`,\n\
          and a fresh `session`; named exchange sessions always write their\n\
@@ -1190,20 +1191,29 @@ const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]"
 
 /// Builds the provider transport every command runs through: a
 /// [`ClaudeClient`] advertising the registry's tools, wrapped in the tool loop.
-///
+fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> {
+    let max_tool_rounds = config.max_tool_rounds;
+    let registry = build_tool_registry(&config);
+    let client = ClaudeClient::from_config(config).with_tools(registry.specs());
+    ToolLoop::new(client, registry, max_tool_rounds)
+}
+
 /// Registers the synchronous tools. `read` and `write` share one read-set
 /// that lives for this process: `read` records into it and `write` gates
 /// overwrites on it.
-fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> {
-    let max_tool_rounds = config.max_tool_rounds;
+fn build_tool_registry(config: &LegConfig) -> ToolRegistry {
     let reads = ReadSet::new();
     let mut registry = ToolRegistry::new();
     registry.register(ReadTool::spec(), Box::new(ReadTool::new(reads.clone())));
     registry.register(WriteTool::spec(), Box::new(WriteTool::new(reads)));
     registry.register(EditTool::spec(), Box::new(EditTool::new()));
-    registry.register(BashTool::spec(), Box::new(BashTool::new()));
-    let client = ClaudeClient::from_config(config).with_tools(registry.specs());
-    ToolLoop::new(client, registry, max_tool_rounds)
+    registry.register(
+        BashTool::spec_with_default_timeout_secs(config.bash_timeout_secs),
+        Box::new(BashTool::with_default_timeout_secs(
+            config.bash_timeout_secs,
+        )),
+    );
+    registry
 }
 
 /// Records `event`, downgrading a persistence failure to a stderr warning.
@@ -1623,11 +1633,11 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
 /// base_url. The exchange is selected first, so a bad `--index` reports its
 /// usage error even when the environment's config would not load.
 ///
-/// The rest of the config — the credential, timeout, max_tokens, system prompt
-/// — is the *current* environment's, so a replay re-runs with today's auth,
-/// not a credential that was never recorded. A tool-bearing exchange reruns
-/// only its prompt: the current tool loop executes its tools afresh, and the
-/// stored tool results are never fed back.
+/// The rest of the config — the credential, timeouts, max_tokens, system
+/// prompt — is the *current* environment's, so a replay re-runs with today's
+/// auth, not a credential that was never recorded. A tool-bearing exchange
+/// reruns only its prompt: the current tool loop executes its tools afresh,
+/// and the stored tool results are never fed back.
 fn replay_target(
     report: &crate::log::ParseReport,
     index: Option<usize>,
@@ -1709,6 +1719,29 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn config_with_bash_timeout(timeout_secs: u64) -> LegConfig {
+        LegConfig::from_lookup(|key| match key {
+            "ANTHROPIC_API_KEY" => Some("test-key".to_string()),
+            "LEG_BASH_TIMEOUT_SECS" => Some(timeout_secs.to_string()),
+            _ => None,
+        })
+        .expect("config loads")
+    }
+
+    fn bash_available() -> bool {
+        let mut probe = std::process::Command::new("bash");
+        #[cfg(windows)]
+        if let Some(path) = std::env::var_os("PATH") {
+            probe.env("PATH", path);
+        }
+        probe
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     struct FakeTransport(std::result::Result<AssistantReply, LegError>);
@@ -1955,6 +1988,7 @@ mod tests {
         assert!(text.contains("leg ask [--model <model>] <prompt>"));
         assert!(text.contains("ANTHROPIC_API_KEY"));
         assert!(text.contains("LEG_MODEL"));
+        assert!(text.contains("LEG_BASH_TIMEOUT_SECS"));
         assert!(text.contains("LEG_MAX_TOOL_ROUNDS"));
         assert!(text.contains("LEG_EVENT_LOG"));
         assert!(text.contains("`ask`, cold `exchange`"));
@@ -2236,6 +2270,80 @@ mod tests {
         let sent = captured.borrow().clone().expect("request body captured");
         let value: serde_json::Value = serde_json::from_str(&sent).expect("valid json");
         assert_eq!(value["model"], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn configured_bash_timeout_flows_through_registry_to_spec_and_handler() {
+        if !bash_available() {
+            return;
+        }
+
+        let default_timeout_secs = if cfg!(windows) {
+            let probe_registry = build_tool_registry(&config_with_bash_timeout(1));
+            let probe_result = probe_registry.dispatch(
+                "toolu_probe",
+                "bash",
+                &serde_json::json!({"command": "true", "timeout": 60}),
+            );
+            let ContentBlock::ToolResult {
+                content,
+                is_error: None,
+                ..
+            } = probe_result
+            else {
+                panic!("bash startup probe failed");
+            };
+            let probe: serde_json::Value =
+                serde_json::from_str(&content).expect("probe returns JSON");
+            assert_eq!(probe["status"], "exited");
+            probe["wall_time_seconds"].as_f64().unwrap().ceil() as u64 + 3
+        } else {
+            1
+        };
+        let config = config_with_bash_timeout(default_timeout_secs);
+        let registry = build_tool_registry(&config);
+        let bash_spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "bash")
+            .expect("bash spec is registered");
+
+        assert_eq!(
+            bash_spec.input_schema["properties"]["timeout"]["default"],
+            default_timeout_secs
+        );
+        let timeout_unit = if default_timeout_secs == 1 {
+            "second"
+        } else {
+            "seconds"
+        };
+        assert!(
+            bash_spec
+                .description
+                .contains(&format!("{default_timeout_secs} {timeout_unit} by default"))
+        );
+        assert_eq!(
+            bash_spec.input_schema["properties"]["timeout"]["description"],
+            format!("Maximum run time in seconds (default {default_timeout_secs})")
+        );
+
+        let command = format!("sleep {}", default_timeout_secs + 1);
+        let result = registry.dispatch(
+            "toolu_bash_timeout",
+            "bash",
+            &serde_json::json!({"command": command}),
+        );
+        let ContentBlock::ToolResult {
+            content,
+            is_error: None,
+            ..
+        } = result
+        else {
+            panic!("bash timeout call failed");
+        };
+        let output: serde_json::Value = serde_json::from_str(&content).expect("bash returns JSON");
+        assert_eq!(output["status"], "timed_out");
+        assert_eq!(output["exit_code"], 124);
     }
 
     #[test]

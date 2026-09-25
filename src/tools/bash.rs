@@ -4,22 +4,20 @@ use std::ffi::OsString;
 use std::time::Duration;
 
 use super::ToolHandler;
+use crate::config::DEFAULT_BASH_TIMEOUT_SECS;
 use crate::model::ToolSpec;
 
 mod process;
 
-/// Default `bash` command timeout in seconds.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
-
 const DESCRIPTION: &str = "Run a shell command with Bash in the current working directory. \
 The command runs as the current OS user. Leg's provider credential variables are removed from \
 the command environment; login-shell startup files may re-export them. Each output stream is \
-capped at 2000 lines or 50 KB. \
-Commands time out after 10 seconds by default; set timeout to change the limit.";
+capped at 2000 lines or 50 KB.";
 
 /// The `bash` tool handler.
 pub struct BashTool {
     shell: OsString,
+    default_timeout_secs: u64,
     #[cfg(test)]
     env: Vec<(OsString, OsString)>,
 }
@@ -28,6 +26,7 @@ impl Default for BashTool {
     fn default() -> Self {
         Self {
             shell: OsString::from("bash"),
+            default_timeout_secs: DEFAULT_BASH_TIMEOUT_SECS,
             #[cfg(test)]
             env: Vec::new(),
         }
@@ -40,11 +39,34 @@ impl BashTool {
         Self::default()
     }
 
+    /// Creates a handler with the configured default command timeout.
+    pub fn with_default_timeout_secs(default_timeout_secs: u64) -> Self {
+        Self {
+            default_timeout_secs,
+            ..Self::default()
+        }
+    }
+
     /// The `bash` declaration advertised to the model.
     pub fn spec() -> ToolSpec {
+        Self::spec_with_default_timeout_secs(DEFAULT_BASH_TIMEOUT_SECS)
+    }
+
+    /// The `bash` declaration with a configured default command timeout.
+    pub fn spec_with_default_timeout_secs(default_timeout_secs: u64) -> ToolSpec {
+        let timeout_unit = if default_timeout_secs == 1 {
+            "second"
+        } else {
+            "seconds"
+        };
+        let description = format!(
+            "{DESCRIPTION} Commands time out after {default_timeout_secs} {timeout_unit} by default; set timeout to change the limit."
+        );
+        let timeout_description =
+            format!("Maximum run time in seconds (default {default_timeout_secs})");
         ToolSpec::new(
             "bash",
-            DESCRIPTION,
+            description,
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -59,8 +81,8 @@ impl BashTool {
                     "timeout": {
                         "type": "integer",
                         "minimum": 0,
-                        "default": DEFAULT_TIMEOUT_SECS,
-                        "description": "Maximum run time in seconds (default 10)"
+                        "default": default_timeout_secs,
+                        "description": timeout_description
                     }
                 },
                 "required": ["command"]
@@ -72,6 +94,7 @@ impl BashTool {
     fn with_shell(shell: impl Into<OsString>) -> Self {
         Self {
             shell: shell.into(),
+            default_timeout_secs: DEFAULT_BASH_TIMEOUT_SECS,
             #[cfg(test)]
             env: Vec::new(),
         }
@@ -106,7 +129,7 @@ impl ToolHandler for BashTool {
             return Err("bash: `description` must be a string".to_string());
         }
         let timeout_secs = match input.get("timeout") {
-            None => DEFAULT_TIMEOUT_SECS,
+            None => self.default_timeout_secs,
             Some(timeout) => timeout
                 .as_u64()
                 .ok_or("bash: `timeout` must be a non-negative integer")?,
@@ -150,6 +173,22 @@ mod tests {
     use std::time::Instant;
 
     fn call(command: &str, extra: Value) -> Result<Value, String> {
+        call_with_tool(BashTool::new(), command, extra)
+    }
+
+    fn call_with_default_timeout(
+        default_timeout_secs: u64,
+        command: &str,
+        extra: Value,
+    ) -> Result<Value, String> {
+        call_with_tool(
+            BashTool::with_default_timeout_secs(default_timeout_secs),
+            command,
+            extra,
+        )
+    }
+
+    fn call_with_tool(tool: BashTool, command: &str, extra: Value) -> Result<Value, String> {
         let mut input = serde_json::json!({"command": command});
         if let Some(fields) = extra.as_object() {
             for (key, value) in fields {
@@ -157,7 +196,7 @@ mod tests {
             }
         }
         let home = temp_dir("home");
-        let tool = BashTool::new().with_env("HOME", home.as_os_str().to_os_string());
+        let tool = tool.with_env("HOME", home.as_os_str().to_os_string());
         let result = tool
             .call(&input)
             .map(|output| serde_json::from_str(&output).unwrap());
@@ -233,7 +272,11 @@ mod tests {
             spec.input_schema["properties"]["description"]["type"],
             "string"
         );
-        assert_eq!(spec.input_schema["properties"]["timeout"]["default"], 10);
+        assert_eq!(
+            spec.input_schema["properties"]["timeout"]["default"],
+            DEFAULT_BASH_TIMEOUT_SECS
+        );
+        assert!(spec.description.contains("120 seconds by default"));
         assert!(spec.description.contains("2000 lines or 50 KB"));
         assert!(
             spec.description
@@ -242,6 +285,21 @@ mod tests {
         assert!(
             spec.description
                 .contains("startup files may re-export them")
+        );
+        assert_eq!(
+            BashTool::new().default_timeout_secs,
+            DEFAULT_BASH_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn configured_timeout_is_reflected_in_the_tool_spec() {
+        let spec = BashTool::spec_with_default_timeout_secs(30);
+        assert_eq!(spec.input_schema["properties"]["timeout"]["default"], 30);
+        assert!(spec.description.contains("30 seconds by default"));
+        assert_eq!(
+            spec.input_schema["properties"]["timeout"]["description"],
+            "Maximum run time in seconds (default 30)"
         );
     }
 
@@ -368,17 +426,21 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_is_ten_seconds_and_times_out() {
+    fn configured_default_timeout_is_used_when_timeout_is_omitted() {
         if !bash_available() {
             return;
         }
-        assert_eq!(DEFAULT_TIMEOUT_SECS, 10);
+        let timeout = if cfg!(windows) {
+            login_startup_budget_secs() + 3
+        } else {
+            1
+        };
         let started = Instant::now();
-        let output = call("sleep 30", serde_json::json!({})).unwrap();
+        let output = call_with_default_timeout(timeout, "sleep 30", serde_json::json!({})).unwrap();
         assert_eq!(output["status"], "timed_out");
         assert_eq!(output["exit_code"], 124);
-        assert!(started.elapsed() >= Duration::from_secs(10));
-        assert!(started.elapsed() < Duration::from_secs(14));
+        assert!(started.elapsed() >= Duration::from_secs(timeout));
+        assert!(started.elapsed() < Duration::from_secs(timeout + 4));
     }
 
     #[test]

@@ -21,8 +21,10 @@ sends the `tool_result` blocks back, stopping after 10 tool-use rounds per
 user turn. The registered tools are `read`, `write`, `edit`, and `bash`.
 `read` and `write` share an in-process read-set. The `bash` tool
 (`src/tools/bash.rs`) runs one `bash -lc <command>` synchronously in the
-caller's working directory and OS identity. Its timeout defaults to 10 seconds;
-timeout results retain partial stdout/stderr, report exit code 124, and
+caller's working directory and OS identity. Its timeout defaults to 120 seconds
+and can be configured with the positive-integer `LEG_BASH_TIMEOUT_SECS`
+environment variable; an explicit per-call timeout overrides that default.
+Timeout results retain partial stdout/stderr, report exit code 124, and
 terminate the shell and descendants after a 50 ms graceful period (Windows
 uses a job object). It stops draining inherited output pipes after a 2-second
 guard. Each output stream is capped at 2000 lines or 50 KB with head/tail
