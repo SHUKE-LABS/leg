@@ -2,14 +2,17 @@
 //!
 //! This module defines the seam between leg's typed model and a concrete
 //! provider client. [`Transport`] is the stable boundary the CLI and tests
-//! depend on; the [`claude`] submodule provides the first concrete
-//! implementation (a Claude-compatible Messages client), and
-//! [`http`] isolates the underlying HTTP execution so the request/response
-//! logic can be tested without a network.
+//! depend on; the [`claude`] submodule provides a Claude-compatible Messages
+//! client, while [`openai`] provides OpenAI-compatible Chat Completions and
+//! Responses clients. The [`http`] module isolates underlying HTTP execution so
+//! provider request/response logic can be tested without a network.
 
 pub mod claude;
 pub mod http;
+pub mod openai;
+pub(crate) mod provider;
 pub mod retry;
+mod sse;
 
 use crate::error::Result;
 use crate::model::{AssistantReply, Message, Prompt};

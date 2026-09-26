@@ -18,6 +18,7 @@ use crate::model::{
     AssistantReply, ContentBlock, Message, StopReason, TokenUsage, ToolSpec, as_single_text,
 };
 use crate::transport::http::{HttpClient, UreqHttpClient};
+use crate::transport::sse::{SseDecoder, SseEvent};
 use crate::transport::{RetryPolicy, RetryingHttpClient, StreamEvent, Transport, TransportCall};
 
 /// The Messages API version pinned by this client.
@@ -158,7 +159,8 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
 /// Maps the resolved [`Credential`] onto the wire-level auth header pair.
 ///
 /// The credential is read from the already-resolved config (no env lookup
-/// happens per request) and converted into the matching name/value pair:
+/// happens per request) and converted into the matching name/value pair;
+/// bearer credentials use `Authorization`.
 /// `ApiKey` -> `x-api-key`, `OAuth` -> `Authorization: Bearer <token>`.
 ///
 /// Returns an owned value for the auth header so it can live on the caller's
@@ -167,7 +169,9 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
 fn auth_header(credential: &Credential) -> (&'static str, String) {
     match credential {
         Credential::ApiKey(key) => ("x-api-key", key.clone()),
-        Credential::OAuth(token) => ("Authorization", format!("Bearer {token}")),
+        Credential::OAuth(token) | Credential::Bearer(token) => {
+            ("Authorization", format!("Bearer {token}"))
+        }
     }
 }
 
@@ -319,85 +323,6 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
         usage,
         response.stop_reason.as_deref().map(StopReason::from_wire),
     ))
-}
-
-struct SseEvent {
-    name: String,
-    data: String,
-}
-
-#[derive(Default)]
-struct SseDecoder {
-    line: Vec<u8>,
-    event_name: Option<String>,
-    data: Vec<String>,
-}
-
-impl SseDecoder {
-    fn push(
-        &mut self,
-        chunk: &[u8],
-        on_event: &mut dyn FnMut(SseEvent) -> Result<()>,
-    ) -> Result<()> {
-        for byte in chunk {
-            if *byte == b'\n' {
-                let line = std::mem::take(&mut self.line);
-                self.process_line(&line, on_event)?;
-            } else {
-                self.line.push(*byte);
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, on_event: &mut dyn FnMut(SseEvent) -> Result<()>) -> Result<()> {
-        if !self.line.is_empty() {
-            let line = std::mem::take(&mut self.line);
-            self.process_line(&line, on_event)?;
-        }
-        self.dispatch(on_event)
-    }
-
-    fn process_line(
-        &mut self,
-        bytes: &[u8],
-        on_event: &mut dyn FnMut(SseEvent) -> Result<()>,
-    ) -> Result<()> {
-        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
-        if bytes.is_empty() {
-            return self.dispatch(on_event);
-        }
-        if bytes.first() == Some(&b':') {
-            return Ok(());
-        }
-
-        let line = std::str::from_utf8(bytes)
-            .map_err(|error| LegError::Decode(format!("invalid UTF-8 in SSE stream: {error}")))?;
-        let (field, value) = line.split_once(':').unwrap_or((line, ""));
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "event" => self.event_name = Some(value.to_string()),
-            "data" => self.data.push(value.to_string()),
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn dispatch(&mut self, on_event: &mut dyn FnMut(SseEvent) -> Result<()>) -> Result<()> {
-        if self.data.is_empty() {
-            self.event_name = None;
-            return Ok(());
-        }
-        let event = SseEvent {
-            name: self
-                .event_name
-                .take()
-                .unwrap_or_else(|| "message".to_string()),
-            data: self.data.join("\n"),
-        };
-        self.data.clear();
-        on_event(event)
-    }
 }
 
 struct PartialContentBlock {
@@ -966,6 +891,7 @@ mod tests {
 
     fn config_with_credential(base_url: &str, model: &str, credential: Credential) -> LegConfig {
         LegConfig {
+            provider: crate::config::Provider::Anthropic,
             credential,
             base_url: base_url.to_string(),
             model: model.to_string(),

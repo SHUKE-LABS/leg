@@ -1,6 +1,7 @@
 use super::*;
 use crate::model::AssistantReply;
 use crate::transport::Transport;
+use crate::transport::claude::ClaudeClient;
 
 fn argv(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| s.to_string()).collect()
@@ -310,6 +311,10 @@ fn help_text_documents_usage_env_and_failure_contract() {
     assert!(text.contains("JPEG, PNG, GIF, and WebP"));
     assert!(text.contains("ANTHROPIC_API_KEY"));
     assert!(text.contains("ANTHROPIC_AUTH_TOKEN is for bearer keys"));
+    assert!(text.contains("LEG_PROVIDER"));
+    assert!(text.contains("openai-chat-completions"));
+    assert!(text.contains("OPENAI_API_KEY"));
+    assert!(text.contains("OPENAI_BASE_URL"));
     assert!(text.contains("Anthropic-compatible endpoints"));
     assert!(text.contains("Claude subscription OAuth tokens"));
     assert!(text.contains("`claude setup-token`"));

@@ -68,6 +68,20 @@ include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_MAX_RETRIES`, `LEG_RETRY_BASE_DELAY_MS`, `LEG_PRETOOL_HOOK`,
 `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
+Anthropic Messages remains the default provider. OpenAI-compatible endpoints
+can use either streamed wire protocol:
+
+```
+LEG_PROVIDER=openai-chat-completions OPENAI_API_KEY=sk-... leg ask "hello"
+LEG_PROVIDER=openai-responses OPENAI_API_KEY=sk-... leg ask "hello"
+```
+
+Both OpenAI protocols share `OPENAI_API_KEY` and `OPENAI_BASE_URL`
+(`https://api.openai.com/v1` by default). `OPENAI_BASE_URL` may name the API
+root or end in `/v1`; leg appends the selected endpoint. `LEG_MODEL` is passed
+through unchanged and defaults to `gpt-4.1-mini` for these protocols. OpenAI
+credentials and base URL are independent of the Anthropic settings.
+
 ### Tool loop
 
 `ask`, `session`, and `exchange` share one tool loop. It runs only when a
