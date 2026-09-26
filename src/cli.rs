@@ -23,7 +23,7 @@ use crate::tools::{
 };
 use crate::transport::claude::ClaudeClient;
 use crate::transport::http::UreqHttpClient;
-use crate::transport::{RetryingHttpClient, Transport, TransportCall};
+use crate::transport::{RetryingHttpClient, StreamEvent, Transport, TransportCall};
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
 const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]";
@@ -1125,9 +1125,10 @@ fn run_session_repl(
 /// `conversation`; the full accumulated history is resent on every request,
 /// so turn N carries all prior user and assistant turns. Each turn runs
 /// through the [`ToolLoop`]; its tool rounds are appended to the history and
-/// only the final reply is printed to `output` (and appended as the next
-/// turn). Blank lines are
-/// ignored; EOF or a lone [`SESSION_EXIT_COMMAND`] line ends the loop cleanly.
+/// assistant text deltas are printed as they stream. Buffered transports fall
+/// back to printing the completed reply. The assembled final reply is appended
+/// as the next history turn. Blank lines are ignored; EOF or a lone
+/// [`SESSION_EXIT_COMMAND`] line ends the loop cleanly.
 ///
 /// A turn that fails at the transport layer is **not** fatal: the error is
 /// reported on stderr and the loop continues. The failed user turn is rolled
@@ -1161,6 +1162,7 @@ fn run_session_repl_with_warning(
         }
 
         conversation.push_user(line.as_str());
+        let mut streamed_text = false;
         let call = timed_session_exchange(
             sink,
             TimedSessionExchangeContext {
@@ -1172,10 +1174,24 @@ fn run_session_repl_with_warning(
             },
             warning,
             |sink| {
-                transport.run_observed_with_attempts(conversation.messages(), &mut |event| {
-                    let turn = Some((session_id.as_str(), turn_index));
-                    emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
-                })
+                transport.run_streaming_observed_with_attempts(
+                    conversation.messages(),
+                    &mut |event| {
+                        let turn = Some((session_id.as_str(), turn_index));
+                        emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
+                    },
+                    &mut |event| {
+                        if let Some(text) = stream_event_text(&event)
+                            && !text.is_empty()
+                        {
+                            interrupt::check()?;
+                            output.write_all(text.as_bytes()).map_err(io_err)?;
+                            output.flush().map_err(io_err)?;
+                            streamed_text = true;
+                        }
+                        Ok(())
+                    },
+                )
             },
         );
         turn_index += 1;
@@ -1183,7 +1199,11 @@ fn run_session_repl_with_warning(
         match call.result {
             Ok(outcome) => {
                 interrupt::check()?;
-                writeln!(output, "{}", outcome.reply.text).map_err(io_err)?;
+                if streamed_text {
+                    writeln!(output).map_err(io_err)?;
+                } else {
+                    writeln!(output, "{}", outcome.reply.text).map_err(io_err)?;
+                }
                 // Keep the turn's tool rounds and the reply's full blocks so
                 // the resent history matches what the provider returned.
                 for message in outcome.transcript {
@@ -1191,8 +1211,13 @@ fn run_session_repl_with_warning(
                 }
                 conversation.push(session_reply_message(outcome.reply.content, outcome.capped));
             }
-            Err(err @ LegError::Interrupted { .. }) => return Err(err),
+            Err(err @ LegError::Interrupted { .. }) | Err(err @ LegError::Io(_)) => {
+                return Err(err);
+            }
             Err(err) => {
+                if streamed_text {
+                    writeln!(output).map_err(io_err)?;
+                }
                 // Roll the failed user turn back out so the next request does
                 // not send two consecutive user turns. The loop continues —
                 // a transient failure should not end an interactive session.
@@ -1212,6 +1237,27 @@ fn run_session_repl_with_warning(
     );
 
     Ok(())
+}
+
+fn stream_event_text(event: &StreamEvent) -> Option<&str> {
+    match event {
+        StreamEvent::ContentBlockStart { content_block, .. }
+            if content_block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("text") =>
+        {
+            content_block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+        }
+        StreamEvent::ContentBlockDelta { delta, .. }
+            if delta.get("type").and_then(serde_json::Value::as_str) == Some("text_delta") =>
+        {
+            delta.get("text").and_then(serde_json::Value::as_str)
+        }
+        _ => None,
+    }
 }
 
 struct TimedSessionExchangeContext<'a> {

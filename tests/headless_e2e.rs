@@ -16,10 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
-
-#[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -100,6 +97,199 @@ fn spawn_sequence_server(rounds: &'static [&'static str]) -> (String, Arc<Mutex<
     });
 
     (format!("http://{addr}"), requests)
+}
+
+fn spawn_sse_sequence_server(rounds: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock SSE server");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+
+    thread::spawn(move || {
+        for reply in rounds {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let Some(body) = read_request_body(&mut stream) else {
+                return;
+            };
+            captured.lock().unwrap().push(body);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (format!("http://{addr}"), requests)
+}
+
+struct PausedSseServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    first_chunk_sent: mpsc::Receiver<()>,
+    continue_stream: mpsc::Sender<()>,
+    server: thread::JoinHandle<()>,
+}
+
+fn spawn_paused_sse_server(first_body: String, rest_body: String) -> PausedSseServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind paused SSE server");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let (first_sent, first_received) = mpsc::channel();
+    let (continue_stream, continue_received) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let Some(request) = read_request_body(&mut stream) else {
+            return;
+        };
+        captured.lock().unwrap().push(request);
+        let content_length = first_body.len() + rest_body.len();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(headers.as_bytes()).is_err()
+            || stream.write_all(first_body.as_bytes()).is_err()
+            || stream.flush().is_err()
+        {
+            return;
+        }
+        let _ = first_sent.send(());
+        let _ = continue_received.recv_timeout(Duration::from_secs(10));
+        let _ = stream.write_all(rest_body.as_bytes());
+        let _ = stream.flush();
+    });
+
+    PausedSseServer {
+        base_url: format!("http://{addr}"),
+        requests,
+        first_chunk_sent: first_received,
+        continue_stream,
+        server,
+    }
+}
+
+fn sse_event(name: &str, data: Value) -> String {
+    format!(
+        "event: {name}\ndata: {}\n\n",
+        serde_json::to_string(&data).expect("serialize SSE event")
+    )
+}
+
+fn sse_text_reply(text: &str) -> String {
+    let mut reply = sse_text_start(text);
+    reply.push_str(&sse_text_finish(""));
+    reply
+}
+
+fn sse_text_start(text: &str) -> String {
+    let mut reply = String::new();
+    reply.push_str(&sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 1, "output_tokens": 0}}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    ));
+    reply
+}
+
+fn sse_text_finish(text: &str) -> String {
+    let mut reply = String::new();
+    reply.push_str(&sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_stop",
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+    ));
+    reply.push_str(&sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 1}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "message_stop",
+        serde_json::json!({"type": "message_stop"}),
+    ));
+    reply
+}
+
+fn sse_tool_use_reply(id: &str, name: &str, input: &Value) -> String {
+    let mut reply = String::new();
+    reply.push_str(&sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 1, "output_tokens": 0}}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": serde_json::to_string(input).expect("serialize tool input")
+            }
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_stop",
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+    ));
+    reply.push_str(&sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": {"output_tokens": 1}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "message_stop",
+        serde_json::json!({"type": "message_stop"}),
+    ));
+    reply
 }
 
 /// Starts a one-shot fake provider that rejects the request with bad credentials.
@@ -315,6 +505,30 @@ fn run(mut cmd: Command, stdin: Option<&str>) -> Output {
     rx.recv_timeout(Duration::from_secs(120))
         .expect("leg did not exit within the deadline")
         .expect("wait for leg")
+}
+
+fn collect_stdout(
+    mut stdout: impl Read + Send + 'static,
+) -> (mpsc::Receiver<Vec<u8>>, thread::JoinHandle<Vec<u8>>) {
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut full_output = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(length) => {
+                    let chunk = buffer[..length].to_vec();
+                    full_output.extend_from_slice(&chunk);
+                    if sender.send(chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        full_output
+    });
+    (receiver, reader)
 }
 
 #[cfg(unix)]
@@ -1409,10 +1623,298 @@ fn sigint_stops_bash_and_records_interrupted_outcome() {
     assert_exchange_interrupt(libc::SIGINT, 130, "SIGINT", "exchange-sigint");
 }
 
+#[test]
+fn session_flushes_text_before_the_provider_finishes_streaming() {
+    let first_body = sse_text_start("hello");
+    let rest_body = sse_text_finish(" world");
+    let PausedSseServer {
+        base_url,
+        requests,
+        first_chunk_sent: first_sent,
+        continue_stream,
+        server,
+    } = spawn_paused_sse_server(first_body, rest_body);
+    let cwd = fixture_dir("session-streaming");
+    let trail = cwd.join("session.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("session");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let (stdout_chunks, stdout_reader) = collect_stdout(child.stdout.take().expect("piped stdout"));
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"hello\n")
+        .expect("write session prompt");
+
+    let first_sent = first_sent.recv_timeout(Duration::from_secs(5));
+    let mut first_output = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !first_output.ends_with(b"hello") && Instant::now() < deadline {
+        match stdout_chunks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(chunk) => first_output.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    let still_running = child.try_wait().expect("check session process").is_none();
+    let _ = continue_stream.send(());
+
+    let (status_sender, status_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = status_sender.send(child.wait());
+    });
+    let status = status_receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("session did not exit after stream completion")
+        .expect("wait for session");
+    let stdout = stdout_reader.join().expect("join stdout reader");
+    let mut stderr_text = String::new();
+    stderr
+        .read_to_string(&mut stderr_text)
+        .expect("read session stderr");
+    server.join().expect("join paused SSE server");
+
+    assert!(first_sent.is_ok(), "provider did not send the first chunk");
+    assert_eq!(
+        first_output, b"hello",
+        "session must flush the first delta before the provider continues"
+    );
+    assert!(
+        still_running,
+        "session exited before the stream was released"
+    );
+    assert!(status.success(), "session failed: {stderr_text}");
+    assert_eq!(stdout, b"hello world\n");
+    assert!(
+        stderr_text.contains("leg session — type"),
+        "session startup banner must remain on stderr: {stderr_text}"
+    );
+    assert!(!stderr_text.contains("error:"), "{stderr_text}");
+
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["stream"], true);
+    let events = read_events(&trail);
+    assert_eq!(events.len(), 4, "stream deltas do not add trail events");
+    assert_eq!(events[2]["event"], "response_ok");
+    assert_eq!(events[2]["reply"], "hello world");
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn session_stream_error_is_reported_and_recorded() {
+    let mut reply = sse_text_start("partial");
+    reply.push_str(&sse_event(
+        "error",
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": "generation failed"}
+        }),
+    ));
+    let (base_url, _) = spawn_sse_sequence_server(vec![reply]);
+    let cwd = fixture_dir("session-stream-error");
+    let trail = cwd.join("session.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("session");
+
+    let output = run(cmd, Some("hello\n"));
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "partial\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("provider stream error (api_error): generation failed"),
+        "provider failure must be visible: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = read_events(&trail);
+    let outcome = events
+        .iter()
+        .find(|event| event["event"] == "response_error")
+        .expect("stream error outcome");
+    assert_eq!(outcome["kind"], "provider_stream");
+    assert!(
+        outcome["message"]
+            .as_str()
+            .unwrap()
+            .contains("generation failed")
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+fn assert_session_stream_interrupt(
+    signal: libc::c_int,
+    exit_code: i32,
+    signal_name: &str,
+    tag: &str,
+) {
+    let first_body = sse_text_start("visible");
+    let rest_body = sse_text_finish(" later");
+    let PausedSseServer {
+        base_url,
+        requests: stream_requests,
+        first_chunk_sent: first_sent,
+        continue_stream,
+        server,
+    } = spawn_paused_sse_server(first_body, rest_body);
+    let cwd = fixture_dir(tag);
+    let trail = cwd.join("session.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail).arg("session");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let leg_pid = child.id().try_into().expect("leg pid fits pid_t");
+    let (stdout_chunks, stdout_reader) = collect_stdout(child.stdout.take().expect("piped stdout"));
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"interrupt\n")
+        .expect("write session prompt");
+
+    let first_sent = first_sent.recv_timeout(Duration::from_secs(5));
+    let mut observed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !observed.ends_with(b"visible") && Instant::now() < deadline {
+        match stdout_chunks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(chunk) => observed.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    let signal_result = unsafe { libc::kill(leg_pid, signal) };
+    let _ = continue_stream.send(());
+
+    let (status_sender, status_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = status_sender.send(child.wait());
+    });
+    let status = status_receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("streaming session did not stop after signal")
+        .expect("wait for interrupted session");
+    let stdout = stdout_reader.join().expect("join stdout reader");
+    let mut stderr_text = String::new();
+    stderr
+        .read_to_string(&mut stderr_text)
+        .expect("read session stderr");
+    server.join().expect("join paused SSE server");
+
+    assert!(first_sent.is_ok(), "provider did not start its stream");
+    assert_eq!(signal_result, 0, "send {signal_name} to session");
+    assert_eq!(
+        observed, b"visible",
+        "text must be visible before interrupt"
+    );
+    assert_eq!(status.code(), Some(exit_code));
+    assert_eq!(
+        stdout, b"visible",
+        "no stdout may be written after the signal"
+    );
+    assert!(
+        stderr_text.contains(&format!("interrupted by {signal_name}")),
+        "missing interruption diagnostic: {stderr_text}"
+    );
+
+    let initial_events = read_events(&trail);
+    let outcome = initial_events
+        .iter()
+        .find(|event| event["event"] == "response_error")
+        .expect("interrupted response outcome");
+    assert_eq!(outcome["kind"], "interrupted");
+    assert!(
+        !initial_events
+            .iter()
+            .any(|event| event["event"] == "session_end"),
+        "interrupted session must remain resumable"
+    );
+    let session_id = initial_events[0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let (resume_url, resume_request_log) =
+        spawn_sse_sequence_server(vec![sse_text_reply("resumed")]);
+    let mut resume = leg(&cwd, &resume_url);
+    resume.args(["session", "--resume"]).arg(&trail);
+    let resumed = run(resume, Some("continue\n/exit\n"));
+    assert!(
+        resumed.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&resumed.stdout), "resumed\n");
+    let resume_requests: Vec<Value> = resume_request_log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("resume request is JSON"))
+        .collect();
+    assert_eq!(resume_requests.len(), 1);
+    let messages = resume_requests[0]["messages"]
+        .as_array()
+        .expect("message history");
+    assert_eq!(messages.len(), 1, "interrupted prompt is not in history");
+    assert_eq!(messages[0]["content"], "continue");
+    let events = read_events(&trail);
+    assert!(events.iter().any(|event| {
+        event["event"] == "request" && event["session_id"] == session_id && event["turn_index"] == 1
+    }));
+
+    let stream_requests: Vec<Value> = stream_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("stream request is JSON"))
+        .collect();
+    assert_eq!(stream_requests.len(), 1);
+    assert_eq!(stream_requests[0]["stream"], true);
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_cancels_midstream_and_keeps_the_session_resumable() {
+    assert_session_stream_interrupt(libc::SIGTERM, 143, "SIGTERM", "session-stream-sigterm");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_midstream_and_keeps_the_session_resumable() {
+    assert_session_stream_interrupt(libc::SIGINT, 130, "SIGINT", "session-stream-sigint");
+}
+
 #[cfg(unix)]
 #[test]
 fn interrupted_session_trail_can_be_resumed() {
-    let (base_url, _) = spawn_sequence_server(&SLEEP_TOOL_ROUNDS);
+    let tool_reply = sse_tool_use_reply(
+        "toolu_sleep",
+        "bash",
+        &serde_json::json!({
+            "command": "echo $$ > shell.pid; sleep 60 & echo $! > sleep.pid; wait",
+            "timeout": 60
+        }),
+    );
+    let (base_url, _) = spawn_sse_sequence_server(vec![tool_reply]);
     let cwd = fixture_dir("session-interrupted");
     let trail = cwd.join("session.jsonl");
 
@@ -1444,7 +1946,7 @@ fn interrupted_session_trail_can_be_resumed() {
         .expect("session id")
         .to_string();
 
-    let (resume_url, requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
+    let (resume_url, requests) = spawn_sse_sequence_server(vec![sse_text_reply("hi there")]);
     let mut resume = leg(&cwd, &resume_url);
     resume.args(["session", "--resume"]).arg(&trail);
     let resumed = run(resume, Some("continue after interrupt\n/exit\n"));

@@ -11,6 +11,7 @@
 //! become [`LegError::Transport`]; setup/protocol and response-body read
 //! failures use distinct variants so only eligible failures are retried.
 
+use std::io::Read;
 use std::time::Duration;
 
 use crate::error::{LegError, Result};
@@ -21,7 +22,8 @@ use crate::interrupt;
 pub struct HttpResponse {
     /// The HTTP status code.
     pub status: u16,
-    /// The response body, read as a UTF-8 string.
+    /// The buffered response body, or empty when successful stream chunks
+    /// were delivered through [`HttpClient::post_json_streaming`].
     pub body: String,
     /// The provider's `Retry-After` header, if present.
     pub retry_after: Option<String>,
@@ -60,6 +62,29 @@ pub trait HttpClient {
     fn post_json_with_attempts(&self, url: &str, headers: &[(&str, &str)], body: &str) -> HttpCall {
         HttpCall::new(self.post_json(url, headers, body), 1)
     }
+
+    /// POSTs JSON and delivers successful response-body chunks as they arrive.
+    ///
+    /// Buffered clients keep working through this default, which forwards the
+    /// completed body as one chunk. HTTP errors retain their complete body for
+    /// the provider client and are not sent to `on_chunk`.
+    fn post_json_streaming(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+        on_chunk: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> HttpCall {
+        let call = self.post_json_with_attempts(url, headers, body);
+        let result = call.result.and_then(|mut response| {
+            if (200..300).contains(&response.status) {
+                on_chunk(response.body.as_bytes())?;
+                response.body.clear();
+            }
+            Ok(response)
+        });
+        HttpCall::new(result, call.attempts)
+    }
 }
 
 impl<T: HttpClient + ?Sized> HttpClient for &T {
@@ -69,6 +94,16 @@ impl<T: HttpClient + ?Sized> HttpClient for &T {
 
     fn post_json_with_attempts(&self, url: &str, headers: &[(&str, &str)], body: &str) -> HttpCall {
         (**self).post_json_with_attempts(url, headers, body)
+    }
+
+    fn post_json_streaming(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+        on_chunk: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> HttpCall {
+        (**self).post_json_streaming(url, headers, body, on_chunk)
     }
 }
 
@@ -138,6 +173,76 @@ impl HttpClient for UreqHttpClient {
                 retry_after,
             })
         })
+    }
+
+    fn post_json_streaming(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+        on_chunk: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> HttpCall {
+        let agent = self.agent.clone();
+        let url = url.to_string();
+        let headers: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        let body = body.to_string();
+
+        let result = interrupt::run_cancellable_with_progress(
+            move |emit| {
+                let mut request = agent.post(&url);
+                for (name, value) in &headers {
+                    request = request.header(name, value);
+                }
+
+                let mut response = request.send(&body).map_err(|err| {
+                    let message = err.to_string();
+                    if is_retryable_connection_error(&err) {
+                        LegError::Transport(message)
+                    } else {
+                        LegError::NonRetryableTransport(message)
+                    }
+                })?;
+
+                let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                if (200..300).contains(&status) {
+                    let mut reader = response.into_body().into_reader();
+                    let mut buffer = [0_u8; 8192];
+                    loop {
+                        let length = reader.read(&mut buffer).map_err(|err| {
+                            LegError::ResponseRead(format!("failed to read response body: {err}"))
+                        })?;
+                        if length == 0 {
+                            break;
+                        }
+                        emit(buffer[..length].to_vec())?;
+                    }
+                    Ok(HttpResponse {
+                        status,
+                        body: String::new(),
+                        retry_after,
+                    })
+                } else {
+                    let body = response.body_mut().read_to_string().map_err(|err| {
+                        LegError::ResponseRead(format!("failed to read response body: {err}"))
+                    })?;
+                    Ok(HttpResponse {
+                        status,
+                        body,
+                        retry_after,
+                    })
+                }
+            },
+            |chunk: Vec<u8>| on_chunk(&chunk),
+        );
+        HttpCall::new(result, 1)
     }
 }
 

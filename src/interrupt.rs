@@ -362,6 +362,93 @@ where
     }
 }
 
+/// Runs a blocking operation while delivering progress on the calling thread.
+///
+/// A bounded channel keeps streamed progress in order and lets the caller poll
+/// for signals even while the worker is blocked reading the provider response.
+#[cfg(unix)]
+pub(crate) fn run_cancellable_with_progress<T, U, F, C>(
+    operation: F,
+    mut on_progress: C,
+) -> Result<T>
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    F: FnOnce(&mut dyn FnMut(U) -> Result<()>) -> Result<T> + Send + 'static,
+    C: FnMut(U) -> Result<()>,
+{
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+    use std::time::Duration;
+
+    enum Message<T, U> {
+        Progress(U),
+        Complete(Result<T>),
+    }
+
+    check()?;
+    if !ENABLED.load(Ordering::Acquire) {
+        return operation(&mut on_progress);
+    }
+
+    let (sender, receiver) = sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("leg-provider-stream".to_string())
+        .spawn(move || {
+            let mut emit = |progress| {
+                sender.send(Message::Progress(progress)).map_err(|_| {
+                    LegError::NonRetryableTransport("provider stream consumer stopped".to_string())
+                })
+            };
+            let result = operation(&mut emit);
+            let _ = sender.send(Message::Complete(result));
+        })
+        .map_err(|error| {
+            LegError::NonRetryableTransport(format!("failed to start provider stream: {error}"))
+        })?;
+
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(Message::Progress(progress)) => {
+                check()?;
+                on_progress(progress)?;
+            }
+            Ok(Message::Complete(result)) => {
+                if worker.join().is_err() {
+                    return Err(LegError::NonRetryableTransport(
+                        "provider stream worker panicked".to_string(),
+                    ));
+                }
+                check()?;
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => check()?,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(if worker.join().is_err() {
+                    LegError::NonRetryableTransport("provider stream worker panicked".to_string())
+                } else {
+                    LegError::NonRetryableTransport(
+                        "provider stream worker exited without a result".to_string(),
+                    )
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn run_cancellable_with_progress<T, U, F, C>(
+    operation: F,
+    mut on_progress: C,
+) -> Result<T>
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    F: FnOnce(&mut dyn FnMut(U) -> Result<()>) -> Result<T> + Send + 'static,
+    C: FnMut(U) -> Result<()>,
+{
+    operation(&mut on_progress)
+}
+
 #[cfg(not(unix))]
 pub(crate) fn run_cancellable<T, F>(operation: F) -> Result<T>
 where

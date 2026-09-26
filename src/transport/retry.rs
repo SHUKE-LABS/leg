@@ -109,6 +109,53 @@ impl<H: HttpClient> HttpClient for RetryingHttpClient<H> {
             retries += 1;
         }
     }
+
+    fn post_json_streaming(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+        on_chunk: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> HttpCall {
+        let mut retries = 0;
+        let mut attempts = 0_u64;
+
+        loop {
+            if let Err(error) = interrupt::check() {
+                return HttpCall::new(Err(error), attempts);
+            }
+
+            let call = self.inner.post_json_streaming(url, headers, body, on_chunk);
+            attempts = attempts.saturating_add(call.attempts);
+
+            match call.result {
+                Ok(response) => {
+                    if !is_retryable_status(response.status) || retries >= self.policy.max_retries {
+                        return HttpCall::new(Ok(response), attempts);
+                    }
+
+                    if let Err(error) = sleep_interruptibly(
+                        self.policy
+                            .delay(retries + 1, response.retry_after.as_deref()),
+                    ) {
+                        return HttpCall::new(Err(error), attempts);
+                    }
+                }
+                Err(error) => {
+                    if !matches!(error, LegError::Transport(_))
+                        || retries >= self.policy.max_retries
+                    {
+                        return HttpCall::new(Err(error), attempts);
+                    }
+
+                    if let Err(error) = sleep_interruptibly(self.policy.delay(retries + 1, None)) {
+                        return HttpCall::new(Err(error), attempts);
+                    }
+                }
+            }
+            retries += 1;
+        }
+    }
 }
 
 fn is_retryable_status(status: u16) -> bool {
@@ -236,6 +283,35 @@ mod tests {
             assert_eq!(call.attempts, 2, "status {status}");
             assert_eq!(inner.calls.get(), 2, "status {status}");
         }
+    }
+
+    #[test]
+    fn streaming_retry_does_not_emit_the_retry_response_body() {
+        let inner = ScriptedHttp::new(vec![
+            Ok(HttpResponse {
+                status: 503,
+                body: "retry body".to_string(),
+                retry_after: Some("0".to_string()),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: "stream body".to_string(),
+                retry_after: None,
+            }),
+        ]);
+        let client = RetryingHttpClient::new(&inner, RetryPolicy::new(1, Duration::ZERO));
+        let mut chunks = Vec::new();
+
+        let call =
+            client.post_json_streaming("https://provider.invalid", &[], "{}", &mut |chunk| {
+                chunks.push(String::from_utf8_lossy(chunk).into_owned());
+                Ok(())
+            });
+
+        assert_eq!(call.result.expect("retry should succeed").status, 200);
+        assert_eq!(call.attempts, 2);
+        assert_eq!(inner.calls.get(), 2);
+        assert_eq!(chunks, ["stream body"]);
     }
 
     #[test]
