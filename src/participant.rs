@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use crate::events::{Exchange, ExchangeMeta, Outcome, RequestRecord, now_ms, trail_content};
 use crate::message::{MessageEnvelope, MessageKind, WrappedExchange};
-use crate::model::Prompt;
+use crate::model::{ContentBlock, Message, Role};
 use crate::transport::Transport;
 
 /// Answers a `baton.message/v1` request envelope with a response envelope.
@@ -45,13 +45,17 @@ impl<T: Transport> LocalParticipant<T> {
     pub fn new(transport: T, meta: ExchangeMeta) -> Self {
         Self { transport, meta }
     }
-}
 
-impl<T: Transport> Participant for LocalParticipant<T> {
-    fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
+    pub(crate) fn respond_with_content(
+        &self,
+        request: &MessageEnvelope,
+        content: &[ContentBlock],
+    ) -> MessageEnvelope {
         let request_ts = now_ms();
         let start = Instant::now();
-        let result = self.transport.send(&Prompt::new(request.body.as_str()));
+        let result = self
+            .transport
+            .send_conversation(&[Message::new(Role::User, content.to_vec())]);
         let duration_ms = start.elapsed().as_millis() as u64;
         let outcome_ts = now_ms();
 
@@ -60,7 +64,7 @@ impl<T: Transport> Participant for LocalParticipant<T> {
             model: self.meta.model.clone(),
             base_url: self.meta.base_url.clone(),
             prompt: request.body.clone(),
-            content: None,
+            content: trail_content(content),
             session_id: None,
             turn_index: None,
         };
@@ -93,8 +97,8 @@ impl<T: Transport> Participant for LocalParticipant<T> {
             }
         };
 
-        // Addressing swaps: the reply is from the request's recipient, to its
-        // sender.
+        // Addressing swaps: the reply comes from the request's recipient and
+        // goes to its sender.
         let mut response = MessageEnvelope::new(
             fresh_message_id(&request.conversation_id, outcome_ts),
             request.conversation_id.clone(),
@@ -110,6 +114,13 @@ impl<T: Transport> Participant for LocalParticipant<T> {
             outcome,
         }));
         response
+    }
+}
+
+impl<T: Transport> Participant for LocalParticipant<T> {
+    fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
+        let content = [ContentBlock::text(request.body.clone())];
+        self.respond_with_content(request, &content)
     }
 }
 

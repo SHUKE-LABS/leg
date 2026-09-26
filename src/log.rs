@@ -29,6 +29,7 @@ use crate::error::{LegError, Result};
 use crate::events::{
     Exchange, Outcome, RequestRecord, ToolCallRecord, ToolResultRecord, ToolRoundRecord, ToolStatus,
 };
+use crate::model::{ContentBlock, ImageSource};
 
 /// The outcome of parsing a JSONL exchange trail: the complete [`Exchange`]
 /// pairs and any non-fatal diagnostics collected along the way.
@@ -42,6 +43,9 @@ pub struct ParseReport {
     /// The tool calls made within each exchange, in call order;
     /// `tools[i]` belongs to `exchanges[i]`.
     pub tools: Vec<Vec<ToolPair>>,
+    /// The full content of each tool-use reply in an exchange, in round order;
+    /// `rounds[i]` belongs to `exchanges[i]`.
+    pub rounds: Vec<Vec<Vec<ContentBlock>>>,
     /// Non-fatal diagnostics, in the order they were encountered.
     pub warnings: Vec<String>,
 }
@@ -81,6 +85,8 @@ pub struct ToolPair {
 ///   records a [`ParseReport::warnings`] entry rather than dropping silently.
 /// - **Trailing request** with no outcome (a torn tail or an in-flight call):
 ///   not yielded and not warned — only complete pairs become an [`Exchange`].
+/// - **`tool_round`**: attached to the pending request's [`ParseReport::rounds`]
+///   in reply order; a round with no pending request is warned and not shown.
 /// - **`tool_call` / `tool_result`**: attached to the pending request's
 ///   [`ParseReport::tools`], a result paired to its call by `tool_use_id`. A
 ///   tool line with no pending request, or a result with no matching call, is
@@ -88,7 +94,7 @@ pub struct ToolPair {
 pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
     let mut buffered = BufReader::new(reader);
     let mut report = ParseReport::default();
-    let mut pending: Option<(RequestRecord, Vec<ToolPair>)> = None;
+    let mut pending: Option<(RequestRecord, Vec<ToolPair>, Vec<Vec<ContentBlock>>)> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
 
@@ -122,12 +128,21 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
         match value.get("event").and_then(Value::as_str) {
             Some("request") => {
                 let record: RequestRecord = from_value(value, line_no, "request")?;
-                pending = Some((record, Vec::new()));
+                pending = Some((record, Vec::new(), Vec::new()));
+            }
+            Some("tool_round") => {
+                let round: ToolRoundRecord = from_value(value, line_no, "tool_round")?;
+                match &mut pending {
+                    Some((_, _, rounds)) => rounds.push(round.content),
+                    None => report.warnings.push(format!(
+                        "line {line_no}: a tool_round had no matching pending request — it is not shown"
+                    )),
+                }
             }
             Some("tool_call") => {
                 let call: ToolCallRecord = from_value(value, line_no, "tool_call")?;
                 match &mut pending {
-                    Some((_, tools)) => tools.push(ToolPair { call, result: None }),
+                    Some((_, tools, _)) => tools.push(ToolPair { call, result: None }),
                     None => report.warnings.push(dangling_tool_warning(
                         line_no,
                         "tool_call",
@@ -137,7 +152,7 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
             }
             Some("tool_result") => {
                 let result: ToolResultRecord = from_value(value, line_no, "tool_result")?;
-                let slot = pending.as_mut().and_then(|(_, tools)| {
+                let slot = pending.as_mut().and_then(|(_, tools, _)| {
                     tools.iter_mut().find(|pair| {
                         pair.call.tool_use_id == result.tool_use_id && pair.result.is_none()
                     })
@@ -159,9 +174,10 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
                     .to_string();
                 let outcome: Outcome = from_value(value, line_no, &event)?;
                 match pending.take() {
-                    Some((request, tools)) => {
+                    Some((request, tools, rounds)) => {
                         report.exchanges.push(Exchange { request, outcome });
                         report.tools.push(tools);
+                        report.rounds.push(rounds);
                     }
                     None => report
                         .warnings
@@ -478,34 +494,56 @@ fn parse_line_value(bytes: &[u8]) -> std::result::Result<Value, String> {
 ///
 /// `n` is the 1-based position shown to the user. The block carries the
 /// timestamp, model, and call duration on its header line, then a truncated
-/// prompt, each tool call made within the exchange (with its result), and
-/// either a truncated reply or the failure (`kind: message`).
+/// prompt, image summaries and thinking excerpts when present, each tool call
+/// made within the exchange (with its result), and either a truncated reply
+/// or the failure (`kind: message`).
 pub fn format_exchange(n: usize, exchange: &Exchange, tools: &[ToolPair]) -> String {
+    format_exchange_with_rounds(n, exchange, tools, &[])
+}
+
+pub(crate) fn format_exchange_with_rounds(
+    n: usize,
+    exchange: &Exchange,
+    tools: &[ToolPair],
+    rounds: &[Vec<ContentBlock>],
+) -> String {
     const MAX: usize = 120;
     let request = &exchange.request;
     let tool_lines: String = tools.iter().map(|pair| format_tool(pair, MAX)).collect();
+    let round_content = rounds
+        .iter()
+        .enumerate()
+        .map(|(i, content)| {
+            format_content_blocks(&format!("tool round {}", i + 1), Some(content), MAX)
+        })
+        .collect::<String>();
+    let request_content = format_content_blocks("request", request.content.as_deref(), MAX);
     let mut out = match &exchange.outcome {
         Outcome::Ok {
             duration_ms,
             reply,
+            content,
             input_tokens,
             output_tokens,
             ..
-        } => format!(
-            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{tool_lines}    reply:  {}\n    tokens: {}",
-            format_ts(request.ts_ms),
-            request.model,
-            excerpt(&request.prompt, MAX),
-            excerpt(reply, MAX),
-            format_tokens(*input_tokens, *output_tokens),
-        ),
+        } => {
+            let reply_content = format_content_blocks("reply", content.as_deref(), MAX);
+            format!(
+                "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{request_content}{round_content}{tool_lines}    reply:  {}\n{reply_content}    tokens: {}",
+                format_ts(request.ts_ms),
+                request.model,
+                excerpt(&request.prompt, MAX),
+                excerpt(reply, MAX),
+                format_tokens(*input_tokens, *output_tokens),
+            )
+        }
         Outcome::Error {
             duration_ms,
             kind,
             message,
             ..
         } => format!(
-            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{tool_lines}    error:  {kind}: {}",
+            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{request_content}{round_content}{tool_lines}    error:  {kind}: {}",
             format_ts(request.ts_ms),
             request.model,
             excerpt(&request.prompt, MAX),
@@ -514,6 +552,26 @@ pub fn format_exchange(n: usize, exchange: &Exchange, tools: &[ToolPair]) -> Str
     };
     out.push('\n');
     out
+}
+
+fn format_content_blocks(label: &str, content: Option<&[ContentBlock]>, max: usize) -> String {
+    content
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, data },
+            } => Some(format!(
+                "    {label} image: {media_type}, {} base64 bytes\n",
+                data.len()
+            )),
+            ContentBlock::Thinking { thinking, .. } => Some(format!(
+                "    {label} thinking: {} (signature retained)\n",
+                excerpt(thinking, max)
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Renders one tool call and its result as two indented lines.
@@ -1124,6 +1182,53 @@ mod tests {
         assert!(rendered.contains("hello"));
         assert!(rendered.contains("hi there"));
         assert!(rendered.contains("12 in, 34 out"));
+    }
+
+    #[test]
+    fn format_exchange_summarizes_image_and_thinking_blocks() {
+        let exchange = Exchange {
+            request: RequestRecord {
+                ts_ms: 1_700_000_000_000,
+                model: "m".to_string(),
+                base_url: "u".to_string(),
+                prompt: "describe".to_string(),
+                content: Some(vec![
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: "iVBORw==".to_string(),
+                        },
+                    },
+                    ContentBlock::text("describe"),
+                ]),
+                session_id: None,
+                turn_index: None,
+            },
+            outcome: Outcome::Ok {
+                ts_ms: 1_700_000_000_420,
+                duration_ms: 1,
+                reply: "answer".to_string(),
+                content: Some(vec![
+                    ContentBlock::Thinking {
+                        thinking: "internal thought".to_string(),
+                        signature: "signed-value".to_string(),
+                    },
+                    ContentBlock::text("answer"),
+                ]),
+                input_tokens: None,
+                output_tokens: None,
+                stop_reason: None,
+                session_id: None,
+                turn_index: None,
+            },
+        };
+
+        let rendered = format_exchange(1, &exchange, &[]);
+
+        assert!(rendered.contains("request image: image/png, 8 base64 bytes"));
+        assert!(rendered.contains("reply thinking: internal thought (signature retained)"));
+        assert!(!rendered.contains("iVBORw=="));
+        assert!(!rendered.contains("signed-value"));
     }
 
     #[test]

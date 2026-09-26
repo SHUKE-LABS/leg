@@ -4,8 +4,9 @@
 //! path. Multi-turn sessions build on [`Message`] (a role-tagged turn) and
 //! [`Conversation`] (the accumulated history resent with every request).
 //! A message's content is an ordered list of [`ContentBlock`]s — `text`,
-//! `tool_use`, and `tool_result` — so tool calls and their results round-trip
-//! through the transport, the trail, and `--resume`. [`ToolSpec`] declares a tool the
+//! `image`, `thinking`, `tool_use`, and `tool_result` — so multimodal input,
+//! reasoning signatures, tool calls, and their results round-trip through the
+//! transport, the trail, and `--resume`. [`ToolSpec`] declares a tool the
 //! provider may call and [`StopReason`] reports why a reply ended; executing
 //! tools and iterating on `tool_use` stop reasons is [`crate::tools`]' job.
 
@@ -35,9 +36,8 @@ impl Role {
 
 /// One block of a message's content, mirroring a Messages API content block.
 ///
-/// Serializes with the wire `type` tag (`text` / `tool_use` / `tool_result`),
-/// so the same shape is sent to the provider, parsed from its replies, and
-/// recorded on the trail.
+/// Serializes with the wire `type` tag, so the same shape is sent to the
+/// provider, parsed from its replies, and recorded on the trail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -45,6 +45,18 @@ pub enum ContentBlock {
     Text {
         /// The text content.
         text: String,
+    },
+    /// An image supplied to the provider.
+    Image {
+        /// The image's source, using the Messages API shape.
+        source: ImageSource,
+    },
+    /// Model reasoning that must be echoed unchanged when continuing a turn.
+    Thinking {
+        /// The reasoning text.
+        thinking: String,
+        /// Provider signature authorizing the reasoning block.
+        signature: String,
     },
     /// A tool call requested by the assistant.
     ToolUse {
@@ -67,6 +79,19 @@ pub enum ContentBlock {
     },
 }
 
+/// A Messages API image source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    /// A base64-encoded image embedded in the request.
+    Base64 {
+        /// MIME type of the encoded image.
+        media_type: String,
+        /// Base64-encoded image data.
+        data: String,
+    },
+}
+
 impl ContentBlock {
     /// Creates a text block from anything string-like.
     pub fn text(text: impl Into<String>) -> Self {
@@ -74,7 +99,7 @@ impl ContentBlock {
     }
 }
 
-/// Concatenates the `text` blocks of `blocks` in order, ignoring tool blocks.
+/// Concatenates the `text` blocks of `blocks` in order, ignoring non-text blocks.
 pub fn blocks_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -301,7 +326,7 @@ pub struct AssistantReply {
     /// The reply's text blocks concatenated in order; empty for a tool-only
     /// reply.
     pub text: String,
-    /// The reply's content blocks, in order (text and `tool_use`).
+    /// The reply's content blocks, in order.
     pub content: Vec<ContentBlock>,
     /// Provider-reported token usage for the call, when available.
     pub usage: TokenUsage,
@@ -374,6 +399,16 @@ mod tests {
     fn content_blocks_serialize_with_wire_type_tags_and_round_trip() {
         let blocks = vec![
             ContentBlock::text("hi"),
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo=".to_string(),
+                },
+            },
+            ContentBlock::Thinking {
+                thinking: "consider this".to_string(),
+                signature: "sig+/:=".to_string(),
+            },
             ContentBlock::ToolUse {
                 id: "toolu_1".to_string(),
                 name: "lookup".to_string(),
@@ -390,6 +425,8 @@ mod tests {
             json,
             serde_json::json!([
                 {"type": "text", "text": "hi"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                {"type": "thinking", "thinking": "consider this", "signature": "sig+/:="},
                 {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}},
                 {"type": "tool_result", "tool_use_id": "toolu_1", "content": "found"},
             ])

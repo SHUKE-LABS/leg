@@ -145,6 +145,42 @@ fn run_ask_emits_request_and_response_ok_events_to_the_sink() {
     assert_eq!(second["reply"], "hi there");
 }
 
+#[test]
+fn run_ask_with_image_content_sends_and_records_the_full_user_turn() {
+    let content = vec![
+        ContentBlock::Image {
+            source: crate::model::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "iVBORw==".to_string(),
+            },
+        },
+        ContentBlock::text("describe"),
+    ];
+    let transport = CapturingTransport::new(vec![AssistantReply::new("answer")]);
+    let participant = LocalParticipant::new(looped(&transport), meta());
+    let mut trail = Vec::new();
+    {
+        let mut sink = WriterSink::new(&mut trail);
+        run_ask_with_content(
+            &participant,
+            &meta(),
+            "describe",
+            &content,
+            Vec::new(),
+            &mut sink,
+        )
+        .expect("ask completes");
+    }
+
+    assert_eq!(
+        transport.calls.borrow()[0],
+        vec![Message::new(Role::User, content.clone())]
+    );
+    let report = crate::log::parse_jsonl(std::io::Cursor::new(trail)).expect("parses trail");
+    assert_eq!(report.exchanges[0].request.prompt, "describe");
+    assert_eq!(report.exchanges[0].request.content, Some(content));
+}
+
 /// A [`Transport`] that panics if called — proves `run_ask` records the
 /// `request` event *before* invoking the provider (must be able to
 /// observe a request line even if the call that follows never returns),
@@ -270,7 +306,8 @@ fn help_flags_parse() {
 #[test]
 fn help_text_documents_usage_env_and_failure_contract() {
     let text = help_text();
-    assert!(text.contains("leg ask [--model <model>] <prompt>"));
+    assert!(text.contains("leg ask [--model <model>] [--image <path> ...] <prompt>"));
+    assert!(text.contains("JPEG, PNG, GIF, and WebP"));
     assert!(text.contains("ANTHROPIC_API_KEY"));
     assert!(text.contains("ANTHROPIC_AUTH_TOKEN is for bearer keys"));
     assert!(text.contains("Anthropic-compatible endpoints"));
@@ -299,6 +336,7 @@ fn ask_parses_positional_prompt() {
         Some(Command::Ask {
             prompt: "hello".to_string(),
             model: None,
+            images: vec![],
         })
     );
 }
@@ -310,6 +348,7 @@ fn ask_parses_model_override_before_or_after_prompt() {
         Some(Command::Ask {
             prompt: "hello".to_string(),
             model: Some("claude-opus-4-8".to_string()),
+            images: vec![],
         })
     );
     assert_eq!(
@@ -317,6 +356,27 @@ fn ask_parses_model_override_before_or_after_prompt() {
         Some(Command::Ask {
             prompt: "hello".to_string(),
             model: Some("claude-opus-4-8".to_string()),
+            images: vec![],
+        })
+    );
+}
+
+#[test]
+fn ask_parses_repeatable_images_before_and_after_the_prompt() {
+    assert_eq!(
+        parse_args(&argv(&[
+            "ask",
+            "--image",
+            "first.png",
+            "describe",
+            "--image",
+            "second.jpg"
+        ]))
+        .unwrap(),
+        Some(Command::Ask {
+            prompt: "describe".to_string(),
+            model: None,
+            images: vec!["first.png".to_string(), "second.jpg".to_string()],
         })
     );
 }
@@ -349,6 +409,14 @@ fn ask_with_extra_positional_argument_is_usage_error() {
 fn model_flag_without_value_is_usage_error() {
     assert!(matches!(
         parse_args(&argv(&["ask", "--model"])).unwrap_err(),
+        LegError::Usage(_)
+    ));
+}
+
+#[test]
+fn image_flag_without_path_is_usage_error() {
+    assert!(matches!(
+        parse_args(&argv(&["ask", "hello", "--image"])).unwrap_err(),
         LegError::Usage(_)
     ));
 }
@@ -1338,6 +1406,83 @@ fn session_resume_rehydrates_tool_rounds_exactly_as_the_live_history() {
     assert_eq!(request["turn_index"], 2);
 }
 
+#[test]
+fn session_resume_echoes_thinking_signature_on_the_next_tool_continuation() {
+    let first_thinking = ContentBlock::Thinking {
+        thinking: "first private reasoning\npreserved exactly".to_string(),
+        signature: "first-signature+/=".to_string(),
+    };
+    let first_tool_use = echo_use("toolu_before_resume", "echo");
+    let first_transport = CapturingTransport::new(vec![
+        tool_reply(vec![first_thinking.clone(), first_tool_use.clone()]),
+        AssistantReply::new("first turn complete"),
+    ]);
+    let mut trail = Vec::new();
+    append_session_run(
+        &echo_looped(&first_transport).0,
+        &mut trail,
+        "sess-thinking",
+        b"first turn\n",
+    );
+
+    let report = crate::log::parse_sessions(std::io::Cursor::new(trail)).expect("parses trail");
+    let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates session");
+    assert_eq!(
+        resumed.conversation.messages()[1],
+        Message::new(
+            Role::Assistant,
+            vec![first_thinking.clone(), first_tool_use.clone()]
+        )
+    );
+    let prior_history = resumed.conversation.messages().to_vec();
+
+    let second_thinking = ContentBlock::Thinking {
+        thinking: "second round reasoning".to_string(),
+        signature: "second-signature:=+/".to_string(),
+    };
+    let second_tool_use = echo_use("toolu_after_resume", "echo");
+    let continued_transport = CapturingTransport::new(vec![
+        tool_reply(vec![second_thinking.clone(), second_tool_use.clone()]),
+        AssistantReply::new("second turn complete"),
+    ]);
+    let mut resumed_trail = Vec::new();
+    {
+        let mut sink = WriterSink::new(&mut resumed_trail);
+        execute_session_resumed(
+            &echo_looped(&continued_transport).0,
+            &mut sink,
+            &meta(),
+            std::io::Cursor::new(b"second turn\n".to_vec()),
+            Vec::new(),
+            resumed,
+        )
+        .expect("resumed session completes");
+    }
+
+    let calls = continued_transport.calls.borrow();
+    let mut expected_first_call = prior_history;
+    expected_first_call.push(Message::user("second turn"));
+    assert_eq!(calls[0], expected_first_call);
+
+    let assistant_messages = calls[1]
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages.len(), 3);
+    assert_eq!(
+        assistant_messages[0].content,
+        vec![first_thinking, first_tool_use]
+    );
+    assert_eq!(
+        assistant_messages[1].content,
+        vec![ContentBlock::text("first turn complete")]
+    );
+    assert_eq!(
+        assistant_messages[2].content,
+        vec![second_thinking, second_tool_use]
+    );
+}
+
 /// A turn capped at the round limit resumes like the live history: every
 /// round, then the capped reply without its unanswered `tool_use`.
 #[test]
@@ -1414,7 +1559,7 @@ fn session_resume_of_a_trail_without_tool_rounds_keeps_text_turns() {
 }
 
 /// `log replay --index` selects a tool-bearing exchange by its global
-/// trail index and reruns only its prompt through the current tool loop,
+/// trail index and reruns its request content through the current tool loop,
 /// appending fresh request/tool/outcome events — the stored tool results
 /// are never fed back.
 #[test]
@@ -1457,11 +1602,12 @@ fn log_replay_reruns_a_tool_bearing_prompt_through_the_loop() {
 
     let report = crate::log::parse_jsonl(std::io::Cursor::new(trail.clone())).expect("parses");
     assert_eq!(report.exchanges.len(), 2, "global indexing spans sessions");
-    let (config, prompt) = replay_target(&report, Some(1), || {
+    let (config, prompt, content) = replay_target(&report, Some(1), || {
         LegConfig::from_lookup(|key| (key == "ANTHROPIC_API_KEY").then(|| "secret".to_string()))
     })
     .expect("selects");
     assert_eq!(prompt, "use a tool");
+    assert_eq!(content, vec![ContentBlock::text("use a tool")]);
     assert_eq!(config.model, "claude-test-model");
     assert_eq!(config.base_url, "https://api.anthropic.com");
 
@@ -1490,6 +1636,76 @@ fn log_replay_reruns_a_tool_bearing_prompt_through_the_loop() {
     assert_eq!(report.tools[2].len(), 1);
     assert_eq!(report.tools[2][0].call.tool_use_id, "toolu_9");
     assert!(report.tools[2][0].result.is_some());
+}
+
+#[test]
+fn log_replay_preserves_image_blocks_in_the_provider_request_and_trail() {
+    let image = ContentBlock::Image {
+        source: crate::model::ImageSource::Base64 {
+            media_type: "image/jpeg".to_string(),
+            data: "AQID".to_string(),
+        },
+    };
+    let content = vec![image, ContentBlock::text("describe this")];
+    let report = crate::log::ParseReport {
+        exchanges: vec![Exchange {
+            request: crate::events::RequestRecord {
+                ts_ms: 1,
+                model: "recorded-model".to_string(),
+                base_url: "https://recorded.example".to_string(),
+                prompt: "describe this".to_string(),
+                content: Some(content.clone()),
+                session_id: None,
+                turn_index: None,
+            },
+            outcome: Outcome::Ok {
+                ts_ms: 2,
+                duration_ms: 1,
+                reply: "old answer".to_string(),
+                content: None,
+                input_tokens: None,
+                output_tokens: None,
+                stop_reason: None,
+                session_id: None,
+                turn_index: None,
+            },
+        }],
+        tools: vec![Vec::new()],
+        rounds: vec![Vec::new()],
+        warnings: Vec::new(),
+    };
+    let (config, prompt, replay_content) = replay_target(&report, None, || {
+        LegConfig::from_lookup(|key| (key == "ANTHROPIC_API_KEY").then(|| "secret".to_string()))
+    })
+    .expect("selects replay target");
+    assert_eq!(replay_content, content);
+    assert_eq!(config.model, "recorded-model");
+    assert_eq!(config.base_url, "https://recorded.example");
+
+    let transport = CapturingTransport::new(vec![AssistantReply::new("new answer")]);
+    let meta = exchange_meta(&config);
+    let participant = LocalParticipant::new(looped(&transport), meta.clone());
+    let mut trail = Vec::new();
+    {
+        let mut sink = WriterSink::new(&mut trail);
+        run_ask_with_content(
+            &participant,
+            &meta,
+            &prompt,
+            &replay_content,
+            Vec::new(),
+            &mut sink,
+        )
+        .expect("replays");
+    }
+
+    assert_eq!(
+        transport.calls.borrow()[0],
+        vec![Message::new(Role::User, content.clone())]
+    );
+    let replayed =
+        crate::log::parse_jsonl(std::io::Cursor::new(trail)).expect("parses replay trail");
+    assert_eq!(replayed.exchanges[0].request.content, Some(content));
 }
 
 /// A bad `--index` is reported as a usage error before the environment's
@@ -1685,6 +1901,7 @@ fn execute_log_show_writes_a_block_per_exchange() {
     }];
     let report = crate::log::ParseReport {
         tools: vec![Vec::new()],
+        rounds: vec![Vec::new()],
         exchanges,
         warnings: Vec::new(),
     };
@@ -1693,6 +1910,57 @@ fn execute_log_show_writes_a_block_per_exchange() {
     let text = String::from_utf8(buf).unwrap();
     assert!(text.contains("#1"));
     assert!(text.contains("hello"));
+}
+
+#[test]
+fn execute_log_show_summarizes_tool_round_thinking_without_payloads() {
+    let image_payload = "not-visible-image-payload";
+    let round_content = vec![
+        ContentBlock::Thinking {
+            thinking: "reasoning from intermediate round".to_string(),
+            signature: "hidden-thinking-signature".to_string(),
+        },
+        ContentBlock::Image {
+            source: crate::model::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: image_payload.to_string(),
+            },
+        },
+        echo_use("toolu_round", "echo"),
+    ];
+    let events = [
+        ExchangeEvent::session_request(1, &meta(), "inspect", "sess-log-show", 0),
+        ExchangeEvent::ToolRound {
+            schema: crate::events::SCHEMA,
+            ts_ms: 2,
+            content: round_content.clone(),
+            session_id: Some("sess-log-show".to_string()),
+            turn_index: Some(0),
+        },
+        ExchangeEvent::session_response_ok(3, 1, "done", None, None, None, "sess-log-show", 0),
+    ];
+    let mut trail = Vec::new();
+    {
+        let mut sink = WriterSink::new(&mut trail);
+        for event in &events {
+            sink.record(event).expect("writes event");
+        }
+    }
+
+    let report = crate::log::parse_jsonl(std::io::Cursor::new(trail)).expect("parses trail");
+    assert_eq!(report.rounds, vec![vec![round_content]]);
+
+    let mut output = Vec::new();
+    execute_log_show(&report, &mut output).expect("renders log");
+    let rendered = String::from_utf8(output).unwrap();
+    assert!(
+        rendered.contains(
+            "tool round 1 thinking: reasoning from intermediate round (signature retained)"
+        )
+    );
+    assert!(rendered.contains("tool round 1 image: image/png"));
+    assert!(!rendered.contains("hidden-thinking-signature"));
+    assert!(!rendered.contains(image_payload));
 }
 
 #[test]

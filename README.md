@@ -47,7 +47,13 @@ licenses of the bundled third-party Rust crates and vendored material.
 
 ```
 ANTHROPIC_API_KEY=sk-... leg ask [--model <model>] "prompt"
+ANTHROPIC_API_KEY=sk-... leg ask --image chart.png "Describe this chart"
 ```
+
+Use repeatable `--image <path>` flags to attach local JPEG, PNG, GIF, or WebP
+images to an `ask` turn. Image type is detected from the file contents; each
+base64-encoded image is limited to 10 MB, with a 32 MB cap on the serialized
+image request.
 
 Prints the assistant reply on success. A provider or delivery failure
 (bad credentials, unreachable base URL, etc.) leaves stdout empty, reports an

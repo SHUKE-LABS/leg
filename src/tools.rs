@@ -139,7 +139,7 @@ pub struct TurnOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolEvent<'a> {
     /// A `tool_use` reply whose calls are about to be dispatched: its full
-    /// content blocks (any text plus the `tool_use` blocks), in reply order.
+    /// content blocks, including signed thinking, in reply order.
     Round {
         /// The reply's content blocks.
         content: &'a [ContentBlock],

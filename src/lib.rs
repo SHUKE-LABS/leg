@@ -6,7 +6,7 @@
 //!
 //! - [`config`] — environment-backed runtime configuration.
 //! - [`model`] — typed prompt/reply structures: role-tagged messages built
-//!   from `text`/`tool_use`/`tool_result` content blocks, and a structured
+//!   from text, image, thinking, and tool content blocks, and a structured
 //!   stop reason.
 //! - [`tools`] — the tool registry/dispatch seam and the tool loop that
 //!   iterates on `tool_use` replies.
@@ -23,6 +23,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod events;
+mod image_input;
 mod interrupt;
 pub mod log;
 pub mod message;
