@@ -72,11 +72,13 @@ include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 
 `ask`, `session`, and `exchange` share one tool loop. It runs only when a
 reply requests tools (`stop_reason: tool_use`): each call is executed and
-its result sent back until the model answers, and only that final reply is
-printed. `LEG_MAX_TOOL_ROUNDS` optionally sets a positive round limit; unset
-or blank is unbounded. With a configured limit, if the reply still requests
-tools after that many rounds, `leg` sends no further request and warns on
-stderr. A call to an unregistered tool is answered with an error result.
+its result sent back until the model answers. `ask` and `exchange` print only
+that final reply; interactive `session` flushes assistant text as it streams,
+while keeping tool arguments and results out of stdout.
+`LEG_MAX_TOOL_ROUNDS` optionally sets a positive round limit; unset or blank is
+unbounded. With a configured limit, if the reply still requests tools after
+that many rounds, `leg` sends no further request and warns on stderr. A call
+to an unregistered tool is answered with an error result.
 
 ### Transient provider retries
 
@@ -179,10 +181,10 @@ LEG_EVENT_LOG=trail.jsonl ANTHROPIC_API_KEY=sk-... leg session
 ```
 
 Runs an interactive multi-turn REPL: each line typed is sent with the full
-prior conversation, and the reply is printed. Ctrl-D or a lone `/exit` line
-ends the session cleanly. Every turn (and, with `LEG_EVENT_LOG` set, the
-session's start/end) is appended to the JSONL trail, keyed by a `session_id`
-minted for the run.
+prior conversation, and assistant text is flushed as it streams. Ctrl-D or a
+lone `/exit` line ends the session cleanly. Every turn (and, with
+`LEG_EVENT_LOG` set, the session's start/end) is appended to the JSONL trail,
+keyed by a `session_id` minted for the run.
 
 ```
 leg session --resume trail.jsonl [--session <id>]

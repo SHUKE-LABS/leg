@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::events::ToolStatus;
 use crate::interrupt;
 use crate::model::{AssistantReply, ContentBlock, Message, Role, StopReason, TokenUsage, ToolSpec};
-use crate::transport::{Transport, TransportCall};
+use crate::transport::{StreamEvent, Transport, TransportCall};
 use pretool::PreToolHook;
 
 mod bash;
@@ -228,12 +228,37 @@ impl<T: Transport> ToolLoop<T> {
         history: &[Message],
         observe: &mut dyn FnMut(ToolEvent<'_>),
     ) -> TransportCall<TurnOutcome> {
+        self.run_observed_with_optional_stream(history, observe, None)
+    }
+
+    /// Runs one user turn while forwarding provider stream events to
+    /// `on_stream_event`, in addition to the tool lifecycle notifications.
+    pub fn run_streaming_observed_with_attempts(
+        &self,
+        history: &[Message],
+        observe: &mut dyn FnMut(ToolEvent<'_>),
+        on_stream_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<TurnOutcome> {
+        self.run_observed_with_optional_stream(history, observe, Some(on_stream_event))
+    }
+
+    fn run_observed_with_optional_stream(
+        &self,
+        history: &[Message],
+        observe: &mut dyn FnMut(ToolEvent<'_>),
+        mut on_stream_event: Option<&mut dyn FnMut(StreamEvent) -> Result<()>>,
+    ) -> TransportCall<TurnOutcome> {
         let mut attempts = 0_u64;
         if let Err(error) = interrupt::check() {
             return TransportCall::completed(Err(error), attempts);
         }
         let mut messages = history.to_vec();
-        let call = self.transport.send_conversation_with_attempts(&messages);
+        let call = match on_stream_event.as_mut() {
+            Some(on_event) => self
+                .transport
+                .send_conversation_streaming_with_attempts(&messages, *on_event),
+            None => self.transport.send_conversation_with_attempts(&messages),
+        };
         attempts = attempts.saturating_add(call.attempts);
         if let Err(error) = interrupt::check() {
             return TransportCall::completed(Err(error), attempts);
@@ -296,7 +321,12 @@ impl<T: Transport> ToolLoop<T> {
             messages.push(Message::new(Role::User, results));
             rounds = rounds.saturating_add(1);
 
-            let call = self.transport.send_conversation_with_attempts(&messages);
+            let call = match on_stream_event.as_mut() {
+                Some(on_event) => self
+                    .transport
+                    .send_conversation_streaming_with_attempts(&messages, *on_event),
+                None => self.transport.send_conversation_with_attempts(&messages),
+            };
             attempts = attempts.saturating_add(call.attempts);
             if let Err(error) = interrupt::check() {
                 return TransportCall::completed(Err(error), attempts);

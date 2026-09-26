@@ -52,6 +52,14 @@ pub enum LegError {
     /// A failure while reading a response body; retrying could duplicate a
     /// request after the provider has already started replying.
     ResponseRead(String),
+    /// The provider returned a stream-level error event after the HTTP
+    /// response had started.
+    ProviderStream {
+        /// The optional provider error type.
+        error_type: Option<String>,
+        /// The provider's error message.
+        message: String,
+    },
     /// The provider rejected the credentials (HTTP 401). The message includes
     /// the provider error type when supplied.
     Auth(String),
@@ -117,6 +125,7 @@ impl LegError {
             LegError::Transport(_) => "transport",
             LegError::NonRetryableTransport(_) => "transport",
             LegError::ResponseRead(_) => "transport",
+            LegError::ProviderStream { .. } => "provider_stream",
             LegError::Auth(_) => "auth",
             LegError::RateLimited(_) => "rate_limited",
             LegError::Server { .. } => "server",
@@ -139,6 +148,16 @@ impl fmt::Display for LegError {
             LegError::Transport(msg) => write!(f, "transport error: {msg}"),
             LegError::NonRetryableTransport(msg) | LegError::ResponseRead(msg) => {
                 write!(f, "transport error: {msg}")
+            }
+            LegError::ProviderStream {
+                error_type,
+                message,
+            } => {
+                write!(f, "provider stream error")?;
+                if let Some(error_type) = error_type {
+                    write!(f, " ({error_type})")?;
+                }
+                write!(f, ": {message}")
             }
             LegError::Auth(msg) => write!(f, "authentication error: {msg}"),
             LegError::RateLimited(msg) => write!(f, "rate limited: {msg}"),

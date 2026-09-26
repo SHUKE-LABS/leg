@@ -1,15 +1,15 @@
-//! A non-streaming Claude-compatible Messages client.
+//! A Claude-compatible Messages client.
 //!
 //! [`ClaudeClient`] implements [`Transport`] against `POST /v1/messages`. It
 //! sends a full conversation history (one or more role-tagged turns), plus any
 //! declared [`ToolSpec`]s, and decodes one assistant reply. Message content is
 //! sent and parsed as content blocks: images and signed thinking are retained,
 //! `tool_use` blocks in a reply are decoded alongside text, and `tool_result`
-//! blocks go out on a follow-up user turn. Streaming remains out of scope.
-//! The request building and response parsing are pure functions so they can be
+//! blocks go out on a follow-up user turn. Streaming response assembly is
 //! tested without a network via a fake [`HttpClient`].
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::config::{Credential, LegConfig};
 use crate::error::{LegError, Result};
@@ -18,7 +18,7 @@ use crate::model::{
     AssistantReply, ContentBlock, Message, StopReason, TokenUsage, ToolSpec, as_single_text,
 };
 use crate::transport::http::{HttpClient, UreqHttpClient};
-use crate::transport::{RetryPolicy, RetryingHttpClient, Transport, TransportCall};
+use crate::transport::{RetryPolicy, RetryingHttpClient, StreamEvent, Transport, TransportCall};
 
 /// The Messages API version pinned by this client.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -105,6 +105,54 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
             .and_then(|response| parse_response(response.status, &response.body));
         TransportCall::new(result, attempts)
     }
+
+    fn send_conversation_streaming_with_attempts(
+        &self,
+        messages: &[Message],
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        let body = match build_request_body_with_stream(
+            &self.config.model,
+            self.config.max_tokens,
+            messages,
+            self.config.system_prompt.as_deref(),
+            &self.tools,
+            true,
+        ) {
+            Ok(body) => body,
+            Err(error) => return TransportCall::completed(Err(error), 0),
+        };
+        let url = self.endpoint();
+        let (auth_name, auth_value) = auth_header(&self.config.credential);
+        let headers = [
+            (auth_name, auth_value.as_str()),
+            ("anthropic-version", ANTHROPIC_VERSION),
+            ("content-type", "application/json"),
+        ];
+
+        let mut decoder = SseDecoder::default();
+        let mut assembler = StreamAssembler::default();
+        let call = {
+            let mut accept_event = |event| assembler.accept(event, on_event);
+            self.http
+                .post_json_streaming(&url, &headers, &body, &mut |chunk| {
+                    decoder.push(chunk, &mut accept_event)
+                })
+        };
+        let attempts = call.attempts;
+        let result = match call.result {
+            Err(error) => Err(error),
+            Ok(response) if (200..300).contains(&response.status) => {
+                let result = {
+                    let mut accept_event = |event| assembler.accept(event, on_event);
+                    decoder.finish(&mut accept_event)
+                };
+                result.and_then(|()| assembler.finish())
+            }
+            Ok(response) => parse_response(response.status, &response.body),
+        };
+        TransportCall::new(result, attempts)
+    }
 }
 
 /// Maps the resolved [`Credential`] onto the wire-level auth header pair.
@@ -142,6 +190,17 @@ fn build_request_body(
     system_prompt: Option<&str>,
     tools: &[ToolSpec],
 ) -> Result<String> {
+    build_request_body_with_stream(model, max_tokens, messages, system_prompt, tools, false)
+}
+
+fn build_request_body_with_stream(
+    model: &str,
+    max_tokens: u32,
+    messages: &[Message],
+    system_prompt: Option<&str>,
+    tools: &[ToolSpec],
+    stream: bool,
+) -> Result<String> {
     validate_message_image_limits(messages)?;
     let has_images = messages.iter().any(|message| {
         message
@@ -164,6 +223,7 @@ fn build_request_body(
             })
             .collect(),
         tools,
+        stream: stream.then_some(true),
     };
     let body = serde_json::to_string(&request)
         .map_err(|err| LegError::Transport(format!("failed to serialize request: {err}")))?;
@@ -261,6 +321,433 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
     ))
 }
 
+struct SseEvent {
+    name: String,
+    data: String,
+}
+
+#[derive(Default)]
+struct SseDecoder {
+    line: Vec<u8>,
+    event_name: Option<String>,
+    data: Vec<String>,
+}
+
+impl SseDecoder {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        on_event: &mut dyn FnMut(SseEvent) -> Result<()>,
+    ) -> Result<()> {
+        for byte in chunk {
+            if *byte == b'\n' {
+                let line = std::mem::take(&mut self.line);
+                self.process_line(&line, on_event)?;
+            } else {
+                self.line.push(*byte);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, on_event: &mut dyn FnMut(SseEvent) -> Result<()>) -> Result<()> {
+        if !self.line.is_empty() {
+            let line = std::mem::take(&mut self.line);
+            self.process_line(&line, on_event)?;
+        }
+        self.dispatch(on_event)
+    }
+
+    fn process_line(
+        &mut self,
+        bytes: &[u8],
+        on_event: &mut dyn FnMut(SseEvent) -> Result<()>,
+    ) -> Result<()> {
+        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        if bytes.is_empty() {
+            return self.dispatch(on_event);
+        }
+        if bytes.first() == Some(&b':') {
+            return Ok(());
+        }
+
+        let line = std::str::from_utf8(bytes)
+            .map_err(|error| LegError::Decode(format!("invalid UTF-8 in SSE stream: {error}")))?;
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => self.event_name = Some(value.to_string()),
+            "data" => self.data.push(value.to_string()),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, on_event: &mut dyn FnMut(SseEvent) -> Result<()>) -> Result<()> {
+        if self.data.is_empty() {
+            self.event_name = None;
+            return Ok(());
+        }
+        let event = SseEvent {
+            name: self
+                .event_name
+                .take()
+                .unwrap_or_else(|| "message".to_string()),
+            data: self.data.join("\n"),
+        };
+        self.data.clear();
+        on_event(event)
+    }
+}
+
+struct PartialContentBlock {
+    value: serde_json::Value,
+    partial_json: String,
+}
+
+#[derive(Default)]
+struct StreamAssembler {
+    started: bool,
+    stopped: bool,
+    blocks: BTreeMap<usize, PartialContentBlock>,
+    completed: BTreeMap<usize, Option<ContentBlock>>,
+    usage: TokenUsage,
+    stop_reason: Option<StopReason>,
+}
+
+impl StreamAssembler {
+    fn accept(
+        &mut self,
+        event: SseEvent,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> Result<()> {
+        if event.name == "ping" {
+            return on_event(StreamEvent::Ping);
+        }
+        if event.name == "error" {
+            let (error_type, message) = extract_error_details(&event.data);
+            on_event(StreamEvent::Error {
+                error_type: error_type.clone(),
+                message: message.clone(),
+            })?;
+            return Err(stream_error(error_type, message));
+        }
+        if !matches!(
+            event.name.as_str(),
+            "message_start"
+                | "content_block_start"
+                | "content_block_delta"
+                | "content_block_stop"
+                | "message_delta"
+                | "message_stop"
+        ) {
+            return on_event(StreamEvent::Unknown {
+                name: event.name,
+                data: event.data,
+            });
+        }
+
+        let data: serde_json::Value = serde_json::from_str(&event.data).map_err(|error| {
+            LegError::Decode(format!("malformed {} SSE event: {error}", event.name))
+        })?;
+        if let Some(event_type) = data.get("type").and_then(serde_json::Value::as_str)
+            && event_type != event.name
+        {
+            return Err(LegError::Decode(format!(
+                "SSE event {:?} contained type {event_type:?}",
+                event.name
+            )));
+        }
+
+        match event.name.as_str() {
+            "message_start" => {
+                if self.started || self.stopped {
+                    return Err(LegError::Decode(
+                        "duplicate message_start in SSE stream".to_string(),
+                    ));
+                }
+                let message = data.get("message").ok_or_else(|| {
+                    LegError::Decode("message_start event omitted message".to_string())
+                })?;
+                self.started = true;
+                self.merge_usage(message.get("usage"))?;
+                on_event(StreamEvent::MessageStart { data })
+            }
+            "content_block_start" => {
+                self.ensure_message_open()?;
+                let index = event_index(&data)?;
+                let content_block = data.get("content_block").ok_or_else(|| {
+                    LegError::Decode("content_block_start omitted content_block".to_string())
+                })?;
+                if self.blocks.contains_key(&index) || self.completed.contains_key(&index) {
+                    return Err(LegError::Decode(format!(
+                        "duplicate content block index {index}"
+                    )));
+                }
+                self.blocks.insert(
+                    index,
+                    PartialContentBlock {
+                        value: content_block.clone(),
+                        partial_json: String::new(),
+                    },
+                );
+                on_event(StreamEvent::ContentBlockStart {
+                    index,
+                    content_block: content_block.clone(),
+                })
+            }
+            "content_block_delta" => {
+                self.ensure_message_open()?;
+                let index = event_index(&data)?;
+                let delta = data.get("delta").ok_or_else(|| {
+                    LegError::Decode("content_block_delta omitted delta".to_string())
+                })?;
+                let block = self.blocks.get_mut(&index).ok_or_else(|| {
+                    LegError::Decode(format!(
+                        "content_block_delta referenced unopened block {index}"
+                    ))
+                })?;
+                apply_content_delta(block, delta)?;
+                on_event(StreamEvent::ContentBlockDelta {
+                    index,
+                    delta: delta.clone(),
+                })
+            }
+            "content_block_stop" => {
+                self.ensure_message_open()?;
+                let index = event_index(&data)?;
+                let block = self.blocks.remove(&index).ok_or_else(|| {
+                    LegError::Decode(format!(
+                        "content_block_stop referenced unopened block {index}"
+                    ))
+                })?;
+                let content = finish_content_block(block)?;
+                self.completed.insert(index, content);
+                on_event(StreamEvent::ContentBlockStop { index })
+            }
+            "message_delta" => {
+                self.ensure_message_open()?;
+                self.merge_usage(data.get("usage"))?;
+                if let Some(reason) = data.pointer("/delta/stop_reason")
+                    && !reason.is_null()
+                {
+                    let reason = reason.as_str().ok_or_else(|| {
+                        LegError::Decode("message_delta stop_reason was not text".to_string())
+                    })?;
+                    self.stop_reason = Some(StopReason::from_wire(reason));
+                }
+                on_event(StreamEvent::MessageDelta { data })
+            }
+            "message_stop" => {
+                self.ensure_message_open()?;
+                if !self.blocks.is_empty() {
+                    return Err(LegError::Decode(
+                        "message_stop arrived before all content blocks stopped".to_string(),
+                    ));
+                }
+                self.stopped = true;
+                on_event(StreamEvent::MessageStop)
+            }
+            _ => on_event(StreamEvent::Unknown {
+                name: event.name,
+                data: event.data,
+            }),
+        }
+    }
+
+    fn ensure_message_open(&self) -> Result<()> {
+        if !self.started {
+            return Err(LegError::Decode(
+                "SSE event arrived before message_start".to_string(),
+            ));
+        }
+        if self.stopped {
+            return Err(LegError::Decode(
+                "SSE event arrived after message_stop".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn merge_usage(&mut self, usage: Option<&serde_json::Value>) -> Result<()> {
+        let Some(usage) = usage.filter(|value| !value.is_null()) else {
+            return Ok(());
+        };
+        let usage: UsageBlock = serde_json::from_value(usage.clone())
+            .map_err(|error| LegError::Decode(format!("malformed stream usage: {error}")))?;
+        self.usage.input_tokens = usage.input_tokens.or(self.usage.input_tokens);
+        self.usage.output_tokens = usage.output_tokens.or(self.usage.output_tokens);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<AssistantReply> {
+        if !self.started {
+            return Err(LegError::Decode(
+                "SSE stream ended before message_start".to_string(),
+            ));
+        }
+        if !self.stopped {
+            return Err(LegError::Decode(
+                "SSE stream ended before message_stop".to_string(),
+            ));
+        }
+        if !self.blocks.is_empty() {
+            return Err(LegError::Decode(
+                "SSE stream ended with an open content block".to_string(),
+            ));
+        }
+
+        let content: Vec<ContentBlock> = self.completed.into_values().flatten().collect();
+        let has_tool_use = content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        let has_text = content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if !text.is_empty()));
+        if !has_text && !has_tool_use {
+            return Err(LegError::Decode(
+                "response contained no assistant text or tool call".to_string(),
+            ));
+        }
+
+        Ok(AssistantReply::from_blocks(
+            content,
+            self.usage,
+            self.stop_reason,
+        ))
+    }
+}
+
+fn event_index(data: &serde_json::Value) -> Result<usize> {
+    data.get("index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| LegError::Decode("SSE content-block event omitted index".to_string()))
+}
+
+fn apply_content_delta(block: &mut PartialContentBlock, delta: &serde_json::Value) -> Result<()> {
+    let block_type = block.value.get("type").and_then(serde_json::Value::as_str);
+    if !matches!(block_type, Some("text" | "tool_use" | "thinking")) {
+        return Ok(());
+    }
+    let delta_type = delta
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| LegError::Decode("content delta omitted type".to_string()))?;
+    match delta_type {
+        "text_delta" => {
+            require_block_type(block, "text", delta_type)?;
+            let text = delta
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| LegError::Decode("text_delta omitted text".to_string()))?;
+            append_block_string(&mut block.value, "text", text)
+        }
+        "input_json_delta" => {
+            require_block_type(block, "tool_use", delta_type)?;
+            let partial_json = delta
+                .get("partial_json")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    LegError::Decode("input_json_delta omitted partial_json".to_string())
+                })?;
+            block.partial_json.push_str(partial_json);
+            Ok(())
+        }
+        "thinking_delta" => {
+            require_block_type(block, "thinking", delta_type)?;
+            let thinking = delta
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| LegError::Decode("thinking_delta omitted thinking".to_string()))?;
+            append_block_string(&mut block.value, "thinking", thinking)
+        }
+        "signature_delta" => {
+            require_block_type(block, "thinking", delta_type)?;
+            let signature = delta
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| LegError::Decode("signature_delta omitted signature".to_string()))?;
+            append_block_string(&mut block.value, "signature", signature)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn require_block_type(block: &PartialContentBlock, expected: &str, delta_type: &str) -> Result<()> {
+    if block.value.get("type").and_then(serde_json::Value::as_str) == Some(expected) {
+        Ok(())
+    } else {
+        Err(LegError::Decode(format!(
+            "{delta_type} referenced a non-{expected} content block"
+        )))
+    }
+}
+
+fn append_block_string(block: &mut serde_json::Value, field: &str, suffix: &str) -> Result<()> {
+    let current = match block.get(field) {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        None => String::new(),
+        _ => {
+            return Err(LegError::Decode(format!(
+                "content block field {field:?} was not text"
+            )));
+        }
+    };
+    let object = block
+        .as_object_mut()
+        .ok_or_else(|| LegError::Decode("content block start was not an object".to_string()))?;
+    object.insert(
+        field.to_string(),
+        serde_json::Value::String(format!("{current}{suffix}")),
+    );
+    Ok(())
+}
+
+fn finish_content_block(mut block: PartialContentBlock) -> Result<Option<ContentBlock>> {
+    let block_type = block
+        .value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if block_type.as_deref() == Some("tool_use") && !block.partial_json.is_empty() {
+        let input = serde_json::from_str(&block.partial_json).map_err(|error| {
+            LegError::Decode(format!("malformed tool-use input JSON delta: {error}"))
+        })?;
+        block
+            .value
+            .as_object_mut()
+            .ok_or_else(|| {
+                LegError::Decode("tool-use content block was not an object".to_string())
+            })?
+            .insert("input".to_string(), input);
+    }
+
+    match block_type.as_deref() {
+        Some("text" | "image" | "thinking" | "tool_use") => serde_json::from_value(block.value)
+            .map(Some)
+            .map_err(|error| {
+                LegError::Decode(format!("malformed streamed content block: {error}"))
+            }),
+        _ => Ok(None),
+    }
+}
+
+fn stream_error(error_type: Option<String>, message: String) -> LegError {
+    match error_type.as_deref() {
+        Some("rate_limit_error") => {
+            LegError::RateLimited(error_message_with_type(error_type.as_deref(), message))
+        }
+        Some("authentication_error") => {
+            LegError::Auth(error_message_with_type(error_type.as_deref(), message))
+        }
+        _ => LegError::ProviderStream {
+            error_type,
+            message,
+        },
+    }
+}
+
 /// Pulls the provider error type and `error.message` out of a Claude error
 /// body, falling back to the raw body (trimmed) when it is unparseable.
 fn extract_error_details(body: &str) -> (Option<String>, String) {
@@ -292,6 +779,8 @@ struct MessagesRequest<'a> {
     messages: Vec<RequestMessage<'a>>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     tools: &'a [ToolSpec],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -400,6 +889,29 @@ mod tests {
                 retry_after: None,
             })
         }
+
+        fn post_json_streaming(
+            &self,
+            url: &str,
+            headers: &[(&str, &str)],
+            body: &str,
+            on_chunk: &mut dyn FnMut(&[u8]) -> Result<()>,
+        ) -> crate::transport::http::HttpCall {
+            let result = self.post_json(url, headers, body).and_then(|response| {
+                if (200..300).contains(&response.status) {
+                    for chunk in response.body.as_bytes().chunks(7) {
+                        on_chunk(chunk)?;
+                    }
+                    Ok(crate::transport::http::HttpResponse {
+                        body: String::new(),
+                        ..response
+                    })
+                } else {
+                    Ok(response)
+                }
+            });
+            crate::transport::http::HttpCall::new(result, 1)
+        }
     }
 
     struct ScriptedHttp {
@@ -435,6 +947,13 @@ mod tests {
                 retry_after: None,
             })
         }
+    }
+
+    fn sse_event(name: &str, data: serde_json::Value) -> String {
+        format!(
+            "event: {name}\ndata: {}\n\n",
+            serde_json::to_string(&data).expect("serializes SSE event")
+        )
     }
 
     fn config_with(base_url: &str, model: &str) -> LegConfig {
@@ -478,6 +997,237 @@ mod tests {
         let reply = client.send(&Prompt::new("hi")).expect("should succeed");
         assert_eq!(reply.text, "Hello there");
         assert_eq!(reply.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn streaming_assembles_a_reply_identical_to_the_buffered_path() {
+        let mut stream = String::new();
+        stream.push_str(&sse_event(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "usage": {"input_tokens": 12, "output_tokens": 0}
+                }
+            }),
+        ));
+        stream.push_str("event: ping\ndata: {}\n\n");
+        stream.push_str("event: future_event\ndata: provider extension\n\n");
+        stream.push_str(&sse_event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "private"}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig+/="}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ));
+        for text in ["read ", "notes"] {
+            stream.push_str(&sse_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": text}
+                }),
+            ));
+        }
+        stream.push_str(&sse_event(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read",
+                    "input": {}
+                }
+            }),
+        ));
+        for partial_json in ["{\"path\":\"", "notes.txt\"}"] {
+            stream.push_str(&sse_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 2,
+                    "delta": {"type": "input_json_delta", "partial_json": partial_json}
+                }),
+            ));
+        }
+        stream.push_str(&sse_event(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": 2}),
+        ));
+        stream.push_str(&sse_event(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                "usage": {"output_tokens": 34}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}),
+        ));
+
+        let buffered = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig+/="},
+                {"type": "text", "text": "read notes"},
+                {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "notes.txt"}}
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 34},
+            "stop_reason": "tool_use"
+        }"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, &stream),
+        );
+        let mut events = Vec::new();
+        let call = client.send_conversation_streaming_with_attempts(
+            &[Message::user("inspect")],
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        );
+
+        let reply = call.result.expect("stream assembles a reply");
+        assert_eq!(call.attempts, 1);
+        assert_eq!(
+            reply,
+            parse_success(buffered).expect("buffered reply decodes")
+        );
+        assert_eq!(reply.text, "read notes");
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::MessageStart { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Ping))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Unknown { name, data }
+                if name == "future_event" && data == "provider extension"
+        )));
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+        let text_deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta { delta, .. }
+                    if delta.get("type").and_then(serde_json::Value::as_str)
+                        == Some("text_delta") =>
+                {
+                    delta.get("text").and_then(serde_json::Value::as_str)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_deltas, ["read ", "notes"]);
+
+        let sent: serde_json::Value =
+            serde_json::from_str(client.http.last_body.borrow().as_deref().unwrap())
+                .expect("stream request is JSON");
+        assert_eq!(sent["stream"], true);
+    }
+
+    #[test]
+    fn streaming_provider_error_is_emitted_and_returned() {
+        let mut stream = String::new();
+        stream.push_str(&sse_event(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 3}}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "partial"}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "error",
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": "generation failed"}
+            }),
+        ));
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, &stream),
+        );
+        let mut events = Vec::new();
+        let call = client.send_conversation_streaming_with_attempts(
+            &[Message::user("inspect")],
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            call.result,
+            Err(LegError::ProviderStream {
+                error_type: Some(ref error_type),
+                ref message,
+            }) if error_type == "api_error" && message == "generation failed"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Error {
+                error_type: Some(error_type),
+                message
+            }) if error_type == "api_error" && message == "generation failed"
+        ));
     }
 
     #[test]

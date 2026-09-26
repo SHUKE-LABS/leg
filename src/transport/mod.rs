@@ -3,7 +3,7 @@
 //! This module defines the seam between leg's typed model and a concrete
 //! provider client. [`Transport`] is the stable boundary the CLI and tests
 //! depend on; the [`claude`] submodule provides the first concrete
-//! implementation (a non-streaming Claude-compatible Messages client), and
+//! implementation (a Claude-compatible Messages client), and
 //! [`http`] isolates the underlying HTTP execution so the request/response
 //! logic can be tested without a network.
 
@@ -15,6 +15,61 @@ use crate::error::Result;
 use crate::model::{AssistantReply, Message, Prompt};
 
 pub use retry::{RetryPolicy, RetryingHttpClient};
+
+/// One provider event emitted while a response is streaming.
+///
+/// Message and content-block payloads retain their provider JSON shape so
+/// callers can observe metadata beyond the fields used to assemble a reply.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    /// The provider began an assistant message.
+    MessageStart {
+        /// The provider's `message_start` payload.
+        data: serde_json::Value,
+    },
+    /// The provider began one content block.
+    ContentBlockStart {
+        /// The block's index in the assistant reply.
+        index: usize,
+        /// The provider's initial content-block object.
+        content_block: serde_json::Value,
+    },
+    /// The provider emitted a content-block delta.
+    ContentBlockDelta {
+        /// The block's index in the assistant reply.
+        index: usize,
+        /// The provider's delta object.
+        delta: serde_json::Value,
+    },
+    /// The provider finished one content block.
+    ContentBlockStop {
+        /// The block's index in the assistant reply.
+        index: usize,
+    },
+    /// The provider emitted message-level metadata.
+    MessageDelta {
+        /// The provider's `message_delta` payload.
+        data: serde_json::Value,
+    },
+    /// The provider finished the assistant message.
+    MessageStop,
+    /// The provider sent an SSE ping.
+    Ping,
+    /// The provider sent a stream-level error event.
+    Error {
+        /// The provider's error type, when supplied.
+        error_type: Option<String>,
+        /// The provider's error message.
+        message: String,
+    },
+    /// A valid but currently unrecognized provider event.
+    Unknown {
+        /// The SSE event name.
+        name: String,
+        /// The raw event data.
+        data: String,
+    },
+}
 
 /// A transport call's result and the number of provider attempts it used.
 ///
@@ -41,16 +96,14 @@ impl<T> TransportCall<T> {
     }
 }
 
-/// Sends a conversation and returns a single reply.
+/// Sends a conversation and returns a single assembled reply.
 ///
-/// Intentionally synchronous and single-call: no streaming, and no tool
-/// execution — a reply's `tool_use` blocks are returned to the caller, who
-/// may send `tool_result` blocks back on a later call
-/// ([`crate::tools::ToolLoop`] does this). The primitive is
-/// [`Transport::send_conversation`], which maps the full message history onto a
-/// provider request — so a multi-turn session resends its accumulated turns on
-/// every call. [`Transport::send`] is a single-turn convenience wrapping one
-/// user prompt, provided so the `ask` path needs no separate implementation.
+/// Synchronous and single-call, with no tool execution: a reply's `tool_use`
+/// blocks are returned to the caller, who may send `tool_result` blocks back
+/// on a later call ([`crate::tools::ToolLoop`] does this). The streaming
+/// methods additionally expose ordered provider events while assembling the
+/// same final reply. Every call maps the full message history onto a provider
+/// request, so a multi-turn session resends its accumulated turns.
 pub trait Transport {
     /// Sends `messages` (the full conversation history, oldest first) and
     /// returns the assistant's reply to the latest turn.
@@ -66,6 +119,30 @@ pub trait Transport {
         messages: &[Message],
     ) -> TransportCall<AssistantReply> {
         TransportCall::new(self.send_conversation(messages), 1)
+    }
+
+    /// Streams provider events while assembling the assistant reply.
+    ///
+    /// The default preserves compatibility with buffered transports: it
+    /// returns their assembled reply without emitting events. Streaming
+    /// implementations override this method.
+    fn send_conversation_streaming_with_attempts(
+        &self,
+        messages: &[Message],
+        _on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        self.send_conversation_with_attempts(messages)
+    }
+
+    /// [`Transport::send_conversation_streaming_with_attempts`] without
+    /// attempt metadata.
+    fn send_conversation_streaming(
+        &self,
+        messages: &[Message],
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> Result<AssistantReply> {
+        self.send_conversation_streaming_with_attempts(messages, on_event)
+            .result
     }
 
     /// Sends a single user `prompt` and returns the assistant's reply.
@@ -97,5 +174,13 @@ impl<T: Transport + ?Sized> Transport for &T {
         messages: &[Message],
     ) -> TransportCall<AssistantReply> {
         (**self).send_conversation_with_attempts(messages)
+    }
+
+    fn send_conversation_streaming_with_attempts(
+        &self,
+        messages: &[Message],
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        (**self).send_conversation_streaming_with_attempts(messages, on_event)
     }
 }
