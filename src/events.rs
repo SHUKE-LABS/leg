@@ -93,6 +93,9 @@ pub enum Outcome {
         /// Provider-reported terminal reason; omitted when unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
+        /// Total provider attempts in this exchange; absent in older records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempts: Option<u64>,
         /// Session this outcome belongs to; absent on `ask`/`exchange`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -112,6 +115,9 @@ pub enum Outcome {
         kind: String,
         /// Human-readable error description.
         message: String,
+        /// Total provider attempts in this exchange; absent in older records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempts: Option<u64>,
         /// Session this outcome belongs to; absent on `ask`/`exchange`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -198,6 +204,9 @@ pub enum ExchangeEvent {
         /// Provider-reported terminal reason; omitted when unknown.
         #[serde(skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
+        /// Total provider attempts used by the exchange.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempts: Option<u64>,
         /// Session this outcome belongs to, when emitted for a session turn.
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -217,6 +226,9 @@ pub enum ExchangeEvent {
         kind: String,
         /// Human-readable error description.
         message: String,
+        /// Total provider attempts used by the exchange.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempts: Option<u64>,
         /// Session this outcome belongs to, when emitted for a session turn.
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -485,6 +497,7 @@ impl ExchangeEvent {
             stop_reason,
             None,
             None,
+            None,
         )
     }
 
@@ -508,6 +521,58 @@ impl ExchangeEvent {
             input_tokens,
             output_tokens,
             stop_reason,
+            None,
+            Some(session_id),
+            Some(turn_index),
+        )
+    }
+
+    /// Builds a success outcome carrying the total provider-attempt count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn response_ok_with_attempts(
+        ts_ms: u64,
+        duration_ms: u64,
+        reply: &str,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        stop_reason: Option<&str>,
+        attempts: u64,
+    ) -> Self {
+        Self::response_ok_inner(
+            ts_ms,
+            duration_ms,
+            reply,
+            input_tokens,
+            output_tokens,
+            stop_reason,
+            Some(attempts),
+            None,
+            None,
+        )
+    }
+
+    /// Builds a session success outcome carrying the total provider-attempt
+    /// count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_response_ok_with_attempts(
+        ts_ms: u64,
+        duration_ms: u64,
+        reply: &str,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        stop_reason: Option<&str>,
+        session_id: &str,
+        turn_index: u64,
+        attempts: u64,
+    ) -> Self {
+        Self::response_ok_inner(
+            ts_ms,
+            duration_ms,
+            reply,
+            input_tokens,
+            output_tokens,
+            stop_reason,
+            Some(attempts),
             Some(session_id),
             Some(turn_index),
         )
@@ -521,6 +586,7 @@ impl ExchangeEvent {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         stop_reason: Option<&str>,
+        attempts: Option<u64>,
         session_id: Option<&str>,
         turn_index: Option<u64>,
     ) -> Self {
@@ -533,6 +599,7 @@ impl ExchangeEvent {
             input_tokens,
             output_tokens,
             stop_reason: stop_reason.map(str::to_string),
+            attempts,
             session_id: session_id.map(str::to_string),
             turn_index,
         }
@@ -541,7 +608,17 @@ impl ExchangeEvent {
     /// Builds the failure outcome event for a single-turn `ask`/`exchange`
     /// (no session framing).
     pub fn response_error(ts_ms: u64, duration_ms: u64, err: &crate::error::LegError) -> Self {
-        Self::response_error_inner(ts_ms, duration_ms, err, None, None)
+        Self::response_error_inner(ts_ms, duration_ms, err, None, None, None)
+    }
+
+    /// Builds a failure outcome carrying the total provider-attempt count.
+    pub fn response_error_with_attempts(
+        ts_ms: u64,
+        duration_ms: u64,
+        err: &crate::error::LegError,
+        attempts: u64,
+    ) -> Self {
+        Self::response_error_inner(ts_ms, duration_ms, err, Some(attempts), None, None)
     }
 
     /// Builds a failure outcome for a session turn, carrying the same
@@ -553,13 +630,41 @@ impl ExchangeEvent {
         session_id: &str,
         turn_index: u64,
     ) -> Self {
-        Self::response_error_inner(ts_ms, duration_ms, err, Some(session_id), Some(turn_index))
+        Self::response_error_inner(
+            ts_ms,
+            duration_ms,
+            err,
+            None,
+            Some(session_id),
+            Some(turn_index),
+        )
+    }
+
+    /// Builds a session failure outcome carrying the total provider-attempt
+    /// count.
+    pub fn session_response_error_with_attempts(
+        ts_ms: u64,
+        duration_ms: u64,
+        err: &crate::error::LegError,
+        session_id: &str,
+        turn_index: u64,
+        attempts: u64,
+    ) -> Self {
+        Self::response_error_inner(
+            ts_ms,
+            duration_ms,
+            err,
+            Some(attempts),
+            Some(session_id),
+            Some(turn_index),
+        )
     }
 
     fn response_error_inner(
         ts_ms: u64,
         duration_ms: u64,
         err: &crate::error::LegError,
+        attempts: Option<u64>,
         session_id: Option<&str>,
         turn_index: Option<u64>,
     ) -> Self {
@@ -569,6 +674,7 @@ impl ExchangeEvent {
             duration_ms,
             kind: err.kind().to_string(),
             message: err.to_string(),
+            attempts,
             session_id: session_id.map(str::to_string),
             turn_index,
         }
@@ -618,6 +724,7 @@ impl ExchangeEvent {
                 input_tokens,
                 output_tokens,
                 stop_reason,
+                attempts,
                 session_id,
                 turn_index,
             } => ExchangeEvent::ResponseOk {
@@ -629,6 +736,7 @@ impl ExchangeEvent {
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
                 stop_reason: stop_reason.clone(),
+                attempts: *attempts,
                 session_id: session_id.clone(),
                 turn_index: *turn_index,
             },
@@ -637,6 +745,7 @@ impl ExchangeEvent {
                 duration_ms,
                 kind,
                 message,
+                attempts,
                 session_id,
                 turn_index,
             } => ExchangeEvent::ResponseError {
@@ -645,6 +754,7 @@ impl ExchangeEvent {
                 duration_ms: *duration_ms,
                 kind: kind.clone(),
                 message: message.clone(),
+                attempts: *attempts,
                 session_id: session_id.clone(),
                 turn_index: *turn_index,
             },

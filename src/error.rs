@@ -45,9 +45,13 @@ pub enum LegError {
     /// Configuration could not be loaded or was invalid (e.g. a missing or
     /// malformed environment variable).
     Config(String),
-    /// A transport-level failure with no HTTP response: connection refused,
-    /// DNS failure, TLS error, timeout, etc.
+    /// A transient connection-level failure before an HTTP response arrived.
     Transport(String),
+    /// A non-retryable HTTP setup or protocol failure before an HTTP response.
+    NonRetryableTransport(String),
+    /// A failure while reading a response body; retrying could duplicate a
+    /// request after the provider has already started replying.
+    ResponseRead(String),
     /// The provider rejected the credentials (HTTP 401). The message includes
     /// the provider error type when supplied.
     Auth(String),
@@ -111,6 +115,8 @@ impl LegError {
             LegError::Usage(_) => "usage",
             LegError::Config(_) => "config",
             LegError::Transport(_) => "transport",
+            LegError::NonRetryableTransport(_) => "transport",
+            LegError::ResponseRead(_) => "transport",
             LegError::Auth(_) => "auth",
             LegError::RateLimited(_) => "rate_limited",
             LegError::Server { .. } => "server",
@@ -131,6 +137,9 @@ impl fmt::Display for LegError {
             LegError::Usage(msg) => write!(f, "usage error: {msg}"),
             LegError::Config(msg) => write!(f, "configuration error: {msg}"),
             LegError::Transport(msg) => write!(f, "transport error: {msg}"),
+            LegError::NonRetryableTransport(msg) | LegError::ResponseRead(msg) => {
+                write!(f, "transport error: {msg}")
+            }
             LegError::Auth(msg) => write!(f, "authentication error: {msg}"),
             LegError::RateLimited(msg) => write!(f, "rate limited: {msg}"),
             LegError::Server {

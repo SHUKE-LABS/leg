@@ -32,6 +32,12 @@ pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 /// Default `max_tokens` requested per reply when `LEG_MAX_TOKENS` is unset.
 pub const DEFAULT_MAX_TOKENS: u32 = 1024;
 
+/// Default number of retries for transient provider failures.
+pub const DEFAULT_MAX_RETRIES: usize = 2;
+
+/// Default base delay for provider retry backoff, in milliseconds.
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 250;
+
 /// An authentication credential accepted by the provider transport.
 ///
 /// Variants map 1:1 onto the wire-format header the transport emits:
@@ -67,6 +73,12 @@ pub struct LegConfig {
     /// defaulting to [`DEFAULT_MAX_TOKENS`]. Must be a positive integer; zero is
     /// rejected because the API rejects it.
     pub max_tokens: u32,
+    /// Maximum retries per provider request. From `LEG_MAX_RETRIES`,
+    /// defaulting to [`DEFAULT_MAX_RETRIES`]; zero disables retries.
+    pub max_retries: usize,
+    /// Base delay for retry backoff. From `LEG_RETRY_BASE_DELAY_MS`,
+    /// defaulting to [`DEFAULT_RETRY_BASE_DELAY_MS`].
+    pub retry_base_delay: Duration,
     /// Optional maximum tool-use rounds per turn. From `LEG_MAX_TOOL_ROUNDS`;
     /// unset or blank means unbounded, while a configured value must be a
     /// positive integer.
@@ -148,6 +160,24 @@ impl LegConfig {
             None => DEFAULT_MAX_TOKENS,
         };
 
+        let max_retries = match non_empty(lookup("LEG_MAX_RETRIES")) {
+            Some(raw) => raw.parse::<usize>().map_err(|_| {
+                LegError::Config(format!(
+                    "LEG_MAX_RETRIES must be a non-negative integer, got {raw:?}"
+                ))
+            })?,
+            None => DEFAULT_MAX_RETRIES,
+        };
+
+        let retry_base_delay_ms = match non_empty(lookup("LEG_RETRY_BASE_DELAY_MS")) {
+            Some(raw) => raw.parse::<u64>().map_err(|_| {
+                LegError::Config(format!(
+                    "LEG_RETRY_BASE_DELAY_MS must be a non-negative integer, got {raw:?}"
+                ))
+            })?,
+            None => DEFAULT_RETRY_BASE_DELAY_MS,
+        };
+
         let max_tool_rounds = match non_empty(lookup("LEG_MAX_TOOL_ROUNDS")) {
             Some(raw) => {
                 let parsed = raw.parse::<usize>().map_err(|_| {
@@ -175,6 +205,8 @@ impl LegConfig {
             timeout: Duration::from_secs(timeout_secs),
             bash_timeout_secs,
             max_tokens,
+            max_retries,
+            retry_base_delay: Duration::from_millis(retry_base_delay_ms),
             max_tool_rounds,
             system_prompt,
             pre_tool_hook,
@@ -276,6 +308,11 @@ mod tests {
         assert_eq!(cfg.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         assert_eq!(cfg.bash_timeout_secs, DEFAULT_BASH_TIMEOUT_SECS);
         assert_eq!(cfg.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(cfg.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(
+            cfg.retry_base_delay,
+            Duration::from_millis(DEFAULT_RETRY_BASE_DELAY_MS)
+        );
         assert_eq!(cfg.max_tool_rounds, None);
         assert_eq!(cfg.system_prompt, None);
         assert_eq!(cfg.pre_tool_hook, None);
@@ -290,6 +327,8 @@ mod tests {
             ("LEG_TIMEOUT_SECS", "5"),
             ("LEG_BASH_TIMEOUT_SECS", "30"),
             ("LEG_MAX_TOKENS", "42"),
+            ("LEG_MAX_RETRIES", "5"),
+            ("LEG_RETRY_BASE_DELAY_MS", "300"),
             ("LEG_MAX_TOOL_ROUNDS", "3"),
             ("LEG_PRETOOL_HOOK", "/tmp/pre-tool-hook"),
         ]))
@@ -299,6 +338,8 @@ mod tests {
         assert_eq!(cfg.timeout, Duration::from_secs(5));
         assert_eq!(cfg.bash_timeout_secs, 30);
         assert_eq!(cfg.max_tokens, 42);
+        assert_eq!(cfg.max_retries, 5);
+        assert_eq!(cfg.retry_base_delay, Duration::from_millis(300));
         assert_eq!(cfg.max_tool_rounds, Some(3));
         assert_eq!(
             cfg.pre_tool_hook.as_deref(),
@@ -388,6 +429,32 @@ mod tests {
     }
 
     #[test]
+    fn retry_count_zero_is_valid_and_invalid_values_are_rejected() {
+        let cfg = LegConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("LEG_MAX_RETRIES", "0"),
+            ("LEG_RETRY_BASE_DELAY_MS", "0"),
+        ]))
+        .expect("zero retries and delay should be valid");
+        assert_eq!(cfg.max_retries, 0);
+        assert_eq!(cfg.retry_base_delay, Duration::ZERO);
+
+        for (var, value) in [
+            ("LEG_MAX_RETRIES", "-1"),
+            ("LEG_MAX_RETRIES", "many"),
+            ("LEG_RETRY_BASE_DELAY_MS", "-1"),
+            ("LEG_RETRY_BASE_DELAY_MS", "slow"),
+        ] {
+            let err = LegConfig::from_lookup(lookup_from(&[
+                ("ANTHROPIC_API_KEY", "secret"),
+                (var, value),
+            ]))
+            .unwrap_err();
+            assert!(matches!(err, LegError::Config(_)), "{var}={value}");
+        }
+    }
+
+    #[test]
     fn zero_or_non_integer_max_tool_rounds_are_rejected() {
         for raw in ["0", "abc"] {
             let err = LegConfig::from_lookup(lookup_from(&[
@@ -407,6 +474,8 @@ mod tests {
             ("ANTHROPIC_BASE_URL", ""),
             ("LEG_BASH_TIMEOUT_SECS", "  "),
             ("LEG_MAX_TOOL_ROUNDS", "  "),
+            ("LEG_MAX_RETRIES", "  "),
+            ("LEG_RETRY_BASE_DELAY_MS", "  "),
             ("LEG_PRETOOL_HOOK", "  "),
         ]))
         .expect("config should load");
@@ -414,6 +483,11 @@ mod tests {
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
         assert_eq!(cfg.bash_timeout_secs, DEFAULT_BASH_TIMEOUT_SECS);
         assert_eq!(cfg.max_tool_rounds, None);
+        assert_eq!(cfg.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(
+            cfg.retry_base_delay,
+            Duration::from_millis(DEFAULT_RETRY_BASE_DELAY_MS)
+        );
         assert_eq!(cfg.pre_tool_hook, None);
     }
 }

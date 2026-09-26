@@ -174,6 +174,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 stop_reason: Some("max_tokens".to_string()),
+                attempts: None,
                 session_id: None,
                 turn_index: None,
             },

@@ -7,9 +7,9 @@
 //!
 //! A non-2xx status is *not* an error at this layer: it is returned as an
 //! ordinary [`HttpResponse`] carrying the status and body so the caller can map
-//! it onto the appropriate [`LegError`] variant. Only failures with no HTTP
-//! response (connection refused, DNS, TLS, timeout) become
-//! [`LegError::Transport`].
+//! it onto the appropriate [`LegError`] variant. Transient connection failures
+//! become [`LegError::Transport`]; setup/protocol and response-body read
+//! failures use distinct variants so only eligible failures are retried.
 
 use std::time::Duration;
 
@@ -23,16 +23,53 @@ pub struct HttpResponse {
     pub status: u16,
     /// The response body, read as a UTF-8 string.
     pub body: String,
+    /// The provider's `Retry-After` header, if present.
+    pub retry_after: Option<String>,
+}
+
+/// A completed HTTP call with its cumulative request-attempt count.
+#[derive(Debug)]
+pub struct HttpCall {
+    /// The raw response or terminal transport error.
+    pub result: Result<HttpResponse>,
+    /// Number of HTTP attempts made, including failed connection attempts.
+    pub attempts: u64,
+}
+
+impl HttpCall {
+    /// Creates an HTTP call result with its attempt count.
+    pub fn new(result: Result<HttpResponse>, attempts: u64) -> Self {
+        Self { result, attempts }
+    }
 }
 
 /// Sends a single JSON POST request and returns the raw response.
 ///
 /// Implementations must return `Ok` for any completed HTTP exchange, including
 /// non-2xx statuses, and reserve `Err(LegError::Transport(..))` for failures
-/// where no response was received.
+/// caused by a transient connection failure before a response was received.
+/// Response-body read failures must use [`LegError::ResponseRead`] and must not
+/// be retried.
 pub trait HttpClient {
     /// POSTs `body` to `url` with the given `headers` (name, value pairs).
     fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<HttpResponse>;
+
+    /// POSTs JSON and reports the attempt count.
+    ///
+    /// Implementations without lower-level attempt metadata count one call.
+    fn post_json_with_attempts(&self, url: &str, headers: &[(&str, &str)], body: &str) -> HttpCall {
+        HttpCall::new(self.post_json(url, headers, body), 1)
+    }
+}
+
+impl<T: HttpClient + ?Sized> HttpClient for &T {
+    fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<HttpResponse> {
+        (**self).post_json(url, headers, body)
+    }
+
+    fn post_json_with_attempts(&self, url: &str, headers: &[(&str, &str)], body: &str) -> HttpCall {
+        (**self).post_json_with_attempts(url, headers, body)
+    }
 }
 
 /// A [`HttpClient`] backed by [`ureq`], with a per-request global timeout.
@@ -76,16 +113,62 @@ impl HttpClient for UreqHttpClient {
                 request = request.header(name, value);
             }
 
-            let mut response = request
-                .send(&body)
-                .map_err(|err| LegError::Transport(err.to_string()))?;
-
-            let status = response.status().as_u16();
-            let body = response.body_mut().read_to_string().map_err(|err| {
-                LegError::Transport(format!("failed to read response body: {err}"))
+            let mut response = request.send(&body).map_err(|err| {
+                let message = err.to_string();
+                if is_retryable_connection_error(&err) {
+                    LegError::Transport(message)
+                } else {
+                    LegError::NonRetryableTransport(message)
+                }
             })?;
 
-            Ok(HttpResponse { status, body })
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = response.body_mut().read_to_string().map_err(|err| {
+                LegError::ResponseRead(format!("failed to read response body: {err}"))
+            })?;
+
+            Ok(HttpResponse {
+                status,
+                body,
+                retry_after,
+            })
         })
+    }
+}
+
+fn is_retryable_connection_error(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::HostNotFound
+            | ureq::Error::ConnectionFailed
+            | ureq::Error::ConnectProxyFailed(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_retryable_connection_error;
+
+    #[test]
+    fn classifies_only_connection_level_ureq_errors_as_retryable() {
+        for error in [
+            ureq::Error::Io(std::io::Error::other("connection reset")),
+            ureq::Error::HostNotFound,
+            ureq::Error::ConnectionFailed,
+            ureq::Error::ConnectProxyFailed("proxy refused connection".to_string()),
+        ] {
+            assert!(is_retryable_connection_error(&error), "{error}");
+        }
+
+        assert!(!is_retryable_connection_error(&ureq::Error::BadUri(
+            "missing scheme".to_string()
+        )));
     }
 }

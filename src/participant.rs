@@ -53,11 +53,12 @@ impl<T: Transport> LocalParticipant<T> {
     ) -> MessageEnvelope {
         let request_ts = now_ms();
         let start = Instant::now();
-        let result = self
+        let call = self
             .transport
-            .send_conversation(&[Message::new(Role::User, content.to_vec())]);
+            .send_conversation_with_attempts(&[Message::new(Role::User, content.to_vec())]);
         let duration_ms = start.elapsed().as_millis() as u64;
         let outcome_ts = now_ms();
+        let attempts = Some(call.attempts);
 
         let request_record = RequestRecord {
             ts_ms: request_ts,
@@ -69,7 +70,7 @@ impl<T: Transport> LocalParticipant<T> {
             turn_index: None,
         };
 
-        let (kind, body, outcome) = match result {
+        let (kind, body, outcome) = match call.result {
             Ok(reply) => {
                 let outcome = Outcome::Ok {
                     ts_ms: outcome_ts,
@@ -79,6 +80,7 @@ impl<T: Transport> LocalParticipant<T> {
                     input_tokens: reply.usage.input_tokens,
                     output_tokens: reply.usage.output_tokens,
                     stop_reason: reply.stop_reason.as_ref().map(|r| r.as_str().to_string()),
+                    attempts,
                     session_id: None,
                     turn_index: None,
                 };
@@ -90,6 +92,7 @@ impl<T: Transport> LocalParticipant<T> {
                     duration_ms,
                     kind: err.kind().to_string(),
                     message: err.to_string(),
+                    attempts,
                     session_id: None,
                     turn_index: None,
                 };
