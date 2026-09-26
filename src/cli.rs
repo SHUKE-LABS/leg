@@ -26,7 +26,7 @@ use crate::transport::claude::ClaudeClient;
 use crate::transport::http::UreqHttpClient;
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
-const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]";
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
 /// to. An unset or blank value disables recording for `ask`, cold `exchange`,
@@ -51,6 +51,8 @@ enum Command {
         prompt: String,
         /// `--model` override, replacing `LEG_MODEL`/the configured default.
         model: Option<String>,
+        /// Repeatable image file paths to attach to the user turn.
+        images: Vec<String>,
     },
     /// Runs an interactive multi-turn REPL, accumulating history on disk.
     Session {
@@ -62,7 +64,7 @@ enum Command {
         /// `--file <path>`; falls back to [`EVENT_LOG_ENV`] when absent.
         file: Option<String>,
     },
-    /// Re-runs one logged exchange's prompt against today's provider config.
+    /// Re-runs one logged exchange's user content against today's provider config.
     LogReplay {
         /// `--file <path>`; falls back to [`EVENT_LOG_ENV`] when absent.
         file: Option<String>,
@@ -114,10 +116,18 @@ pub fn run() -> Result<()> {
             println!("{}", help_text());
             Ok(())
         }
-        Some(Command::Ask { prompt, model }) => {
+        Some(Command::Ask {
+            prompt,
+            model,
+            images,
+        }) => {
             interrupt::install()?;
             let stdout = std::io::stdout();
-            execute_ask(&prompt, model, stdout.lock())
+            if images.is_empty() {
+                execute_ask(&prompt, model, stdout.lock())
+            } else {
+                execute_ask_with_images(&prompt, model, &images, stdout.lock())
+            }
         }
         Some(Command::Session { resume }) => {
             interrupt::install()?;
@@ -171,10 +181,10 @@ pub fn run() -> Result<()> {
         }
         Some(Command::LogReplay { file, index }) => {
             let report = read_log(file.as_deref())?;
-            let (config, prompt) = replay_target(&report, index, LegConfig::from_env)?;
+            let (config, prompt, content) = replay_target(&report, index, LegConfig::from_env)?;
 
             let stdout = std::io::stdout();
-            execute_ask_with_config(config, &prompt, stdout.lock())
+            execute_ask_with_content(config, &prompt, &content, stdout.lock())
         }
         Some(Command::Exchange {
             in_path,
@@ -202,6 +212,9 @@ fn help_text() -> String {
          Anthropic-compatible endpoints. Claude subscription OAuth tokens\n\
          (including `claude setup-token`) are unsupported outside Claude Code;\n\
          use an Anthropic Console API key with ANTHROPIC_API_KEY instead.\n\
+         `leg ask --image <path>` accepts JPEG, PNG, GIF, and WebP; repeat the\n\
+         flag to attach multiple images. Each base64 image is limited to 10 MB,\n\
+         and image requests to 32 MB.\n\
          Also honours ANTHROPIC_BASE_URL, LEG_MODEL, LEG_TIMEOUT_SECS,\n\
          LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS,\n\
          LEG_PRETOOL_HOOK, and LEG_SYSTEM_PROMPT.\n\n\
@@ -247,11 +260,13 @@ fn parse_args(args: &[String]) -> Result<Option<Command>> {
     }
 }
 
-/// Parses the arguments following `ask`: an optional `--model <value>` flag (in
-/// any position) plus exactly one non-blank positional prompt.
+/// Parses the arguments following `ask`: optional `--model <value>` and
+/// repeatable `--image <path>` flags in any position, plus one non-blank
+/// positional prompt.
 fn parse_ask<'a>(iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut model = None;
     let mut prompt = None;
+    let mut images = Vec::new();
 
     let mut iter = iter.peekable();
     while let Some(arg) = iter.next() {
@@ -260,6 +275,16 @@ fn parse_ask<'a>(iter: impl Iterator<Item = &'a String>) -> Result<Command> {
                 .next()
                 .ok_or_else(|| LegError::Usage("--model requires a value".to_string()))?;
             model = Some(value.clone());
+        } else if arg == "--image" {
+            let value = iter
+                .next()
+                .ok_or_else(|| LegError::Usage("--image requires a path".to_string()))?;
+            if value.is_empty() {
+                return Err(LegError::Usage(
+                    "--image path must not be empty".to_string(),
+                ));
+            }
+            images.push(value.clone());
         } else if prompt.is_some() {
             return Err(LegError::Usage(format!(
                 "unexpected extra argument {arg:?}; ask takes exactly one prompt"
@@ -276,7 +301,11 @@ fn parse_ask<'a>(iter: impl Iterator<Item = &'a String>) -> Result<Command> {
         ));
     }
 
-    Ok(Command::Ask { prompt, model })
+    Ok(Command::Ask {
+        prompt,
+        model,
+        images,
+    })
 }
 
 /// Parses the arguments following `session`: optional `--resume <file>` and
@@ -636,7 +665,10 @@ fn execute_exchange_core(
     sink: &mut dyn EventSink,
 ) -> Result<()> {
     let (request, mode) = parse_exchange_request(raw);
-    let response = respond_with_trail(participant, meta, &request, sink)?;
+    let content = [ContentBlock::text(request.body.clone())];
+    let response = respond_with_trail(meta, &request, &content, sink, |envelope| {
+        participant.respond(envelope)
+    })?;
 
     write_exchange_response(mode, &response, output)
 }
@@ -839,18 +871,45 @@ fn execute_ask(prompt: &str, model: Option<String>, output: impl Write) -> Resul
     execute_ask_with_config(config, prompt, output)
 }
 
-/// The testable core of [`execute_ask`], parameterised over an already-built
-/// [`LegConfig`] so `leg log replay` (which overrides `model`/`base_url` from
-/// the logged exchange) shares this path.
+fn execute_ask_with_images(
+    prompt: &str,
+    model: Option<String>,
+    image_paths: &[String],
+    output: impl Write,
+) -> Result<()> {
+    let mut content = crate::image_input::load_images(image_paths)?;
+    content.push(ContentBlock::text(prompt));
+
+    let mut config = LegConfig::from_env()?;
+    apply_model_override(&mut config, model);
+    execute_ask_with_content(config, prompt, &content, output)
+}
+
+/// The text-only core of [`execute_ask`].
+fn execute_ask_with_config(config: LegConfig, prompt: &str, output: impl Write) -> Result<()> {
+    execute_ask_with_content(config, prompt, &[ContentBlock::text(prompt)], output)
+}
+
+/// Runs an ask from an already-built config and user content blocks.
 ///
 /// The one opened trail is shared between `run_ask` and the tool loop's
 /// observer, so the turn's tool events land between its request and outcome.
-fn execute_ask_with_config(config: LegConfig, prompt: &str, output: impl Write) -> Result<()> {
+fn execute_ask_with_content(
+    config: LegConfig,
+    prompt: &str,
+    content: &[ContentBlock],
+    output: impl Write,
+) -> Result<()> {
     let meta = exchange_meta(&config);
     let mut sink = Rc::new(RefCell::new(open_event_sink()));
     let transport = build_transport(config).with_observer(tool_trail_observer(sink.clone()));
     let participant = LocalParticipant::new(transport, meta.clone());
-    run_ask(&participant, &meta, prompt, output, &mut sink)
+    match content {
+        [ContentBlock::Text { text }] if text == prompt => {
+            run_ask(&participant, &meta, prompt, output, &mut sink)
+        }
+        _ => run_ask_with_content(&participant, &meta, prompt, content, output, &mut sink),
+    }
 }
 
 /// A tool-loop observer recording each sessionless tool event on `sink`.
@@ -865,15 +924,19 @@ fn tool_trail_observer(mut sink: Rc<RefCell<Box<dyn EventSink>>>) -> ToolObserve
 
 /// Emits the sessionless request and outcome around one participant call.
 fn respond_with_trail(
-    participant: &impl Participant,
     meta: &ExchangeMeta,
     request: &MessageEnvelope,
+    content: &[ContentBlock],
     sink: &mut dyn EventSink,
+    respond: impl FnOnce(&MessageEnvelope) -> MessageEnvelope,
 ) -> Result<MessageEnvelope> {
-    emit(sink, &ExchangeEvent::request(now_ms(), meta, &request.body));
+    emit(
+        sink,
+        &ExchangeEvent::request(now_ms(), meta, &request.body).with_content(content),
+    );
 
     let start = Instant::now();
-    let response = participant.respond(request);
+    let response = respond(request);
     let duration_ms = start.elapsed().as_millis() as u64;
     if let Some(error) = interrupt::error() {
         emit(
@@ -891,7 +954,7 @@ fn respond_with_trail(
     Ok(response)
 }
 
-/// Testable core of [`execute_ask_with_config`], parameterised over a
+/// Testable core of [`execute_ask_with_content`], parameterised over a
 /// [`Participant`] so the success and delivered-error behavior is exercisable
 /// without a network.
 ///
@@ -906,8 +969,35 @@ fn run_ask(
     participant: &impl Participant,
     meta: &ExchangeMeta,
     prompt: &str,
+    output: impl Write,
+    sink: &mut dyn EventSink,
+) -> Result<()> {
+    let content = [ContentBlock::text(prompt)];
+    run_ask_inner(meta, prompt, &content, output, sink, |request| {
+        participant.respond(request)
+    })
+}
+
+fn run_ask_with_content<T: Transport>(
+    participant: &LocalParticipant<T>,
+    meta: &ExchangeMeta,
+    prompt: &str,
+    content: &[ContentBlock],
+    output: impl Write,
+    sink: &mut dyn EventSink,
+) -> Result<()> {
+    run_ask_inner(meta, prompt, content, output, sink, |request| {
+        participant.respond_with_content(request, content)
+    })
+}
+
+fn run_ask_inner(
+    meta: &ExchangeMeta,
+    prompt: &str,
+    content: &[ContentBlock],
     mut output: impl Write,
     sink: &mut dyn EventSink,
+    respond: impl FnOnce(&MessageEnvelope) -> MessageEnvelope,
 ) -> Result<()> {
     let request = MessageEnvelope::new(
         "ask-1",
@@ -918,7 +1008,7 @@ fn run_ask(
         prompt,
         crate::events::now_ms(),
     );
-    let response = respond_with_trail(participant, meta, &request, sink)?;
+    let response = respond_with_trail(meta, &request, content, sink, respond)?;
     interrupt::check()?;
 
     match response.kind {
@@ -1190,20 +1280,27 @@ fn timed_session_exchange(
 ///
 /// A reply that stopped at the tool-round limit still carries `tool_use`
 /// blocks that were never answered; the provider rejects a later request whose
-/// `tool_use` has no matching `tool_result`, so those blocks are dropped
-/// (leaving a placeholder when the reply had no text).
+/// `tool_use` has no matching `tool_result`, so those blocks are dropped while
+/// text, images, and signed thinking blocks remain in history.
 fn session_reply_message(content: Vec<ContentBlock>, capped: bool) -> Message {
     if !capped {
         return Message::new(Role::Assistant, content);
     }
-    let text: Vec<ContentBlock> = content
+    let preserved: Vec<ContentBlock> = content
         .into_iter()
-        .filter(|block| matches!(block, ContentBlock::Text { .. }))
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::Thinking { .. }
+            )
+        })
         .collect();
-    if text.is_empty() {
+    if preserved.is_empty() {
         Message::assistant(TOOL_ROUND_LIMIT_PLACEHOLDER)
     } else {
-        Message::new(Role::Assistant, text)
+        Message::new(Role::Assistant, preserved)
     }
 }
 
@@ -1360,8 +1457,8 @@ fn select_and_rehydrate(
 }
 
 /// Rebuilds one trail turn as the history the live REPL appended for it: the
-/// user turn, each tool round's `tool_use` reply and its `tool_result` user
-/// turn, then the final reply (see [`run_session_repl_with_warning`]).
+/// user turn, each tool round's full assistant reply and its `tool_result`
+/// user turn, then the final reply (see [`run_session_repl_with_warning`]).
 ///
 /// `None` for a turn that contributed nothing to the live history — an
 /// `Error` or torn outcome — or whose tool results never all landed, since a
@@ -1656,7 +1753,7 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
     }
 }
 
-/// Resolves what `leg log replay` reruns: the selected exchange's user prompt
+/// Resolves what `leg log replay` reruns: the selected exchange's user content
 /// against the config from `load_config` retargeted at that exchange's model +
 /// base_url. The exchange is selected first, so a bad `--index` reports its
 /// usage error even when the environment's config would not load.
@@ -1664,18 +1761,22 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
 /// The rest of the config — the credential, timeouts, max_tokens, system
 /// prompt — is the *current* environment's, so a replay re-runs with today's
 /// auth, not a credential that was never recorded. A tool-bearing exchange
-/// reruns only its prompt: the current tool loop executes its tools afresh,
-/// and the stored tool results are never fed back.
+/// reruns its recorded request content: the current tool loop executes its
+/// tools afresh, and the stored tool results are never fed back.
 fn replay_target(
     report: &crate::log::ParseReport,
     index: Option<usize>,
     load_config: impl FnOnce() -> Result<LegConfig>,
-) -> Result<(LegConfig, String)> {
+) -> Result<(LegConfig, String, Vec<ContentBlock>)> {
     let request = &select_exchange(&report.exchanges, index)?.request;
     let mut config = load_config()?;
     config.model = request.model.clone();
     config.base_url = request.base_url.clone();
-    Ok((config, request.prompt.clone()))
+    let content = request
+        .content
+        .clone()
+        .unwrap_or_else(|| vec![ContentBlock::text(request.prompt.clone())]);
+    Ok((config, request.prompt.clone(), content))
 }
 
 /// Selects the exchange to replay: 1-based `index`, or the last when `None`.

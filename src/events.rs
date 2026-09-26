@@ -55,8 +55,8 @@ pub struct RequestRecord {
     pub base_url: String,
     /// The user prompt text.
     pub prompt: String,
-    /// The turn's content blocks when it is not a single text block (tool
-    /// results, multiple blocks); absent for a text-only prompt.
+    /// The turn's content blocks when it is not a single text block (images,
+    /// tool results, multiple blocks); absent for a text-only prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentBlock>>,
     /// Session this turn belongs to; absent on single-turn `ask`/`exchange`.

@@ -29,6 +29,7 @@ use crate::error::{LegError, Result};
 use crate::events::{
     Exchange, Outcome, RequestRecord, ToolCallRecord, ToolResultRecord, ToolRoundRecord, ToolStatus,
 };
+use crate::model::{ContentBlock, ImageSource};
 
 /// The outcome of parsing a JSONL exchange trail: the complete [`Exchange`]
 /// pairs and any non-fatal diagnostics collected along the way.
@@ -478,34 +479,40 @@ fn parse_line_value(bytes: &[u8]) -> std::result::Result<Value, String> {
 ///
 /// `n` is the 1-based position shown to the user. The block carries the
 /// timestamp, model, and call duration on its header line, then a truncated
-/// prompt, each tool call made within the exchange (with its result), and
-/// either a truncated reply or the failure (`kind: message`).
+/// prompt, image summaries and thinking excerpts when present, each tool call
+/// made within the exchange (with its result), and either a truncated reply
+/// or the failure (`kind: message`).
 pub fn format_exchange(n: usize, exchange: &Exchange, tools: &[ToolPair]) -> String {
     const MAX: usize = 120;
     let request = &exchange.request;
     let tool_lines: String = tools.iter().map(|pair| format_tool(pair, MAX)).collect();
+    let request_content = format_content_blocks("request", request.content.as_deref(), MAX);
     let mut out = match &exchange.outcome {
         Outcome::Ok {
             duration_ms,
             reply,
+            content,
             input_tokens,
             output_tokens,
             ..
-        } => format!(
-            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{tool_lines}    reply:  {}\n    tokens: {}",
-            format_ts(request.ts_ms),
-            request.model,
-            excerpt(&request.prompt, MAX),
-            excerpt(reply, MAX),
-            format_tokens(*input_tokens, *output_tokens),
-        ),
+        } => {
+            let reply_content = format_content_blocks("reply", content.as_deref(), MAX);
+            format!(
+                "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{request_content}{tool_lines}    reply:  {}\n{reply_content}    tokens: {}",
+                format_ts(request.ts_ms),
+                request.model,
+                excerpt(&request.prompt, MAX),
+                excerpt(reply, MAX),
+                format_tokens(*input_tokens, *output_tokens),
+            )
+        }
         Outcome::Error {
             duration_ms,
             kind,
             message,
             ..
         } => format!(
-            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{tool_lines}    error:  {kind}: {}",
+            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n{request_content}{tool_lines}    error:  {kind}: {}",
             format_ts(request.ts_ms),
             request.model,
             excerpt(&request.prompt, MAX),
@@ -514,6 +521,26 @@ pub fn format_exchange(n: usize, exchange: &Exchange, tools: &[ToolPair]) -> Str
     };
     out.push('\n');
     out
+}
+
+fn format_content_blocks(label: &str, content: Option<&[ContentBlock]>, max: usize) -> String {
+    content
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, data },
+            } => Some(format!(
+                "    {label} image: {media_type}, {} base64 bytes\n",
+                data.len()
+            )),
+            ContentBlock::Thinking { thinking, .. } => Some(format!(
+                "    {label} thinking: {} (signature retained)\n",
+                excerpt(thinking, max)
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Renders one tool call and its result as two indented lines.
@@ -1124,6 +1151,53 @@ mod tests {
         assert!(rendered.contains("hello"));
         assert!(rendered.contains("hi there"));
         assert!(rendered.contains("12 in, 34 out"));
+    }
+
+    #[test]
+    fn format_exchange_summarizes_image_and_thinking_blocks() {
+        let exchange = Exchange {
+            request: RequestRecord {
+                ts_ms: 1_700_000_000_000,
+                model: "m".to_string(),
+                base_url: "u".to_string(),
+                prompt: "describe".to_string(),
+                content: Some(vec![
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: "iVBORw==".to_string(),
+                        },
+                    },
+                    ContentBlock::text("describe"),
+                ]),
+                session_id: None,
+                turn_index: None,
+            },
+            outcome: Outcome::Ok {
+                ts_ms: 1_700_000_000_420,
+                duration_ms: 1,
+                reply: "answer".to_string(),
+                content: Some(vec![
+                    ContentBlock::Thinking {
+                        thinking: "internal thought".to_string(),
+                        signature: "signed-value".to_string(),
+                    },
+                    ContentBlock::text("answer"),
+                ]),
+                input_tokens: None,
+                output_tokens: None,
+                stop_reason: None,
+                session_id: None,
+                turn_index: None,
+            },
+        };
+
+        let rendered = format_exchange(1, &exchange, &[]);
+
+        assert!(rendered.contains("request image: image/png, 8 base64 bytes"));
+        assert!(rendered.contains("reply thinking: internal thought (signature retained)"));
+        assert!(!rendered.contains("iVBORw=="));
+        assert!(!rendered.contains("signed-value"));
     }
 
     #[test]

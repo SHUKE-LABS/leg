@@ -3,9 +3,9 @@
 //! [`ClaudeClient`] implements [`Transport`] against `POST /v1/messages`. It
 //! sends a full conversation history (one or more role-tagged turns), plus any
 //! declared [`ToolSpec`]s, and decodes one assistant reply. Message content is
-//! sent and parsed as content blocks: `tool_use` blocks in a reply are decoded
-//! alongside text, and `tool_result` blocks go out on a follow-up user turn.
-//! Streaming and tool execution remain out of scope.
+//! sent and parsed as content blocks: images and signed thinking are retained,
+//! `tool_use` blocks in a reply are decoded alongside text, and `tool_result`
+//! blocks go out on a follow-up user turn. Streaming remains out of scope.
 //! The request building and response parsing are pure functions so they can be
 //! tested without a network via a fake [`HttpClient`].
 
@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Credential, LegConfig};
 use crate::error::{LegError, Result};
+use crate::image_input::{MAX_IMAGE_REQUEST_BYTES, validate_message_image_limits};
 use crate::model::{
     AssistantReply, ContentBlock, Message, StopReason, TokenUsage, ToolSpec, as_single_text,
 };
@@ -112,7 +113,8 @@ fn auth_header(credential: &Credential) -> (&'static str, String) {
 /// Each turn's [`Role`](crate::model::Role) is emitted as its wire `role` value,
 /// preserving order so multi-turn history reaches the provider intact. A turn
 /// that is exactly one text block is sent as a bare `content` string; any other
-/// turn (tool calls, tool results, multiple blocks) is sent as the block array.
+/// turn (images, thinking, tool calls/results, or multiple blocks) is sent as
+/// the block array.
 /// When
 /// `system_prompt` is `Some`, it is emitted as the request's `system` field;
 /// `None` omits the field entirely. Likewise `tools` is emitted only when
@@ -125,6 +127,13 @@ fn build_request_body(
     system_prompt: Option<&str>,
     tools: &[ToolSpec],
 ) -> Result<String> {
+    validate_message_image_limits(messages)?;
+    let has_images = messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    });
     let request = MessagesRequest {
         model,
         max_tokens,
@@ -141,8 +150,14 @@ fn build_request_body(
             .collect(),
         tools,
     };
-    serde_json::to_string(&request)
-        .map_err(|err| LegError::Transport(format!("failed to serialize request: {err}")))
+    let body = serde_json::to_string(&request)
+        .map_err(|err| LegError::Transport(format!("failed to serialize request: {err}")))?;
+    if has_images && body.len() > MAX_IMAGE_REQUEST_BYTES {
+        return Err(LegError::Usage(
+            "serialized image request exceeds the 32 MB Messages API request limit".to_string(),
+        ));
+    }
+    Ok(body)
 }
 
 /// Maps an HTTP status and body onto an [`AssistantReply`] or [`LegError`].
@@ -181,12 +196,11 @@ fn parse_response(status: u16, body: &str) -> Result<AssistantReply> {
 
 /// Decodes a successful Messages response into an [`AssistantReply`].
 ///
-/// `text` and `tool_use` content blocks are kept in order; any other block
-/// type (e.g. `thinking`) is skipped so a newer provider shape still decodes.
-/// The provider's optional terminal reason is retained as a [`StopReason`]. A
-/// body that fails to decode, a malformed `text`/`tool_use` block, or a reply
-/// with neither assistant text nor a tool call is a [`LegError::Decode`] — the
-/// client never returns a silently empty reply.
+/// Supported content blocks are kept in order; unknown block types are
+/// skipped so a newer provider shape still decodes. The provider's optional
+/// terminal reason is retained as a [`StopReason`]. A body that fails to
+/// decode, a malformed supported block, or a reply with neither non-empty
+/// text nor a tool call is a [`LegError::Decode`].
 fn parse_success(body: &str) -> Result<AssistantReply> {
     let response: MessagesResponse = serde_json::from_str(body)
         .map_err(|err| LegError::Decode(format!("malformed Messages response: {err}")))?;
@@ -194,7 +208,7 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
     let mut content = Vec::new();
     for block in response.content {
         match block.get("type").and_then(serde_json::Value::as_str) {
-            Some("text") | Some("tool_use") => {
+            Some("text") | Some("image") | Some("thinking") | Some("tool_use") => {
                 let block: ContentBlock = serde_json::from_value(block).map_err(|err| {
                     LegError::Decode(format!("malformed response content block: {err}"))
                 })?;
@@ -550,10 +564,45 @@ mod tests {
     }
 
     #[test]
+    fn decodes_image_and_thinking_blocks_in_order() {
+        let body = r#"{
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw=="}},
+                {"type": "thinking", "thinking": "private reasoning", "signature": "sig+/=:"},
+                {"type": "text", "text": "answer"}
+            ]
+        }"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, body),
+        );
+
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+
+        assert_eq!(reply.text, "answer");
+        assert_eq!(
+            reply.content,
+            vec![
+                ContentBlock::Image {
+                    source: crate::model::ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "iVBORw==".to_string(),
+                    },
+                },
+                ContentBlock::Thinking {
+                    thinking: "private reasoning".to_string(),
+                    signature: "sig+/=:".to_string(),
+                },
+                ContentBlock::text("answer"),
+            ]
+        );
+    }
+
+    #[test]
     fn skips_unknown_block_types() {
         let body = r#"{
             "content": [
-                {"type": "thinking", "thinking": "hmm", "signature": "s"},
+                {"type": "future_block", "data": "ignored"},
                 {"type": "text", "text": "answer"}
             ]
         }"#;
@@ -563,6 +612,42 @@ mod tests {
         );
         let reply = client.send(&Prompt::new("hi")).expect("should succeed");
         assert_eq!(reply.content, vec![ContentBlock::text("answer")]);
+    }
+
+    #[test]
+    fn serializes_image_and_thinking_blocks_with_messages_api_shapes() {
+        let history = [
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Thinking {
+                    thinking: "private reasoning".to_string(),
+                    signature: "sig+/=:".to_string(),
+                }],
+            ),
+            Message::new(
+                Role::User,
+                vec![
+                    ContentBlock::Image {
+                        source: crate::model::ImageSource::Base64 {
+                            media_type: "image/webp".to_string(),
+                            data: "cmlmZg==".to_string(),
+                        },
+                    },
+                    ContentBlock::text("inspect"),
+                ],
+            ),
+        ];
+        let body = build_request_body("m", 16, &history, None, &[]).expect("serializes");
+
+        assert_eq!(
+            body,
+            concat!(
+                r#"{"model":"m","max_tokens":16,"messages":["#,
+                r#"{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"sig+/=:"}]},"#,
+                r#"{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/webp","data":"cmlmZg=="}},{"type":"text","text":"inspect"}]}"#,
+                r#"]}"#,
+            )
+        );
     }
 
     #[test]
@@ -1074,7 +1159,8 @@ mod tests {
         for body in [
             r#"{"content": []}"#,
             r#"{"content": [{"type": "text", "text": ""}]}"#,
-            r#"{"content": [{"type": "thinking", "thinking": "hmm"}]}"#,
+            r#"{"content": [{"type": "thinking", "thinking": "hmm", "signature": "s"}]}"#,
+            r#"{"content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "a"}}]}"#,
         ] {
             let client = ClaudeClient::with_http(
                 config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
