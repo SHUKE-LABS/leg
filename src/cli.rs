@@ -1802,7 +1802,7 @@ fn select_exchange(exchanges: &[Exchange], index: Option<usize>) -> Result<&Exch
     Ok(&exchanges[position])
 }
 
-/// Writes each exchange, with the tool calls made within it, as a
+/// Writes each exchange, with its tool-round summaries and calls, as a
 /// human-readable block to `output`.
 ///
 /// Parameterised over [`Write`] so the rendering is unit-testable with an
@@ -1810,10 +1810,11 @@ fn select_exchange(exchanges: &[Exchange], index: Option<usize>) -> Result<&Exch
 fn execute_log_show(report: &crate::log::ParseReport, mut output: impl Write) -> Result<()> {
     for (i, exchange) in report.exchanges.iter().enumerate() {
         let tools = report.tools.get(i).map_or(&[][..], Vec::as_slice);
+        let rounds = report.rounds.get(i).map_or(&[][..], Vec::as_slice);
         write!(
             output,
             "{}",
-            crate::log::format_exchange(i + 1, exchange, tools)
+            crate::log::format_exchange_with_rounds(i + 1, exchange, tools, rounds)
         )
         .map_err(io_err)?;
     }

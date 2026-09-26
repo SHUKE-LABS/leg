@@ -1671,6 +1671,7 @@ fn log_replay_preserves_image_blocks_in_the_provider_request_and_trail() {
             },
         }],
         tools: vec![Vec::new()],
+        rounds: vec![Vec::new()],
         warnings: Vec::new(),
     };
     let (config, prompt, replay_content) = replay_target(&report, None, || {
@@ -1900,6 +1901,7 @@ fn execute_log_show_writes_a_block_per_exchange() {
     }];
     let report = crate::log::ParseReport {
         tools: vec![Vec::new()],
+        rounds: vec![Vec::new()],
         exchanges,
         warnings: Vec::new(),
     };
@@ -1908,6 +1910,57 @@ fn execute_log_show_writes_a_block_per_exchange() {
     let text = String::from_utf8(buf).unwrap();
     assert!(text.contains("#1"));
     assert!(text.contains("hello"));
+}
+
+#[test]
+fn execute_log_show_summarizes_tool_round_thinking_without_payloads() {
+    let image_payload = "not-visible-image-payload";
+    let round_content = vec![
+        ContentBlock::Thinking {
+            thinking: "reasoning from intermediate round".to_string(),
+            signature: "hidden-thinking-signature".to_string(),
+        },
+        ContentBlock::Image {
+            source: crate::model::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: image_payload.to_string(),
+            },
+        },
+        echo_use("toolu_round", "echo"),
+    ];
+    let events = [
+        ExchangeEvent::session_request(1, &meta(), "inspect", "sess-log-show", 0),
+        ExchangeEvent::ToolRound {
+            schema: crate::events::SCHEMA,
+            ts_ms: 2,
+            content: round_content.clone(),
+            session_id: Some("sess-log-show".to_string()),
+            turn_index: Some(0),
+        },
+        ExchangeEvent::session_response_ok(3, 1, "done", None, None, None, "sess-log-show", 0),
+    ];
+    let mut trail = Vec::new();
+    {
+        let mut sink = WriterSink::new(&mut trail);
+        for event in &events {
+            sink.record(event).expect("writes event");
+        }
+    }
+
+    let report = crate::log::parse_jsonl(std::io::Cursor::new(trail)).expect("parses trail");
+    assert_eq!(report.rounds, vec![vec![round_content]]);
+
+    let mut output = Vec::new();
+    execute_log_show(&report, &mut output).expect("renders log");
+    let rendered = String::from_utf8(output).unwrap();
+    assert!(
+        rendered.contains(
+            "tool round 1 thinking: reasoning from intermediate round (signature retained)"
+        )
+    );
+    assert!(rendered.contains("tool round 1 image: image/png"));
+    assert!(!rendered.contains("hidden-thinking-signature"));
+    assert!(!rendered.contains(image_payload));
 }
 
 #[test]
