@@ -21,9 +21,9 @@ use crate::tools::{
     BashTool, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome,
     WriteTool, tool_round_limit_warning,
 };
-use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 use crate::transport::http::UreqHttpClient;
+use crate::transport::{RetryingHttpClient, Transport, TransportCall};
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
 const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]";
@@ -217,6 +217,7 @@ fn help_text() -> String {
          and image requests to 32 MB.\n\
          Also honours ANTHROPIC_BASE_URL, LEG_MODEL, LEG_TIMEOUT_SECS,\n\
          LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS,\n\
+         LEG_MAX_RETRIES, LEG_RETRY_BASE_DELAY_MS,\n\
          LEG_PRETOOL_HOOK, and LEG_SYSTEM_PROMPT.\n\n\
          LEG_EVENT_LOG names an optional JSONL trail for `ask`, cold `exchange`,\n\
          and a fresh `session`; named exchange sessions always write their\n\
@@ -691,7 +692,7 @@ fn execute_exchange_session_core(
     let stderr = std::io::stderr();
     let mut warning = stderr.lock();
     let call_start = Instant::now();
-    let result = timed_session_exchange(
+    let call = timed_session_exchange(
         sink,
         TimedSessionExchangeContext {
             meta,
@@ -702,17 +703,18 @@ fn execute_exchange_session_core(
         },
         &mut warning,
         |sink| {
-            transport.run_observed(resumed.conversation.messages(), &mut |event| {
+            transport.run_observed_with_attempts(resumed.conversation.messages(), &mut |event| {
                 let turn = Some((session_id.as_str(), turn_index));
                 emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
             })
         },
     );
+    let attempts = Some(call.attempts);
     let duration_ms = call_start.elapsed().as_millis() as u64;
     resumed.next_turn_index += 1;
 
     let outcome_ts_ms = now_ms();
-    let (kind, body, outcome) = match result {
+    let (kind, body, outcome) = match call.result {
         Ok(turn) => {
             for message in turn.transcript {
                 resumed.conversation.push(message);
@@ -733,6 +735,7 @@ fn execute_exchange_session_core(
                     .stop_reason
                     .as_ref()
                     .map(|reason| reason.as_str().to_string()),
+                attempts,
                 session_id: Some(session_id.clone()),
                 turn_index: Some(turn_index),
             };
@@ -746,6 +749,7 @@ fn execute_exchange_session_core(
                 duration_ms,
                 kind: err.kind().to_string(),
                 message: body.clone(),
+                attempts,
                 session_id: Some(session_id.clone()),
                 turn_index: Some(turn_index),
             };
@@ -939,9 +943,18 @@ fn respond_with_trail(
     let response = respond(request);
     let duration_ms = start.elapsed().as_millis() as u64;
     if let Some(error) = interrupt::error() {
+        let attempts = response
+            .exchange
+            .as_ref()
+            .map(|wrapped| match &wrapped.exchange.outcome {
+                Outcome::Ok { attempts, .. } | Outcome::Error { attempts, .. } => {
+                    attempts.unwrap_or_default()
+                }
+            })
+            .unwrap_or_default();
         emit(
             sink,
-            &ExchangeEvent::response_error(now_ms(), duration_ms, &error),
+            &ExchangeEvent::response_error_with_attempts(now_ms(), duration_ms, &error, attempts),
         );
         return Err(error);
     }
@@ -1148,7 +1161,7 @@ fn run_session_repl_with_warning(
         }
 
         conversation.push_user(line.as_str());
-        let result = timed_session_exchange(
+        let call = timed_session_exchange(
             sink,
             TimedSessionExchangeContext {
                 meta,
@@ -1159,7 +1172,7 @@ fn run_session_repl_with_warning(
             },
             warning,
             |sink| {
-                transport.run_observed(conversation.messages(), &mut |event| {
+                transport.run_observed_with_attempts(conversation.messages(), &mut |event| {
                     let turn = Some((session_id.as_str(), turn_index));
                     emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
                 })
@@ -1167,7 +1180,7 @@ fn run_session_repl_with_warning(
         );
         turn_index += 1;
 
-        match result {
+        match call.result {
             Ok(outcome) => {
                 interrupt::check()?;
                 writeln!(output, "{}", outcome.reply.text).map_err(io_err)?;
@@ -1216,8 +1229,8 @@ fn timed_session_exchange(
     sink: &mut dyn EventSink,
     context: TimedSessionExchangeContext<'_>,
     warning: &mut dyn Write,
-    call: impl FnOnce(&mut dyn EventSink) -> Result<TurnOutcome>,
-) -> Result<TurnOutcome> {
+    call: impl FnOnce(&mut dyn EventSink) -> TransportCall<TurnOutcome>,
+) -> TransportCall<TurnOutcome> {
     let TimedSessionExchangeContext {
         meta,
         prompt,
@@ -1229,11 +1242,12 @@ fn timed_session_exchange(
     emit(sink, &request);
 
     let start = Instant::now();
-    let result = call(sink);
+    let call = call(sink);
     let duration_ms = start.elapsed().as_millis() as u64;
+    let attempts = call.attempts;
     let result = match interrupt::error() {
         Some(error) => Err(error),
-        None => result,
+        None => call.result,
     };
 
     if let Ok(outcome) = &result {
@@ -1252,7 +1266,7 @@ fn timed_session_exchange(
     }
 
     let event = match &result {
-        Ok(TurnOutcome { reply, .. }) => ExchangeEvent::session_response_ok(
+        Ok(TurnOutcome { reply, .. }) => ExchangeEvent::session_response_ok_with_attempts(
             now_ms(),
             duration_ms,
             &reply.text,
@@ -1261,19 +1275,21 @@ fn timed_session_exchange(
             reply.stop_reason.as_ref().map(StopReason::as_str),
             session_id,
             turn_index,
+            attempts,
         )
         .with_content(&reply.content),
-        Err(err) => ExchangeEvent::session_response_error(
+        Err(err) => ExchangeEvent::session_response_error_with_attempts(
             now_ms(),
             duration_ms,
             err,
             session_id,
             turn_index,
+            attempts,
         ),
     };
     emit(sink, &event);
 
-    result
+    TransportCall::completed(result, attempts)
 }
 
 /// The history turn recorded for a session reply.
@@ -1309,7 +1325,9 @@ const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]"
 
 /// Builds the provider transport every command runs through: a
 /// [`ClaudeClient`] advertising the registry's tools, wrapped in the tool loop.
-fn build_transport(config: LegConfig) -> ToolLoop<ClaudeClient<UreqHttpClient>> {
+fn build_transport(
+    config: LegConfig,
+) -> ToolLoop<ClaudeClient<RetryingHttpClient<UreqHttpClient>>> {
     let max_tool_rounds = config.max_tool_rounds;
     let registry = build_tool_registry(&config);
     let client = ClaudeClient::from_config(config).with_tools(registry.specs());

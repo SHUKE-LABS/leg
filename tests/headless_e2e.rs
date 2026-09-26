@@ -126,6 +126,44 @@ fn spawn_auth_failure_server() -> String {
     format!("http://{addr}")
 }
 
+/// Starts a one-shot retry scenario against a sequence of HTTP responses.
+fn spawn_response_sequence_server(
+    responses: Vec<(u16, String, Option<String>)>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+
+    thread::spawn(move || {
+        for (status, body, retry_after) in responses {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let Some(request) = read_request_body(&mut stream) else {
+                return;
+            };
+            captured.lock().unwrap().push(request);
+            let reason = match status {
+                200 => "OK",
+                503 => "Service Unavailable",
+                _ => "Test response",
+            };
+            let retry_after = retry_after
+                .map(|value| format!("Retry-After: {value}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (format!("http://{addr}"), requests)
+}
+
 /// Starts a stoppable provider probe. Every received request is captured and
 /// answered, allowing tests to prove a command made no network call.
 type RequestProbe = (
@@ -562,6 +600,7 @@ fn assert_exchange_trail(cwd: &Path, base_url: &str, trail: &Path, prompt: &str)
     assert_eq!(tool_names, ["read", "edit", "bash"]);
     let outcome = events.last().expect("outcome event");
     assert_eq!(outcome["reply"], "all done");
+    assert_eq!(outcome["attempts"], 4);
 
     let mut show = leg(cwd, base_url);
     show.arg("log").arg("show").arg("--file").arg(trail);
@@ -802,6 +841,70 @@ fn ask_provider_failure_leaves_stdout_empty_and_exits_nonzero() {
         stderr.contains("invalid x-api-key"),
         "stderr must include the provider diagnostic; got {stderr:?}"
     );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn ask_retries_transient_provider_failure_and_records_attempts() {
+    let error_body =
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"try again"}}"#;
+    let (base_url, requests) = spawn_response_sequence_server(vec![
+        (503, error_body.to_string(), Some("1".to_string())),
+        (200, ONE_TEXT_REPLY[0].to_string(), None),
+    ]);
+    let cwd = fixture_dir("ask-retry");
+    let trail = cwd.join("trail.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail)
+        .env("LEG_MAX_RETRIES", "1")
+        .env("LEG_RETRY_BASE_DELAY_MS", "0")
+        .args(["ask", "hello"]);
+
+    let started = std::time::Instant::now();
+    let output = run(cmd, None);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "Retry-After must delay the retry"
+    );
+    assert!(
+        output.status.success(),
+        "retry should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hi there\n");
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let events = read_events(&trail);
+    assert_eq!(events.last().expect("outcome")["event"], "response_ok");
+    assert_eq!(events.last().expect("outcome")["attempts"], 2);
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn max_retries_zero_fails_after_one_transient_attempt() {
+    let error_body =
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"try again"}}"#;
+    let (base_url, requests) =
+        spawn_response_sequence_server(vec![(503, error_body.to_string(), Some("0".to_string()))]);
+    let cwd = fixture_dir("ask-retry-disabled");
+    let trail = cwd.join("trail.jsonl");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_EVENT_LOG", &trail)
+        .env("LEG_MAX_RETRIES", "0")
+        .env("LEG_RETRY_BASE_DELAY_MS", "0")
+        .args(["ask", "hello"]);
+
+    let output = run(cmd, None);
+    assert!(
+        !output.status.success(),
+        "transient failure must be surfaced"
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let events = read_events(&trail);
+    assert_eq!(events.last().expect("outcome")["event"], "response_error");
+    assert_eq!(events.last().expect("outcome")["attempts"], 1);
 
     std::fs::remove_dir_all(&cwd).ok();
 }

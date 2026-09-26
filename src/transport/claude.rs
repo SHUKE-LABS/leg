@@ -17,8 +17,8 @@ use crate::image_input::{MAX_IMAGE_REQUEST_BYTES, validate_message_image_limits}
 use crate::model::{
     AssistantReply, ContentBlock, Message, StopReason, TokenUsage, ToolSpec, as_single_text,
 };
-use crate::transport::Transport;
 use crate::transport::http::{HttpClient, UreqHttpClient};
+use crate::transport::{RetryPolicy, RetryingHttpClient, Transport, TransportCall};
 
 /// The Messages API version pinned by this client.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -30,11 +30,12 @@ pub struct ClaudeClient<H: HttpClient> {
     tools: Vec<ToolSpec>,
 }
 
-impl ClaudeClient<UreqHttpClient> {
+impl ClaudeClient<RetryingHttpClient<UreqHttpClient>> {
     /// Creates a client that talks to the provider over real HTTP, using the
-    /// timeout from `config`.
+    /// timeout and retry policy from `config`.
     pub fn from_config(config: LegConfig) -> Self {
-        let http = UreqHttpClient::new(config.timeout);
+        let retry_policy = RetryPolicy::new(config.max_retries, config.retry_base_delay);
+        let http = RetryingHttpClient::new(UreqHttpClient::new(config.timeout), retry_policy);
         Self::with_http(config, http)
     }
 }
@@ -68,13 +69,23 @@ impl<H: HttpClient> ClaudeClient<H> {
 
 impl<H: HttpClient> Transport for ClaudeClient<H> {
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
-        let body = build_request_body(
+        self.send_conversation_with_attempts(messages).result
+    }
+
+    fn send_conversation_with_attempts(
+        &self,
+        messages: &[Message],
+    ) -> TransportCall<AssistantReply> {
+        let body = match build_request_body(
             &self.config.model,
             self.config.max_tokens,
             messages,
             self.config.system_prompt.as_deref(),
             &self.tools,
-        )?;
+        ) {
+            Ok(body) => body,
+            Err(error) => return TransportCall::completed(Err(error), 0),
+        };
         let url = self.endpoint();
         // `auth_value` is bound to this stack frame so the array of header
         // refs below can borrow from it. The OAuth case formats the bearer
@@ -87,8 +98,12 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
             ("content-type", "application/json"),
         ];
 
-        let response = self.http.post_json(&url, &headers, &body)?;
-        parse_response(response.status, &response.body)
+        let call = self.http.post_json_with_attempts(&url, &headers, &body);
+        let attempts = call.attempts;
+        let result = call
+            .result
+            .and_then(|response| parse_response(response.status, &response.body));
+        TransportCall::new(result, attempts)
     }
 }
 
@@ -338,6 +353,7 @@ mod tests {
     use crate::model::{Prompt, Role};
     use crate::participant::{LocalParticipant, Participant};
     use crate::tools::ToolLoop;
+    use crate::transport::{RetryPolicy, RetryingHttpClient};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -381,6 +397,7 @@ mod tests {
             Ok(crate::transport::http::HttpResponse {
                 status: self.status,
                 body: self.body.clone(),
+                retry_after: None,
             })
         }
     }
@@ -412,7 +429,11 @@ mod tests {
                     "scripted HTTP response queue exhausted".to_string(),
                 ));
             };
-            Ok(crate::transport::http::HttpResponse { status, body })
+            Ok(crate::transport::http::HttpResponse {
+                status,
+                body,
+                retry_after: None,
+            })
         }
     }
 
@@ -432,6 +453,8 @@ mod tests {
             timeout: Duration::from_secs(60),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            max_retries: crate::config::DEFAULT_MAX_RETRIES,
+            retry_base_delay: Duration::from_millis(crate::config::DEFAULT_RETRY_BASE_DELAY_MS),
             max_tool_rounds: None,
             system_prompt: None,
             pre_tool_hook: None,
@@ -1088,12 +1111,18 @@ mod tests {
             .exchange
             .outcome
         {
-            Outcome::Error { kind, message, .. } => {
+            Outcome::Error {
+                kind,
+                message,
+                attempts,
+                ..
+            } => {
                 assert_eq!(kind, "api");
                 assert_eq!(
                     message,
                     "provider error (400, invalid_request_error): prompt is too long"
                 );
+                assert_eq!(*attempts, Some(2));
             }
             other => panic!("expected delivered error outcome, got {other:?}"),
         }
@@ -1188,6 +1217,105 @@ mod tests {
         ) -> Result<crate::transport::http::HttpResponse> {
             Err(LegError::Transport("connection timed out".to_string()))
         }
+    }
+
+    struct ResponseReadFailingHttp(Rc<Cell<usize>>);
+
+    impl HttpClient for ResponseReadFailingHttp {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &str,
+        ) -> Result<crate::transport::http::HttpResponse> {
+            self.0.set(self.0.get() + 1);
+            Err(LegError::ResponseRead(
+                "failed to read response body".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn retryable_statuses_retry_and_keep_the_total_attempt_count() {
+        const ERROR_BODY: &str =
+            r#"{"type":"error","error":{"type":"api_error","message":"try again"}}"#;
+
+        for status in [408, 429, 500, 502, 503, 504, 529] {
+            let calls = Rc::new(Cell::new(0));
+            let http = RetryingHttpClient::new(
+                ScriptedHttp::new(
+                    vec![
+                        (status, ERROR_BODY.to_string()),
+                        (200, SUCCESS_BODY.to_string()),
+                    ],
+                    calls.clone(),
+                ),
+                RetryPolicy::new(1, Duration::ZERO),
+            );
+            let client = ClaudeClient::with_http(
+                config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+                http,
+            );
+
+            let call = client.send_with_attempts(&Prompt::new("hi"));
+
+            assert_eq!(
+                call.result.expect("eligible status should retry").text,
+                "Hello there",
+                "status {status}"
+            );
+            assert_eq!(call.attempts, 2, "status {status}");
+            assert_eq!(calls.get(), 2, "status {status}");
+        }
+    }
+
+    #[test]
+    fn non_retryable_http_status_does_not_retry() {
+        const ERROR_BODY: &str =
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad model"}}"#;
+        let calls = Rc::new(Cell::new(0));
+        let http = RetryingHttpClient::new(
+            ScriptedHttp::new(
+                vec![
+                    (400, ERROR_BODY.to_string()),
+                    (200, SUCCESS_BODY.to_string()),
+                ],
+                calls.clone(),
+            ),
+            RetryPolicy::new(2, Duration::ZERO),
+        );
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            http,
+        );
+
+        let call = client.send_with_attempts(&Prompt::new("hi"));
+
+        assert!(matches!(
+            call.result,
+            Err(LegError::Api { status: 400, .. })
+        ));
+        assert_eq!(call.attempts, 1);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn response_body_read_failure_is_not_retried() {
+        let calls = Rc::new(Cell::new(0));
+        let http = RetryingHttpClient::new(
+            ResponseReadFailingHttp(calls.clone()),
+            RetryPolicy::new(2, Duration::ZERO),
+        );
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            http,
+        );
+
+        let call = client.send_with_attempts(&Prompt::new("hi"));
+
+        assert!(matches!(call.result, Err(LegError::ResponseRead(_))));
+        assert_eq!(call.attempts, 1);
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

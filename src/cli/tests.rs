@@ -278,7 +278,7 @@ fn run_ask_wire_lines_match_batons_field_order_and_omitted_fields() {
     assert_eq!(
         response_line,
         format!(
-            r#"{{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":{r_ts_ms},"duration_ms":{duration_ms},"reply":"hi there"}}"#
+            r#"{{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":{r_ts_ms},"duration_ms":{duration_ms},"reply":"hi there","attempts":1}}"#
         ),
     );
 }
@@ -317,6 +317,8 @@ fn help_text_documents_usage_env_and_failure_contract() {
     assert!(text.contains("LEG_MODEL"));
     assert!(text.contains("LEG_BASH_TIMEOUT_SECS"));
     assert!(text.contains("LEG_MAX_TOOL_ROUNDS"));
+    assert!(text.contains("LEG_MAX_RETRIES"));
+    assert!(text.contains("LEG_RETRY_BASE_DELAY_MS"));
     assert!(text.contains("LEG_EVENT_LOG"));
     assert!(text.contains("`ask`, cold `exchange`"));
     assert!(text.contains("named exchange sessions always write their"));
@@ -595,6 +597,7 @@ impl crate::transport::http::HttpClient for RecordingHttp {
         Ok(crate::transport::http::HttpResponse {
             status: 200,
             body: r#"{"content":[{"type":"text","text":"hi"}]}"#.to_string(),
+            retry_after: None,
         })
     }
 }
@@ -1666,6 +1669,7 @@ fn log_replay_preserves_image_blocks_in_the_provider_request_and_trail() {
                 input_tokens: None,
                 output_tokens: None,
                 stop_reason: None,
+                attempts: None,
                 session_id: None,
                 turn_index: None,
             },
@@ -1815,6 +1819,7 @@ fn select_and_rehydrate_restores_conversation_and_next_turn_index() {
                     input_tokens: None,
                     output_tokens: None,
                     stop_reason: None,
+                    attempts: None,
                     session_id: Some("sess-1".to_string()),
                     turn_index: Some(0),
                 }),
@@ -1895,6 +1900,7 @@ fn execute_log_show_writes_a_block_per_exchange() {
             input_tokens: None,
             output_tokens: None,
             stop_reason: None,
+            attempts: None,
             session_id: None,
             turn_index: None,
         },
@@ -1991,6 +1997,7 @@ fn select_exchange_defaults_to_last_and_validates_range() {
                 input_tokens: None,
                 output_tokens: None,
                 stop_reason: None,
+                attempts: None,
                 session_id: None,
                 turn_index: None,
             },
@@ -2013,6 +2020,7 @@ fn select_exchange_defaults_to_last_and_validates_range() {
                 input_tokens: None,
                 output_tokens: None,
                 stop_reason: None,
+                attempts: None,
                 session_id: None,
                 turn_index: None,
             },

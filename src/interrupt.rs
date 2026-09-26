@@ -334,14 +334,14 @@ where
             let _ = sender.send(operation());
         })
         .map_err(|error| {
-            LegError::Transport(format!("failed to start provider request: {error}"))
+            LegError::NonRetryableTransport(format!("failed to start provider request: {error}"))
         })?;
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(10)) {
             Ok(result) => {
                 if worker.join().is_err() {
-                    return Err(LegError::Transport(
+                    return Err(LegError::NonRetryableTransport(
                         "provider request worker panicked".to_string(),
                     ));
                 }
@@ -351,9 +351,9 @@ where
             Err(RecvTimeoutError::Timeout) => check()?,
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(if worker.join().is_err() {
-                    LegError::Transport("provider request worker panicked".to_string())
+                    LegError::NonRetryableTransport("provider request worker panicked".to_string())
                 } else {
-                    LegError::Transport(
+                    LegError::NonRetryableTransport(
                         "provider request worker exited without a result".to_string(),
                     )
                 });

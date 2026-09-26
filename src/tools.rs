@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::events::ToolStatus;
 use crate::interrupt;
 use crate::model::{AssistantReply, ContentBlock, Message, Role, StopReason, TokenUsage, ToolSpec};
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportCall};
 use pretool::PreToolHook;
 
 mod bash;
@@ -206,7 +206,7 @@ impl<T: Transport> ToolLoop<T> {
     /// Runs one user turn: sends `history` and iterates while the reply
     /// requests tools, stopping at the configured limit if one is set.
     pub fn run(&self, history: &[Message]) -> Result<TurnOutcome> {
-        self.run_observed(history, &mut |_| {})
+        self.run_observed_with_attempts(history, &mut |_| {}).result
     }
 
     /// [`ToolLoop::run`], notifying `observe` of each dispatched round, then
@@ -218,25 +218,49 @@ impl<T: Transport> ToolLoop<T> {
         history: &[Message],
         observe: &mut dyn FnMut(ToolEvent<'_>),
     ) -> Result<TurnOutcome> {
-        interrupt::check()?;
+        self.run_observed_with_attempts(history, observe).result
+    }
+
+    /// [`ToolLoop::run_observed`] with the total provider-attempt count for
+    /// the user turn, including attempts made before a terminal error.
+    pub fn run_observed_with_attempts(
+        &self,
+        history: &[Message],
+        observe: &mut dyn FnMut(ToolEvent<'_>),
+    ) -> TransportCall<TurnOutcome> {
+        let mut attempts = 0_u64;
+        if let Err(error) = interrupt::check() {
+            return TransportCall::completed(Err(error), attempts);
+        }
         let mut messages = history.to_vec();
-        let result = self.transport.send_conversation(&messages);
-        interrupt::check()?;
-        let mut reply = result?;
+        let call = self.transport.send_conversation_with_attempts(&messages);
+        attempts = attempts.saturating_add(call.attempts);
+        if let Err(error) = interrupt::check() {
+            return TransportCall::completed(Err(error), attempts);
+        }
+        let mut reply = match call.result {
+            Ok(reply) => reply,
+            Err(error) => return TransportCall::completed(Err(error), attempts),
+        };
         let mut usage = reply.usage;
         let mut rounds = 0;
 
         while reply.stop_reason == Some(StopReason::ToolUse) {
-            interrupt::check()?;
+            if let Err(error) = interrupt::check() {
+                return TransportCall::completed(Err(error), attempts);
+            }
             if let Some(max_tool_rounds) = self.max_tool_rounds
                 && rounds >= max_tool_rounds
             {
                 reply.usage = usage;
-                return Ok(TurnOutcome {
-                    reply,
-                    transcript: messages.split_off(history.len()),
-                    capped: true,
-                });
+                return TransportCall::completed(
+                    Ok(TurnOutcome {
+                        reply,
+                        transcript: messages.split_off(history.len()),
+                        capped: true,
+                    }),
+                    attempts,
+                );
             }
             observe(ToolEvent::Round {
                 content: &reply.content,
@@ -244,16 +268,18 @@ impl<T: Transport> ToolLoop<T> {
             let mut results = Vec::new();
             for block in &reply.content {
                 if let ContentBlock::ToolUse { id, name, input } = block {
-                    interrupt::check()?;
+                    if let Err(error) = interrupt::check() {
+                        return TransportCall::completed(Err(error), attempts);
+                    }
                     observe(ToolEvent::Call { id, name, input });
                     if let Some(error) = interrupt::error() {
                         observe_interrupted_result(observe, id, name, &error);
-                        return Err(error);
+                        return TransportCall::completed(Err(error), attempts);
                     }
                     let (result, status) = self.registry.dispatch_with_status(id, name, input);
                     if let Some(error) = interrupt::error() {
                         observe_interrupted_result(observe, id, name, &error);
-                        return Err(error);
+                        return TransportCall::completed(Err(error), attempts);
                     }
                     if let ContentBlock::ToolResult { content, .. } = &result {
                         observe(ToolEvent::Result {
@@ -270,18 +296,27 @@ impl<T: Transport> ToolLoop<T> {
             messages.push(Message::new(Role::User, results));
             rounds = rounds.saturating_add(1);
 
-            let result = self.transport.send_conversation(&messages);
-            interrupt::check()?;
-            reply = result?;
+            let call = self.transport.send_conversation_with_attempts(&messages);
+            attempts = attempts.saturating_add(call.attempts);
+            if let Err(error) = interrupt::check() {
+                return TransportCall::completed(Err(error), attempts);
+            }
+            reply = match call.result {
+                Ok(reply) => reply,
+                Err(error) => return TransportCall::completed(Err(error), attempts),
+            };
             usage = add_usage(usage, reply.usage);
         }
 
         reply.usage = usage;
-        Ok(TurnOutcome {
-            reply,
-            transcript: messages.split_off(history.len()),
-            capped: false,
-        })
+        TransportCall::completed(
+            Ok(TurnOutcome {
+                reply,
+                transcript: messages.split_off(history.len()),
+                capped: false,
+            }),
+            attempts,
+        )
     }
 }
 
@@ -304,19 +339,29 @@ impl<T: Transport> Transport for ToolLoop<T> {
     /// Runs the tool loop and returns only the final reply, warning on stderr
     /// when the turn hit its configured round limit.
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
-        let outcome = match &self.observer {
-            Some(observer) => {
-                self.run_observed(messages, &mut |event| (observer.borrow_mut())(event))?
-            }
-            None => self.run(messages)?,
+        self.send_conversation_with_attempts(messages).result
+    }
+
+    fn send_conversation_with_attempts(
+        &self,
+        messages: &[Message],
+    ) -> TransportCall<AssistantReply> {
+        let call = match &self.observer {
+            Some(observer) => self
+                .run_observed_with_attempts(messages, &mut |event| (observer.borrow_mut())(event)),
+            None => self.run_observed_with_attempts(messages, &mut |_| {}),
         };
-        if outcome.capped {
-            let max_tool_rounds = self
-                .max_tool_rounds
-                .expect("a capped turn has a configured round limit");
-            eprintln!("{}", tool_round_limit_warning(max_tool_rounds));
-        }
-        Ok(outcome.reply)
+        let attempts = call.attempts;
+        let result = call.result.map(|outcome| {
+            if outcome.capped {
+                let max_tool_rounds = self
+                    .max_tool_rounds
+                    .expect("a capped turn has a configured round limit");
+                eprintln!("{}", tool_round_limit_warning(max_tool_rounds));
+            }
+            outcome.reply
+        });
+        TransportCall::completed(result, attempts)
     }
 }
 

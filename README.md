@@ -65,7 +65,8 @@ endpoints, and `CLAUDE_CODE_OAUTH_TOKEN`. Claude subscription OAuth tokens
 Anthropic Console API key with `ANTHROPIC_API_KEY` instead. Other settings
 include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_BASH_TIMEOUT_SECS`, `LEG_MAX_TOKENS`, `LEG_MAX_TOOL_ROUNDS`,
-`LEG_PRETOOL_HOOK`, `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
+`LEG_MAX_RETRIES`, `LEG_RETRY_BASE_DELAY_MS`, `LEG_PRETOOL_HOOK`,
+`LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
 ### Tool loop
 
@@ -76,6 +77,24 @@ printed. `LEG_MAX_TOOL_ROUNDS` optionally sets a positive round limit; unset
 or blank is unbounded. With a configured limit, if the reply still requests
 tools after that many rounds, `leg` sends no further request and warns on
 stderr. A call to an unregistered tool is answered with an error result.
+
+### Transient provider retries
+
+`LEG_MAX_RETRIES` sets the number of retries after the first provider request
+(default `2`; `0` disables retries). `LEG_RETRY_BASE_DELAY_MS` sets the
+exponential-backoff base (default `250` ms). Each retry uses full jitter from
+zero through `min(base_delay * 2^(retry_number - 1), 30 seconds)`.
+`Retry-After` values in delay-seconds or HTTP-date form take precedence and are
+capped at 30 seconds.
+
+Retries apply to transient connection failures (I/O, timeouts, DNS, connection
+establishment, and proxy connection) and HTTP 408, 429, 500, 502, 503, 504, and
+529. TLS/protocol setup failures outside those connection classes, other 4xx
+responses, response-body read failures, and decode errors are surfaced without
+retry. The `attempts` field on `response_ok` and `response_error` trail outcomes
+counts all provider-call attempts in that exchange, including retries and calls
+across tool-loop rounds; it is absent in older trail records, which remain
+readable.
 
 `LEG_PRETOOL_HOOK` optionally names an executable to run before every tool
 dispatch; unset or blank leaves dispatch unchanged. The hook receives this
