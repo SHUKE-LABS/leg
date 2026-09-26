@@ -21,9 +21,8 @@ use crate::tools::{
     BashTool, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome,
     WriteTool, tool_round_limit_warning,
 };
-use crate::transport::claude::ClaudeClient;
-use crate::transport::http::UreqHttpClient;
-use crate::transport::{RetryingHttpClient, StreamEvent, Transport, TransportCall};
+use crate::transport::provider::ProviderTransport;
+use crate::transport::{StreamEvent, Transport, TransportCall};
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
 const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]";
@@ -212,10 +211,13 @@ fn help_text() -> String {
          Anthropic-compatible endpoints. Claude subscription OAuth tokens\n\
          (including `claude setup-token`) are unsupported outside Claude Code;\n\
          use an Anthropic Console API key with ANTHROPIC_API_KEY instead.\n\
+         LEG_PROVIDER defaults to anthropic; openai-chat-completions and\n\
+         openai-responses use OPENAI_API_KEY and OPENAI_BASE_URL.\n\
          `leg ask --image <path>` accepts JPEG, PNG, GIF, and WebP; repeat the\n\
          flag to attach multiple images. Each base64 image is limited to 10 MB,\n\
          and image requests to 32 MB.\n\
-         Also honours ANTHROPIC_BASE_URL, LEG_MODEL, LEG_TIMEOUT_SECS,\n\
+         Also honours LEG_PROVIDER, ANTHROPIC_BASE_URL, OPENAI_BASE_URL,\n\
+         LEG_MODEL, LEG_TIMEOUT_SECS,\n\
          LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS,\n\
          LEG_MAX_RETRIES, LEG_RETRY_BASE_DELAY_MS,\n\
          LEG_PRETOOL_HOOK, and LEG_SYSTEM_PROMPT.\n\n\
@@ -1256,6 +1258,22 @@ fn stream_event_text(event: &StreamEvent) -> Option<&str> {
         {
             delta.get("text").and_then(serde_json::Value::as_str)
         }
+        StreamEvent::ContentBlockDelta { delta, .. } => delta
+            .pointer("/choices/0/delta/content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                delta
+                    .pointer("/choices/0/delta/refusal")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                matches!(
+                    delta.get("type").and_then(serde_json::Value::as_str),
+                    Some("response.output_text.delta" | "response.refusal.delta")
+                )
+                .then(|| delta.get("delta").and_then(serde_json::Value::as_str))
+                .flatten()
+            }),
         _ => None,
     }
 }
@@ -1369,14 +1387,12 @@ fn session_reply_message(content: Vec<ContentBlock>, capped: bool) -> Message {
 /// History text standing in for a tool-only reply stopped at the round limit.
 const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]";
 
-/// Builds the provider transport every command runs through: a
-/// [`ClaudeClient`] advertising the registry's tools, wrapped in the tool loop.
-fn build_transport(
-    config: LegConfig,
-) -> ToolLoop<ClaudeClient<RetryingHttpClient<UreqHttpClient>>> {
+/// Builds the selected provider transport with registry tools, wrapped in the
+/// shared tool loop.
+fn build_transport(config: LegConfig) -> ToolLoop<ProviderTransport> {
     let max_tool_rounds = config.max_tool_rounds;
     let registry = build_tool_registry(&config);
-    let client = ClaudeClient::from_config(config).with_tools(registry.specs());
+    let client = ProviderTransport::from_config(config, registry.specs());
     ToolLoop::new(client, registry, max_tool_rounds)
 }
 

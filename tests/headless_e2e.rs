@@ -292,6 +292,168 @@ fn sse_tool_use_reply(id: &str, name: &str, input: &Value) -> String {
     reply
 }
 
+fn chat_sse_data(data: Value) -> String {
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&data).expect("serialize Chat Completions chunk")
+    )
+}
+
+fn chat_tool_call_reply() -> String {
+    let mut reply = chat_sse_data(serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"notes.txt\"}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    }));
+    reply.push_str(&chat_sse_data(serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    })));
+    reply.push_str("data: [DONE]\n\n");
+    reply
+}
+
+fn chat_text_reply(text: &str) -> String {
+    let mut reply = chat_sse_data(serde_json::json!({
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+    }));
+    reply.push_str(&chat_sse_data(serde_json::json!({
+        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+    })));
+    reply.push_str(&chat_sse_data(serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2}
+    })));
+    reply.push_str("data: [DONE]\n\n");
+    reply
+}
+
+fn responses_tool_call_reply() -> String {
+    let call = serde_json::json!({
+        "type": "function_call",
+        "id": "fc_read",
+        "call_id": "call_read",
+        "name": "read",
+        "arguments": "{\"path\":\"notes.txt\"}"
+    });
+    let response = serde_json::json!({
+        "id": "resp_tool",
+        "status": "completed",
+        "output": [call],
+        "usage": {"input_tokens": 4, "output_tokens": 2}
+    });
+    let mut reply = sse_event(
+        "response.created",
+        serde_json::json!({"type": "response.created", "response": {"id": "resp_tool"}}),
+    );
+    reply.push_str(&sse_event(
+        "response.output_item.added",
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_read",
+                "call_id": "call_read",
+                "name": "read",
+                "arguments": ""
+            }
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.function_call_arguments.delta",
+        serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_read",
+            "output_index": 0,
+            "delta": "{\"path\":\"notes.txt\"}"
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.output_item.done",
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": call
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.completed",
+        serde_json::json!({"type": "response.completed", "response": response}),
+    ));
+    reply
+}
+
+fn responses_text_reply(text: &str) -> String {
+    let output_text = serde_json::json!({"type": "output_text", "text": text});
+    let response = serde_json::json!({
+        "id": "resp_text",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [output_text]
+        }],
+        "usage": {"input_tokens": 4, "output_tokens": 2}
+    });
+    let mut reply = sse_event(
+        "response.created",
+        serde_json::json!({"type": "response.created", "response": {"id": "resp_text"}}),
+    );
+    reply.push_str(&sse_event(
+        "response.output_item.added",
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_text", "role": "assistant", "content": []}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.content_part.added",
+        serde_json::json!({
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.output_text.delta",
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.content_part.done",
+        serde_json::json!({
+            "type": "response.content_part.done",
+            "output_index": 0,
+            "content_index": 0,
+            "part": output_text
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.completed",
+        serde_json::json!({"type": "response.completed", "response": response}),
+    ));
+    reply
+}
+
 /// Starts a one-shot fake provider that rejects the request with bad credentials.
 fn spawn_auth_failure_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
@@ -472,6 +634,18 @@ fn leg(cwd: &Path, base_url: &str) -> Command {
         .env_remove("LEG_EVENT_LOG")
         .env_remove("LEG_SYSTEM_PROMPT")
         .env_remove("LEG_PRETOOL_HOOK");
+    cmd
+}
+
+fn openai_leg(cwd: &Path, base_url: &str, provider: &str) -> Command {
+    let mut cmd = leg(cwd, base_url);
+    cmd.env("LEG_PROVIDER", provider)
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .env("OPENAI_BASE_URL", base_url)
+        .env("LEG_MODEL", "openai-test-model")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     cmd
 }
 
@@ -1711,6 +1885,116 @@ fn session_flushes_text_before_the_provider_finishes_streaming() {
     assert_eq!(events[2]["reply"], "hello world");
 
     std::fs::remove_dir_all(&cwd).ok();
+}
+
+fn assert_openai_tool_loop_trail_and_resume(
+    provider: &str,
+    is_responses: bool,
+    replies: Vec<String>,
+) {
+    let (base_url, requests) = spawn_sse_sequence_server(replies);
+    let cwd = fixture_dir(provider);
+    let trail = cwd.join("openai-session.jsonl");
+
+    let mut first = openai_leg(&cwd, &base_url, provider);
+    first.env("LEG_EVENT_LOG", &trail).arg("session");
+    let first_output = run(first, Some("read notes.txt\n/exit\n"));
+    assert!(
+        first_output.status.success(),
+        "first OpenAI session failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&first_output.stdout),
+        "tool finished\n"
+    );
+
+    let mut resume = openai_leg(&cwd, &base_url, provider);
+    resume.args(["session", "--resume"]).arg(&trail);
+    let resumed = run(resume, Some("continue after the tool call\n/exit\n"));
+    assert!(
+        resumed.status.success(),
+        "OpenAI session resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&resumed.stdout),
+        "resume finished\n"
+    );
+
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect();
+    assert_eq!(requests.len(), 3, "tool round plus final and resumed turns");
+    let resumed_request = &requests[2];
+    if is_responses {
+        let input = resumed_request["input"]
+            .as_array()
+            .expect("Responses input");
+        assert_eq!(input.len(), 5);
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_read");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_read");
+        assert_eq!(input[3]["role"], "assistant");
+        assert_eq!(
+            input[4]["content"][0]["text"],
+            "continue after the tool call"
+        );
+    } else {
+        let messages = resumed_request["messages"]
+            .as_array()
+            .expect("Chat Completions messages");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_read");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_read");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[4]["content"], "continue after the tool call");
+    }
+
+    let events = read_events(&trail);
+    assert!(
+        events.iter().any(|event| event["event"] == "tool_result"),
+        "the tool result must be persisted in the resumable trail"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["event"] == "response_ok" && event["reply"] == "tool finished" }),
+        "the tool-loop reply must be persisted"
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn openai_chat_completions_drives_tool_loop_trail_and_resume() {
+    assert_openai_tool_loop_trail_and_resume(
+        "openai-chat-completions",
+        false,
+        vec![
+            chat_tool_call_reply(),
+            chat_text_reply("tool finished"),
+            chat_text_reply("resume finished"),
+        ],
+    );
+}
+
+#[test]
+fn openai_responses_drives_tool_loop_trail_and_resume() {
+    assert_openai_tool_loop_trail_and_resume(
+        "openai-responses",
+        true,
+        vec![
+            responses_tool_call_reply(),
+            responses_text_reply("tool finished"),
+            responses_text_reply("resume finished"),
+        ],
+    );
 }
 
 #[test]

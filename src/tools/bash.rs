@@ -313,10 +313,11 @@ mod tests {
             .with_env("ANTHROPIC_API_KEY", "test-api-key")
             .with_env("ANTHROPIC_AUTH_TOKEN", "test-auth-token")
             .with_env("CLAUDE_CODE_OAUTH_TOKEN", "test-oauth-token")
+            .with_env("OPENAI_API_KEY", "test-openai-api-key")
             .with_env("MAT_TEST_MARKER", "visible");
         let result = tool
             .call(&serde_json::json!({
-                "command": "env | while IFS= read -r line; do case \"$line\" in ANTHROPIC_API_KEY=*|ANTHROPIC_AUTH_TOKEN=*|CLAUDE_CODE_OAUTH_TOKEN=*|MAT_TEST_MARKER=*) printf '%s\\n' \"$line\";; esac; done"
+                "command": "env | while IFS= read -r line; do case \"$line\" in ANTHROPIC_API_KEY=*|ANTHROPIC_AUTH_TOKEN=*|CLAUDE_CODE_OAUTH_TOKEN=*|OPENAI_API_KEY=*|MAT_TEST_MARKER=*) printf '%s\\n' \"$line\";; esac; done"
             }))
             .map(|output| serde_json::from_str::<Value>(&output).unwrap());
         std::fs::remove_dir_all(home).unwrap();
@@ -328,6 +329,7 @@ mod tests {
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
         ] {
             assert!(
                 !stdout
