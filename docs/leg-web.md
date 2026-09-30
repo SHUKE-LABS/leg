@@ -40,7 +40,7 @@ Each host creates a cryptographically random 256-bit token. The token appears
 once in the printed launch URL's fragment. URL fragments are not sent in HTTP
 requests. The embedded page moves the token to that tab's `sessionStorage` and
 removes the fragment from the address bar. Browser API calls send it in an
-`Authorization: Bearer` header. The Web UI should use authenticated `fetch`
+`Authorization: Bearer` header. The Web UI uses authenticated `fetch`
 for event streams; native `EventSource` cannot set that header.
 
 The token is not stored in the catalog, receipts, static assets, query strings,
@@ -104,6 +104,37 @@ submit again with a new request ID. If that explicit submission repeats the
 catalog's recoverable prompt, the host uses the shared `prepare_retry` and
 `confirm_retry` path; a different prompt starts a new turn.
 
+## Browser workbench
+
+Open the one-time launch URL printed by `leg-web`. The page keeps its launch
+token in per-tab session storage and sends no provider credentials. On the
+first screen, enter an absolute path to an existing folder on the host and
+start a conversation. The browser cannot browse the host filesystem. Leg runs
+tools as the host OS user with that folder as its working directory; it is not
+a sandbox. Provider configuration comes from the environment that launched
+`leg-web`, and missing binaries or setup are reported with local recovery
+steps.
+
+The transcript shows provisional streamed text and tool activity. The
+effective provider and model appear from leg's `turn_start` metadata; the UI
+does not invent a default. A terminal turn reply replaces its provisional
+text. Stop interrupts the host-owned run. If the browser reloads or the host
+connection drops, the page reconnects to a snapshot and event cursor without
+resubmitting the prompt. A send whose HTTP response is lost is reconciled with
+its saved request ID and prompt hash. If the host proves it did not accept the
+send, **Retry same send** reuses that ID and exact text; it never creates a new
+turn automatically.
+
+Press Enter for a newline. Press Ctrl+Enter or Cmd+Enter, or select **Send**,
+to submit. Send is disabled while leg is running; a draft can still be edited
+and failed prompts remain available. Markdown formatting uses local DOM
+rendering: raw HTML is shown as text, unsupported or unsafe links remain text,
+and model/tool output cannot load remote images or other resources.
+
+Session history browsing and detailed execution inspection are covered by
+#85. The manual keyboard and screen-reader checklist is
+[`companions/leg-web/tests/keyboard-screen-reader-checklist.md`](../companions/leg-web/tests/keyboard-screen-reader-checklist.md).
+
 ## Validation
 
 Run the host package tests with:
@@ -117,6 +148,12 @@ python3 companions/leg-web/tests/lifecycle_smoke.py \
   companions/target/debug/leg-web \
   target/debug/leg \
   companions/target/debug/leg-ui-supervisor
+python3 -m pip install --requirement companions/leg-web/tests/browser-requirements.txt
+python3 -m playwright install chromium
+python3 companions/leg-web/tests/browser_e2e.py \
+  companions/target/debug/leg-web \
+  target/debug/leg \
+  companions/target/debug/leg-ui-supervisor
 ```
 
 Package tests cover loopback binding, host ownership, authentication and
@@ -126,4 +163,9 @@ The fake-provider lifecycle smoke covers a lost submit response and duplicate
 request, two tabs, disconnect/reconnect, expired cursors, an incomplete
 provider stream, Stop, host crash cleanup, graceful shutdown, and restart
 without prompt replay. CI runs these checks on Linux and macOS; Windows runs
-the Web package tests and builds the host binary.
+the Web package tests and builds the host binary. The Chromium browser E2E
+covers exact multiline input and one-submission counts across IME, Enter,
+repeated clicks, network and provider retries, and refresh; live tool activity
+and Stop; safe Markdown output; large tool summaries; history scroll anchoring;
+and the required viewport sizes. CI caches the pinned Playwright Chromium
+build and runs browser E2E on Linux.

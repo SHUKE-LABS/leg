@@ -1,0 +1,853 @@
+:root {
+  color-scheme: light;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #182327;
+  background: #f4f6f4;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  min-width: 320px;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  min-height: 2.75rem;
+  border: 1px solid #aab8b2;
+  border-radius: 0.55rem;
+  padding: 0.55rem 0.9rem;
+  color: #182327;
+  background: #fff;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #edf3ef;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+.transcript:focus-visible {
+  outline: 3px solid #146b54;
+  outline-offset: 3px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-rows: 3.6rem minmax(0, 1fr);
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid #d5ded9;
+  padding: 0 1.25rem;
+  background: #fff;
+}
+
+.brand {
+  color: #173c30;
+  font-size: 1.05rem;
+  font-weight: 750;
+  letter-spacing: -0.025em;
+  text-decoration: none;
+}
+
+.brand span {
+  color: #66776f;
+  font-weight: 500;
+}
+
+.connection-state {
+  color: #35463f;
+  font-size: 0.875rem;
+}
+
+.workbench {
+  display: grid;
+  grid-template-columns: 15rem minmax(0, 1fr);
+  min-height: 0;
+}
+
+.session-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+  border-right: 1px solid #d5ded9;
+  padding: 1.25rem 1rem;
+  background: #edf1ee;
+}
+
+.rail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.rail-heading h1 {
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.quiet-button {
+  min-height: 2.5rem;
+  padding-inline: 0.75rem;
+  font-size: 0.875rem;
+}
+
+.current-session-card {
+  display: flex;
+  gap: 0.65rem;
+  border: 1px solid #c9d6cf;
+  border-radius: 0.65rem;
+  padding: 0.8rem 0.7rem;
+  background: #fff;
+  overflow-wrap: anywhere;
+}
+
+.session-marker {
+  flex: 0 0 auto;
+  color: #146b54;
+  font-size: 0.8rem;
+}
+
+.current-session-card strong {
+  display: block;
+  font-size: 0.875rem;
+}
+
+.current-session-card p,
+.rail-note {
+  margin: 0.35rem 0 0;
+  color: #54645c;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.rail-note {
+  margin-top: auto;
+}
+
+.main-panel {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #f8faf8;
+}
+
+.welcome-panel {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  padding: 2rem;
+}
+
+.welcome-card {
+  width: min(100%, 38rem);
+  border: 1px solid #d5ded9;
+  border-radius: 1rem;
+  padding: clamp(1.25rem, 4vw, 2.25rem);
+  background: #fff;
+  box-shadow: 0 0.8rem 2.5rem rgb(24 35 39 / 6%);
+}
+
+.eyebrow {
+  margin: 0 0 0.4rem;
+  color: #43675a;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.welcome-card h2,
+.session-heading h2 {
+  margin: 0;
+  font-size: clamp(1.35rem, 2vw, 1.8rem);
+  letter-spacing: -0.035em;
+}
+
+.welcome-copy {
+  max-width: 34rem;
+  margin: 0.8rem 0 1.5rem;
+  color: #4d5f56;
+  line-height: 1.6;
+}
+
+.start-form {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.start-form label,
+.composer label {
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.start-form input,
+.composer textarea {
+  width: 100%;
+  border: 1px solid #9caaa3;
+  border-radius: 0.55rem;
+  padding: 0.75rem 0.85rem;
+  color: #182327;
+  background: #fff;
+}
+
+.start-form input {
+  min-height: 2.9rem;
+}
+
+.field-help {
+  margin: 0 0 0.45rem;
+  color: #53645b;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.primary-button {
+  border-color: #145d49;
+  color: #fff;
+  background: #145d49;
+  font-weight: 700;
+}
+
+.primary-button:hover:not(:disabled) {
+  border-color: #0e4938;
+  color: #fff;
+  background: #0e4938;
+}
+
+.safety-note {
+  margin-top: 1.5rem;
+  border-left: 4px solid #9a6020;
+  padding: 0.65rem 0.85rem;
+  color: #342918;
+  background: #fff5df;
+  line-height: 1.5;
+}
+
+.safety-note strong {
+  display: block;
+  font-size: 0.9rem;
+}
+
+.safety-note p {
+  margin: 0.2rem 0 0;
+  font-size: 0.875rem;
+}
+
+.conversation {
+  display: grid;
+  grid-template-rows: auto auto auto auto minmax(5rem, 1fr) auto auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.conversation-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid #dbe3de;
+  padding: 1rem clamp(1rem, 3vw, 2.25rem) 0.85rem;
+  background: #f8faf8;
+}
+
+.session-heading {
+  min-width: 0;
+}
+
+.session-heading h2 {
+  overflow-wrap: anywhere;
+  font-size: 1.25rem;
+}
+
+.workspace-label {
+  max-width: 56vw;
+  margin: 0.3rem 0 0;
+  overflow-wrap: anywhere;
+  color: #51635a;
+  font-size: 0.82rem;
+}
+
+.turn-meta {
+  flex: 0 0 auto;
+  max-width: 40%;
+  text-align: right;
+}
+
+.provider-model,
+.elapsed-time {
+  margin: 0.2rem 0 0;
+  color: #42564c;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.elapsed-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.activity-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-height: 3rem;
+  border-bottom: 1px solid #e1e7e3;
+  padding: 0.4rem clamp(1rem, 3vw, 2.25rem);
+  background: #fff;
+}
+
+.activity-copy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem 1rem;
+  min-width: 0;
+}
+
+.status-text {
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.active-tool {
+  color: #3f5148;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.stop-button {
+  flex: 0 0 auto;
+  border-color: #8f3333;
+  color: #842c2c;
+  font-weight: 700;
+}
+
+.stop-button:hover:not(:disabled) {
+  border-color: #6c2020;
+  color: #6c2020;
+  background: #fff0f0;
+}
+
+.workspace-warning {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  border-bottom: 1px solid #e6d3aa;
+  padding: 0.55rem clamp(1rem, 3vw, 2.25rem);
+  color: #382d19;
+  background: #fff7e7;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.workspace-warning strong {
+  flex: 0 0 auto;
+}
+
+.connection-message {
+  margin: 0;
+  border-bottom: 1px solid #b4c7da;
+  padding: 0.5rem clamp(1rem, 3vw, 2.25rem);
+  color: #203e55;
+  background: #edf6ff;
+  font-size: 0.85rem;
+}
+
+.transcript {
+  position: relative;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 1.25rem clamp(1rem, 3vw, 2.25rem) 1.5rem;
+  scroll-behavior: auto;
+}
+
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  width: min(100%, 58rem);
+  margin: 0 auto;
+}
+
+.message {
+  min-width: 0;
+  border-radius: 0.85rem;
+  padding: 0.95rem 1rem;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+
+.message-user {
+  align-self: flex-end;
+  width: min(92%, 44rem);
+  border: 1px solid #c7d6ce;
+  background: #eef5f0;
+}
+
+.message-assistant {
+  align-self: stretch;
+  border: 1px solid #e0e5e2;
+  background: #fff;
+}
+
+.message-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.55rem;
+  color: #41564b;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.message-content > :first-child {
+  margin-top: 0;
+}
+
+.message-content > :last-child {
+  margin-bottom: 0;
+}
+
+.message-content p,
+.message-content ul,
+.message-content ol,
+.message-content blockquote {
+  margin: 0.55rem 0;
+}
+
+.message-content h2,
+.message-content h3 {
+  margin: 1rem 0 0.45rem;
+  font-size: 1.05rem;
+}
+
+.message-content ul,
+.message-content ol {
+  padding-left: 1.5rem;
+}
+
+.message-content blockquote {
+  border-left: 3px solid #95a99d;
+  padding-left: 0.8rem;
+  color: #4b5a52;
+}
+
+.message-content code {
+  border-radius: 0.25rem;
+  padding: 0.08rem 0.25rem;
+  background: #edf1ee;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.message-content pre {
+  max-width: 100%;
+  margin: 0.7rem 0;
+  overflow: auto;
+  border: 1px solid #dce3df;
+  border-radius: 0.55rem;
+  padding: 0.8rem;
+  background: #f1f4f2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message-content pre code {
+  padding: 0;
+  background: transparent;
+  white-space: inherit;
+  overflow-wrap: inherit;
+}
+
+.message-content a {
+  color: #075a91;
+  text-decoration-thickness: 0.08em;
+  text-underline-offset: 0.15em;
+  overflow-wrap: anywhere;
+}
+
+.tool-summary {
+  margin-top: 0.75rem;
+  border: 1px solid #d9e1dc;
+  border-radius: 0.55rem;
+  padding: 0.65rem 0.75rem;
+  background: #f5f7f5;
+  font-size: 0.82rem;
+}
+
+.tool-summary strong {
+  display: block;
+}
+
+.tool-summary p {
+  margin: 0.3rem 0 0;
+  color: #4c5b53;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.turn-outcome {
+  margin-top: 0.7rem;
+  color: #4b5d53;
+  font-size: 0.78rem;
+}
+
+.empty-transcript {
+  width: min(100%, 58rem);
+  margin: 2rem auto;
+  color: #5b6c63;
+  text-align: center;
+}
+
+.new-content-button {
+  position: sticky;
+  bottom: 0.35rem;
+  z-index: 1;
+  display: block;
+  width: max-content;
+  min-height: 2.5rem;
+  margin: 0.35rem auto;
+  border-color: #255b49;
+  color: #174b39;
+  background: #fff;
+  box-shadow: 0 0.2rem 0.6rem rgb(0 0 0 / 12%);
+  font-weight: 700;
+}
+
+.composer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  border-top: 1px solid #d4ded8;
+  padding: 0.8rem clamp(1rem, 3vw, 2.25rem) 0.9rem;
+  background: #fff;
+  box-shadow: 0 -0.4rem 1rem rgb(24 35 39 / 4%);
+}
+
+.composer textarea {
+  display: block;
+  min-height: 5rem;
+  max-height: 12rem;
+  margin-top: 0.4rem;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.55rem;
+}
+
+.key-help {
+  margin: 0;
+  color: #5b6a62;
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.composer-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.error-message {
+  margin: 0.5rem 0 0;
+  color: #842c2c;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+@media (max-width: 40rem) {
+  .workbench {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .session-rail {
+    flex-direction: row;
+    align-items: center;
+    border-right: 0;
+    border-bottom: 1px solid #d5ded9;
+    padding: 0.4rem 0.85rem;
+  }
+
+  .rail-heading {
+    width: 100%;
+  }
+
+  .current-session-card,
+  .rail-note {
+    display: none;
+  }
+
+  .workspace-label {
+    max-width: 100%;
+  }
+
+  .turn-meta {
+    max-width: 45%;
+  }
+
+  .workspace-warning {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .composer-footer {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 25rem) {
+  .topbar {
+    padding-inline: 0.75rem;
+  }
+
+  .connection-state {
+    max-width: 58%;
+    font-size: 0.75rem;
+    text-align: right;
+  }
+
+  .conversation-header {
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .turn-meta {
+    max-width: 100%;
+    text-align: left;
+  }
+
+  .provider-model,
+  .elapsed-time {
+    font-size: 0.75rem;
+  }
+
+  .composer-footer {
+    align-items: flex-start;
+  }
+
+  .composer-actions {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 760px) {
+  body {
+    overflow: auto;
+  }
+
+  .app-shell {
+    grid-template-rows: auto minmax(0, 1fr);
+    min-height: 100dvh;
+    height: 100dvh;
+  }
+
+  .topbar {
+    min-height: 3.4rem;
+    padding-inline: 0.85rem;
+  }
+
+  .workbench {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .session-rail {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.65rem;
+    border-right: 0;
+    border-bottom: 1px solid #d5ded9;
+    padding: 0.55rem 0.8rem;
+  }
+
+  .rail-heading h1,
+  .rail-note {
+    display: none;
+  }
+
+  .current-session-card {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0.45rem 0.55rem;
+  }
+
+  .current-session-card p {
+    max-width: 42vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .main-panel {
+    min-height: 0;
+  }
+
+  .welcome-panel {
+    align-items: start;
+    padding: 1rem 0.75rem;
+  }
+
+  .welcome-card {
+    padding: 1.15rem;
+  }
+
+  .conversation-header {
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.7rem 0.85rem;
+  }
+
+  .session-heading h2 {
+    font-size: 1.1rem;
+  }
+
+  .workspace-label {
+    max-width: 100%;
+  }
+
+  .turn-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.75rem;
+    max-width: 100%;
+    text-align: left;
+  }
+
+  .provider-model,
+  .elapsed-time {
+    margin-top: 0;
+  }
+
+  .activity-bar {
+    min-height: 2.7rem;
+    padding-inline: 0.85rem;
+  }
+
+  .workspace-warning {
+    align-items: flex-start;
+    padding: 0.45rem 0.85rem;
+    font-size: 0.74rem;
+  }
+
+  .workspace-warning strong {
+    max-width: 6rem;
+  }
+
+  .connection-message {
+    padding-inline: 0.85rem;
+  }
+
+  .transcript {
+    padding: 0.8rem 0.75rem 1rem;
+  }
+
+  .message {
+    padding: 0.75rem;
+  }
+
+  .message-user {
+    width: 96%;
+  }
+
+  .composer {
+    padding: 0.65rem 0.75rem max(0.7rem, env(safe-area-inset-bottom));
+  }
+
+  .composer textarea {
+    min-height: 4.2rem;
+  }
+
+  .composer-footer {
+    align-items: flex-end;
+  }
+
+  .key-help {
+    max-width: 12rem;
+    font-size: 0.7rem;
+  }
+}
+
+@media (max-height: 620px) {
+  .conversation-header {
+    padding-block: 0.45rem;
+  }
+
+  .activity-bar {
+    min-height: 2.5rem;
+  }
+
+  .workspace-warning {
+    padding-block: 0.35rem;
+  }
+
+  .composer textarea {
+    min-height: 3.6rem;
+  }
+}
