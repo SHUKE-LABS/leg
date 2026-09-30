@@ -519,7 +519,7 @@ fn build_router(state: HostState) -> Router {
 }
 
 async fn guard_request(State(state): State<HostState>, request: Request, next: Next) -> Response {
-    let path = request.uri().path();
+    let path = request.uri().path().to_owned();
     let api = path.starts_with("/api/");
     let expected_authority = lock(&state.inner.authority).clone();
     let Some(expected_authority) = expected_authority else {
@@ -562,6 +562,10 @@ async fn guard_request(State(state): State<HostState>, request: Request, next: N
     }
 
     let mut response = next.run(request).await;
+    if api && !response.status().is_success() && !response_is_json(&response) {
+        let status = response.status();
+        response = api_error(status, api_rejection_code(&path, status)).into_response();
+    }
     response.headers_mut().insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
@@ -581,6 +585,32 @@ async fn guard_request(State(state): State<HostState>, request: Request, next: N
         );
     }
     response
+}
+
+fn response_is_json(response: &Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("application/json")
+            })
+        })
+}
+
+fn api_rejection_code(path: &str, status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST if path.ends_with("/events") => "invalid_cursor",
+        StatusCode::BAD_REQUEST => "invalid_request",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+        StatusCode::UNPROCESSABLE_ENTITY => "invalid_request",
+        status if status.is_server_error() => "internal_error",
+        _ => "invalid_request",
+    }
 }
 
 async fn index() -> Response {
@@ -1705,8 +1735,11 @@ fn acquire_host_lock(state_dir: &Path) -> Result<File, HostError> {
         options.mode(0o600);
     }
     let file = options.open(path)?;
+    let contended_code = fs2::lock_contended_error().raw_os_error();
     file.try_lock_exclusive().map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
+        let is_contended = error.kind() == io::ErrorKind::WouldBlock
+            || contended_code.is_some_and(|code| error.raw_os_error() == Some(code));
+        if is_contended {
             HostError::State(
                 "another leg-web host already owns this catalog; use its printed URL or stop it before starting another".into(),
             )
@@ -1788,6 +1821,48 @@ mod tests {
             .header(AUTHORIZATION, format!("Bearer {}", host.state.inner.token))
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn api_json_request(
+        host: &Host,
+        method: Method,
+        path: &str,
+        body: &str,
+        content_type: bool,
+    ) -> HttpRequest<Body> {
+        let mut request = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header(HOST, "127.0.0.1:43127")
+            .header(ORIGIN, "http://127.0.0.1:43127")
+            .header(AUTHORIZATION, format!("Bearer {}", host.state.inner.token));
+        if content_type {
+            request = request.header(CONTENT_TYPE, "application/json");
+        }
+        request.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    async fn assert_api_error_json(
+        response: Response,
+        expected_status: StatusCode,
+        expected_code: &str,
+        forbidden: &str,
+    ) {
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(forbidden),
+            "error echoed request input: {text}"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": expected_code})
+        );
     }
 
     #[test]
@@ -1966,40 +2041,102 @@ mod tests {
     async fn malformed_json_unknown_ids_and_traversal_have_no_effect() {
         let (host, _temp) = test_host();
         let router = build_router(host.state.clone());
-        let malformed = HttpRequest::builder()
-            .method(Method::POST)
-            .uri("/api/sessions")
-            .header(HOST, "127.0.0.1:43127")
-            .header(ORIGIN, "http://127.0.0.1:43127")
-            .header(AUTHORIZATION, format!("Bearer {}", host.state.inner.token))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from("{bad json"))
-            .unwrap();
-        assert_eq!(
-            router.clone().oneshot(malformed).await.unwrap().status(),
-            StatusCode::BAD_REQUEST
-        );
-        let unknown = router
+        let malformed = router
             .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::POST)
-                    .uri("/api/sessions/unknown/submit")
-                    .header(HOST, "127.0.0.1:43127")
-                    .header(ORIGIN, "http://127.0.0.1:43127")
-                    .header(AUTHORIZATION, format!("Bearer {}", host.state.inner.token))
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"request_id":1,"prompt":"start"}"#))
-                    .unwrap(),
-            )
+            .oneshot(api_json_request(
+                &host,
+                Method::POST,
+                "/api/sessions",
+                "MALFORMED_SENTINEL {",
+                true,
+            ))
             .await
             .unwrap();
-        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_api_error_json(
+            malformed,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "MALFORMED_SENTINEL",
+        )
+        .await;
+
+        let unknown_field = router
+            .clone()
+            .oneshot(api_json_request(
+                &host,
+                Method::POST,
+                "/api/sessions",
+                r#"{"name":"safe","UNKNOWN_FIELD_SENTINEL":"private"}"#,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_api_error_json(
+            unknown_field,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request",
+            "UNKNOWN_FIELD_SENTINEL",
+        )
+        .await;
+
+        let bad_query = router
+            .clone()
+            .oneshot(api_request(
+                &host,
+                "/api/sessions/not-a-session/events?after=CURSOR_SENTINEL",
+            ))
+            .await
+            .unwrap();
+        assert_api_error_json(
+            bad_query,
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "CURSOR_SENTINEL",
+        )
+        .await;
+
+        let missing_content_type = router
+            .clone()
+            .oneshot(api_json_request(
+                &host,
+                Method::POST,
+                "/api/sessions",
+                r#"{"name":"CONTENT_TYPE_SENTINEL"}"#,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_api_error_json(
+            missing_content_type,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "CONTENT_TYPE_SENTINEL",
+        )
+        .await;
+
+        let unknown = router
+            .clone()
+            .oneshot(api_json_request(
+                &host,
+                Method::POST,
+                "/api/sessions/unknown/submit",
+                r#"{"request_id":1,"prompt":"start"}"#,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_api_error_json(unknown, StatusCode::NOT_FOUND, "session_not_found", "start").await;
         let traversal = router
             .oneshot(api_request(&host, "/api/sessions/%2e%2e%2fetc%2fpasswd"))
             .await
             .unwrap();
-        assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
+        assert_api_error_json(
+            traversal,
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "/etc/passwd",
+        )
+        .await;
         assert!(host.inner_sessions().is_empty());
     }
 

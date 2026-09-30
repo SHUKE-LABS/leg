@@ -6,12 +6,15 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
+from threading import Thread
 from urllib.parse import urlsplit
 
 
@@ -21,16 +24,46 @@ FIXTURE = ROOT / "trials" / "fake_provider.py"
 
 def read_until(process: subprocess.Popen[str], prefix: str, timeout: float = 15) -> str:
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        line = process.stdout.readline() if process.stdout else ""
-        if not line:
-            if process.poll() is not None:
-                stderr = process.stderr.read() if process.stderr else ""
-                raise AssertionError(f"process exited before {prefix!r}: {stderr}")
-            continue
+    lines: queue.Queue[str | None] = queue.Queue()
+    stderr_tail: deque[str] = deque(maxlen=30)
+
+    def forward_stdout() -> None:
+        if process.stdout is not None:
+            for line in process.stdout:
+                lines.put(line)
+        lines.put(None)
+
+    def capture_stderr() -> None:
+        if process.stderr is not None:
+            for line in process.stderr:
+                stderr_tail.append(line.rstrip())
+
+    Thread(target=forward_stdout, daemon=True).start()
+    stderr_reader = Thread(target=capture_stderr, daemon=True)
+    stderr_reader.start()
+
+    def stderr_output() -> str:
+        return "\n".join(stderr_tail) or "<no stderr output captured>"
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"did not receive {prefix!r} within {timeout}s; fixture/process stderr:\n{stderr_output()}"
+            )
+        try:
+            line = lines.get(timeout=remaining)
+        except queue.Empty:
+            raise TimeoutError(
+                f"did not receive {prefix!r} within {timeout}s; fixture/process stderr:\n{stderr_output()}"
+            ) from None
+        if line is None:
+            stderr_reader.join(timeout=1)
+            raise AssertionError(
+                f"process exited before {prefix!r}; fixture/process stderr:\n{stderr_output()}"
+            )
         if line.startswith(prefix):
             return line.strip()
-    raise TimeoutError(f"did not receive {prefix!r}")
 
 
 def start_provider(workspace: Path) -> tuple[subprocess.Popen[str], str]:
@@ -41,7 +74,11 @@ def start_provider(workspace: Path) -> tuple[subprocess.Popen[str], str]:
         text=True,
         bufsize=1,
     )
-    line = read_until(process, "Listening:")
+    try:
+        line = read_until(process, "Listening:")
+    except BaseException:
+        stop_process(process, graceful=False)
+        raise
     return process, line.split()[1].removesuffix("/v1/messages")
 
 
@@ -87,7 +124,11 @@ def start_host(
         text=True,
         bufsize=1,
     )
-    line = read_until(process, "Open this one-time launch URL:")
+    try:
+        line = read_until(process, "Open this one-time launch URL:")
+    except BaseException:
+        stop_process(process, graceful=False)
+        raise
     url = line.split(": ", 1)[1]
     parts = urlsplit(url)
     return process, parts.netloc, parts.fragment
