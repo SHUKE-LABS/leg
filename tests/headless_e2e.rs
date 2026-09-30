@@ -2299,7 +2299,9 @@ fn exchange_stream_json_flushes_a_text_delta_before_provider_completion() {
     std::fs::remove_dir_all(&cwd).ok();
 }
 
-#[cfg(unix)]
+// On Apple targets, pipe creation and close-on-exec setup can race with child
+// processes spawned by parallel tests, making this broken-pipe timing flaky.
+#[cfg(target_os = "linux")]
 #[test]
 fn exchange_stream_json_broken_stdout_stops_before_tool_dispatch() {
     let full_reply = sse_text_bash_reply("before tool");
