@@ -305,12 +305,29 @@ def child_pid(workspace: Path) -> int:
     return int((workspace / "trial-stalled-child.pid").read_text(encoding="utf-8").strip())
 
 
+def clear_child_pid(workspace: Path) -> None:
+    (workspace / "trial-stalled-child.pid").unlink(missing_ok=True)
+
+
 def pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
+
+
+def wait_for_child(workspace: Path, previous_pid: int | None = None) -> int:
+    def live_child() -> int | None:
+        try:
+            pid = child_pid(workspace)
+        except (OSError, ValueError):
+            return None
+        if pid == previous_pid or not pid_is_alive(pid):
+            return None
+        return pid
+
+    return wait_for(live_child, "new live stalled child PID")
 
 
 def stop_process(process: subprocess.Popen[str], graceful: bool = True) -> None:
@@ -467,6 +484,7 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
 
             # Explicit Stop is repeatable and the owned shell child disappears.
             stop_cursor = int(snapshot(authority, token, session_id)["cursor"])
+            clear_child_pid(workspace)
             status, running = request(
                 authority,
                 token,
@@ -475,8 +493,7 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 {"request_id": 5, "prompt": "TRIAL-STOP: start a stalled tool."},
             )
             assert status == 202, running
-            wait_for(lambda: (workspace / "trial-stalled-child.pid").exists(), "stalled child PID")
-            pid = child_pid(workspace)
+            pid = wait_for_child(workspace)
             connection, response = open_events(
                 authority,
                 token,
@@ -513,6 +530,7 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
             assert not (workspace / "trial-stall-finished.txt").exists()
 
             # A hard controller crash closes the supervisor pipe and never replays.
+            clear_child_pid(workspace)
             status, crash_turn = request(
                 authority,
                 token,
@@ -521,8 +539,7 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 {"request_id": 6, "prompt": "TRIAL-STOP: start another stalled tool."},
             )
             assert status == 202, crash_turn
-            wait_for(lambda: (workspace / "trial-stalled-child.pid").exists(), "crash child PID")
-            crash_pid = child_pid(workspace)
+            crash_pid = wait_for_child(workspace, previous_pid=pid)
             before_restart = fixture_request_count(provider_url)
             stop_process(host, graceful=False)
             host = None
@@ -543,6 +560,7 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
             )
 
             # A new request ID explicitly retries the incomplete prompt; graceful shutdown stops it.
+            clear_child_pid(workspace)
             status, shutdown_turn = request(
                 new_authority,
                 new_token,
@@ -551,8 +569,7 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 {"request_id": 7, "prompt": "TRIAL-STOP: start another stalled tool."},
             )
             assert status == 202, shutdown_turn
-            wait_for(lambda: (workspace / "trial-stalled-child.pid").exists(), "shutdown child PID")
-            shutdown_pid = child_pid(workspace)
+            shutdown_pid = wait_for_child(workspace, previous_pid=crash_pid)
             stop_process(restarted, graceful=True)
             restarted = None
             wait_for(lambda: not pid_is_alive(shutdown_pid), "graceful host shutdown cleanup")
