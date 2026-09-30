@@ -30,7 +30,7 @@ SCENARIOS = (
     "reopen-after-failure",
     "reopen-after-interruption",
 )
-PAUSE_MS = 1200
+PAUSE_MS = 5000
 TRIAL_LINES = "Line one: keep this first.\n第二行：保留中文。\nLine three: keep this third."
 
 
@@ -112,8 +112,11 @@ class Fixture:
             "TRIAL-REOPEN",
             "TRIAL-AUTH",
             "TRIAL-RETRY",
+            "TRIAL-PROVIDER-RETRY",
             "TRIAL-RUNNING",
             "TRIAL-LONG",
+            "TRIAL-LARGE-TOOL",
+            "TRIAL-UNTRUSTED-MARKDOWN",
             "TRIAL-CONTINUE",
             "TRIAL-COMPOSE",
         )
@@ -306,6 +309,10 @@ class Fixture:
         request, occurrence = self.advance(marker)
         handler.fixture_request_number = request
 
+        if marker == "TRIAL-PROVIDER-RETRY" and occurrence == 1:
+            self.check("provider_retry_first_attempt_failed")
+            self.send_error(handler, 503, "overloaded_error", "retry this provider request once")
+            return
         if marker in ("auth-error", "TRIAL-AUTH"):
             self.check("auth_error_sent")
             self.send_error(handler, 401, "authentication_error", "deterministic trial authentication error")
@@ -416,6 +423,28 @@ class Fixture:
             long_text = "\n".join(f"Long fixture line {i:03d}: the complete answer remains available to browse and copy." for i in range(1, 181)) + "\nEND OF FIXTURE ANSWER"
             self.send_stream(handler, [{"type": "text", "text": long_text}])
             return
+        if marker == "TRIAL-LARGE-TOOL":
+            if self.has_tool_result(payload):
+                self.check("large_tool_result_returned", True)
+                self.send_stream(handler, [{"type": "text", "text": "The large tool result was returned."}])
+            else:
+                self.send_stream(
+                    handler,
+                    [{"type": "tool_use", "name": "bash", "input": {"command": "python3 -c 'print(\"L\" * 12000)'"}}],
+                    stop_reason="tool_use",
+                )
+            return
+        if marker == "TRIAL-UNTRUSTED-MARKDOWN":
+            if self.has_tool_result(payload):
+                self.check("untrusted_tool_result_returned", True)
+                self.send_stream(handler, [{"type": "text", "text": "The fixture's untrusted file content was returned as tool data."}])
+            else:
+                self.send_stream(
+                    handler,
+                    [{"type": "tool_use", "name": "read", "input": {"path": "xss-fixture.html"}}],
+                    stop_reason="tool_use",
+                )
+            return
         if marker == "TRIAL-CONTINUE":
             self.send_stream(handler, [{"type": "text", "text": "Continuation response: the earlier fixture answer is still in this session."}])
             return
@@ -440,27 +469,28 @@ class Fixture:
 
     @staticmethod
     def has_tool_result(payload: dict[str, Any]) -> bool:
-        for message in payload.get("messages", []):
+        for message in reversed(payload.get("messages", [])):
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
             content = message.get("content")
-            if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
-                return True
+            return isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            )
         return False
 
     @staticmethod
     def has_error_tool_result(payload: dict[str, Any]) -> bool:
-        for message in payload.get("messages", []):
+        for message in reversed(payload.get("messages", [])):
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
             content = message.get("content")
-            if isinstance(content, list) and any(
+            return isinstance(content, list) and any(
                 isinstance(block, dict)
                 and block.get("type") == "tool_result"
                 and block.get("is_error") is True
                 for block in content
-            ):
-                return True
+            )
         return False
 
     def status(self) -> dict[str, Any]:

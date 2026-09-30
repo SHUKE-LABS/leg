@@ -9,7 +9,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path as RoutePath, Query, Request, State};
@@ -32,6 +32,7 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
+const APP_CSS: &str = include_str!("assets/app.css");
 const STORE_NAME: &str = "web-host-state.json";
 const LOCK_NAME: &str = ".leg-web.lock";
 const STORE_VERSION: u32 = 1;
@@ -244,6 +245,9 @@ struct LiveSnapshot {
     prompt: String,
     text: String,
     status: String,
+    started_at_ms: u64,
+    provider: Option<String>,
+    model: Option<String>,
     active_tool: Option<Value>,
     tools: Vec<Value>,
 }
@@ -505,6 +509,7 @@ fn build_router(state: HostState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
+        .route("/app.css", get(app_css))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/select", post(select_session))
         .route("/api/sessions/{id}", get(get_session).patch(rename_session))
@@ -555,7 +560,7 @@ async fn guard_request(State(state): State<HostState>, request: Request, next: N
         if !authorization_matches(request.headers().get(AUTHORIZATION), &state.inner.token) {
             return api_error(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
-    } else if path != "/" && path != "/app.js" {
+    } else if path != "/" && path != "/app.js" && path != "/app.css" {
         return api_error(StatusCode::NOT_FOUND, "not_found").into_response();
     } else if request.method() != Method::GET {
         return api_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed").into_response();
@@ -580,7 +585,7 @@ async fn guard_request(State(state): State<HostState>, request: Request, next: N
         response.headers_mut().insert(
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(
-                "default-src 'none'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
             ),
         );
     }
@@ -619,6 +624,10 @@ async fn index() -> Response {
 
 async fn app_js() -> Response {
     static_response("text/javascript; charset=utf-8", APP_JS)
+}
+
+async fn app_css() -> Response {
+    static_response("text/css; charset=utf-8", APP_CSS)
 }
 
 fn static_response(content_type: &'static str, content: &'static str) -> Response {
@@ -778,14 +787,22 @@ async fn stop_turn(
             "status": "stop_requested",
         })));
     }
+    let turn_id = active.turn_id.clone();
     active.stop_requested = true;
     active
         .stop
         .stop()
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "stop_unavailable"))?;
+    if let Some(live) = runtime
+        .sessions
+        .get_mut(&runtime_id)
+        .and_then(|entry| entry.live.as_mut())
+    {
+        live.status = "stopping".into();
+    }
     Ok(Json(json!({
         "session_id": id,
-        "turn_id": active.turn_id,
+        "turn_id": turn_id,
         "status": "stop_requested",
     })))
 }
@@ -1034,6 +1051,9 @@ impl HostState {
                 prompt: body.prompt.clone(),
                 text: String::new(),
                 status: "starting".into(),
+                started_at_ms: now_millis(),
+                provider: None,
+                model: None,
                 active_tool: None,
                 tools: Vec::new(),
             });
@@ -1107,6 +1127,13 @@ impl HostState {
                     Some(bound_id.clone()),
                     outcome.clone(),
                 );
+                let mut runtime = lock(&state.inner.runtime);
+                let key = runtime_id(&runtime, &ledger_id_worker);
+                if let Some(entry) = runtime.sessions.get_mut(&key) {
+                    entry.active = None;
+                    entry.live = None;
+                }
+                drop(runtime);
                 let _ = state.append_event(
                     &ledger_id_worker,
                     &bound_id,
@@ -1114,12 +1141,6 @@ impl HostState {
                     "outcome",
                     outcome,
                 );
-                let mut runtime = lock(&state.inner.runtime);
-                let key = runtime_id(&runtime, &ledger_id_worker);
-                if let Some(entry) = runtime.sessions.get_mut(&key) {
-                    entry.active = None;
-                    entry.live = None;
-                }
             });
         let worker = match worker {
             Ok(worker) => worker,
@@ -1132,13 +1153,14 @@ impl HostState {
                     Some(id.to_string()),
                     incomplete.clone(),
                 );
-                let _ = self.append_event(&ledger_id, id, &turn_id, "outcome", incomplete);
                 let mut runtime = lock(&self.inner.runtime);
                 let key = runtime_id(&runtime, &ledger_id);
                 if let Some(entry) = runtime.sessions.get_mut(&key) {
                     entry.active = None;
                     entry.live = None;
                 }
+                drop(runtime);
+                let _ = self.append_event(&ledger_id, id, &turn_id, "outcome", incomplete);
                 receipt_result?;
                 return Ok(SubmissionReceipt {
                     request_id: body.request_id,
@@ -1351,8 +1373,16 @@ impl HostState {
                 .entry(key)
                 .or_insert_with(SessionRuntime::new);
             if let Some(live) = entry.live.as_mut() {
-                live.status = "running".into();
+                if live.status != "stopping" {
+                    live.status = "running".into();
+                }
                 match &event {
+                    StreamEvent::TurnStart {
+                        provider, model, ..
+                    } => {
+                        live.provider = Some(provider.clone());
+                        live.model = Some(model.clone());
+                    }
                     StreamEvent::TextDelta { text, .. } => live.text.push_str(text),
                     StreamEvent::ToolCall {
                         tool_use_id,
@@ -1381,6 +1411,32 @@ impl HostState {
                     _ => {}
                 }
             }
+        }
+        if let StreamEvent::TurnStart {
+            provider,
+            model,
+            turn_index: Some(turn_index),
+            ..
+        } = &event
+        {
+            let mut metadata = self
+                .inner
+                .catalog
+                .get(session_id)
+                .ok()
+                .and_then(|session| session.display.get("web.turn_metadata").cloned())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            metadata[turn_index.to_string()] = json!({
+                "provider": provider,
+                "model": model,
+                "started_at_ms": now_millis(),
+            });
+            let _ = self.inner.catalog.save_display_metadata(
+                session_id,
+                "web.turn_metadata".into(),
+                metadata,
+            );
         }
         self.append_event(ledger_id, session_id, turn_id, "stream", value)?;
         Ok(())
@@ -1642,6 +1698,15 @@ fn validate_bind_address(addr: SocketAddr) -> Result<(), HostError> {
 
 fn authority_for(addr: SocketAddr) -> String {
     format!("127.0.0.1:{}", addr.port())
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn authorization_matches(value: Option<&HeaderValue>, token: &str) -> bool {
@@ -2035,6 +2100,119 @@ mod tests {
         assert!(APP_JS.contains("location.hash"));
         assert!(APP_JS.contains("sessionStorage"));
         assert!(APP_JS.contains("replaceState"));
+        assert!(INDEX_HTML.contains("/app.css"));
+        assert!(String::from_utf8_lossy(&body).contains("/app.css"));
+        assert!(APP_CSS.contains(".composer"));
+        let css_response = build_router(host.state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/app.css")
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(css_response.status(), StatusCode::OK);
+        assert_eq!(
+            css_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/css; charset=utf-8"
+        );
+        assert!(
+            css_response
+                .headers()
+                .get(CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("style-src 'self'")
+        );
+    }
+
+    #[test]
+    fn turn_start_metadata_is_kept_in_the_live_and_session_snapshots() {
+        let (host, _temp) = test_host();
+        let draft = host
+            .state
+            .inner
+            .catalog
+            .create_draft(SessionInterface::Web, Some("metadata-test".into()), None)
+            .unwrap();
+        host.state.ensure_runtime(&draft.id);
+        {
+            let mut runtime = lock(&host.state.inner.runtime);
+            let entry = runtime.sessions.get_mut(&draft.id).unwrap();
+            entry.live = Some(LiveSnapshot {
+                turn_id: "turn-metadata".into(),
+                prompt: "hello".into(),
+                text: String::new(),
+                status: "starting".into(),
+                started_at_ms: now_millis(),
+                provider: None,
+                model: None,
+                active_tool: None,
+                tools: Vec::new(),
+            });
+        }
+
+        host.state
+            .record_stream_event(
+                &draft.id,
+                &draft.id,
+                "turn-metadata",
+                StreamEvent::TurnStart {
+                    seq: 0,
+                    request: json!({"schema": "baton.message/v1"}),
+                    provider: "anthropic".into(),
+                    model: "fixture-model".into(),
+                    session_id: Some(draft.id.clone()),
+                    turn_index: Some(0),
+                },
+            )
+            .unwrap();
+
+        let snapshot = host.state.snapshot(&draft.id).unwrap();
+        let live = snapshot.active.unwrap();
+        assert_eq!(live.provider.as_deref(), Some("anthropic"));
+        assert_eq!(live.model.as_deref(), Some("fixture-model"));
+        assert!(live.started_at_ms > 0);
+        assert_eq!(
+            snapshot.session.display["web.turn_metadata"]["0"]["provider"],
+            "anthropic"
+        );
+        assert_eq!(
+            snapshot.session.display["web.turn_metadata"]["0"]["model"],
+            "fixture-model"
+        );
+
+        {
+            let mut runtime = lock(&host.state.inner.runtime);
+            runtime
+                .sessions
+                .get_mut(&draft.id)
+                .unwrap()
+                .live
+                .as_mut()
+                .unwrap()
+                .status = "stopping".into();
+        }
+        host.state
+            .record_stream_event(
+                &draft.id,
+                &draft.id,
+                "turn-metadata",
+                StreamEvent::TextDelta {
+                    seq: 1,
+                    round_index: 0,
+                    block_index: 0,
+                    text: "late text".into(),
+                },
+            )
+            .unwrap();
+        let snapshot = host.state.snapshot(&draft.id).unwrap();
+        let live = snapshot.active.unwrap();
+        assert_eq!(live.status, "stopping");
+        assert_eq!(live.text, "late text");
     }
 
     #[tokio::test]

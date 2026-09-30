@@ -152,9 +152,11 @@ cargo metadata --locked --manifest-path Cargo.toml
 
 ## Experimental Web host
 
-The authenticated loopback browser host is documented in
-[leg-web.md](leg-web.md), including its launch token, API and snapshot contract,
-retention limits, lifecycle, startup options, and fake-provider validation.
+The authenticated loopback browser host and #84 first-session workbench are
+documented in [leg-web.md](leg-web.md), including its launch token, API and
+snapshot contract, retention limits, browser controls, accessibility checklist,
+startup options, and fake-provider/browser validation. Session history browsing
+and execution inspection remain #85.
 
 ## Experimental terminal UI
 

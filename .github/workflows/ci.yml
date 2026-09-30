@@ -40,6 +40,20 @@ jobs:
         with:
           node-version: 22
 
+      - uses: actions/setup-python@v5
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: companions/leg-web/tests/browser-requirements.txt
+
+      - name: Cache Playwright Chromium
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('companions/leg-web/tests/browser-requirements.txt') }}
+
       - name: Test companion packages (locked)
         if: ${{ matrix.target != 'x86_64-pc-windows-msvc' }}
         shell: bash
@@ -68,6 +82,20 @@ jobs:
         shell: bash
         run: |
           python3 companions/leg-web/tests/lifecycle_smoke.py \
+            companions/target/debug/leg-web \
+            target/debug/leg \
+            companions/target/debug/leg-ui-supervisor
+
+      - name: Install Playwright Chromium
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          python3 -m pip install --requirement companions/leg-web/tests/browser-requirements.txt
+          python3 -m playwright install --with-deps chromium
+
+      - name: Web browser E2E with fake provider
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          python3 companions/leg-web/tests/browser_e2e.py \
             companions/target/debug/leg-web \
             target/debug/leg \
             companions/target/debug/leg-ui-supervisor
