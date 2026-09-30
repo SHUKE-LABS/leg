@@ -16,7 +16,7 @@ use crate::events::{
 use crate::interrupt;
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
-use crate::participant::{LocalParticipant, Participant, fresh_message_id};
+use crate::participant::{LocalParticipant, Participant, build_response_envelope};
 use crate::tools::{
     BashTool, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome,
     WriteTool, tool_round_limit_warning,
@@ -24,8 +24,10 @@ use crate::tools::{
 use crate::transport::provider::ProviderTransport;
 use crate::transport::{StreamEvent, Transport, TransportCall};
 
+mod stream;
+
 /// The one-line usage summary, shared by `--help` output and usage errors.
-const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]";
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>] [--stream-json]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
 /// to. An unset or blank value disables recording for `ask`, cold `exchange`,
@@ -80,6 +82,8 @@ enum Command {
         session: Option<ExchangeSession>,
         /// Writes the selected session id after the turn.
         session_id_out: Option<String>,
+        /// Writes a `leg.exchange.stream/v1` NDJSON event stream to stdout.
+        stream_json: bool,
     },
 }
 
@@ -190,6 +194,7 @@ pub fn run() -> Result<()> {
             out_path,
             session,
             session_id_out,
+            stream_json,
         }) => {
             interrupt::install()?;
             execute_exchange(
@@ -197,6 +202,7 @@ pub fn run() -> Result<()> {
                 out_path.as_deref(),
                 session,
                 session_id_out.as_deref(),
+                stream_json,
             )
         }
     }
@@ -204,6 +210,13 @@ pub fn run() -> Result<()> {
 
 /// The full `--help` body: the provider environment variables and trail behavior.
 fn help_text() -> String {
+    let stream_examples = concat!(
+        r#"{"schema":"leg.exchange.stream/v1","event":"turn_start","seq":0,"provider":"anthropic","model":"claude-test","request":{"schema":"baton.message/v1","message_id":"m-1","conversation_id":"c-1","from":"external","to":"leg","in_reply_to":null,"kind":"request","body":"hello","ts_ms":1,"exchange":null}}"#,
+        "\n",
+        r#"{"schema":"leg.exchange.stream/v1","event":"text_delta","seq":1,"round_index":0,"block_index":0,"text":"Hello"}"#,
+        "\n",
+        r#"{"schema":"leg.exchange.stream/v1","event":"turn_end","seq":2,"capped":false,"response":{"schema":"baton.message/v1","message_id":"c-1-r-2-0","conversation_id":"c-1","from":"leg","to":"external","in_reply_to":"m-1","kind":"response","body":"Hello","ts_ms":2,"exchange":{"schema":"baton.exchange/v1","exchange":{"request":{"ts_ms":1,"model":"claude-test","base_url":"https://api.anthropic.com","prompt":"hello"},"outcome":{"event":"response_ok","ts_ms":2,"duration_ms":1,"reply":"Hello","input_tokens":1,"output_tokens":1,"stop_reason":"end_turn","attempts":1}}}}}"#
+    );
     format!(
         "{USAGE}\n\n\
          Reads credentials from ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN /\n\
@@ -238,7 +251,14 @@ fn help_text() -> String {
          the turn when either is used. The session store is\n\
          LEG_SESSION_DIR, else XDG_STATE_HOME/leg/sessions, else\n\
          ~/.local/state/leg/sessions. `baton serve --agent-cmd <path>\n\
-         --agent-arg exchange` expects this protocol."
+         --agent-arg exchange` expects this protocol. `--stream-json` opts\n\
+         into the `leg.exchange.stream/v1` NDJSON live-turn feed on stdout; it\n\
+         cannot be combined with `--out`. With `--session` or `--new-session`,\n\
+         `--session-id-out` remains available and writes that id after the turn.\n\
+         Each record has a\n\
+         zero-based increasing `seq`; text deltas are provisional, and EOF\n\
+         without `turn_end` means incomplete. Example NDJSON:\n\
+         {stream_examples}"
     )
 }
 
@@ -433,6 +453,7 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
     let mut out_path: Option<String> = None;
     let mut session: Option<ExchangeSession> = None;
     let mut session_id_out: Option<String> = None;
+    let mut stream_json = false;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -459,7 +480,12 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
                     .ok_or_else(|| LegError::Usage("--session requires a value".to_string()))?;
                 if matches!(
                     value.as_str(),
-                    "--in" | "--out" | "--session" | "--new-session" | "--session-id-out"
+                    "--in"
+                        | "--out"
+                        | "--session"
+                        | "--new-session"
+                        | "--session-id-out"
+                        | "--stream-json"
                 ) {
                     return Err(LegError::Usage("--session requires a value".to_string()));
                 }
@@ -479,6 +505,7 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
                 })?;
                 session_id_out = Some(value.clone());
             }
+            "--stream-json" => stream_json = true,
             other => {
                 return Err(LegError::Usage(format!("unexpected argument {other:?}")));
             }
@@ -491,11 +518,18 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
         ));
     }
 
+    if stream_json && out_path.is_some() {
+        return Err(LegError::Usage(
+            "--stream-json cannot be combined with --out".to_string(),
+        ));
+    }
+
     Ok(Command::Exchange {
         in_path,
         out_path,
         session,
         session_id_out,
+        stream_json,
     })
 }
 
@@ -553,7 +587,11 @@ fn execute_exchange(
     out_path: Option<&str>,
     session: Option<ExchangeSession>,
     session_id_out: Option<&str>,
+    stream_json: bool,
 ) -> Result<()> {
+    if stream_json {
+        return stream::execute_exchange_stream_json(in_path, session, session_id_out);
+    }
     if let Some(session) = session {
         return execute_exchange_session(in_path, out_path, session, session_id_out);
     }
@@ -768,20 +806,8 @@ fn execute_exchange_session_core(
         session_id: Some(session_id),
         turn_index: Some(turn_index),
     };
-    let mut response = MessageEnvelope::new(
-        fresh_message_id(&request.conversation_id, outcome_ts_ms),
-        request.conversation_id.clone(),
-        request.to.clone(),
-        request.from.clone(),
-        kind,
-        body,
-        outcome_ts_ms,
-    );
-    response.in_reply_to = Some(request.message_id.clone());
-    response.exchange = Some(crate::message::WrappedExchange::new(Exchange {
-        request: request_record,
-        outcome,
-    }));
+    let response =
+        build_response_envelope(&request, request_record, kind, body, outcome_ts_ms, outcome);
 
     write_exchange_response(mode, &response, output)
 }

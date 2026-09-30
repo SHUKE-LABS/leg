@@ -166,6 +166,71 @@ pub enum ToolEvent<'a> {
     },
 }
 
+/// An owned form of [`ToolEvent`] for fallible streaming callbacks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnedToolEvent {
+    /// A tool-use reply in provider block order.
+    Round { content: Vec<ContentBlock> },
+    /// A tool call before dispatch.
+    Call {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// A completed, failed, denied, or interrupted tool call.
+    Result {
+        id: String,
+        name: String,
+        output: String,
+        status: ToolStatus,
+    },
+}
+
+impl OwnedToolEvent {
+    fn from_borrowed(event: ToolEvent<'_>) -> Self {
+        match event {
+            ToolEvent::Round { content } => Self::Round {
+                content: content.to_vec(),
+            },
+            ToolEvent::Call { id, name, input } => Self::Call {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: input.clone(),
+            },
+            ToolEvent::Result {
+                id,
+                name,
+                output,
+                status,
+            } => Self::Result {
+                id: id.to_string(),
+                name: name.to_string(),
+                output: output.to_string(),
+                status,
+            },
+        }
+    }
+
+    /// Borrows the event in the form used by existing tool observers.
+    pub fn as_tool_event(&self) -> ToolEvent<'_> {
+        match self {
+            Self::Round { content } => ToolEvent::Round { content },
+            Self::Call { id, name, input } => ToolEvent::Call { id, name, input },
+            Self::Result {
+                id,
+                name,
+                output,
+                status,
+            } => ToolEvent::Result {
+                id,
+                name,
+                output,
+                status: *status,
+            },
+        }
+    }
+}
+
 /// A callback receiving each [`ToolEvent`] as it happens.
 pub type ToolObserver = Box<dyn FnMut(ToolEvent<'_>)>;
 
@@ -228,7 +293,7 @@ impl<T: Transport> ToolLoop<T> {
         history: &[Message],
         observe: &mut dyn FnMut(ToolEvent<'_>),
     ) -> TransportCall<TurnOutcome> {
-        self.run_observed_with_optional_stream(history, observe, None)
+        self.run_observed_with_optional_stream(history, observe, None, None)
     }
 
     /// Runs one user turn while forwarding provider stream events to
@@ -239,7 +304,24 @@ impl<T: Transport> ToolLoop<T> {
         observe: &mut dyn FnMut(ToolEvent<'_>),
         on_stream_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<TurnOutcome> {
-        self.run_observed_with_optional_stream(history, observe, Some(on_stream_event))
+        self.run_observed_with_optional_stream(history, observe, Some(on_stream_event), None)
+    }
+
+    /// Streaming counterpart that can stop the loop when observing a tool
+    /// lifecycle event fails (for example, when the caller's output pipe
+    /// closes). A failed observer prevents the next tool from being dispatched.
+    pub fn run_streaming_observed_fallible_with_attempts(
+        &self,
+        history: &[Message],
+        observe: &mut dyn FnMut(OwnedToolEvent) -> Result<()>,
+        on_stream_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<TurnOutcome> {
+        self.run_observed_with_optional_stream(
+            history,
+            &mut |_| {},
+            Some(on_stream_event),
+            Some(observe),
+        )
     }
 
     fn run_observed_with_optional_stream(
@@ -247,6 +329,7 @@ impl<T: Transport> ToolLoop<T> {
         history: &[Message],
         observe: &mut dyn FnMut(ToolEvent<'_>),
         mut on_stream_event: Option<&mut dyn FnMut(StreamEvent) -> Result<()>>,
+        mut observe_fallible: Option<&mut dyn FnMut(OwnedToolEvent) -> Result<()>>,
     ) -> TransportCall<TurnOutcome> {
         let mut attempts = 0_u64;
         if let Err(error) = interrupt::check() {
@@ -287,32 +370,66 @@ impl<T: Transport> ToolLoop<T> {
                     attempts,
                 );
             }
-            observe(ToolEvent::Round {
-                content: &reply.content,
-            });
+            if let Err(error) = notify_tool_observers(
+                observe,
+                &mut observe_fallible,
+                ToolEvent::Round {
+                    content: &reply.content,
+                },
+            ) {
+                return TransportCall::completed(Err(error), attempts);
+            }
             let mut results = Vec::new();
             for block in &reply.content {
                 if let ContentBlock::ToolUse { id, name, input } = block {
                     if let Err(error) = interrupt::check() {
                         return TransportCall::completed(Err(error), attempts);
                     }
-                    observe(ToolEvent::Call { id, name, input });
+                    if let Err(error) = notify_tool_observers(
+                        observe,
+                        &mut observe_fallible,
+                        ToolEvent::Call { id, name, input },
+                    ) {
+                        return TransportCall::completed(Err(error), attempts);
+                    }
                     if let Some(error) = interrupt::error() {
-                        observe_interrupted_result(observe, id, name, &error);
+                        if let Err(write_error) = observe_interrupted_result(
+                            observe,
+                            &mut observe_fallible,
+                            id,
+                            name,
+                            &error,
+                        ) {
+                            return TransportCall::completed(Err(write_error), attempts);
+                        }
                         return TransportCall::completed(Err(error), attempts);
                     }
                     let (result, status) = self.registry.dispatch_with_status(id, name, input);
                     if let Some(error) = interrupt::error() {
-                        observe_interrupted_result(observe, id, name, &error);
-                        return TransportCall::completed(Err(error), attempts);
-                    }
-                    if let ContentBlock::ToolResult { content, .. } = &result {
-                        observe(ToolEvent::Result {
+                        if let Err(write_error) = observe_interrupted_result(
+                            observe,
+                            &mut observe_fallible,
                             id,
                             name,
-                            output: content,
-                            status,
-                        });
+                            &error,
+                        ) {
+                            return TransportCall::completed(Err(write_error), attempts);
+                        }
+                        return TransportCall::completed(Err(error), attempts);
+                    }
+                    if let ContentBlock::ToolResult { content, .. } = &result
+                        && let Err(error) = notify_tool_observers(
+                            observe,
+                            &mut observe_fallible,
+                            ToolEvent::Result {
+                                id,
+                                name,
+                                output: content,
+                                status,
+                            },
+                        )
+                    {
+                        return TransportCall::completed(Err(error), attempts);
                     }
                     results.push(result);
                 }
@@ -352,17 +469,35 @@ impl<T: Transport> ToolLoop<T> {
 
 fn observe_interrupted_result(
     observe: &mut dyn FnMut(ToolEvent<'_>),
+    observe_fallible: &mut Option<&mut dyn FnMut(OwnedToolEvent) -> Result<()>>,
     id: &str,
     name: &str,
     error: &crate::error::LegError,
-) {
+) -> Result<()> {
     let output = error.to_string();
-    observe(ToolEvent::Result {
-        id,
-        name,
-        output: &output,
-        status: ToolStatus::Failed,
-    });
+    notify_tool_observers(
+        observe,
+        observe_fallible,
+        ToolEvent::Result {
+            id,
+            name,
+            output: &output,
+            status: ToolStatus::Failed,
+        },
+    )
+}
+
+fn notify_tool_observers(
+    observe: &mut dyn FnMut(ToolEvent<'_>),
+    observe_fallible: &mut Option<&mut dyn FnMut(OwnedToolEvent) -> Result<()>>,
+    event: ToolEvent<'_>,
+) -> Result<()> {
+    observe(event);
+    if let Some(observer) = observe_fallible.as_mut() {
+        (**observer)(OwnedToolEvent::from_borrowed(event))
+    } else {
+        Ok(())
+    }
 }
 
 impl<T: Transport> Transport for ToolLoop<T> {
@@ -578,6 +713,35 @@ pub(crate) mod tests {
                 "result toolu_2 Failed unknown tool: missing",
             ]
         );
+    }
+
+    #[test]
+    fn fallible_stream_observer_stops_dispatch_after_a_result_write_failure() {
+        let count = std::rc::Rc::new(Cell::new(0));
+        let mut first = tool_use_reply("toolu_1", "echo");
+        first.content.push(ContentBlock::ToolUse {
+            id: "toolu_2".to_string(),
+            name: "echo".to_string(),
+            input: serde_json::json!({"text": "again"}),
+        });
+        let transport = ScriptedTransport::new(vec![first, AssistantReply::new("done")]);
+        let tool_loop = ToolLoop::new(transport, echo_registry(count.clone()), None);
+
+        let mut observe = |event| match event {
+            OwnedToolEvent::Result { id, .. } if id == "toolu_1" => {
+                Err(crate::error::LegError::Io("closed output".to_string()))
+            }
+            _ => Ok(()),
+        };
+        let call = tool_loop.run_streaming_observed_fallible_with_attempts(
+            &[Message::user("go")],
+            &mut observe,
+            &mut |_| Ok(()),
+        );
+
+        assert!(matches!(call.result, Err(crate::error::LegError::Io(_))));
+        assert_eq!(count.get(), 1, "the second call must not be dispatched");
+        assert_eq!(tool_loop.transport.calls.borrow().len(), 1);
     }
 
     #[test]

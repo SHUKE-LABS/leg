@@ -8,7 +8,7 @@
 //! well as what it did on disk. No live provider is contacted; every run gets
 //! its own temp working directory.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -124,6 +124,40 @@ fn spawn_sse_sequence_server(rounds: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
     });
 
     (format!("http://{addr}"), requests)
+}
+
+fn spawn_counting_sse_server() -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting SSE server");
+    listener
+        .set_nonblocking(true)
+        .expect("set mock server nonblocking");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    if let Some(body) = read_request_body(&mut stream) {
+                        captured.lock().unwrap().push(body);
+                        let response_body = sse_text_reply("unexpected");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                            response_body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (format!("http://{addr}"), requests, server)
 }
 
 struct PausedSseServer {
@@ -292,6 +326,98 @@ fn sse_tool_use_reply(id: &str, name: &str, input: &Value) -> String {
     reply
 }
 
+fn sse_text_tool_reply(text: &str) -> String {
+    let mut reply = String::new();
+    reply.push_str(&sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 1, "output_tokens": 0}}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_stop",
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_stream",
+                "name": "read",
+                "input": {}
+            }
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"path\":\"notes.txt\"}"
+            }
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "content_block_stop",
+        serde_json::json!({"type": "content_block_stop", "index": 1}),
+    ));
+    reply.push_str(&sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": {"output_tokens": 2}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "message_stop",
+        serde_json::json!({"type": "message_stop"}),
+    ));
+    reply
+}
+
+fn sse_text_bash_reply(text: &str) -> String {
+    let mut reply = sse_text_tool_reply(text).replace("\"name\":\"read\"", "\"name\":\"bash\"");
+    let previous = serde_json::to_string(&serde_json::json!({"path": "notes.txt"}))
+        .expect("serialize prior tool input");
+    let next = serde_json::to_string(&serde_json::json!({
+        "command": "touch dispatched.txt"
+    }))
+    .expect("serialize bash input");
+    let previous_field = format!(
+        "\"partial_json\":{}",
+        serde_json::to_string(&previous).expect("escape prior tool input")
+    );
+    let next_field = format!(
+        "\"partial_json\":{}",
+        serde_json::to_string(&next).expect("escape bash input")
+    );
+    reply = reply.replace(&previous_field, &next_field);
+    reply
+}
+
 fn chat_sse_data(data: Value) -> String {
     format!(
         "data: {}\n\n",
@@ -318,6 +444,38 @@ fn chat_tool_call_reply() -> String {
             "finish_reason": null
         }]
     }));
+    reply.push_str(&chat_sse_data(serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    })));
+    reply.push_str("data: [DONE]\n\n");
+    reply
+}
+
+fn chat_text_tool_reply(text: &str) -> String {
+    let mut reply = chat_sse_data(serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": text},
+            "finish_reason": null
+        }]
+    }));
+    reply.push_str(&chat_sse_data(serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_stream",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"notes.txt\"}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    })));
     reply.push_str(&chat_sse_data(serde_json::json!({
         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
     })));
@@ -387,6 +545,105 @@ fn responses_tool_call_reply() -> String {
             "type": "response.output_item.done",
             "output_index": 0,
             "item": call
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.completed",
+        serde_json::json!({"type": "response.completed", "response": response}),
+    ));
+    reply
+}
+
+fn responses_text_tool_reply(text: &str) -> String {
+    let output_text = serde_json::json!({"type": "output_text", "text": text});
+    let function_call = serde_json::json!({
+        "type": "function_call",
+        "id": "fc_stream",
+        "call_id": "call_stream",
+        "name": "read",
+        "arguments": "{\"path\":\"notes.txt\"}"
+    });
+    let response = serde_json::json!({
+        "id": "resp_mixed",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [output_text]
+            },
+            function_call
+        ],
+        "usage": {"input_tokens": 4, "output_tokens": 3}
+    });
+    let mut reply = sse_event(
+        "response.created",
+        serde_json::json!({"type": "response.created", "response": {"id": "resp_mixed"}}),
+    );
+    reply.push_str(&sse_event(
+        "response.output_item.added",
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_mixed", "role": "assistant", "content": []}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.content_part.added",
+        serde_json::json!({
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""}
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.output_text.delta",
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.content_part.done",
+        serde_json::json!({
+            "type": "response.content_part.done",
+            "output_index": 0,
+            "content_index": 0,
+            "part": output_text
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.output_item.added",
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "id": "fc_stream",
+                "call_id": "call_stream",
+                "name": "read",
+                "arguments": ""
+            }
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.function_call_arguments.delta",
+        serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_stream",
+            "output_index": 1,
+            "delta": "{\"path\":\"notes.txt\"}"
+        }),
+    ));
+    reply.push_str(&sse_event(
+        "response.output_item.done",
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": function_call
         }),
     ));
     reply.push_str(&sse_event(
@@ -1797,6 +2054,75 @@ fn sigint_stops_bash_and_records_interrupted_outcome() {
     assert_exchange_interrupt(libc::SIGINT, 130, "SIGINT", "exchange-sigint");
 }
 
+#[cfg(unix)]
+fn assert_stream_exchange_interrupt(
+    signal: libc::c_int,
+    exit_code: i32,
+    signal_name: &str,
+    tag: &str,
+) {
+    let tool_reply = sse_tool_use_reply(
+        "toolu_sleep",
+        "bash",
+        &serde_json::json!({
+            "command": "echo $$ > shell.pid; sleep 60 & echo $! > sleep.pid; wait",
+            "timeout": 60
+        }),
+    );
+    let (base_url, requests) = spawn_sse_sequence_server(vec![tool_reply]);
+    let cwd = fixture_dir(tag);
+    let trail = cwd.join("trail.jsonl");
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["exchange", "--stream-json"]);
+    let output =
+        run_until_bash_signal(command, &cwd, Some("run the long command\n"), false, signal);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(exit_code));
+    assert!(
+        stderr.contains(&format!("interrupted by {signal_name}")),
+        "missing interruption diagnostic: {stderr}"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    let records: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("stream output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stream record is JSON"))
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "turn_start",
+            "tool_round",
+            "tool_call",
+            "tool_result",
+            "turn_end"
+        ]
+    );
+    assert_eq!(records[3]["status"], "failed");
+    assert!(records[3]["output"].as_str().unwrap().contains(signal_name));
+    assert_eq!(
+        records[4]["response"]["exchange"]["exchange"]["outcome"]["kind"],
+        "interrupted"
+    );
+    let trail_events = read_events(&trail);
+    assert_eq!(trail_events.last().unwrap()["event"], "response_error");
+    assert_eq!(trail_events.last().unwrap()["kind"], "interrupted");
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_exchange_signals_keep_tool_cleanup_and_emit_interrupted_terminal() {
+    assert_stream_exchange_interrupt(libc::SIGTERM, 143, "SIGTERM", "stream-exchange-sigterm");
+    assert_stream_exchange_interrupt(libc::SIGINT, 130, "SIGINT", "stream-exchange-sigint");
+}
+
 #[test]
 fn session_flushes_text_before_the_provider_finishes_streaming() {
     let first_body = sse_text_start("hello");
@@ -1884,6 +2210,462 @@ fn session_flushes_text_before_the_provider_finishes_streaming() {
     assert_eq!(events[2]["event"], "response_ok");
     assert_eq!(events[2]["reply"], "hello world");
 
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_stream_json_flushes_a_text_delta_before_provider_completion() {
+    let first_body = sse_text_start("hello");
+    let rest_body = sse_text_finish(" world");
+    let PausedSseServer {
+        base_url,
+        first_chunk_sent: first_sent,
+        continue_stream,
+        server,
+        ..
+    } = spawn_paused_sse_server(first_body, rest_body);
+    let cwd = fixture_dir("exchange-stream-paused");
+    let mut command = leg(&cwd, &base_url);
+    command.arg("exchange").arg("--stream-json");
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    let (stdout_chunks, stdout_reader) = collect_stdout(child.stdout.take().expect("piped stdout"));
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"hello\n")
+        .expect("write request");
+
+    let first_sent = first_sent.recv_timeout(Duration::from_secs(5));
+    let mut first_output = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&first_output).contains("\"event\":\"text_delta\"")
+        && Instant::now() < deadline
+    {
+        match stdout_chunks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(chunk) => first_output.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    let first_text = String::from_utf8_lossy(&first_output).into_owned();
+    let still_running = child.try_wait().expect("check exchange process").is_none();
+    let _ = continue_stream.send(());
+
+    let (status_sender, status_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = status_sender.send(child.wait());
+    });
+    let status = status_receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("exchange did not exit after stream completion")
+        .expect("wait for exchange");
+    let stdout = stdout_reader.join().expect("join stdout reader");
+    let mut stderr_text = String::new();
+    stderr
+        .read_to_string(&mut stderr_text)
+        .expect("read exchange stderr");
+    server.join().expect("join paused SSE server");
+
+    assert!(first_sent.is_ok(), "provider did not send the first chunk");
+    assert!(
+        first_text.contains("\"text\":\"hello\""),
+        "first text delta was not flushed while the provider was paused: {first_text}"
+    );
+    assert!(
+        still_running,
+        "exchange exited before the provider completed"
+    );
+    assert!(status.success(), "exchange failed: {stderr_text}");
+    let records: Vec<Value> = String::from_utf8(stdout)
+        .expect("stream is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record is JSON"))
+        .collect();
+    assert_eq!(records[0]["event"], "turn_start");
+    assert_eq!(records[1]["event"], "text_delta");
+    assert_eq!(records[1]["text"], "hello");
+    assert_eq!(records[2]["event"], "text_delta");
+    assert_eq!(records[2]["text"], " world");
+    assert_eq!(records[3]["event"], "turn_end");
+    assert_eq!(records[3]["response"]["body"], "hello world");
+    assert!(!stderr_text.contains("error:"), "{stderr_text}");
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn exchange_stream_json_broken_stdout_stops_before_tool_dispatch() {
+    let full_reply = sse_text_bash_reply("before tool");
+    let split_marker = "event: content_block_stop\n";
+    let split_at = full_reply
+        .find(split_marker)
+        .expect("mixed reply has text block stop");
+    let PausedSseServer {
+        base_url,
+        requests,
+        first_chunk_sent,
+        continue_stream,
+        server,
+    } = spawn_paused_sse_server(
+        full_reply[..split_at].to_string(),
+        full_reply[split_at..].to_string(),
+    );
+    let cwd = fixture_dir("exchange-stream-broken-pipe");
+    let mut command = leg(&cwd, &base_url);
+    command.arg("exchange").arg("--stream-json");
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leg");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"hello\n")
+        .expect("write request");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut start_line = String::new();
+    stdout
+        .read_line(&mut start_line)
+        .expect("read flushed turn_start");
+    let start: Value = serde_json::from_str(&start_line).expect("turn_start is JSON");
+    assert_eq!(start["event"], "turn_start");
+    assert!(
+        first_chunk_sent
+            .recv_timeout(Duration::from_secs(5))
+            .is_ok()
+    );
+    let mut text_delta_line = String::new();
+    stdout
+        .read_line(&mut text_delta_line)
+        .expect("read flushed text delta");
+    let text_delta: Value = serde_json::from_str(&text_delta_line).expect("text delta is JSON");
+    assert_eq!(text_delta["event"], "text_delta");
+    assert_eq!(text_delta["text"], "before tool");
+
+    drop(stdout);
+    let _ = continue_stream.send(());
+    let output = child.wait_with_output().expect("wait for broken-pipe exit");
+    server.join().expect("join paused SSE server");
+
+    assert!(
+        !output.status.success(),
+        "broken stdout must fail the exchange"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(
+        !cwd.join("dispatched.txt").exists(),
+        "no tool may dispatch after its stream consumer closes; status={:?}, stdout={:?}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "broken stdout error reaches stderr"
+    );
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_stream_json_preserves_text_tool_text_order_for_all_providers() {
+    let before = "before🙂";
+    let after = "after🙂";
+    let cases = [
+        (
+            "anthropic",
+            sse_text_tool_reply(before),
+            sse_text_reply(after),
+        ),
+        (
+            "openai-chat-completions",
+            chat_text_tool_reply(before),
+            chat_text_reply(after),
+        ),
+        (
+            "openai-responses",
+            responses_text_tool_reply(before),
+            responses_text_reply(after),
+        ),
+    ];
+
+    for (provider, first, second) in cases {
+        let cwd = fixture_dir(&format!("stream-{provider}"));
+        let (base_url, requests) = spawn_sse_sequence_server(vec![first, second]);
+        let mut command = if provider == "anthropic" {
+            leg(&cwd, &base_url)
+        } else {
+            openai_leg(&cwd, &base_url, provider)
+        };
+        command.arg("exchange").arg("--stream-json");
+        let output = run(command, Some("hello\n"));
+        assert!(
+            output.status.success(),
+            "{provider} exchange failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("stream output is UTF-8");
+        let records: Vec<Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each output line is JSON"))
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "turn_start",
+                "text_delta",
+                "tool_round",
+                "tool_call",
+                "tool_result",
+                "text_delta",
+                "turn_end",
+            ],
+            "unexpected {provider} record order: {stdout}"
+        );
+        for (seq, record) in records.iter().enumerate() {
+            assert_eq!(record["schema"], "leg.exchange.stream/v1");
+            assert_eq!(record["seq"], seq as u64);
+        }
+        assert_eq!(records[0]["provider"], provider);
+        assert_eq!(records[0]["request"]["body"], "hello");
+        assert_eq!(records[1]["round_index"], 0);
+        assert_eq!(records[1]["block_index"], 0);
+        assert_eq!(records[1]["text"], before);
+        assert_eq!(records[2]["round_index"], 0);
+        assert_eq!(records[2]["content"][0]["text"], before);
+        assert_eq!(records[2]["content"][1]["type"], "tool_use");
+        let tool_id = if provider == "anthropic" {
+            "toolu_stream"
+        } else {
+            "call_stream"
+        };
+        assert_eq!(records[2]["content"][1]["id"], tool_id);
+        assert_eq!(records[3]["round_index"], 0);
+        assert_eq!(records[3]["tool_use_id"], tool_id);
+        assert_eq!(records[3]["tool_name"], "read");
+        assert_eq!(records[3]["input"]["path"], "notes.txt");
+        assert_eq!(records[4]["round_index"], 0);
+        assert_eq!(records[4]["tool_use_id"], tool_id);
+        assert_eq!(records[4]["status"], "completed");
+        assert_eq!(records[5]["round_index"], 1);
+        assert_eq!(records[5]["text"], after);
+        assert_eq!(records[6]["capped"], false);
+        assert_eq!(records[6]["response"]["kind"], "response");
+        assert_eq!(records[6]["response"]["body"], after);
+        assert_eq!(records[6]["response"]["in_reply_to"], "exchange-1");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["event"] == "text_delta")
+                .filter_map(|record| record["text"].as_str())
+                .collect::<String>(),
+            format!("{before}{after}")
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+}
+
+#[test]
+fn exchange_stream_json_prestart_errors_emit_no_records_or_provider_requests() {
+    let cwd = fixture_dir("stream-prestart-errors");
+    let store = cwd.join("empty-sessions");
+    std::fs::create_dir_all(&store).expect("create empty session store");
+    let response_path = cwd.join("response.jsonl");
+    let (base_url, requests, server) = spawn_counting_sse_server();
+
+    let mut invalid_flags = leg(&cwd, &base_url);
+    invalid_flags
+        .arg("exchange")
+        .arg("--out")
+        .arg(&response_path)
+        .arg("--stream-json");
+    let output = run(invalid_flags, None);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--stream-json"));
+    assert!(!response_path.exists());
+
+    let mut missing_session = leg(&cwd, &base_url);
+    missing_session
+        .env("LEG_SESSION_DIR", &store)
+        .arg("exchange")
+        .arg("--session")
+        .arg("missing-session")
+        .arg("--stream-json");
+    let output = run(missing_session, None);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no session found"));
+
+    let mut invalid_config = leg(&cwd, &base_url);
+    invalid_config
+        .env("LEG_MAX_TOOL_ROUNDS", "not-a-number")
+        .arg("exchange")
+        .arg("--stream-json");
+    let output = run(invalid_config, None);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("LEG_MAX_TOOL_ROUNDS"));
+
+    server.join().expect("join counting provider server");
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "pre-start failures must not contact the provider"
+    );
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_stream_json_new_and_named_sessions_restore_successful_history() {
+    let cwd = fixture_dir("stream-named-session");
+    let store = cwd.join("sessions");
+    let first_id_out = cwd.join("new-session-id.txt");
+    let second_id_out = cwd.join("continued-session-id.txt");
+    let (base_url, requests) = spawn_sse_sequence_server(vec![
+        sse_text_reply("first remembered"),
+        sse_text_reply("history restored"),
+    ]);
+
+    let mut first = leg(&cwd, &base_url);
+    first
+        .env("LEG_SESSION_DIR", &store)
+        .args(["exchange", "--new-session", "--session-id-out"])
+        .arg(&first_id_out)
+        .arg("--stream-json");
+    let first_output = run(first, Some("remember this\n"));
+    assert!(
+        first_output.status.success(),
+        "new stream session failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let first_records: Vec<Value> = String::from_utf8(first_output.stdout)
+        .expect("first stream is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("first record is JSON"))
+        .collect();
+    assert_eq!(first_records[0]["event"], "turn_start");
+    assert_eq!(first_records[0]["turn_index"], 0);
+    let session_id = first_records[0]["session_id"]
+        .as_str()
+        .expect("new session id in turn_start")
+        .to_string();
+    assert_eq!(
+        std::fs::read_to_string(&first_id_out).expect("session id file written after turn"),
+        format!("{session_id}\n")
+    );
+    assert_eq!(first_records[2]["event"], "turn_end");
+    assert_eq!(first_records[2]["session_id"], session_id);
+    assert_eq!(first_records[2]["response"]["body"], "first remembered");
+
+    let mut second = leg(&cwd, &base_url);
+    second
+        .env("LEG_SESSION_DIR", &store)
+        .args(["exchange", "--session", &session_id, "--stream-json"])
+        .args(["--session-id-out"])
+        .arg(&second_id_out);
+    let second_output = run(second, Some("continue from memory\n"));
+    assert!(
+        second_output.status.success(),
+        "continued stream session failed: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    let second_records: Vec<Value> = String::from_utf8(second_output.stdout)
+        .expect("second stream is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("second record is JSON"))
+        .collect();
+    assert_eq!(second_records[0]["session_id"], session_id);
+    assert_eq!(second_records[0]["turn_index"], 1);
+    assert_eq!(second_records[2]["session_id"], session_id);
+    assert_eq!(second_records[2]["turn_index"], 1);
+    assert_eq!(
+        std::fs::read_to_string(&second_id_out).expect("continued session id written"),
+        format!("{session_id}\n")
+    );
+
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect();
+    assert_eq!(requests.len(), 2);
+    let history = requests[1]["messages"].as_array().expect("request history");
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0]["content"], "remember this");
+    assert_eq!(history[1]["content"], "first remembered");
+    assert_eq!(history[2]["content"], "continue from memory");
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_stream_json_exposes_failed_new_session_without_restoring_failed_turn() {
+    let cwd = fixture_dir("stream-failed-session");
+    let store = cwd.join("sessions");
+    let id_out = cwd.join("session-id.txt");
+    let failure_url = spawn_auth_failure_server();
+    let mut first = leg(&cwd, &failure_url);
+    first
+        .env("LEG_SESSION_DIR", &store)
+        .args(["exchange", "--new-session", "--session-id-out"])
+        .arg(&id_out)
+        .arg("--stream-json");
+    let first_output = run(first, Some("this turn fails\n"));
+    assert!(!first_output.status.success());
+    let first_records: Vec<Value> = String::from_utf8(first_output.stdout)
+        .expect("failed stream is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("failed record is JSON"))
+        .collect();
+    assert_eq!(first_records[0]["event"], "turn_start");
+    assert_eq!(first_records[1]["event"], "turn_end");
+    assert_eq!(first_records[1]["response"]["kind"], "error");
+    let session_id = first_records[0]["session_id"]
+        .as_str()
+        .expect("failed first turn exposes its new session id")
+        .to_string();
+    assert_eq!(
+        std::fs::read_to_string(&id_out).expect("failed turn still writes session id"),
+        format!("{session_id}\n")
+    );
+
+    let (base_url, requests) = spawn_sse_sequence_server(vec![sse_text_reply("recovered")]);
+    let mut continued = leg(&cwd, &base_url);
+    continued.env("LEG_SESSION_DIR", &store).args([
+        "exchange",
+        "--session",
+        &session_id,
+        "--stream-json",
+    ]);
+    let continued_output = run(continued, Some("new user turn\n"));
+    assert!(
+        continued_output.status.success(),
+        "continuation failed: {}",
+        String::from_utf8_lossy(&continued_output.stderr)
+    );
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(requests[0]["messages"][0]["content"], "new user turn");
     std::fs::remove_dir_all(&cwd).ok();
 }
 

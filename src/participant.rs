@@ -100,23 +100,7 @@ impl<T: Transport> LocalParticipant<T> {
             }
         };
 
-        // Addressing swaps: the reply comes from the request's recipient and
-        // goes to its sender.
-        let mut response = MessageEnvelope::new(
-            fresh_message_id(&request.conversation_id, outcome_ts),
-            request.conversation_id.clone(),
-            request.to.clone(),
-            request.from.clone(),
-            kind,
-            body,
-            outcome_ts,
-        );
-        response.in_reply_to = Some(request.message_id.clone());
-        response.exchange = Some(WrappedExchange::new(Exchange {
-            request: request_record,
-            outcome,
-        }));
-        response
+        build_response_envelope(request, request_record, kind, body, outcome_ts, outcome)
     }
 }
 
@@ -125,6 +109,35 @@ impl<T: Transport> Participant for LocalParticipant<T> {
         let content = [ContentBlock::text(request.body.clone())];
         self.respond_with_content(request, &content)
     }
+}
+
+/// Builds the correlated reply envelope shared by cold, session, and
+/// streaming exchange paths.
+pub(crate) fn build_response_envelope(
+    request: &MessageEnvelope,
+    request_record: RequestRecord,
+    kind: MessageKind,
+    body: String,
+    ts_ms: u64,
+    outcome: Outcome,
+) -> MessageEnvelope {
+    // Addressing swaps: the reply comes from the request's recipient and goes
+    // to its sender.
+    let mut response = MessageEnvelope::new(
+        fresh_message_id(&request.conversation_id, ts_ms),
+        request.conversation_id.clone(),
+        request.to.clone(),
+        request.from.clone(),
+        kind,
+        body,
+        ts_ms,
+    );
+    response.in_reply_to = Some(request.message_id.clone());
+    response.exchange = Some(WrappedExchange::new(Exchange {
+        request: request_record,
+        outcome,
+    }));
+    response
 }
 
 /// A process-lifetime counter making every synthesized response id distinct.
