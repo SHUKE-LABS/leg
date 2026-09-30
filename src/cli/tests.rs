@@ -2054,6 +2054,7 @@ fn parse_args_exchange_bare_defaults_both_paths_to_none() {
             out_path: None,
             session: None,
             session_id_out: None,
+            stream_json: false,
         })
     );
 }
@@ -2067,6 +2068,7 @@ fn parse_args_exchange_accepts_in_and_out() {
             out_path: Some("/tmp/b".to_string()),
             session: None,
             session_id_out: None,
+            stream_json: false,
         })
     );
 }
@@ -2087,6 +2089,7 @@ fn parse_args_exchange_accepts_session_flags_in_either_order() {
             out_path: None,
             session: Some(ExchangeSession::Existing("sess-1".to_string())),
             session_id_out: Some("/tmp/id".to_string()),
+            stream_json: false,
         })
     );
     assert_eq!(
@@ -2102,6 +2105,7 @@ fn parse_args_exchange_accepts_session_flags_in_either_order() {
             out_path: None,
             session: Some(ExchangeSession::New),
             session_id_out: Some("/tmp/id".to_string()),
+            stream_json: false,
         })
     );
 }
@@ -2132,6 +2136,40 @@ fn parse_args_exchange_rejects_conflicting_or_incomplete_session_flags() {
 #[test]
 fn parse_args_exchange_missing_in_value_is_usage_error() {
     assert!(parse_args(&argv(&["exchange", "--in"])).is_err());
+}
+
+#[test]
+fn parse_args_exchange_accepts_stream_json_with_session_id_out() {
+    assert_eq!(
+        parse_args(&argv(&[
+            "exchange",
+            "--new-session",
+            "--session-id-out",
+            "/tmp/id",
+            "--stream-json",
+        ]))
+        .unwrap(),
+        Some(Command::Exchange {
+            in_path: None,
+            out_path: None,
+            session: Some(ExchangeSession::New),
+            session_id_out: Some("/tmp/id".to_string()),
+            stream_json: true,
+        })
+    );
+}
+
+#[test]
+fn parse_args_exchange_rejects_stream_json_with_out() {
+    assert!(matches!(
+        parse_args(&argv(&[
+            "exchange",
+            "--out",
+            "/tmp/response",
+            "--stream-json",
+        ])),
+        Err(LegError::Usage(message)) if message.contains("--stream-json")
+    ));
 }
 
 #[test]

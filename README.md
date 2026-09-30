@@ -244,7 +244,7 @@ session trail can therefore be resumed without reusing the failed turn.
 ### Exchange
 
 ```
-leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>]
+leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>] [--stream-json]
 ```
 
 Answers one `baton.message/v1` request (from `--in`, or stdin) with exactly
@@ -261,6 +261,35 @@ the session id plus a newline after the turn. Each session is stored as
 `~/.local/state/leg/sessions` when neither variable is set. The store directory
 is created when a new session is started. A missing id fails before contacting
 the provider with `leg: no session found: <id>`.
+
+Pass `--stream-json` to write a flushed NDJSON feed using the
+`leg.exchange.stream/v1` schema. This mode always writes to stdout and cannot
+be combined with `--out`. With `--session` or `--new-session`,
+`--session-id-out` remains available and writes that id after the turn. Each
+line has `schema`, `event`, and a zero-based increasing
+`seq`. Events are `turn_start`, `text_delta`, `tool_round`, `tool_call`,
+`tool_result`, and `turn_end`. Provider-round and content-block indices start
+at zero. Session records also carry `session_id` and `turn_index`.
+
+Example output (each line is one JSON value):
+
+```jsonl
+{"schema":"leg.exchange.stream/v1","event":"turn_start","seq":0,"provider":"anthropic","model":"claude-test","request":{"schema":"baton.message/v1","message_id":"m-1","conversation_id":"c-1","from":"external","to":"leg","in_reply_to":null,"kind":"request","body":"hello","ts_ms":1,"exchange":null}}
+{"schema":"leg.exchange.stream/v1","event":"text_delta","seq":1,"round_index":0,"block_index":0,"text":"Hello"}
+{"schema":"leg.exchange.stream/v1","event":"turn_end","seq":2,"capped":false,"response":{"schema":"baton.message/v1","message_id":"c-1-r-2-0","conversation_id":"c-1","from":"leg","to":"external","in_reply_to":"m-1","kind":"response","body":"Hello","ts_ms":2,"exchange":{"schema":"baton.exchange/v1","exchange":{"request":{"ts_ms":1,"model":"claude-test","base_url":"https://api.anthropic.com","prompt":"hello"},"outcome":{"event":"response_ok","ts_ms":2,"duration_ms":1,"reply":"Hello","input_tokens":1,"output_tokens":1,"stop_reason":"end_turn","attempts":1}}}}}
+```
+
+`turn_start.request` and `turn_end.response` are the correlated message
+envelopes; the terminal response is authoritative. Text deltas are provisional
+and are not repeated as a second final-text event. `turn_end.capped` is true
+only when `LEG_MAX_TOOL_ROUNDS` stops a turn while the provider still requests
+tools. Provider failures and capped turns still end with a terminal envelope.
+Unix cancellation attempts an `interrupted` terminal record while stdout is
+writable; a broken pipe stops further tool dispatch and exits non-zero. EOF
+without `turn_end` means the exchange is incomplete. No records follow
+`turn_end`. Unknown optional fields and events may be ignored by consumers of
+this schema version. See [the stream contract](docs/exchange-stream.md) for
+tool-event fields, session rules, and complete error/truncation behavior.
 
 ## Development checks
 
