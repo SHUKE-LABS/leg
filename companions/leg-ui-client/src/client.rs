@@ -515,14 +515,17 @@ fn join_stderr(reader: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
 
 fn disconnect_supervisor_for_cleanup(
     child_stdin: ChildStdin,
-    child: Child,
+    mut child: Child,
     stderr_reader: thread::JoinHandle<Vec<u8>>,
 ) {
     // Closing the control pipe lets the guardian stop its owned process tree.
-    // Killing the guardian here could orphan a native leg child.
+    // Reap it in the background so dropping a handle stays nonblocking and
+    // long-lived hosts do not retain a zombie supervisor.
     drop(child_stdin);
-    drop(child);
-    drop(stderr_reader);
+    thread::spawn(move || {
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+    });
 }
 
 fn bounded_text(bytes: &[u8]) -> String {

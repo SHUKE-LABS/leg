@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CHECK_OUTPUT: usize = 1024 * 1024;
+const MAX_NPM_LAUNCHER_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedLeg {
@@ -127,10 +128,42 @@ fn check_executable(path: &Path) -> Result<(), ResolveError> {
 }
 
 fn is_published_npm_launcher(path: &Path) -> Result<bool, ResolveError> {
-    let content = fs::read(path).map_err(|source| ResolveError::Inspect {
+    let mut file = fs::File::open(path).map_err(|source| ResolveError::Inspect {
         path: path.to_path_buf(),
         source,
     })?;
+    let mut prefix = [0_u8; 2];
+    let count = file
+        .read(&mut prefix)
+        .map_err(|source| ResolveError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if count != prefix.len() || &prefix != b"#!" {
+        return Ok(false);
+    }
+
+    let length = file
+        .metadata()
+        .map_err(|source| ResolveError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if length > MAX_NPM_LAUNCHER_BYTES {
+        return Ok(false);
+    }
+
+    let mut content = prefix.to_vec();
+    file.take(MAX_NPM_LAUNCHER_BYTES - count as u64 + 1)
+        .read_to_end(&mut content)
+        .map_err(|source| ResolveError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if content.len() as u64 > MAX_NPM_LAUNCHER_BYTES {
+        return Ok(false);
+    }
     let content = String::from_utf8_lossy(&content);
     Ok(content.contains("const platformPackages = {")
         && content.contains("function resolvePlatformBinary(")

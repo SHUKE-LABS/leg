@@ -538,7 +538,7 @@ fn capture_process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 fn snapshot_owned_processes(root: &ProcessIdentity) -> HashSet<ProcessIdentity> {
-    let mut system = System::new_all();
+    let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let Some((_, process)) = system
         .processes()

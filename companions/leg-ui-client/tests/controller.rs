@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,30 @@ use leg_ui_client::{
     TurnRequest,
 };
 use serde_json::{Value, json};
+use sysinfo::{Pid, ProcessesToUpdate, System};
+
+#[derive(Clone)]
+struct ReplyGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl ReplyGate {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    fn wait(&self) {
+        let (released, ready) = &*self.0;
+        let mut released = released.lock().expect("reply gate lock");
+        while !*released {
+            released = ready.wait(released).expect("reply gate wait");
+        }
+    }
+
+    fn release(&self) {
+        let (released, ready) = &*self.0;
+        *released.lock().expect("reply gate lock") = true;
+        ready.notify_all();
+    }
+}
 
 #[derive(Clone)]
 struct MockReply {
@@ -23,6 +47,7 @@ struct MockReply {
     body: String,
     content_type: &'static str,
     delay: Duration,
+    gate: Option<ReplyGate>,
 }
 
 impl MockReply {
@@ -32,6 +57,7 @@ impl MockReply {
             body,
             content_type: "text/event-stream",
             delay: Duration::ZERO,
+            gate: None,
         }
     }
 
@@ -41,11 +67,17 @@ impl MockReply {
             body,
             content_type: "application/json",
             delay: Duration::ZERO,
+            gate: None,
         }
     }
 
     fn delayed(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    fn gated(mut self, gate: ReplyGate) -> Self {
+        self.gate = Some(gate);
         self
     }
 }
@@ -60,6 +92,7 @@ struct MockProvider {
     base_url: String,
     records: Arc<Mutex<Vec<RecordedRequest>>>,
     stopped: Arc<AtomicBool>,
+    gates: Vec<ReplyGate>,
     server: Option<JoinHandle<()>>,
 }
 
@@ -74,6 +107,10 @@ impl MockProvider {
         let server_records = Arc::clone(&records);
         let stopped = Arc::new(AtomicBool::new(false));
         let server_stopped = Arc::clone(&stopped);
+        let gates = replies
+            .iter()
+            .filter_map(|reply| reply.gate.clone())
+            .collect();
         let server = thread::spawn(move || {
             for reply in replies {
                 let mut connection = loop {
@@ -99,7 +136,11 @@ impl MockProvider {
                     .lock()
                     .expect("record lock")
                     .push(RecordedRequest { headers, body });
-                thread::sleep(reply.delay);
+                if let Some(gate) = reply.gate {
+                    gate.wait();
+                } else {
+                    thread::sleep(reply.delay);
+                }
                 let reason = if reply.status == 200 { "OK" } else { "Error" };
                 let response = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -119,6 +160,7 @@ impl MockProvider {
             base_url: format!("http://{address}"),
             records,
             stopped,
+            gates,
             server: Some(server),
         }
     }
@@ -143,16 +185,25 @@ impl MockProvider {
     }
 
     fn finish(mut self) -> Vec<RecordedRequest> {
+        self.release_gates();
+        self.stopped.store(true, Ordering::Release);
         if let Some(server) = self.server.take() {
             server.join().expect("mock provider server");
         }
         self.records()
+    }
+
+    fn release_gates(&self) {
+        for gate in &self.gates {
+            gate.release();
+        }
     }
 }
 
 impl Drop for MockProvider {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        self.release_gates();
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
@@ -379,7 +430,7 @@ fn collect_events(turn: &mut leg_ui_client::TurnHandle) -> Vec<StreamEvent> {
     events
 }
 
-fn create_npm_fixture(root: &Path, native_leg: &Path) -> (PathBuf, PathBuf) {
+fn create_npm_fixture(root: &Path, native_leg: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let launcher = root.join("node_modules/@shukelabs/leg/leg.js");
     fs::create_dir_all(launcher.parent().unwrap()).expect("create npm package");
     fs::copy(
@@ -415,7 +466,7 @@ fn create_npm_fixture(root: &Path, native_leg: &Path) -> (PathBuf, PathBuf) {
     fs::create_dir_all(&global_path).expect("create global npm bin directory");
     let global_entry = global_path.join("leg");
     std::os::unix::fs::symlink(&launcher, &global_entry).expect("create global npm symlink");
-    (launcher, global_entry)
+    (launcher, global_entry, platform_binary)
 }
 
 fn assert_resolution_failures(
@@ -554,7 +605,8 @@ fn companion_controller_contract_and_cleanup() {
     environment.set("LEG_MAX_RETRIES", "0");
     environment.remove("LEG_MAX_TOOL_ROUNDS");
 
-    let (launcher, global_entry) = create_npm_fixture(&scratch.path().join("npm"), &leg);
+    let (launcher, global_entry, npm_binary) =
+        create_npm_fixture(&scratch.path().join("npm"), &leg);
     let node = Command::new("node").arg("--version").output();
     assert!(node.is_ok(), "Node is needed for the published npm fixture");
 
@@ -766,7 +818,7 @@ fn companion_controller_contract_and_cleanup() {
     ]);
     environment.set("ANTHROPIC_BASE_URL", &stop_provider.base_url);
     let stop_store = scratch.path().join("stop-store");
-    let mut stopped = client(Some(leg.clone()), &supervisor, &stop_store)
+    let mut stopped = client(Some(global_entry.clone()), &supervisor, &stop_store)
         .start(TurnRequest::new("start a long tool", &cwd, LegSession::New))
         .expect("start stoppable turn");
     let mut stop_session_id = None;
@@ -788,6 +840,7 @@ fn companion_controller_contract_and_cleanup() {
     let bash_pid = read_pid(&stop_pid_dir.join("bash.pid"));
     let sleep_pid = read_pid(&stop_pid_dir.join("sleep.pid"));
     stop_provider.wait_for_records(1, Duration::from_secs(3));
+    assert_native_leg_ancestor(&npm_binary, bash_pid);
     stopped.stop().expect("send Stop to supervisor");
     let _ = collect_events(&mut stopped);
     assert!(matches!(
@@ -803,7 +856,7 @@ fn companion_controller_contract_and_cleanup() {
         stop_trail.contains("\"kind\":\"interrupted\""),
         "Stop trail lacks interrupted outcome: {stop_trail}"
     );
-    let mut resumed = client(Some(leg.clone()), &supervisor, &stop_store)
+    let mut resumed = client(Some(global_entry.clone()), &supervisor, &stop_store)
         .start(TurnRequest::new(
             "resume after Stop",
             &cwd,
@@ -846,8 +899,9 @@ fn companion_controller_contract_and_cleanup() {
 
     // The supervisor lock blocks another process before it makes a provider
     // request, while a first new-session request is still in flight.
+    let reply_gate = ReplyGate::new();
     let provider = MockProvider::start(vec![
-        MockReply::stream(text_reply("serialized")).delayed(Duration::from_millis(500)),
+        MockReply::stream(text_reply("serialized")).gated(reply_gate.clone()),
     ]);
     environment.set("ANTHROPIC_BASE_URL", &provider.base_url);
     let store = scratch.path().join("busy-store");
@@ -863,18 +917,17 @@ fn companion_controller_contract_and_cleanup() {
         other => panic!("expected session turn_start, got {other:?}"),
     };
     provider.wait_for_records(1, Duration::from_secs(3));
-    let error = client(Some(leg.clone()), &supervisor, &store)
-        .start(TurnRequest::new(
-            "competing",
-            &cwd,
-            LegSession::Existing(session_id),
-        ))
-        .err()
-        .expect("competing start is busy");
+    let competing = client(Some(leg.clone()), &supervisor, &store).start(TurnRequest::new(
+        "competing",
+        &cwd,
+        LegSession::Existing(session_id),
+    ));
+    let request_count_while_held = provider.records().len();
+    reply_gate.release();
+    let error = competing.err().expect("competing start is busy");
     assert!(matches!(error, StartError::Busy));
     assert_eq!(
-        provider.records().len(),
-        1,
+        request_count_while_held, 1,
         "busy start must not call provider"
     );
     let _ = collect_events(&mut first);
@@ -941,7 +994,7 @@ fn companion_controller_contract_and_cleanup() {
     let mut controller = Command::new(test_binary)
         .args(["--exact", "controller_child_entrypoint", "--nocapture"])
         .env("LEG_UI_TEST_CONTROLLER_CHILD", "1")
-        .env("LEG_UI_TEST_LEG_BIN", &leg)
+        .env("LEG_UI_TEST_LEG_BIN", &global_entry)
         .env("LEG_UI_TEST_SUPERVISOR_BIN", &supervisor)
         .env("LEG_UI_TEST_STORE", &child_store)
         .env("LEG_UI_TEST_CWD", &cwd)
@@ -956,6 +1009,7 @@ fn companion_controller_contract_and_cleanup() {
     let bash_pid = read_pid(&pid_dir.join("bash.pid"));
     let sleep_pid = read_pid(&pid_dir.join("sleep.pid"));
     provider.wait_for_records(1, Duration::from_secs(3));
+    assert_native_leg_ancestor(&npm_binary, bash_pid);
     controller.kill().expect("kill controller process");
     let _ = controller.wait();
     wait_until(Duration::from_secs(3), || {
@@ -963,7 +1017,7 @@ fn companion_controller_contract_and_cleanup() {
     });
 
     let resume_client = || {
-        client(Some(leg.clone()), &supervisor, &child_store).start(TurnRequest::new(
+        client(Some(global_entry.clone()), &supervisor, &child_store).start(TurnRequest::new(
             "continue after cleanup",
             &cwd,
             LegSession::Existing(session_id.clone()),
@@ -1039,7 +1093,7 @@ fn companion_controller_contract_and_cleanup() {
     // The global entry really is a symlink to the copied published launcher.
     assert_eq!(
         fs::canonicalize(&global_entry).unwrap(),
-        fs::canonicalize(launcher).unwrap()
+        fs::canonicalize(&launcher).unwrap()
     );
 }
 
@@ -1092,6 +1146,37 @@ fn process_is_running(pid: u32) -> bool {
             output.status.success() && !state.trim().is_empty() && !state.contains('Z')
         });
     }
+}
+
+fn assert_native_leg_ancestor(native_leg: &Path, descendant_pid: u32) {
+    let expected = fs::canonicalize(native_leg).expect("canonicalize npm platform binary");
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let mut pid = Pid::from_u32(descendant_pid);
+    for _ in 0..64 {
+        let Some(process) = system.process(pid) else {
+            break;
+        };
+        if let Some(executable) = process.exe() {
+            let actual = fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+            if actual == expected {
+                return;
+            }
+            assert_ne!(
+                executable.file_name().and_then(OsStr::to_str),
+                Some("node"),
+                "Node must not own the active leg process"
+            );
+        }
+        let Some(parent) = process.parent() else {
+            break;
+        };
+        pid = parent;
+    }
+    panic!(
+        "no process for npm platform binary {} owns descendant PID {descendant_pid}",
+        expected.display()
+    );
 }
 
 fn shell_quote(path: &Path) -> String {
