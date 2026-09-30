@@ -36,8 +36,12 @@ fn catalog_locations_recovery_and_metadata_are_safe() {
     let state = scratch.path().join("state");
     let cwd = scratch.path().join("workspace");
     fs::create_dir_all(&cwd).unwrap();
+    let canonical_cwd = fs::canonicalize(&cwd).unwrap();
     let catalog = SessionCatalog::open(config(&state)).unwrap();
-    assert_eq!(catalog.sessions_dir(), state.join("sessions"));
+    assert_eq!(
+        catalog.sessions_dir(),
+        fs::canonicalize(state.join("sessions")).unwrap()
+    );
 
     let draft = catalog
         .create_draft(SessionInterface::Tui, Some("work".into()), Some(&cwd))
@@ -98,7 +102,7 @@ fn catalog_locations_recovery_and_metadata_are_safe() {
     let assigned = reopened.get(orphan_id).unwrap();
     assert!(!assigned.recovered);
     assert!(!assigned.read_only);
-    assert_eq!(assigned.cwd.as_deref(), Some(cwd.as_path()));
+    assert_eq!(assigned.cwd.as_deref(), Some(canonical_cwd.as_path()));
 
     assert!(matches!(
         reopened.get("../outside"),
@@ -177,9 +181,10 @@ fn active_driver_lock_blocks_workspace_change() {
     FileExt::unlock(&lock).unwrap();
     assert!(catalog.prepare_retry(id).is_ok());
     catalog.set_workspace(id, &cwd_b).unwrap();
+    let canonical_cwd_b = fs::canonicalize(&cwd_b).unwrap();
     assert_eq!(
         catalog.get(id).unwrap().cwd.as_deref(),
-        Some(cwd_b.as_path())
+        Some(canonical_cwd_b.as_path())
     );
 }
 
@@ -202,9 +207,10 @@ fn missing_workspace_blocks_submission_until_explicit_replacement() {
         Err(CatalogError::WorkspaceMissing(_))
     ));
     catalog.set_workspace(&draft.id, &replacement).unwrap();
+    let canonical_replacement = fs::canonicalize(&replacement).unwrap();
     assert_eq!(
         catalog.get(&draft.id).unwrap().cwd.as_deref(),
-        Some(replacement.as_path())
+        Some(canonical_replacement.as_path())
     );
 }
 

@@ -449,6 +449,8 @@ fn shared_catalog_controller_contract(
     second_cwd: &Path,
     sentinel: &str,
 ) {
+    let first_cwd = fs::canonicalize(first_cwd).expect("canonicalize first catalog workspace");
+    let second_cwd = fs::canonicalize(second_cwd).expect("canonicalize second catalog workspace");
     let state_dir = scratch.join("shared-catalog");
     let inherited_store = scratch.join("inherited-session-store");
     let provider = MockProvider::start(vec![
@@ -481,7 +483,7 @@ fn shared_catalog_controller_contract(
         .create_draft(
             SessionInterface::Tui,
             Some("shared session".into()),
-            Some(first_cwd),
+            Some(first_cwd.as_path()),
         )
         .expect("create UI draft");
     first_controller
@@ -517,7 +519,7 @@ fn shared_catalog_controller_contract(
         .get(&session_id)
         .expect("browse shared session");
     assert_eq!(after_first.name.as_deref(), Some("shared session"));
-    assert_eq!(after_first.cwd.as_deref(), Some(first_cwd));
+    assert_eq!(after_first.cwd.as_deref(), Some(first_cwd.as_path()));
     assert_eq!(after_first.turns.len(), 1);
     assert_eq!(
         after_first.turns[0].outcome,
@@ -543,7 +545,7 @@ fn shared_catalog_controller_contract(
         )
         .expect("save Web draft");
     second_controller
-        .set_workspace(&session_id, second_cwd)
+        .set_workspace(&session_id, second_cwd.as_path())
         .expect("change workspace while idle");
     let after_workspace_change = second_controller
         .get(&session_id)
@@ -594,7 +596,7 @@ fn shared_catalog_controller_contract(
         .create_draft(
             SessionInterface::Web,
             Some("named first failure".into()),
-            Some(first_cwd),
+            Some(first_cwd.as_path()),
         )
         .expect("create first-failure draft");
     let mut first_failure = second_controller
