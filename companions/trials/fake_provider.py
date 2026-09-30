@@ -25,13 +25,22 @@ SCENARIOS = (
     "failed-tool",
     "auth-error",
     "capped-tool-loop",
+    "browser",
     "paused-live-text",
     "stalled-bash",
     "reopen-after-failure",
     "reopen-after-interruption",
 )
-PAUSE_MS = 5000
+PAUSE_MS = 1200
+BROWSER_PAUSE_MS = 5000
 TRIAL_LINES = "Line one: keep this first.\n第二行：保留中文。\nLine three: keep this third."
+UNTRUSTED_MARKDOWN = (
+    "<script>window.__legXss = true</script>\n"
+    '<img src="http://leg-web-xss.invalid/pixel" onerror="fetch(\'/api/sessions/invalid/stop\',{method:\'POST\'})">\n'
+    "[x](javascript:fetch('/api/sessions/invalid/stop',{method:'POST'}))\n"
+    "[data](data:text/html,boom)\n"
+    "![remote image](http://leg-web-xss.invalid/pixel)\n"
+)
 
 
 def text_content(value: Any) -> str:
@@ -64,7 +73,7 @@ class Fixture:
         self.tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     def prepare_hook(self) -> None:
-        if self.scenario not in ("trial", "denied-tool"):
+        if self.scenario not in ("trial", "browser", "denied-tool"):
             return
         self.tempdir = tempfile.TemporaryDirectory(prefix="leg-ui-trial-")
         hook = Path(self.tempdir.name) / "trial-deny-hook.py"
@@ -305,7 +314,7 @@ class Fixture:
         handler.close_connection = True
 
     def handle_messages(self, handler: http.server.BaseHTTPRequestHandler, payload: dict[str, Any]) -> None:
-        marker = self.marker_for(payload) if self.scenario == "trial" else self.scenario
+        marker = self.marker_for(payload) if self.scenario in ("trial", "browser") else self.scenario
         request, occurrence = self.advance(marker)
         handler.fixture_request_number = request
 
@@ -346,7 +355,8 @@ class Fixture:
             self.send_error(handler, 401, "authentication_error", "press the UI's explicit retry action")
             return
         if marker == "paused-live-text" or marker == "TRIAL-PAUSE":
-            self.send_stream(handler, [{"type": "text", "text": "The first live text is visible. The fixture resumes after its fixed pause."}], pause_ms=PAUSE_MS, marker=marker)
+            pause_ms = BROWSER_PAUSE_MS if self.scenario == "browser" else PAUSE_MS
+            self.send_stream(handler, [{"type": "text", "text": "The first live text is visible. The fixture resumes after its fixed pause."}], pause_ms=pause_ms, marker=marker)
             self.check("paused_response_completed")
             return
         if marker == "TRIAL-SEED-SESSION":
@@ -437,7 +447,7 @@ class Fixture:
         if marker == "TRIAL-UNTRUSTED-MARKDOWN":
             if self.has_tool_result(payload):
                 self.check("untrusted_tool_result_returned", True)
-                self.send_stream(handler, [{"type": "text", "text": "The fixture's untrusted file content was returned as tool data."}])
+                self.send_stream(handler, [{"type": "text", "text": UNTRUSTED_MARKDOWN}])
             else:
                 self.send_stream(
                     handler,
@@ -600,9 +610,9 @@ def environment(base_url: str, scenario: str, hook: Path | None) -> dict[str, st
         "LEG_MODEL": "trial-fixture",
         "LEG_MAX_RETRIES": "0",
     }
-    if scenario in ("trial", "capped-tool-loop"):
+    if scenario in ("trial", "browser", "capped-tool-loop"):
         values["LEG_MAX_TOOL_ROUNDS"] = "2"
-    if scenario in ("trial", "stalled-bash"):
+    if scenario in ("trial", "browser", "stalled-bash"):
         values["LEG_BASH_TIMEOUT_SECS"] = "120"
     if hook is not None:
         values["LEG_PRETOOL_HOOK"] = str(hook)

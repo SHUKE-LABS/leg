@@ -213,7 +213,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
         (workspace / "xss-fixture.html").write_text(xss_payload, encoding="utf-8")
 
         provider, provider_lines = start_process(
-            [sys.executable, str(FAKE_PROVIDER), "--scenario", "trial", "--workspace", str(workspace)]
+            [sys.executable, str(FAKE_PROVIDER), "--scenario", "browser", "--workspace", str(workspace)]
         )
         host = None
         try:
@@ -506,19 +506,36 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 stops_before_xss = len(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/stop")]
                 )
+                submits_before_xss = len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                )
                 await composer.fill("TRIAL-UNTRUSTED-MARKDOWN: read the malicious fixture as plain content")
                 await page.get_by_role("button", name="Send").click()
                 xss_turn = wait_completed_submission(authority, token, session_id, 6)
                 await wait_status(page, "Succeeded")
                 wait_fixture_count(provider_authority, 9)
+                xss_transcript = await page.locator("#messages").inner_text()
+                assistant_markdown = await page.locator(
+                    "#messages .message-assistant .message-content"
+                ).last.inner_text()
                 assert await page.locator("#messages script, #messages img, #messages iframe").count() == 0
-                assert await page.locator("#messages a[href^='javascript:']").count() == 0
-                assert "onerror" in await page.locator("#messages").inner_text()
+                assert await page.locator("#messages a[href^='javascript:'], #messages a[href^='data:']").count() == 0
+                assert "window.__legXss = true" in xss_transcript
+                assert "onerror" in xss_transcript
+                assert "javascript:fetch" in assistant_markdown
+                assert "data:text/html,boom" in assistant_markdown
+                assert "remote image" in xss_transcript
+                assert await page.evaluate("() => window.__legXss") is None
+                assert fixture_status(provider_authority)["input_checks"].get("untrusted_tool_result_returned") is True
                 assert not external_attempts, external_attempts
                 stops_after_xss = len(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/stop")]
                 )
                 assert stops_after_xss == stops_before_xss, "untrusted output caused a Stop API action"
+                submits_after_xss = len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                )
+                assert submits_after_xss - submits_before_xss == 1, "untrusted output caused another submission"
                 assert xss_turn["high_water"] == 6
 
                 await composer.fill("TRIAL-LONG: create a long readable history")
