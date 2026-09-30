@@ -125,6 +125,9 @@ impl MockProvider {
                         Err(_) => return,
                     }
                 };
+                connection
+                    .set_nonblocking(false)
+                    .expect("set mock provider connection blocking");
                 let _ = connection.set_read_timeout(Some(Duration::from_secs(10)));
                 let Some((headers, body)) = read_request(&mut connection) else {
                     return;
@@ -542,6 +545,7 @@ fn assert_resolution_failures(
     assert!(matches!(error, StartError::InvalidCwd(_)));
 }
 
+#[track_caller]
 fn assert_success(outcome: TurnOutcome) {
     assert!(
         matches!(outcome, TurnOutcome::Succeeded { .. }),
@@ -1097,10 +1101,12 @@ fn companion_controller_contract_and_cleanup() {
     );
 }
 
+#[track_caller]
 fn wait_for_file(path: &Path, timeout: Duration) {
     wait_until(timeout, || path.is_file());
 }
 
+#[track_caller]
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while !condition() {
@@ -1112,6 +1118,7 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     }
 }
 
+#[track_caller]
 fn read_pid(path: &Path) -> u32 {
     wait_for_file(path, Duration::from_secs(3));
     fs::read_to_string(path)
