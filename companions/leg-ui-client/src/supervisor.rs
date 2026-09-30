@@ -360,7 +360,7 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     }
     // `try_wait` reaps on success, but calling wait again is harmless and makes
     // the guard's lifetime visibly extend through process completion.
-    let child_code = status.and_then(|status| exit_code(status)).unwrap_or(1);
+    let child_code = status.and_then(exit_code).unwrap_or(1);
     let stderr = stderr_thread.join().unwrap_or_default();
     let stderr = redact_credentials(&String::from_utf8_lossy(&stderr));
     if !stderr.is_empty() {
@@ -590,10 +590,11 @@ fn snapshot_owned_processes(root: &ProcessIdentity) -> HashSet<ProcessIdentity> 
     let mut queue = VecDeque::from([root.pid]);
     while let Some(parent) = queue.pop_front() {
         for (pid, (candidate_parent, identity)) in &processes {
-            if *candidate_parent == Some(parent) && *pid != root.pid {
-                if descendants.insert(identity.clone()) {
-                    queue.push_back(*pid);
-                }
+            if *candidate_parent == Some(parent)
+                && *pid != root.pid
+                && descendants.insert(identity.clone())
+            {
+                queue.push_back(*pid);
             }
         }
     }

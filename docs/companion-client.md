@@ -25,6 +25,10 @@ while let Some(event) = turn.observe()? {
 let outcome = turn.wait()?;
 ```
 
+An event loop that reads `CatalogTurn` on a worker thread can retain a cloneable
+`turn.stop_handle()` and request Stop from its input thread while the worker
+continues draining stream events.
+
 `start` accepts one whole prompt for one session. The prompt is sent as UTF-8 on
 stdin and stdin is closed before provider work begins. The native executable is
 run directly, with an explicit working directory and canonical
@@ -144,4 +148,35 @@ process disappearance on both platforms. Companion dependencies remain in
 
 ```sh
 cargo metadata --locked --manifest-path Cargo.toml
+```
+
+## Experimental terminal UI
+
+`leg-tui` is a separate companion package. Build the native `leg` binary and
+the companion supervisor, then launch the UI with the native binary path:
+
+```sh
+cargo build --locked --bin leg
+cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
+cargo run --locked --manifest-path companions/Cargo.toml -p leg-tui -- --leg-bin "$PWD/target/debug/leg"
+```
+
+The UI inherits provider configuration from its launching environment. Choose
+an existing workspace directory, review and acknowledge the first-run warning,
+then type a prompt. Ctrl-S sends a nonblank prompt. Ctrl-C stops a running turn;
+when idle it exits and keeps the draft. Press `?` for keyboard help and Esc to
+close the overlay. The first-run warning explains that the workspace is the
+tool working directory, not a sandbox.
+
+The Linux PTY smoke test uses the local fake provider and explicit native
+binary paths:
+
+```sh
+cargo build --locked --bin leg
+cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
+cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui
+python3 companions/leg-tui/tests/pty_smoke.py \
+  --tui-bin companions/target/debug/leg-tui \
+  --leg-bin target/debug/leg \
+  --supervisor-bin companions/target/debug/leg-ui-supervisor
 ```
