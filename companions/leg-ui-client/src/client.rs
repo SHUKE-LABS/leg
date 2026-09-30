@@ -261,9 +261,10 @@ impl Client {
             }
             _ => {
                 disconnect_supervisor_for_cleanup(child_stdin, child, stderr_thread);
-                return Err(StartError::Supervisor(format!(
+                return Err(StartError::Supervisor(
                     "invalid supervisor startup response; the supervisor was disconnected so it can clean up any owned child"
-                )));
+                        .to_string(),
+                ));
             }
         }
 
@@ -271,6 +272,7 @@ impl Client {
         let weak_control = Arc::downgrade(&control);
         let (message_tx, message_rx) = mpsc::channel();
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(true));
         let worker_stop_requested = Arc::clone(&stop_requested);
         thread::Builder::new()
             .name("leg-ui-turn-reader".to_string())
@@ -293,6 +295,7 @@ impl Client {
             finished: None,
             protocol_error: None,
             stop_requested,
+            active,
         })
     }
 }
@@ -304,9 +307,38 @@ pub struct TurnHandle {
     finished: Option<TurnOutcome>,
     protocol_error: Option<StreamFailure>,
     stop_requested: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub struct TurnStopHandle {
+    control: Arc<Mutex<Option<ChildStdin>>>,
+    stop_requested: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+}
+
+impl TurnStopHandle {
+    /// Requests interruption without needing access to the stream reader.
+    pub fn stop(&self) -> Result<(), ClientError> {
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.stop_requested.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        send_control(&self.control, "stop").map_err(ClientError::Stop)
+    }
 }
 
 impl TurnHandle {
+    pub fn stop_handle(&self) -> TurnStopHandle {
+        TurnStopHandle {
+            control: Arc::clone(&self.control),
+            stop_requested: Arc::clone(&self.stop_requested),
+            active: Arc::clone(&self.active),
+        }
+    }
+
     /// Waits for the next validated stream event. `None` means the turn ended.
     pub fn observe(&mut self) -> Result<Option<StreamEvent>, ClientError> {
         if let Some(event) = self.pending.pop_front() {
@@ -318,31 +350,27 @@ impl TurnHandle {
         if self.finished.is_some() {
             return Ok(None);
         }
-        loop {
-            match self.messages.recv() {
-                Ok(WorkerMessage::Event(event)) => return Ok(Some(event)),
-                Ok(WorkerMessage::Protocol(error)) => {
-                    self.protocol_error = Some(error.clone());
-                    return Err(ClientError::Protocol(error));
-                }
-                Ok(WorkerMessage::Finished(outcome)) => {
-                    self.finished = Some(outcome);
-                    return Ok(None);
-                }
-                Err(_) => return Err(ClientError::SupervisorStopped),
+        match self.messages.recv() {
+            Ok(WorkerMessage::Event(event)) => Ok(Some(event)),
+            Ok(WorkerMessage::Protocol(error)) => {
+                self.protocol_error = Some(error.clone());
+                Err(ClientError::Protocol(error))
+            }
+            Ok(WorkerMessage::Finished(outcome)) => {
+                self.active.store(false, Ordering::Release);
+                self.finished = Some(outcome);
+                Ok(None)
+            }
+            Err(_) => {
+                self.active.store(false, Ordering::Release);
+                Err(ClientError::SupervisorStopped)
             }
         }
     }
 
     /// Requests interruption. Call `wait` to collect the final distinct outcome.
     pub fn stop(&mut self) -> Result<(), ClientError> {
-        if self.finished.is_some() {
-            return Ok(());
-        }
-        if self.stop_requested.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        send_control(&self.control, "stop").map_err(ClientError::Stop)
+        self.stop_handle().stop()
     }
 
     /// Waits for process cleanup and returns the authoritative terminal outcome.
@@ -356,10 +384,12 @@ impl TurnHandle {
                 Ok(WorkerMessage::Event(event)) => self.pending.push_back(event),
                 Ok(WorkerMessage::Protocol(error)) => self.protocol_error = Some(error),
                 Ok(WorkerMessage::Finished(outcome)) => {
+                    self.active.store(false, Ordering::Release);
                     self.finished = Some(outcome.clone());
                     return Ok(outcome);
                 }
                 Err(_) => {
+                    self.active.store(false, Ordering::Release);
                     return Err(ClientError::Incomplete(
                         "supervisor message channel closed before a result".to_string(),
                     ));
@@ -371,6 +401,7 @@ impl TurnHandle {
 
 impl Drop for TurnHandle {
     fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
         if let Ok(mut slot) = self.control.lock() {
             slot.take();
         }

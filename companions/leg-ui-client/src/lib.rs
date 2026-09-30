@@ -12,7 +12,8 @@ pub use catalog::{
     TrailToolResult, TrailTurn,
 };
 pub use client::{
-    Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome, TurnRequest,
+    Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,
+    TurnRequest, TurnStopHandle,
 };
 pub use protocol::{StreamEvent, StreamFailure};
 pub use resolve::ResolveError;

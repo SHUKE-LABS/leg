@@ -40,10 +40,22 @@ jobs:
         with:
           node-version: 22
 
-      - name: Test companion client (locked)
+      - name: Test companion packages (locked)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'aarch64-apple-darwin' }}
         shell: bash
-        run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-ui-client
+        run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-ui-client -p leg-tui
+
+      - name: TUI Linux PTY smoke (locked)
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        shell: bash
+        run: |
+          cargo build --locked --bin leg
+          cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
+          cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui
+          python3 companions/leg-tui/tests/pty_smoke.py \
+            --tui-bin companions/target/debug/leg-tui \
+            --leg-bin target/debug/leg \
+            --supervisor-bin companions/target/debug/leg-ui-supervisor
 
       - name: Build (locked)
         shell: bash

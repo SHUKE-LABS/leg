@@ -19,7 +19,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::client::{
-    Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome, TurnRequest,
+    Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,
+    TurnRequest, TurnStopHandle,
 };
 use crate::protocol::StreamEvent;
 use crate::supervisor;
@@ -919,6 +920,12 @@ impl CatalogTurn {
 
     pub fn stop(&mut self) -> Result<(), ClientError> {
         self.turn.stop()
+    }
+
+    /// Returns a cloneable Stop control for an event loop that reads the turn
+    /// from a separate thread.
+    pub fn stop_handle(&self) -> TurnStopHandle {
+        self.turn.stop_handle()
     }
 
     pub fn wait(&mut self) -> Result<TurnOutcome, CatalogTurnError> {

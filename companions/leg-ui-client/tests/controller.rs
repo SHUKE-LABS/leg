@@ -1396,10 +1396,10 @@ fn process_is_running(pid: u32) -> bool {
         let Some(close) = stat.rfind(')') else {
             return false;
         };
-        return stat[close + 1..]
+        stat[close + 1..]
             .split_whitespace()
             .next()
-            .is_some_and(|state| state != "Z");
+            .is_some_and(|state| state != "Z")
     }
     #[cfg(target_os = "macos")]
     {
@@ -1407,10 +1407,10 @@ fn process_is_running(pid: u32) -> bool {
             .args(["-o", "stat=", "-p"])
             .arg(pid.to_string())
             .output();
-        return output.ok().is_some_and(|output| {
+        output.ok().is_some_and(|output| {
             let state = String::from_utf8_lossy(&output.stdout);
             output.status.success() && !state.trim().is_empty() && !state.contains('Z')
-        });
+        })
     }
 }
 
