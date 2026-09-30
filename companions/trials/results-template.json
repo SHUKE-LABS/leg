@@ -1,0 +1,56 @@
+{
+  "schema": "leg-ui-trial.results/v1",
+  "context": {
+    "core_revision": null,
+    "ui_revisions": {
+      "TUI": null,
+      "Web": null
+    },
+    "os_device": null,
+    "provider": null,
+    "model": null,
+    "provider_config": null,
+    "workspace_fixture_revision": null,
+    "session_length": {
+      "TUI": null,
+      "Web": null
+    }
+  },
+  "eligibility_gates": {
+    "TUI": {
+      "common_critical_workflows_pass": null,
+      "no_accidental_submit_or_replay": null,
+      "committed_history_preserved": null,
+      "stop_terminates_tool_processes": null,
+      "credentials_not_exposed": null,
+      "unauthenticated_web_mutations_rejected": "n/a"
+    },
+    "Web": {
+      "common_critical_workflows_pass": null,
+      "no_accidental_submit_or_replay": null,
+      "committed_history_preserved": null,
+      "stop_terminates_tool_processes": null,
+      "credentials_not_exposed": null,
+      "unauthenticated_web_mutations_rejected": null
+    }
+  },
+  "participants": [],
+  "setup_friction": {
+    "TUI": [],
+    "Web": []
+  },
+  "calculated_scores": null,
+  "resource_measurements": {
+    "TUI": {
+      "startup_time_ms": null,
+      "idle_rss_bytes": null,
+      "bundle_size_bytes": null
+    },
+    "Web": {
+      "startup_time_ms": null,
+      "idle_rss_bytes": null,
+      "bundle_size_bytes": null
+    }
+  },
+  "limitations": []
+}
