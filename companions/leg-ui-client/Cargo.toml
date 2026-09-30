@@ -1,0 +1,25 @@
+[package]
+name = "leg-ui-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Shared native leg subprocess controller for companion user interfaces"
+
+[lib]
+name = "leg_ui_client"
+
+[[bin]]
+name = "leg-ui-supervisor"
+path = "src/bin/leg-ui-supervisor.rs"
+
+[dependencies]
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sysinfo = "0.33"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.15"
