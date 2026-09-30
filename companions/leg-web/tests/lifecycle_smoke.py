@@ -25,11 +25,13 @@ FIXTURE = ROOT / "trials" / "fake_provider.py"
 def read_until(process: subprocess.Popen[str], prefix: str, timeout: float = 15) -> str:
     deadline = time.monotonic() + timeout
     lines: queue.Queue[str | None] = queue.Queue()
+    stdout_tail: deque[str] = deque(maxlen=30)
     stderr_tail: deque[str] = deque(maxlen=30)
 
     def forward_stdout() -> None:
         if process.stdout is not None:
             for line in process.stdout:
+                stdout_tail.append(line.rstrip())
                 lines.put(line)
         lines.put(None)
 
@@ -42,25 +44,27 @@ def read_until(process: subprocess.Popen[str], prefix: str, timeout: float = 15)
     stderr_reader = Thread(target=capture_stderr, daemon=True)
     stderr_reader.start()
 
-    def stderr_output() -> str:
-        return "\n".join(stderr_tail) or "<no stderr output captured>"
+    def process_output() -> str:
+        stdout = "\n".join(stdout_tail) or "<no stdout output captured>"
+        stderr = "\n".join(stderr_tail) or "<no stderr output captured>"
+        return f"stdout:\n{stdout}\nstderr:\n{stderr}"
 
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(
-                f"did not receive {prefix!r} within {timeout}s; fixture/process stderr:\n{stderr_output()}"
+                f"did not receive {prefix!r} within {timeout}s; fixture/process output:\n{process_output()}"
             )
         try:
             line = lines.get(timeout=remaining)
         except queue.Empty:
             raise TimeoutError(
-                f"did not receive {prefix!r} within {timeout}s; fixture/process stderr:\n{stderr_output()}"
+                f"did not receive {prefix!r} within {timeout}s; fixture/process output:\n{process_output()}"
             ) from None
         if line is None:
             stderr_reader.join(timeout=1)
             raise AssertionError(
-                f"process exited before {prefix!r}; fixture/process stderr:\n{stderr_output()}"
+                f"process exited before {prefix!r}; fixture/process output:\n{process_output()}"
             )
         if line.startswith(prefix):
             return line.strip()
