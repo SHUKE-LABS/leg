@@ -80,10 +80,10 @@ exit/outcome disagreement is incomplete. The client never retries or replays
 the prompt. Provider credentials are never included in client metadata, and
 stderr/error diagnostics redact inherited credential values.
 
-The initial native trial targets are Linux and macOS. Process-tree cleanup
-tests run on both platforms and check that an interrupted session trail is
-recorded as well as checking process disappearance. Companion dependencies
-remain in `companions/Cargo.lock`; verify the core graph with:
+CI runs the companion suite on native Linux and macOS hosts. Its Stop and
+abrupt-controller cleanup tests check for an interrupted session trail and
+process disappearance on both platforms. Companion dependencies remain in
+`companions/Cargo.lock`; verify the core graph with:
 
 ```sh
 cargo metadata --locked --manifest-path Cargo.toml
