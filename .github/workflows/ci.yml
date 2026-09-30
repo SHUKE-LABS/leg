@@ -45,6 +45,16 @@ jobs:
         shell: bash
         run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-ui-client -p leg-tui -p leg-web
 
+      - name: Test Web host package on Windows (locked)
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-web
+
+      - name: Build Web host on Windows (locked)
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: cargo build --locked --manifest-path companions/Cargo.toml -p leg-web --bin leg-web
+
       - name: Build Web lifecycle binaries (locked)
         if: ${{ matrix.target != 'x86_64-pc-windows-msvc' }}
         shell: bash

@@ -125,4 +125,5 @@ bootstrap, durable receipt/high-water boundaries, and event cursor recovery.
 The fake-provider lifecycle smoke covers a lost submit response and duplicate
 request, two tabs, disconnect/reconnect, expired cursors, an incomplete
 provider stream, Stop, host crash cleanup, graceful shutdown, and restart
-without prompt replay. CI runs both checks on Linux and macOS.
+without prompt replay. CI runs these checks on Linux and macOS; Windows runs
+the Web package tests and builds the host binary.
