@@ -150,6 +150,12 @@ process disappearance on both platforms. Companion dependencies remain in
 cargo metadata --locked --manifest-path Cargo.toml
 ```
 
+## Experimental Web host
+
+The authenticated loopback browser host is documented in
+[leg-web.md](leg-web.md), including its launch token, API and snapshot contract,
+retention limits, lifecycle, startup options, and fake-provider validation.
+
 ## Experimental terminal UI
 
 `leg-tui` is a separate companion package. Build the native `leg` binary and

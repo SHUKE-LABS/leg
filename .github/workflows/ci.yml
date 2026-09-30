@@ -41,9 +41,36 @@ jobs:
           node-version: 22
 
       - name: Test companion packages (locked)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'aarch64-apple-darwin' }}
+        if: ${{ matrix.target != 'x86_64-pc-windows-msvc' }}
         shell: bash
-        run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-ui-client -p leg-tui
+        run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-ui-client -p leg-tui -p leg-web
+
+      - name: Test Web host package on Windows (locked)
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-web
+
+      - name: Build Web host on Windows (locked)
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: cargo build --locked --manifest-path companions/Cargo.toml -p leg-web --bin leg-web
+
+      - name: Build Web lifecycle binaries (locked)
+        if: ${{ matrix.target != 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: |
+          cargo build --locked --bin leg
+          cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
+          cargo build --locked --manifest-path companions/Cargo.toml -p leg-web --bin leg-web
+
+      - name: Web host fake-provider lifecycle smoke
+        if: ${{ matrix.target != 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: |
+          python3 companions/leg-web/tests/lifecycle_smoke.py \
+            companions/target/debug/leg-web \
+            target/debug/leg \
+            companions/target/debug/leg-ui-supervisor
 
       - name: TUI Linux PTY smoke (locked)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
@@ -117,5 +144,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check companion formatting
+        run: cargo fmt --manifest-path companions/Cargo.toml --all -- --check
+
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run Web host Clippy
+        run: cargo clippy --locked --manifest-path companions/Cargo.toml -p leg-web --all-targets -- -D warnings

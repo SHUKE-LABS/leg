@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import shlex
+import socketserver
 import tempfile
 import threading
 import time
@@ -551,6 +552,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
 
+class LoopbackThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -590,7 +597,7 @@ def main() -> int:
     fixture.prepare_hook()
     handler_type = type("FixtureHandler", (Handler,), {"fixture": fixture})
     try:
-        server = http.server.ThreadingHTTPServer((args.host, args.port), handler_type)
+        server = LoopbackThreadingHTTPServer((args.host, args.port), handler_type)
     except OSError as error:
         parser.error(f"cannot listen on {args.host}:{args.port}: {error}")
     server.daemon_threads = True
