@@ -2480,6 +2480,179 @@ fn exchange_stream_json_preserves_text_tool_text_order_for_all_providers() {
 }
 
 #[test]
+fn exchange_stream_json_marks_tool_round_limit_cap_without_dispatching_capped_tools() {
+    let capped_tool_id = "toolu_capped";
+    let cwd = fixture_dir("stream-tool-round-cap");
+    let (base_url, requests) = spawn_sse_sequence_server(vec![
+        sse_tool_use_reply(
+            "toolu_before_cap",
+            "read",
+            &serde_json::json!({"path":"notes.txt"}),
+        ),
+        sse_tool_use_reply(
+            capped_tool_id,
+            "bash",
+            &serde_json::json!({"command":"touch capped.txt"}),
+        ),
+    ]);
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_MAX_TOOL_ROUNDS", "1")
+        .arg("exchange")
+        .arg("--stream-json");
+    let output = run(command, Some("keep going with tools\n"));
+    assert!(
+        output.status.success(),
+        "capped stream exchange failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stream output is UTF-8");
+    let records: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each output line is JSON"))
+        .collect();
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "provider kept requesting tools"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "turn_end")
+            .count(),
+        1,
+        "a capped turn has exactly one terminal record: {stdout}"
+    );
+    let terminal = records
+        .iter()
+        .find(|record| record["event"] == "turn_end")
+        .expect("terminal record");
+    assert_eq!(terminal["capped"], true);
+
+    let tool_events: Vec<(&str, &str)> = records
+        .iter()
+        .filter(|record| record["event"] == "tool_call" || record["event"] == "tool_result")
+        .map(|record| {
+            (
+                record["event"].as_str().expect("tool event name"),
+                record["tool_use_id"].as_str().expect("tool event id"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tool_events,
+        [
+            ("tool_call", "toolu_before_cap"),
+            ("tool_result", "toolu_before_cap"),
+        ]
+    );
+    assert!(
+        !tool_events.iter().any(|(_, id)| *id == capped_tool_id),
+        "the capped reply's tool must not be dispatched"
+    );
+    assert!(!cwd.join("capped.txt").exists());
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn exchange_stream_json_records_pretool_denial_consistently_with_trail() {
+    let cwd = fixture_dir("stream-pretool-deny");
+    let trail = cwd.join("trail.jsonl");
+    let hook = write_pretool_hook(
+        &cwd,
+        r#"payload="$(cat)"
+printf '%s' "$payload" | grep -Fq '"hook_event_name":"PreToolUse"' || exit 2
+printf '%s' "$payload" | grep -Fq '"tool_name":"bash"' || exit 3
+printf '{"decision":"deny","reason":"bash is forbidden"}'
+"#,
+    );
+    let (base_url, requests) = spawn_sse_sequence_server(vec![
+        sse_tool_use_reply(
+            "toolu_stream_denied",
+            "bash",
+            &serde_json::json!({"command":"touch blocked.txt"}),
+        ),
+        sse_text_reply("done"),
+    ]);
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_PRETOOL_HOOK", &hook)
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["exchange", "--stream-json"]);
+    let output = run(command, Some("try a forbidden command\n"));
+    assert!(
+        output.status.success(),
+        "denied stream exchange failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !cwd.join("blocked.txt").exists(),
+        "denied handler must not run"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+
+    let stdout = String::from_utf8(output.stdout).expect("stream output is UTF-8");
+    let records: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each output line is JSON"))
+        .collect();
+    let denied = records
+        .iter()
+        .find(|record| record["event"] == "tool_result")
+        .expect("stream records the denied tool result");
+    assert_eq!(denied["tool_use_id"], "toolu_stream_denied");
+    assert_eq!(denied["status"], "denied");
+
+    let stream_tools: Vec<(String, String, Option<String>)> = records
+        .iter()
+        .filter(|record| record["event"] == "tool_call" || record["event"] == "tool_result")
+        .map(|record| {
+            (
+                record["event"].as_str().expect("event name").to_owned(),
+                record["tool_use_id"].as_str().expect("tool id").to_owned(),
+                record["status"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    let trail_tools: Vec<(String, String, Option<String>)> = read_events(&trail)
+        .iter()
+        .filter(|record| record["event"] == "tool_call" || record["event"] == "tool_result")
+        .map(|record| {
+            (
+                record["event"].as_str().expect("event name").to_owned(),
+                record["tool_use_id"].as_str().expect("tool id").to_owned(),
+                record["status"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        stream_tools,
+        [
+            (
+                "tool_call".to_owned(),
+                "toolu_stream_denied".to_owned(),
+                None
+            ),
+            (
+                "tool_result".to_owned(),
+                "toolu_stream_denied".to_owned(),
+                Some("denied".to_owned()),
+            ),
+        ]
+    );
+    assert_eq!(
+        stream_tools, trail_tools,
+        "stream and trail tool records differ"
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
 fn exchange_stream_json_prestart_errors_emit_no_records_or_provider_requests() {
     let cwd = fixture_dir("stream-prestart-errors");
     let store = cwd.join("empty-sessions");
