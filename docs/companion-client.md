@@ -33,6 +33,63 @@ configuration and `LEG_PRETOOL_HOOK` are inherited by leg. The companion does
 not resolve credentials, retry requests, rehydrate history, run tools, or write
 authoritative trails.
 
+## Shared session catalog
+
+TUI and Web use `SessionCatalog` from the same companion package. The catalog
+stores names, the selected canonical working directory, timestamps, display
+metadata, and separate per-interface drafts. It never stores process
+environment values or provider credentials.
+
+The default state root is `$XDG_STATE_HOME/leg-ui` on Linux, falling back to
+`~/.local/state/leg-ui`; on macOS it is
+`~/Library/Application Support/leg-ui`. Windows uses
+`%LOCALAPPDATA%/leg-ui`. Set `LEG_UI_STATE_DIR` or
+`SessionCatalogConfig::state_dir` to choose another root. Metadata is kept in
+`catalog.json`; leg-owned JSONL trails are kept in `sessions/`.
+Catalog-managed turns always pass that `sessions/` directory as
+`LEG_SESSION_DIR`, even if the launching process inherited another value.
+The lower-level `Client` API retains its standalone session-store resolution.
+
+Opening or browsing the catalog reads trails without running leg or executing
+tools. The browser pairs tool calls with their results and represents successful,
+failed, interrupted, and incomplete turns. A compatible future event is
+ignored while known history is kept. Missing or malformed trails produce
+warnings and read-only entries. A trail without catalog metadata is shown as a
+recovered, read-only session until a person selects an existing workspace; the
+catalog never derives a workspace from tool output. If a saved workspace
+disappears, submission stays blocked until a replacement is selected.
+
+Catalog updates use a cross-process lock and atomic file replacement. New UI
+sessions remain draft records until leg emits the session id at `turn_start`;
+that id is recorded before later turn success or failure. Reopening or importing
+a session only reads its trail. Starting another prompt and retrying a failed
+or incomplete prompt are explicit operations. Retry keeps the original prompt
+and returns a warning that tools may run again. The supervisor's session lock
+is held until owned leg and tool processes finish; catalog workspace changes
+and retries require that lock to be idle.
+
+Use `SessionCatalog::export_transcript` to export the parsed leg trail. It
+contains trail events only, without catalog metadata or inherited environment
+values. Failed and incomplete turns are displayed but are not included in
+resumed provider history; leg reconstructs history from complete successful
+turns in its own trail.
+
+For example, a host UI creates a draft and submits it explicitly:
+
+```rust,ignore
+let catalog = SessionCatalog::open(SessionCatalogConfig::default())?;
+let draft = catalog.create_draft(
+    SessionInterface::Tui,
+    Some("Build session".into()),
+    Some(&working_directory),
+)?;
+let mut turn = catalog.start_new(&draft.id, SessionInterface::Tui, prompt)?;
+while let Some(event) = turn.observe()? {
+    // Render validated events; turn_start binds the leg session id to the draft.
+}
+let outcome = turn.wait()?;
+```
+
 ## Binary selection
 
 The default resolver finds `leg` on `PATH`. A host UI may set
