@@ -1,0 +1,3 @@
+[workspace]
+members = ["leg-ui-client"]
+resolver = "3"
