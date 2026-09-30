@@ -386,12 +386,42 @@ fn open_lock_file(path: &Path) -> Result<File, String> {
         .map_err(|error| format!("could not open lock file {}: {error}", path.display()))
 }
 
-fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Option<File>, String> {
+pub(crate) fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Option<File>, String> {
     let lock = open_lock_file(&store_dir.join(format!(".leg-ui-session-{session_id}.lock")))?;
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock)),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(format!("could not lock session {session_id}: {error}")),
+    }
+}
+
+/// Reads whether a driver lock is held without creating a lock file. This is
+/// for catalog display only; state-changing operations use the guard methods
+/// above and hold the guard through their metadata update.
+pub(crate) fn session_lock_is_held(store_dir: &Path, session_id: &str) -> Result<bool, String> {
+    let path = store_dir.join(format!(".leg-ui-session-{session_id}.lock"));
+    lock_is_held_if_present(&path, session_id)
+}
+
+pub(crate) fn creation_lock_is_held(store_dir: &Path) -> Result<bool, String> {
+    lock_is_held_if_present(
+        &store_dir.join(".leg-ui-client-create.lock"),
+        "session creation",
+    )
+}
+
+fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    let lock = match options.open(path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not open {label} lock: {error}")),
+    };
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(format!("could not inspect {label} lock: {error}")),
     }
 }
 

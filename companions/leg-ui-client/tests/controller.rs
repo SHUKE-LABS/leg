@@ -12,8 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use leg_ui_client::{
-    Client, ClientConfig, LegSession, ResolveError, StartError, StreamEvent, TurnOutcome,
-    TurnRequest,
+    Client, ClientConfig, LegSession, ResolveError, SessionCatalog, SessionCatalogConfig,
+    SessionInterface, StartError, StreamEvent, TurnOutcome, TurnRequest,
 };
 use serde_json::{Value, json};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -433,6 +433,244 @@ fn collect_events(turn: &mut leg_ui_client::TurnHandle) -> Vec<StreamEvent> {
     events
 }
 
+fn collect_catalog_events(turn: &mut leg_ui_client::CatalogTurn) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    while let Some(event) = turn.observe().expect("observe catalog turn") {
+        events.push(event);
+    }
+    events
+}
+
+fn shared_catalog_controller_contract(
+    scratch: &Path,
+    leg: &Path,
+    supervisor: &Path,
+    first_cwd: &Path,
+    second_cwd: &Path,
+    sentinel: &str,
+) {
+    let first_cwd = fs::canonicalize(first_cwd).expect("canonicalize first catalog workspace");
+    let second_cwd = fs::canonicalize(second_cwd).expect("canonicalize second catalog workspace");
+    let state_dir = scratch.join("shared-catalog");
+    let inherited_store = scratch.join("inherited-session-store");
+    let provider = MockProvider::start(vec![
+        MockReply::stream(bash_tool_reply("pwd-one", "pwd", "")),
+        MockReply::stream(text_reply("first final answer")),
+        MockReply::stream(bash_tool_reply("pwd-two", "pwd", "")),
+        MockReply::stream(text_reply("second final answer")),
+        MockReply::error(
+            500,
+            json!({"error":{"type":"api_error","message":"temporary fixture failure"}}).to_string(),
+        ),
+        MockReply::stream(text_reply("retried final answer")),
+        MockReply::error(
+            500,
+            json!({"error":{"type":"api_error","message":format!("first turn fixture failure: {sentinel}")}})
+                .to_string(),
+        ),
+    ]);
+    let mut environment = EnvGuard::new();
+    environment.set("ANTHROPIC_BASE_URL", &provider.base_url);
+    environment.set("LEG_SESSION_DIR", &inherited_store);
+    let config = SessionCatalogConfig {
+        state_dir: Some(state_dir.clone()),
+        leg_bin: Some(leg.to_path_buf()),
+        supervisor_bin: Some(supervisor.to_path_buf()),
+    };
+
+    let first_controller = SessionCatalog::open(config.clone()).expect("open first catalog");
+    let draft = first_controller
+        .create_draft(
+            SessionInterface::Tui,
+            Some("shared session".into()),
+            Some(first_cwd.as_path()),
+        )
+        .expect("create UI draft");
+    first_controller
+        .save_draft(
+            &draft.id,
+            SessionInterface::Tui,
+            "TUI draft survives".into(),
+        )
+        .expect("save TUI draft");
+    first_controller
+        .save_display_metadata(&draft.id, "color".into(), json!("blue"))
+        .expect("save display metadata");
+
+    let mut first = first_controller
+        .start_new(&draft.id, SessionInterface::Tui, "first catalog prompt")
+        .expect("start first catalog turn");
+    let first_events = collect_catalog_events(&mut first);
+    assert_success(first.wait().expect("finish first catalog turn"));
+    let session_id = first
+        .session_id()
+        .expect("new leg id is persisted at turn_start")
+        .to_string();
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        StreamEvent::TurnStart {
+            session_id: Some(id),
+            ..
+        } if id == &session_id
+    )));
+
+    let second_controller = SessionCatalog::open(config.clone()).expect("reopen second catalog");
+    let after_first = second_controller
+        .get(&session_id)
+        .expect("browse shared session");
+    assert_eq!(after_first.name.as_deref(), Some("shared session"));
+    assert_eq!(after_first.cwd.as_deref(), Some(first_cwd.as_path()));
+    assert_eq!(after_first.turns.len(), 1);
+    assert_eq!(
+        after_first.turns[0].outcome,
+        leg_ui_client::TrailOutcome::Succeeded
+    );
+    let tool_output = after_first.turns[0].tools[0]
+        .result
+        .as_ref()
+        .unwrap()
+        .result
+        .as_deref()
+        .unwrap_or("<missing tool output>");
+    assert!(
+        tool_output.contains(first_cwd.to_string_lossy().as_ref()),
+        "tool output {tool_output:?} does not contain cwd {}",
+        first_cwd.display()
+    );
+    second_controller
+        .save_draft(
+            &session_id,
+            SessionInterface::Web,
+            "Web draft stays independent".into(),
+        )
+        .expect("save Web draft");
+    second_controller
+        .set_workspace(&session_id, second_cwd.as_path())
+        .expect("change workspace while idle");
+    let after_workspace_change = second_controller
+        .get(&session_id)
+        .expect("read changed workspace");
+    assert_eq!(
+        after_workspace_change.drafts[&SessionInterface::Tui],
+        "TUI draft survives"
+    );
+    assert_eq!(
+        after_workspace_change.drafts[&SessionInterface::Web],
+        "Web draft stays independent"
+    );
+
+    let mut second = second_controller
+        .start_existing(&session_id, SessionInterface::Web, "second catalog prompt")
+        .expect("continue from another controller");
+    let second_events = collect_catalog_events(&mut second);
+    assert_success(second.wait().expect("finish second catalog turn"));
+    assert!(second_events.iter().any(|event| matches!(
+        event,
+        StreamEvent::TurnStart {
+            session_id: Some(id),
+            ..
+        } if id == &session_id
+    )));
+
+    let failed_prompt = "retry this failed catalog prompt";
+    let mut failed = second_controller
+        .start_existing(&session_id, SessionInterface::Web, failed_prompt)
+        .expect("start a turn that fails");
+    let _ = collect_catalog_events(&mut failed);
+    assert!(matches!(
+        failed.wait().expect("collect provider failure"),
+        TurnOutcome::Failed { .. }
+    ));
+    let retry = second_controller
+        .prepare_retry(&session_id)
+        .expect("prepare explicit retry");
+    assert_eq!(retry.prompt(), failed_prompt);
+    assert!(retry.warning().contains("tools again"));
+    let mut retried = second_controller
+        .confirm_retry(&retry, SessionInterface::Web)
+        .expect("confirm explicit retry");
+    let _ = collect_catalog_events(&mut retried);
+    assert_success(retried.wait().expect("finish retry"));
+
+    let first_failure_draft = second_controller
+        .create_draft(
+            SessionInterface::Web,
+            Some("named first failure".into()),
+            Some(first_cwd.as_path()),
+        )
+        .expect("create first-failure draft");
+    let mut first_failure = second_controller
+        .start_new(
+            &first_failure_draft.id,
+            SessionInterface::Web,
+            "first provider request fails",
+        )
+        .expect("start first turn that fails");
+    let _ = collect_catalog_events(&mut first_failure);
+    assert!(matches!(
+        first_failure.wait().expect("collect first-turn failure"),
+        TurnOutcome::Failed { .. }
+    ));
+    let first_failed_id = first_failure
+        .session_id()
+        .expect("first-turn failure retains the emitted session id")
+        .to_string();
+    let reopened_failure = second_controller
+        .get(&first_failed_id)
+        .expect("failed first turn remains browsable");
+    assert_eq!(
+        reopened_failure.name.as_deref(),
+        Some("named first failure")
+    );
+    assert_eq!(
+        reopened_failure.turns[0].outcome,
+        leg_ui_client::TrailOutcome::Failed
+    );
+    let failed_transcript = second_controller
+        .export_transcript(&first_failed_id)
+        .expect("export failed trail");
+    assert!(!failed_transcript.contains(sentinel));
+
+    let records = provider.finish();
+    assert_eq!(records.len(), 7);
+    for record in &records {
+        let request = record.body.to_string();
+        assert!(!request.contains("shared session"));
+        assert!(!request.contains("TUI draft survives"));
+        assert!(!request.contains("Web draft stays independent"));
+        assert!(!request.contains("blue"));
+    }
+    let second_turn_request = records[2].body.to_string();
+    assert!(second_turn_request.contains("first final answer"));
+    assert!(second_turn_request.contains(first_cwd.to_string_lossy().as_ref()));
+    let changed_cwd_observation = records[3].body.to_string();
+    assert!(changed_cwd_observation.contains(second_cwd.to_string_lossy().as_ref()));
+    let retry_request = records[5].body.to_string();
+    assert_eq!(retry_request.matches(failed_prompt).count(), 1);
+    assert!(retry_request.contains("first final answer"));
+
+    let sessions_dir = state_dir.join("sessions");
+    assert!(sessions_dir.join(format!("{session_id}.jsonl")).is_file());
+    assert!(
+        !inherited_store.exists(),
+        "catalog-managed sessions override inherited LEG_SESSION_DIR"
+    );
+    let transcript = second_controller
+        .export_transcript(&session_id)
+        .expect("export leg trail only");
+    assert!(!transcript.contains(sentinel));
+    assert!(!transcript.contains("shared session"));
+    assert!(!transcript.contains("TUI draft survives"));
+    let index = fs::read_to_string(state_dir.join("catalog.json")).expect("read catalog index");
+    assert!(!index.contains(sentinel));
+    assert_eq!(second_controller.get(&session_id).unwrap().turns.len(), 4);
+    assert!(
+        sessions_dir
+            .join(format!("{first_failed_id}.jsonl"))
+            .is_file()
+    );
+}
+
 fn create_npm_fixture(root: &Path, native_leg: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let launcher = root.join("node_modules/@shukelabs/leg/leg.js");
     fs::create_dir_all(launcher.parent().unwrap()).expect("create npm package");
@@ -670,6 +908,23 @@ fn companion_controller_contract_and_cleanup() {
             .body
             .to_string()
             .contains("第一行：检查会话\\n第二行：保留换行与中文。")
+    );
+
+    let catalog_workspaces = tempfile::Builder::new()
+        .prefix("catalog-cwd-")
+        .tempdir_in("/tmp")
+        .expect("catalog workspace root");
+    let first_catalog_cwd = catalog_workspaces.path().join("workspace-one");
+    let second_cwd = catalog_workspaces.path().join("workspace-two");
+    fs::create_dir_all(&first_catalog_cwd).expect("create first catalog workspace");
+    fs::create_dir_all(&second_cwd).expect("create second catalog workspace");
+    shared_catalog_controller_contract(
+        scratch.path(),
+        &leg,
+        &supervisor,
+        &first_catalog_cwd,
+        &second_cwd,
+        sentinel,
     );
 
     // Default PATH resolution follows a global npm symlink to the published
@@ -1120,7 +1375,11 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
 
 #[track_caller]
 fn read_pid(path: &Path) -> u32 {
-    wait_for_file(path, Duration::from_secs(3));
+    wait_until(Duration::from_secs(3), || {
+        fs::read_to_string(path)
+            .ok()
+            .is_some_and(|value| value.trim().parse::<u32>().is_ok())
+    });
     fs::read_to_string(path)
         .expect("read process id")
         .trim()

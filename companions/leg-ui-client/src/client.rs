@@ -816,7 +816,7 @@ fn redact_stream_event(event: &mut StreamEvent) {
     }
 }
 
-fn redact_value(value: &mut Value) {
+pub(crate) fn redact_value(value: &mut Value) {
     match value {
         Value::String(text) => *text = redact_credentials(std::mem::take(text)),
         Value::Array(items) => items.iter_mut().for_each(redact_value),
