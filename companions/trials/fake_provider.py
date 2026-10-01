@@ -35,7 +35,7 @@ SCENARIOS = (
     "reopen-after-interruption",
 )
 PAUSE_MS = 1200
-BROWSER_PAUSE_MS = 5000
+BROWSER_PAUSE_MS = 12000
 TRIAL_LINES = "Line one: keep this first.\n第二行：保留中文。\nLine three: keep this third."
 UNTRUSTED_MARKDOWN = (
     "<script>window.__legXss = true</script>\n"
@@ -126,6 +126,8 @@ class Fixture:
             "TRIAL-NAV-SEED",
             "TRIAL-NAV-CONTINUE",
             "TRIAL-NAV-LOSER",
+            "TRIAL-SEARCH-LARGE-TOOL",
+            "TRIAL-COPY-UNICODE",
             "TRIAL-HISTORY-SEED",
             "TRIAL-HISTORY-STREAM",
             "TRIAL-CROSS-TAB",
@@ -501,6 +503,19 @@ class Fixture:
                 self.workspace is not None and str(self.workspace.resolve()) in history,
             )
             self.send_stream(handler, [{"type": "text", "text": "The reopened session kept its prior tool history and workspace."}])
+            return
+        if marker == "TRIAL-SEARCH-LARGE-TOOL":
+            if self.has_tool_result(payload):
+                self.send_stream(handler, [{"type": "text", "text": "Search used the full tool result."}])
+            else:
+                command = "python3 -c 'print(\"S\" * 1000 + \"HIDDEN_TOOL_SEARCH_SENTINEL_Ω\")'"
+                self.send_stream(handler, [{"type": "tool_use", "name": "bash", "input": {"command": command}}], stop_reason="tool_use")
+            return
+        if marker == "TRIAL-COPY-UNICODE":
+            self.send_stream(
+                handler,
+                [{"type": "text", "text": "Unicode reply Ω with two lines.\n\n```text\nconst greeting = '你好';\nsecond line Δ\n```\nFinal line."}],
+            )
             return
         if marker == "TRIAL-CHINESE" or marker == "chinese-multiline":
             all_text = "\n".join(text_content(item.get("content")) for item in payload.get("messages", []) if isinstance(item, dict) and item.get("role") == "user")

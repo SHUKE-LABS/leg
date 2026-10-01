@@ -134,6 +134,30 @@ textarea:focus-visible,
   font-size: 0.875rem;
 }
 
+.session-filter {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.session-filter label,
+.transcript-search label {
+  color: #42564c;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.session-filter input,
+.transcript-search input,
+.copy-fallback textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #9caaa3;
+  border-radius: 0.45rem;
+  padding: 0.55rem 0.65rem;
+  color: #182327;
+  background: #fff;
+}
+
 .rail-note {
   margin: 0.35rem 0 0;
   color: #54645c;
@@ -203,6 +227,64 @@ textarea:focus-visible,
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.transcript-controls {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.65rem 1rem;
+  border-bottom: 1px solid #e1e7e3;
+  padding: 0.55rem clamp(1rem, 3vw, 2.25rem) 0.45rem;
+  background: #fff;
+}
+
+.transcript-search {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.transcript-search-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.transcript-search-row input {
+  flex: 1 1 14rem;
+  min-height: 2.25rem;
+}
+
+.transcript-search-row button,
+.transcript-controls > button,
+.transcript-download > button {
+  min-height: 2.25rem;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.78rem;
+}
+
+.transcript-download {
+  display: grid;
+  flex: 0 0 auto;
+  justify-items: end;
+  gap: 0.15rem;
+}
+
+.transcript-search-status,
+.workbench-help {
+  margin: 0;
+  color: #54645c;
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.workbench-help {
+  border-bottom: 1px solid #e7ece9;
+  padding: 0.25rem clamp(1rem, 3vw, 2.25rem) 0.4rem;
+  background: #fff;
 }
 
 .session-entry-name {
@@ -615,12 +697,88 @@ textarea:focus-visible,
 
 .message-heading {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.55rem;
   color: #41564b;
   font-size: 0.76rem;
   font-weight: 700;
+}
+
+.message-copy-button,
+.code-copy-button,
+.tool-copy-button,
+.retry-turn-button {
+  min-height: 1.9rem;
+  padding: 0.2rem 0.5rem;
+  color: #355b4b;
+  font-size: 0.72rem;
+}
+
+.message-copy-button {
+  margin-left: auto;
+}
+
+.message-code-block {
+  margin: 0.7rem 0;
+}
+
+.message-code-block .code-copy-button {
+  display: block;
+  margin-left: auto;
+  border-radius: 0.45rem 0.45rem 0 0;
+}
+
+.message-code-block pre {
+  margin: 0;
+  border-top-right-radius: 0;
+}
+
+.tool-copy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.copy-fallback {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+  border: 1px solid #d5b7a5;
+  border-radius: 0.45rem;
+  padding: 0.5rem;
+  background: #fff8f3;
+  font-size: 0.75rem;
+}
+
+.copy-fallback textarea {
+  min-height: 4rem;
+  resize: vertical;
+  white-space: pre-wrap;
+}
+
+.retry-turn-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.65rem;
+  border-top: 1px solid #e1e7e3;
+  padding-top: 0.55rem;
+}
+
+.retry-turn-warning {
+  margin: 0;
+  color: #7b4b1f;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.search-match-current {
+  outline: 3px solid #b0791e;
+  outline-offset: 2px;
 }
 
 .message-content > :first-child {
@@ -854,6 +1012,7 @@ textarea:focus-visible,
 
   .session-rail {
     flex-direction: row;
+    flex-wrap: wrap;
     align-items: center;
     border-right: 0;
     border-bottom: 1px solid #d5ded9;
@@ -952,7 +1111,7 @@ textarea:focus-visible,
     border-right: 0;
     border-bottom: 1px solid #d5ded9;
     padding: 0.35rem 0.6rem;
-    max-height: 7.5rem;
+    max-height: 11rem;
   }
 
   .rail-heading {
@@ -974,12 +1133,27 @@ textarea:focus-visible,
     padding: 0.1rem 0.1rem 0.25rem;
   }
 
+  .session-filter {
+    order: 3;
+    flex: 1 1 100%;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+  }
+
+  .session-list {
+    order: 4;
+  }
+
   .session-entry {
     flex: 0 0 13rem;
   }
 
   .session-list-empty {
     display: none;
+  }
+
+  #session-list-no-results {
+    order: 5;
   }
 
   .rail-form {
@@ -1047,6 +1221,28 @@ textarea:focus-visible,
   }
 
   .connection-message {
+    padding-inline: 0.85rem;
+  }
+
+  .transcript-controls {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 0.45rem 0.85rem;
+  }
+
+  .transcript-search-row input {
+    flex-basis: 100%;
+  }
+
+  .transcript-controls > button {
+    align-self: flex-end;
+  }
+
+  .transcript-download {
+    justify-items: end;
+  }
+
+  .workbench-help {
     padding-inline: 0.85rem;
   }
 

@@ -20,6 +20,10 @@
             <h1>Sessions</h1>
             <button id="new-conversation" class="quiet-button" type="button">New</button>
           </div>
+          <div class="session-filter">
+            <label for="session-filter">Filter by title</label>
+            <input id="session-filter" type="search" autocomplete="off" placeholder="Search session titles" />
+          </div>
           <form id="rename-form" class="rail-form" hidden>
             <label for="rename-input">Session name</label>
             <input id="rename-input" type="text" maxlength="120" autocomplete="off" />
@@ -32,6 +36,7 @@
           <p id="session-list-heading" class="rail-section-label">Recent sessions</p>
           <ul id="session-list" class="session-list" aria-labelledby="session-list-heading"></ul>
           <p id="session-list-empty" class="rail-note" hidden>No saved sessions yet. Choose New to begin.</p>
+          <p id="session-list-no-results" class="rail-note" role="status" hidden>No sessions match this title.</p>
           <p id="session-list-error" class="rail-message" role="status" hidden></p>
           <p class="rail-note rail-help">The workspace is the working directory for tools.</p>
         </nav>
@@ -96,6 +101,25 @@
             <p id="connection-message" class="connection-message" role="status" hidden></p>
 
             <aside id="transcript-warnings" class="transcript-warnings" role="note" hidden></aside>
+
+            <section class="transcript-controls" aria-label="Transcript search and export">
+              <div class="transcript-search">
+                <label for="transcript-search">Search this transcript</label>
+                <div class="transcript-search-row">
+                  <input id="transcript-search" type="search" autocomplete="off" placeholder="Search prompts, replies, and tool text" />
+                  <button id="transcript-search-prev" class="quiet-button" type="button" disabled>Previous</button>
+                  <button id="transcript-search-next" class="quiet-button" type="button" disabled>Next</button>
+                  <button id="transcript-search-clear" class="quiet-button" type="button" disabled>Clear</button>
+                </div>
+                <p id="transcript-search-status" class="transcript-search-status" role="status" aria-live="polite">Enter text to search this transcript.</p>
+              </div>
+              <div class="transcript-download">
+                <button id="download-transcript" class="quiet-button" type="button">Download transcript</button>
+                <p id="download-status" class="transcript-search-status" role="status" aria-live="polite"></p>
+              </div>
+            </section>
+            <p class="workbench-help">Title and transcript searches stay local; Previous and Next navigate matches, and Clear resets the query. Copy and download are explicit. “Retry turn” resubmits a finished prompt and may repeat tool side effects; “Retry same send” appears only when the host confirms a send was not accepted.</p>
+            <p id="copy-status" class="transcript-search-status copy-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
 
             <div id="transcript" class="transcript" tabindex="0" aria-label="Conversation transcript. Use Home, End, Page Up, and Page Down to browse history.">
               <div id="messages" class="messages"></div>
