@@ -278,6 +278,7 @@ impl PendingStop {
 #[serde(deny_unknown_fields)]
 struct LiveSnapshot {
     turn_id: String,
+    turn_index: Option<u64>,
     prompt: String,
     text: String,
     status: String,
@@ -1195,6 +1196,7 @@ impl HostState {
             });
             entry.live = Some(LiveSnapshot {
                 turn_id: turn_id.clone(),
+                turn_index: None,
                 prompt: body.prompt.clone(),
                 text: String::new(),
                 status: "starting".into(),
@@ -1589,8 +1591,16 @@ impl HostState {
         turn_id: &str,
         event: StreamEvent,
     ) -> Result<(), ApiError> {
-        let value = stream_event_value(&event);
-        {
+        let observed_at_ms = matches!(
+            &event,
+            StreamEvent::ToolCall { .. } | StreamEvent::ToolResult { .. }
+        )
+        .then(now_millis);
+        let mut value = stream_event_value(&event);
+        if let Some(observed_at_ms) = observed_at_ms {
+            value["observed_at_ms"] = json!(observed_at_ms);
+        }
+        let active_turn_index = {
             let mut runtime = lock(&self.inner.runtime);
             let key = runtime_id(&runtime, ledger_id);
             let entry = runtime
@@ -1603,10 +1613,14 @@ impl HostState {
                 }
                 match &event {
                     StreamEvent::TurnStart {
-                        provider, model, ..
+                        provider,
+                        model,
+                        turn_index,
+                        ..
                     } => {
                         live.provider = Some(provider.clone());
                         live.model = Some(model.clone());
+                        live.turn_index = *turn_index;
                     }
                     StreamEvent::TextDelta { text, .. } => live.text.push_str(text),
                     StreamEvent::ToolCall {
@@ -1615,7 +1629,13 @@ impl HostState {
                         input,
                         ..
                     } => {
-                        let tool = json!({"tool_use_id": tool_use_id, "tool_name": tool_name, "input": input, "status": "running"});
+                        let tool = json!({
+                            "tool_use_id": tool_use_id,
+                            "tool_name": tool_name,
+                            "input": input,
+                            "status": "running",
+                            "call_observed_at_ms": observed_at_ms,
+                        });
                         live.active_tool = Some(tool.clone());
                         live.tools.push(tool);
                     }
@@ -1630,13 +1650,15 @@ impl HostState {
                         }) {
                             tool["status"] = Value::String(status.clone());
                             tool["output"] = output.clone();
+                            tool["result_observed_at_ms"] = json!(observed_at_ms);
                         }
                         live.active_tool = None;
                     }
                     _ => {}
                 }
             }
-        }
+            entry.live.as_ref().and_then(|live| live.turn_index)
+        };
         if let StreamEvent::TurnStart {
             provider,
             model,
@@ -1662,6 +1684,65 @@ impl HostState {
                 "web.turn_metadata".into(),
                 metadata,
             );
+        }
+        match &event {
+            StreamEvent::ToolCall { tool_use_id, .. } => {
+                if let (Some(turn_index), Some(observed_at_ms)) =
+                    (active_turn_index, observed_at_ms)
+                {
+                    save_tool_observation(
+                        &self.inner.catalog,
+                        session_id,
+                        turn_index,
+                        tool_use_id,
+                        "call_observed_at_ms",
+                        observed_at_ms,
+                    );
+                }
+            }
+            StreamEvent::ToolResult { tool_use_id, .. } => {
+                if let (Some(turn_index), Some(observed_at_ms)) =
+                    (active_turn_index, observed_at_ms)
+                {
+                    save_tool_observation(
+                        &self.inner.catalog,
+                        session_id,
+                        turn_index,
+                        tool_use_id,
+                        "result_observed_at_ms",
+                        observed_at_ms,
+                    );
+                }
+            }
+            StreamEvent::TurnEnd {
+                capped,
+                turn_index: Some(turn_index),
+                ..
+            } => {
+                let mut metadata = self
+                    .inner
+                    .catalog
+                    .get(session_id)
+                    .ok()
+                    .and_then(|session| session.display.get("web.turn_metadata").cloned())
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
+                let entry = metadata
+                    .as_object_mut()
+                    .expect("turn metadata is an object")
+                    .entry(turn_index.to_string())
+                    .or_insert_with(|| json!({}));
+                if !entry.is_object() {
+                    *entry = json!({});
+                }
+                entry["capped"] = json!(capped);
+                let _ = self.inner.catalog.save_display_metadata(
+                    session_id,
+                    "web.turn_metadata".into(),
+                    metadata,
+                );
+            }
+            _ => {}
         }
         self.append_event(ledger_id, session_id, turn_id, "stream", value)?;
         Ok(())
@@ -1967,6 +2048,42 @@ fn stream_event_value(event: &StreamEvent) -> Value {
             json!({"event":event,"seq":seq,"record":record})
         }
     }
+}
+
+fn save_tool_observation(
+    catalog: &SessionCatalog,
+    session_id: &str,
+    turn_index: u64,
+    tool_use_id: &str,
+    field: &str,
+    observed_at_ms: u64,
+) {
+    let mut metadata = catalog
+        .get(session_id)
+        .ok()
+        .and_then(|session| session.display.get("web.tool_observations").cloned())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let turns = metadata
+        .as_object_mut()
+        .expect("tool observation metadata is an object");
+    let turn = turns
+        .entry(turn_index.to_string())
+        .or_insert_with(|| json!({}));
+    if !turn.is_object() {
+        *turn = json!({});
+    }
+    let tools = turn
+        .as_object_mut()
+        .expect("turn observations are an object");
+    let tool = tools
+        .entry(tool_use_id.to_string())
+        .or_insert_with(|| json!({}));
+    if !tool.is_object() {
+        *tool = json!({});
+    }
+    tool[field] = json!(observed_at_ms);
+    let _ = catalog.save_display_metadata(session_id, "web.tool_observations".into(), metadata);
 }
 
 fn validate_bind_address(addr: SocketAddr) -> Result<(), HostError> {
@@ -2571,6 +2688,7 @@ mod tests {
             let entry = runtime.sessions.get_mut(&draft.id).unwrap();
             entry.live = Some(LiveSnapshot {
                 turn_id: "turn-metadata".into(),
+                turn_index: None,
                 prompt: "hello".into(),
                 text: String::new(),
                 status: "starting".into(),
@@ -2598,11 +2716,45 @@ mod tests {
             )
             .unwrap();
 
+        host.state
+            .record_stream_event(
+                &draft.id,
+                &draft.id,
+                "turn-metadata",
+                StreamEvent::ToolCall {
+                    seq: 1,
+                    round_index: 0,
+                    tool_use_id: "reuse-id".into(),
+                    tool_name: "bash".into(),
+                    input: json!({"command": "pwd"}),
+                },
+            )
+            .unwrap();
+        host.state
+            .record_stream_event(
+                &draft.id,
+                &draft.id,
+                "turn-metadata",
+                StreamEvent::ToolResult {
+                    seq: 2,
+                    round_index: 0,
+                    tool_use_id: "reuse-id".into(),
+                    tool_name: "bash".into(),
+                    status: "completed".into(),
+                    output: json!("done"),
+                },
+            )
+            .unwrap();
+
         let snapshot = host.state.snapshot(&draft.id).unwrap();
         let live = snapshot.active.unwrap();
         assert_eq!(live.provider.as_deref(), Some("anthropic"));
         assert_eq!(live.model.as_deref(), Some("fixture-model"));
+        assert_eq!(live.turn_index, Some(0));
         assert!(live.started_at_ms > 0);
+        assert!(live.tools[0]["call_observed_at_ms"].as_u64().is_some());
+        assert!(live.tools[0]["result_observed_at_ms"].as_u64().is_some());
+        assert_eq!(live.tools[0]["status"], "completed");
         assert_eq!(
             snapshot.session.display["web.turn_metadata"]["0"]["provider"],
             "anthropic"
@@ -2610,6 +2762,35 @@ mod tests {
         assert_eq!(
             snapshot.session.display["web.turn_metadata"]["0"]["model"],
             "fixture-model"
+        );
+        assert!(snapshot.session.display["web.tool_observations"]["0"]["reuse-id"]["call_observed_at_ms"]
+            .as_u64()
+            .is_some());
+        assert!(snapshot.session.display["web.tool_observations"]["0"]["reuse-id"]["result_observed_at_ms"]
+            .as_u64()
+            .is_some());
+        let first_call_timestamp = snapshot.session.display["web.tool_observations"]["0"]["reuse-id"]["call_observed_at_ms"]
+            .as_u64()
+            .unwrap();
+        save_tool_observation(
+            &host.state.inner.catalog,
+            &draft.id,
+            1,
+            "reuse-id",
+            "call_observed_at_ms",
+            first_call_timestamp + 1,
+        );
+        let display = host.state.inner.catalog.get(&draft.id).unwrap().display;
+        assert_eq!(
+            display["web.tool_observations"]["0"]["reuse-id"]["call_observed_at_ms"],
+            first_call_timestamp
+        );
+        assert_eq!(
+            display["web.tool_observations"]["1"]["reuse-id"]["call_observed_at_ms"],
+            first_call_timestamp + 1
+        );
+        assert!(
+            display["web.tool_observations"]["1"]["reuse-id"]["result_observed_at_ms"].is_null()
         );
 
         {
@@ -2629,10 +2810,24 @@ mod tests {
                 &draft.id,
                 "turn-metadata",
                 StreamEvent::TextDelta {
-                    seq: 1,
+                    seq: 3,
                     round_index: 0,
                     block_index: 0,
                     text: "late text".into(),
+                },
+            )
+            .unwrap();
+        host.state
+            .record_stream_event(
+                &draft.id,
+                &draft.id,
+                "turn-metadata",
+                StreamEvent::TurnEnd {
+                    seq: 4,
+                    response: json!({}),
+                    capped: true,
+                    session_id: Some(draft.id.clone()),
+                    turn_index: Some(0),
                 },
             )
             .unwrap();
@@ -2640,6 +2835,10 @@ mod tests {
         let live = snapshot.active.unwrap();
         assert_eq!(live.status, "stopping");
         assert_eq!(live.text, "late text");
+        assert_eq!(
+            snapshot.session.display["web.turn_metadata"]["0"]["capped"],
+            true
+        );
     }
 
     #[tokio::test]

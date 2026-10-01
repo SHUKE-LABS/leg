@@ -7,6 +7,7 @@ import http.client
 import asyncio
 import json
 import os
+import platform
 import queue
 import signal
 import subprocess
@@ -152,6 +153,87 @@ def recovered_request_event(session_id: str, prompt: str) -> str:
     ) + "\n"
 
 
+def long_history_fixture(session_id: str, count: int = 1000) -> str:
+    events = [
+        {
+            "schema": "baton.exchange/v1",
+            "event": "session_start",
+            "ts_ms": 1,
+            "session_id": session_id,
+        }
+    ]
+    for turn_index in range(count):
+        timestamp = (turn_index + 1) * 10
+        events.append(
+            {
+                "schema": "baton.exchange/v1",
+                "event": "request",
+                "ts_ms": timestamp,
+                "model": "fixture",
+                "base_url": "http://fixture.invalid",
+                "prompt": f"Long history prompt {turn_index}",
+                "session_id": session_id,
+                "turn_index": turn_index,
+            }
+        )
+        events.append(
+            {
+                "schema": "baton.exchange/v1",
+                "event": "tool_call",
+                "ts_ms": timestamp + 1,
+                "tool_use_id": "reused-tool-use-id",
+                "tool_name": "fixture-read",
+                "input": {"turn": turn_index, "path": f"fixture-{turn_index}.txt"},
+                "session_id": session_id,
+                "turn_index": turn_index,
+            }
+        )
+        if turn_index == count - 1:
+            continue
+        if turn_index == 3:
+            events.append(
+                {
+                    "schema": "baton.exchange/v1",
+                    "event": "response_error",
+                    "ts_ms": timestamp + 2,
+                    "kind": "interrupted",
+                    "message": "fixture interrupted before the tool result",
+                    "session_id": session_id,
+                    "turn_index": turn_index,
+                }
+            )
+            continue
+        status = {0: "completed", 1: "failed", 2: "denied"}.get(turn_index, "completed")
+        result = {
+            "schema": "baton.exchange/v1",
+            "event": "tool_result",
+            "ts_ms": timestamp + 2,
+            "tool_use_id": "reused-tool-use-id",
+            "tool_name": "fixture-read",
+            "status": status,
+            "session_id": session_id,
+            "turn_index": turn_index,
+        }
+        if status in ("failed", "denied"):
+            result["error"] = f"fixture error for turn {turn_index}"
+        elif turn_index == 4:
+            result["result"] = json.dumps({"stdout": "partial output", "stdout_omitted_bytes": 12})
+        else:
+            result["result"] = f"fixture result for turn {turn_index}"
+        events.append(result)
+        events.append(
+            {
+                "schema": "baton.exchange/v1",
+                "event": "response_ok",
+                "ts_ms": timestamp + 3,
+                "reply": f"Fixture reply for turn {turn_index}",
+                "session_id": session_id,
+                "turn_index": turn_index,
+            }
+        )
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
 def wait_until(predicate, description: str, timeout: float = 25):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -243,9 +325,10 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
 
         xss_payload = (
             '<script>window.__legXss = true</script>\n'
-            '<img src="http://leg-web-xss.invalid/pixel" '
+            '<img alt="remote image" src="http://leg-web-xss.invalid/pixel" '
             'onerror="fetch(\'/api/sessions/invalid/stop\',{method:\'POST\'})">\n'
-            '<a href="javascript:fetch(\'/api/sessions/invalid/stop\',{method:\'POST\'})">unsafe link</a>'
+            '<a href="javascript:fetch(\'/api/sessions/invalid/stop\',{method:\'POST\'})">unsafe link</a>\n'
+            'OSC/control fixture: \x1b]0;tool inspector title\x07'
         )
         (workspace / "xss-fixture.html").write_text(xss_payload, encoding="utf-8")
 
@@ -533,7 +616,25 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 tool_turn = wait_completed_submission(authority, token, session_id, 4)
                 await wait_status(page, "Succeeded")
                 wait_fixture_count(provider_authority, 5)
-                assert "Tool activity: write" in (await page.locator("#messages").inner_text())
+                write_card = page.locator(".tool-inspector").last
+                write_button = write_card.locator(".tool-disclosure")
+                assert "Tool write" in await write_button.inner_text()
+                assert "Completed" in await write_button.inner_text()
+                write_identity = await write_button.get_attribute("data-focus-key")
+                provider_calls_before_write_details = fixture_status(provider_authority)["requests"]
+                mutations_before_write_details = len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith(("/submit", "/stop"))]
+                )
+                await write_button.click()
+                write_details = await write_card.locator(".tool-detail-body").text_content()
+                assert "fixture-write.txt" in write_details
+                assert "fixture-write-ok" in write_details
+                assert "Call observed" in write_details and "Result observed" in write_details
+                assert "Timestamp unavailable" not in write_details
+                assert fixture_status(provider_authority)["requests"] == provider_calls_before_write_details
+                assert len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith(("/submit", "/stop"))]
+                ) == mutations_before_write_details
                 assert (workspace / "fixture-write.txt").read_text(encoding="utf-8") == "fixture-write-ok\n"
 
                 await composer.fill("TRIAL-LARGE-TOOL: summarize the large tool result")
@@ -541,10 +642,21 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 large_turn = wait_completed_submission(authority, token, session_id, 5)
                 await wait_status(page, "Succeeded")
                 wait_fixture_count(provider_authority, 7)
-                large_summaries = page.locator(".tool-summary p[data-output-chars]")
+                await page.wait_for_function(
+                    "identity => [...document.querySelectorAll('.tool-disclosure')].some(button => "
+                    "button.dataset.focusKey === identity && button.getAttribute('aria-expanded') === 'true')",
+                    arg=write_identity,
+                )
+                large_summaries = page.locator(".tool-preview[data-output-chars]")
                 assert await large_summaries.count() >= 1
                 assert int(await large_summaries.last.get_attribute("data-output-chars")) > 10000
                 assert len(await large_summaries.last.inner_text()) < 400
+                large_card = page.locator(".tool-inspector").last
+                large_button = large_card.locator(".tool-disclosure")
+                await large_button.click()
+                large_output = await large_card.locator(".tool-detail-field").nth(1).locator("pre").text_content()
+                assert len(large_output) > 10000
+                assert "LLLLLLLL" in large_output
                 assert tool_turn["high_water"] == 4 and large_turn["high_water"] == 5
 
                 stops_before_xss = len(
@@ -572,6 +684,26 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert await page.evaluate("() => window.__legXss") is None
                 assert fixture_status(provider_authority)["input_checks"].get("untrusted_tool_result_returned") is True
                 assert not external_attempts, external_attempts
+                xss_card = page.locator(".tool-inspector").last
+                xss_button = xss_card.locator(".tool-disclosure")
+                provider_calls_before_xss_details = fixture_status(provider_authority)["requests"]
+                mutations_before_xss_details = len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith(("/submit", "/stop"))]
+                )
+                await xss_button.click()
+                tool_text = await xss_card.locator(".tool-detail-body").text_content()
+                assert "<script>window.__legXss = true</script>" in tool_text
+                assert "javascript:fetch" in tool_text
+                assert "remote image" in tool_text, repr(tool_text)
+                assert "\x1b]0;tool inspector title\x07" in tool_text
+                assert await page.locator("#messages script, #messages img, #messages iframe").count() == 0
+                assert await page.locator("#messages a[href^='javascript:'], #messages a[href^='data:']").count() == 0
+                assert await page.evaluate("() => window.__legXss") is None
+                assert fixture_status(provider_authority)["requests"] == provider_calls_before_xss_details
+                assert not external_attempts, external_attempts
+                assert len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith(("/submit", "/stop"))]
+                ) == mutations_before_xss_details
                 stops_after_xss = len(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/stop")]
                 )
@@ -594,7 +726,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 anchor_before = await page.evaluate(
                     """() => {
                       const scroller = document.querySelector('#transcript');
-                      const item = [...document.querySelector('#messages').children].find(node => node.getBoundingClientRect().bottom > scroller.getBoundingClientRect().top);
+                      const item = [...document.querySelectorAll('#messages .transcript-turn')].find(node => node.getBoundingClientRect().bottom > scroller.getBoundingClientRect().top);
                       return item ? { key: item.dataset.key, offset: item.getBoundingClientRect().top - scroller.getBoundingClientRect().top } : null;
                     }"""
                 )
@@ -606,7 +738,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 anchor_after = await page.evaluate(
                     """key => {
                       const scroller = document.querySelector('#transcript');
-                      const item = [...document.querySelector('#messages').children].find(node => node.dataset.key === key);
+                      const item = [...document.querySelectorAll('#messages .transcript-turn')].find(node => node.dataset.key === key);
                       return item ? item.getBoundingClientRect().top - scroller.getBoundingClientRect().top : null;
                     }""",
                     anchor_before["key"],
@@ -633,6 +765,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 capped = wait_completed_submission(authority, token, session_id, 10)
                 await wait_status(page, "Capped")
                 assert capped["last_submission"]["outcome"]["capped"] is True, capped
+                assert "Output capped by Leg" in await page.locator(".turn-warning").last.inner_text()
 
                 await composer.fill("TRIAL-REOPEN-INTERRUPTION: expose an incomplete stream")
                 await page.get_by_role("button", name="Send").click()
@@ -657,6 +790,24 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 await composer.fill("TRIAL-STOP: leave this turn incomplete on host restart")
                 await page.get_by_role("button", name="Send").click()
                 await page.locator("#active-tool").wait_for(state="visible")
+                pending_turn = page.locator(".transcript-turn").last
+                pending_tool = pending_turn.locator(".tool-disclosure")
+                assert "Pending" in await pending_tool.inner_text()
+                await pending_tool.click()
+                assert await pending_tool.get_attribute("aria-expanded") == "true"
+                await page.reload(wait_until="load")
+                await page.wait_for_function(
+                    "() => document.querySelector('#active-tool') && !document.querySelector('#active-tool').hidden",
+                )
+                await page.locator("#transcript").focus()
+                await page.keyboard.press("End")
+                pending_turn = page.locator(".transcript-turn").last
+                pending_tool = pending_turn.locator(".tool-disclosure")
+                await page.wait_for_function(
+                    "() => document.querySelectorAll('.tool-disclosure').length > 0 && "
+                    "document.querySelectorAll('.tool-disclosure').item(document.querySelectorAll('.tool-disclosure').length - 1).textContent.includes('Pending')",
+                )
+                assert await pending_tool.get_attribute("aria-expanded") == "true"
                 stalled_pid_path = workspace / "trial-stalled-child.pid"
                 child_pid = wait_until(
                     lambda: int(stalled_pid_path.read_text(encoding="utf-8").strip())
@@ -710,6 +861,15 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 )
                 await page.reload(wait_until="load")
                 await wait_status(page, "Incomplete")
+                interrupted_turn = page.locator(".transcript-turn").last
+                interrupted_tool = interrupted_turn.locator(".tool-inspector")
+                assert await interrupted_tool.count() == 1
+                interrupted_button = interrupted_tool.locator(".tool-disclosure")
+                interrupted_status = await interrupted_button.inner_text()
+                assert any(label in interrupted_status for label in ("Interrupted", "Missing outcome", "Failed")), interrupted_status
+                await interrupted_button.click()
+                stopped_tool_details = await interrupted_tool.locator(".tool-detail-body").inner_text()
+                assert "Arguments" in stopped_tool_details and "Call observed" in stopped_tool_details
                 recovered = host_snapshot(
                     restart_authority,
                     urlsplit(restart_url).fragment,
@@ -782,10 +942,14 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
 
         recovered_id = "sess-103-701"
         readonly_id = "sess-103-702"
+        long_history_id = "sess-104-1000"
         (sessions_dir / f"{recovered_id}.jsonl").write_text(
             recovered_request_event(recovered_id, "recovered transcript"), encoding="utf-8"
         )
         (sessions_dir / f"{readonly_id}.jsonl").write_text("not json\n", encoding="utf-8")
+        (sessions_dir / f"{long_history_id}.jsonl").write_text(
+            long_history_fixture(long_history_id), encoding="utf-8"
+        )
 
         provider, provider_lines = start_process(
             [sys.executable, str(FAKE_PROVIDER), "--scenario", "browser", "--workspace", str(workspace_a)]
@@ -835,6 +999,29 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 browser = await playwright.chromium.launch(headless=True)
                 context = await browser.new_context(viewport={"width": 1280, "height": 800})
                 page = await context.new_page()
+                await page.add_init_script(
+                    """(() => {
+                      window.__legFeedback = [];
+                      document.addEventListener('click', event => {
+                        const target = event.target?.closest?.('.session-select[data-session-id], .tool-disclosure');
+                        if (!target) return;
+                        const isSession = target.matches('.session-select[data-session-id]');
+                        const kind = isSession ? 'session' : 'inspector';
+                        const sessionId = isSession ? target.dataset.sessionId : null;
+                        const eventTime = event.timeStamp;
+                        requestAnimationFrame(() => {
+                          const current = isSession
+                            ? document.querySelector(`.session-select[data-session-id="${CSS.escape(sessionId)}"]`)
+                            : target;
+                          const visible = isSession
+                            ? !document.querySelector('#conversation').hidden && current?.getAttribute('aria-current') === 'page'
+                            : current?.getAttribute('aria-expanded') === 'true' &&
+                              !document.getElementById(current.getAttribute('aria-controls'))?.hidden;
+                          if (visible) window.__legFeedback.push({kind, ms: performance.now() - eventTime});
+                        });
+                      }, true);
+                    })();"""
+                )
                 page_requests: list[tuple[str, str]] = []
                 page_errors: list[str] = []
                 allowed_authorities = {authority}
@@ -890,8 +1077,36 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 async def send_and_wait(target_page, request_id: int, prompt: str, session_id: str) -> dict[str, object]:
                     await target_page.locator("#prompt").fill(prompt)
                     await target_page.get_by_role("button", name="Send").click()
-                    result = await asyncio.to_thread(
-                        wait_completed_submission, authority, token, session_id, request_id
+                    try:
+                        result = await asyncio.to_thread(
+                            wait_completed_submission, authority, token, session_id, request_id
+                        )
+                    except AssertionError as error:
+                        page_state = await target_page.evaluate(
+                            """() => ({
+                              sessionId: sessionStorage.getItem('leg-web-current-session'),
+                              titleId: document.querySelector('#session-title')?.dataset.sessionId,
+                              status: document.querySelector('#turn-status')?.textContent,
+                              sendDisabled: document.querySelector('#send')?.disabled,
+                              prompt: document.querySelector('#prompt')?.value,
+                              sendError: document.querySelector('#send-error')?.textContent,
+                              guidance: document.querySelector('#session-guidance')?.textContent,
+                              turns: [...document.querySelectorAll('#messages .transcript-turn')].map(turn => ({
+                                key: turn.dataset.key,
+                                prompt: turn.querySelector('.message-user .message-content')?.textContent,
+                                outcome: turn.querySelector('.turn-outcome')?.textContent,
+                              })),
+                            })"""
+                        )
+                        raise AssertionError(
+                            f"browser state after request {request_id} timed out: {page_state}; "
+                            f"requests={page_requests}"
+                        ) from error
+                    await target_page.wait_for_function(
+                        "prompt => [...document.querySelectorAll('#messages .transcript-turn')].some(turn => "
+                        "turn.querySelector('.message-user .message-content')?.textContent === prompt && "
+                        "turn.querySelector('.turn-outcome')?.textContent === 'Succeeded')",
+                        arg=prompt,
                     )
                     await wait_status(target_page, "Succeeded")
                     return result
@@ -1019,9 +1234,29 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 assert busy_rejection == {"status": 409, "body": {"error": "session_busy"}}, busy_rejection
                 await page2.reload(wait_until="load")
                 await open_session(page2, alpha_id, "Alpha")
-                await page2.wait_for_function(
-                    "() => document.querySelector('#session-guidance')?.textContent.includes('busy')"
-                )
+                try:
+                    await page2.wait_for_function(
+                        "() => document.querySelector('#session-guidance')?.textContent.includes('busy')"
+                    )
+                except PlaywrightTimeoutError as error:
+                    page_state = await page2.evaluate(
+                        """() => ({
+                          sessionId: sessionStorage.getItem('leg-web-current-session'),
+                          titleId: document.querySelector('#session-title')?.dataset.sessionId,
+                          connection: document.querySelector('#connection-state')?.textContent,
+                          status: document.querySelector('#turn-status')?.textContent,
+                          guidance: document.querySelector('#session-guidance')?.textContent,
+                          prompt: document.querySelector('#prompt')?.value,
+                          sendDisabled: document.querySelector('#send')?.disabled,
+                          messages: document.querySelector('#messages')?.innerText,
+                        })"""
+                    )
+                    host_state = await asyncio.to_thread(host_snapshot, authority, token, alpha_id)
+                    raise AssertionError(
+                        f"busy session guidance did not appear; page={page_state}; "
+                        f"hostRunState={host_state['session'].get('run_state')}; "
+                        f"active={host_state.get('active')}; lastSubmission={host_state.get('last_submission')}"
+                    ) from error
                 assert await page2.locator("#prompt").input_value() == loser_draft
                 assert await page2.get_by_role("button", name="Send").is_disabled()
                 await open_session(page, beta_draft_id, "Beta")
@@ -1308,6 +1543,124 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 assert final_provider_status["scenario_requests"].get("TRIAL-HISTORY-STREAM") == 1
                 assert final_provider_status["scenario_requests"].get("TRIAL-CROSS-TAB") == 1
                 assert final_provider_status["scenario_requests"].get("TRIAL-LOCAL-PROVENANCE") == 1
+                long_session_button = page.locator(
+                    f'#session-list .session-select[data-session-id="{long_history_id}"]'
+                )
+                await long_session_button.wait_for()
+                await page.evaluate("window.__legFeedback = []")
+                await long_session_button.click()
+                await page.wait_for_function(
+                    "id => document.querySelector('#session-title')?.dataset.sessionId === id",
+                    arg=long_history_id,
+                )
+                await page.locator(
+                    '#messages .transcript-turn[data-turn-index="999"]'
+                ).wait_for()
+                await page.wait_for_function(
+                    "() => window.__legFeedback.some(item => item.kind === 'session')"
+                )
+                selection_ms = await page.evaluate(
+                    "() => window.__legFeedback.find(item => item.kind === 'session')?.ms"
+                )
+                assert selection_ms <= 200, selection_ms
+
+                mounted_turns = await page.locator("#messages .transcript-turn").count()
+                mounted_detail_fields = await page.locator("#messages .tool-detail-field").count()
+                assert mounted_turns < 1000, mounted_turns
+                assert mounted_detail_fields == 0, mounted_detail_fields
+                last_turn = page.locator('#messages .transcript-turn[data-turn-index="999"]')
+                last_tool_button = last_turn.locator(".tool-disclosure")
+                assert "reused-tool-use-id" in await last_tool_button.inner_text()
+                assert "Missing outcome" in await last_tool_button.inner_text()
+                provider_requests_before_expand = fixture_status(provider_authority)["requests"]
+                mutations_before_expand = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith(("/submit", "/stop"))]
+                )
+                await page.evaluate("window.__legFeedback = []")
+                await last_tool_button.click()
+                await page.wait_for_function(
+                    "() => window.__legFeedback.some(item => item.kind === 'inspector')"
+                )
+                inspector_ms = await page.evaluate(
+                    "() => window.__legFeedback.find(item => item.kind === 'inspector')?.ms"
+                )
+                assert inspector_ms <= 200, inspector_ms
+                last_details = await last_turn.locator(".tool-detail-body").text_content()
+                assert "No result was recorded." in last_details
+                assert "fixture result for turn 998" not in last_details
+                assert last_details.count("Timestamp unavailable") == 2
+                assert fixture_status(provider_authority)["requests"] == provider_requests_before_expand
+                assert len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith(("/submit", "/stop"))]
+                ) == mutations_before_expand
+
+                await page.locator("#transcript").evaluate("element => { element.scrollTop = 0; }")
+                await page.wait_for_function(
+                    "() => document.activeElement === document.querySelector('#transcript') && "
+                    "document.querySelector('#messages .transcript-turn[data-turn-index=\"0\"]')"
+                )
+                mounted_turns = await page.locator("#messages .transcript-turn").count()
+                assert mounted_turns < 1000, mounted_turns
+
+                await page.locator("#transcript").focus()
+                await page.keyboard.press("Home")
+                await page.wait_for_function(
+                    "() => document.querySelector('#messages .transcript-turn[data-turn-index=\"0\"]')"
+                )
+                for index, status in ((0, "Completed"), (1, "Failed"), (2, "Denied"), (3, "Interrupted")):
+                    button = page.locator(
+                        f'#messages .transcript-turn[data-turn-index="{index}"] .tool-disclosure'
+                    )
+                    assert status in await button.inner_text(), (index, await button.inner_text())
+                first_turn = page.locator('#messages .transcript-turn[data-turn-index="0"]')
+                await first_turn.locator(".tool-disclosure").click()
+                first_details = first_turn.locator(".tool-detail-body")
+                first_text = await first_details.text_content()
+                assert "fixture result for turn 0" in first_text
+                assert "fixture result for turn 998" not in first_text
+                assert "Timestamp unavailable" in first_text
+                await page.locator("#transcript").focus()
+                turn_four_button = page.locator(
+                    '#messages .transcript-turn[data-turn-index="4"] .tool-disclosure'
+                )
+                for _ in range(12):
+                    if await turn_four_button.count():
+                        break
+                    previous_scroll_top = await page.locator("#transcript").evaluate(
+                        "element => element.scrollTop"
+                    )
+                    await page.keyboard.press("PageDown")
+                    await page.wait_for_function(
+                        "previous => document.querySelector('#transcript').scrollTop > previous",
+                        arg=previous_scroll_top,
+                        timeout=1000,
+                    )
+                assert await turn_four_button.count(), "Page Down could not reach turn 4 within 12 pages"
+                omitted_turn = page.locator('#messages .transcript-turn[data-turn-index="4"]')
+                await omitted_turn.locator(".tool-disclosure").click()
+                omitted_details = await omitted_turn.locator(".tool-detail-body").text_content()
+                assert "Output omission" in omitted_details
+                assert "stdout_omitted_bytes: 12 omitted" in omitted_details
+                await page.reload(wait_until="load")
+                await page.wait_for_function(
+                    "() => document.querySelector('#messages .transcript-turn[data-turn-index=\"0\"] .tool-disclosure[aria-expanded=\"true\"]')"
+                )
+                await page.locator("#transcript").focus()
+                await page.keyboard.press("End")
+                await page.wait_for_function(
+                    "() => document.querySelector('#messages .transcript-turn[data-turn-index=\"999\"] .tool-disclosure[aria-expanded=\"true\"]')"
+                )
+                mounted_turns = await page.locator("#messages .transcript-turn").count()
+                mounted_detail_fields = await page.locator("#messages .tool-detail-field").count()
+                assert mounted_turns < 1000, mounted_turns
+                assert mounted_detail_fields <= 4, mounted_detail_fields
+                print(
+                    "1,000-turn interaction: "
+                    f"selection={selection_ms:.1f}ms, inspector={inspector_ms:.1f}ms; "
+                    f"mounted turns={mounted_turns}, detail fields={mounted_detail_fields}; "
+                    f"Chromium={browser.version}, platform={platform.platform()}, viewport=1280x800; "
+                    "timing=click event to first requestAnimationFrame showing selection/expanded panel"
+                )
                 assert not page_errors, page_errors
 
                 await context.close()

@@ -548,6 +548,19 @@ textarea:focus-visible,
   font-size: 0.85rem;
 }
 
+.transcript-warnings {
+  border-bottom: 1px solid #e6d3aa;
+  padding: 0.45rem clamp(1rem, 3vw, 2.25rem);
+  color: #664713;
+  background: #fff7e7;
+  font-size: 0.8rem;
+}
+
+.transcript-warnings p {
+  width: min(100%, 58rem);
+  margin: 0.2rem auto;
+}
+
 .transcript {
   position: relative;
   min-height: 0;
@@ -560,9 +573,23 @@ textarea:focus-visible,
 .messages {
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 0;
   width: min(100%, 58rem);
   margin: 0 auto;
+}
+
+.transcript-turn {
+  width: 100%;
+  min-width: 0;
+}
+
+.transcript-turn-spaced {
+  margin-bottom: 1.25rem;
+}
+
+.transcript-spacer {
+  flex: 0 0 auto;
+  width: 100%;
 }
 
 .message {
@@ -662,7 +689,7 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
-.tool-summary {
+.tool-inspector {
   margin-top: 0.75rem;
   border: 1px solid #d9e1dc;
   border-radius: 0.55rem;
@@ -671,13 +698,56 @@ textarea:focus-visible,
   font-size: 0.82rem;
 }
 
-.tool-summary strong {
-  display: block;
+.tool-inspector-denied,
+.tool-inspector-failed,
+.tool-inspector-interrupted,
+.tool-inspector-missing {
+  border-left: 3px solid #9a5134;
 }
 
-.tool-summary p {
+.tool-disclosure {
+  width: 100%;
+  min-height: 2.35rem;
+  border: 0;
+  padding: 0.25rem 0;
+  text-align: left;
+  background: transparent;
+  font-weight: 700;
+}
+
+.tool-disclosure:hover:not(:disabled) {
+  text-decoration: underline;
+  background: transparent;
+}
+
+.tool-preview {
   margin: 0.3rem 0 0;
   color: #4c5b53;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tool-detail-body {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.7rem;
+}
+
+.tool-detail-field strong {
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.tool-detail-field pre {
+  max-height: 24rem;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #dce3df;
+  border-radius: 0.4rem;
+  padding: 0.65rem;
+  background: #fff;
+  color: #27342d;
+  font: 0.78rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -685,6 +755,14 @@ textarea:focus-visible,
 .turn-outcome {
   margin-top: 0.7rem;
   color: #4b5d53;
+  font-size: 0.78rem;
+}
+
+.turn-warning {
+  margin: 0.4rem 0 0;
+  border-left: 3px solid #a36c1b;
+  padding-left: 0.55rem;
+  color: #664713;
   font-size: 0.78rem;
 }
 
