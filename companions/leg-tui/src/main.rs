@@ -758,12 +758,15 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
     };
     let composer_width = chunks[2].width.saturating_sub(2).max(1) as usize;
     let composer_height = chunks[2].height.saturating_sub(2).max(1) as usize;
-    let (cursor_row, cursor_column) = app.composer.cursor_position(composer_width);
+    let (composer_lines, (cursor_row, cursor_column)) = app.composer.layout(composer_width);
+    let composer_text = composer_lines
+        .into_iter()
+        .map(|line| Line::from(sanitize::terminal_safe_text(&line)))
+        .collect::<Vec<_>>();
     let scroll = cursor_row.saturating_sub(composer_height.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(sanitize::terminal_safe_text(app.composer.text()))
+        Paragraph::new(composer_text)
             .block(Block::default().borders(Borders::ALL).title(composer_title))
-            .wrap(Wrap { trim: false })
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         chunks[2],
     );

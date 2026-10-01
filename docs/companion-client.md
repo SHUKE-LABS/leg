@@ -180,7 +180,8 @@ help, F2 opens the keyboard action menu, and Esc closes either overlay. Ctrl-C
 stops a running turn; when idle it exits and keeps the draft. Editing stays
 available during a turn, but another Ctrl-S is rejected while busy. The first-run
 warning explains that the workspace is the tool working directory, not a
-sandbox.
+sandbox. Sending clears the editor for the next draft; if a turn stops or fails
+before you edit that draft, the submitted prompt is restored.
 
 The Linux PTY smoke test uses the local fake provider and explicit native
 binary paths:

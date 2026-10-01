@@ -108,28 +108,57 @@ impl ComposerEditor {
         true
     }
 
-    pub(super) fn cursor_position(&self, width: usize) -> (usize, usize) {
+    pub(super) fn layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
         let width = width.max(1);
+        let mut lines = Vec::new();
+        let mut line = String::new();
         let mut row = 0;
         let mut column = 0;
-        for grapheme in self.text[..self.cursor].graphemes(true) {
+        let mut cursor_position = (0, 0);
+
+        for (start, grapheme) in self.text.grapheme_indices(true) {
+            let end = start + grapheme.len();
             if grapheme == "\n" {
+                if self.cursor == start {
+                    cursor_position = if column == width {
+                        (row + 1, 0)
+                    } else {
+                        (row, column)
+                    };
+                }
+                lines.push(std::mem::take(&mut line));
                 row += 1;
                 column = 0;
+                if self.cursor == end {
+                    cursor_position = (row, column);
+                }
                 continue;
             }
             let grapheme_width = UnicodeWidthStr::width(grapheme).min(width);
-            if column + grapheme_width > width {
+            if column == width || column + grapheme_width > width {
+                lines.push(std::mem::take(&mut line));
                 row += 1;
                 column = 0;
             }
+            if self.cursor == start {
+                cursor_position = (row, column);
+            }
+            line.push_str(grapheme);
             column += grapheme_width;
-            if column == width {
-                row += 1;
-                column = 0;
+            if self.cursor == end {
+                cursor_position = (row, column);
             }
         }
-        (row, column)
+
+        if self.cursor == self.text.len() && column == width {
+            lines.push(line);
+            row += 1;
+            cursor_position = (row, 0);
+            lines.push(String::new());
+        } else {
+            lines.push(line);
+        }
+        (lines, cursor_position)
     }
 
     fn replace(&mut self, range: Range<usize>, inserted: &str) {
@@ -237,8 +266,20 @@ mod tests {
     fn cursor_position_uses_unicode_display_width() {
         let mut editor = ComposerEditor::default();
         editor.insert("中a");
-        assert_eq!(editor.cursor_position(8), (0, 3));
+        assert_eq!(editor.layout(8).1, (0, 3));
         editor.insert("bcd");
-        assert_eq!(editor.cursor_position(4), (1, 2));
+        assert_eq!(editor.layout(4).1, (1, 2));
+    }
+
+    #[test]
+    fn soft_wrapped_layout_keeps_cursor_on_the_next_grapheme() {
+        let mut editor = ComposerEditor::default();
+        editor.insert("hello wonderful");
+        editor.move_left();
+
+        let (lines, (row, column)) = editor.layout(10);
+        assert_eq!(lines, ["hello wond", "erful"]);
+        assert_eq!((row, column), (1, 4));
+        assert_eq!(lines[row].chars().nth(column), Some('l'));
     }
 }
