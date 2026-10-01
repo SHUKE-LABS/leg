@@ -3,8 +3,6 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const MAX_UNDO_EDITS: usize = 256;
-
 #[derive(Debug, Default)]
 pub(super) struct ComposerEditor {
     text: String,
@@ -150,9 +148,6 @@ impl ComposerEditor {
             cursor_before,
             cursor_after: self.cursor,
         };
-        if self.undo.len() == MAX_UNDO_EDITS {
-            self.undo.remove(0);
-        }
         self.undo.push(edit);
         self.redo.clear();
     }
