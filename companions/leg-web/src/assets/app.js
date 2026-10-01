@@ -4,6 +4,7 @@ const tabKey = "leg-web-tab-id";
 const workspaceKey = "leg-web-last-workspace";
 const draftPrefix = "leg-web-draft:";
 const pendingPrefix = "leg-web-pending:";
+const readingPrefix = "leg-web-reading:";
 
 const bootstrap = window.location.hash.slice(1);
 if (/^[0-9a-f]{64}$/i.test(bootstrap)) {
@@ -19,9 +20,13 @@ const ui = Object.fromEntries(
   [
     "connection-state",
     "new-conversation",
-    "current-session-card",
-    "rail-session-name",
-    "rail-workspace",
+    "session-list",
+    "session-list-empty",
+    "session-list-error",
+    "rename-form",
+    "rename-input",
+    "rename-error",
+    "cancel-rename",
     "welcome",
     "start-form",
     "workspace-input",
@@ -29,6 +34,11 @@ const ui = Object.fromEntries(
     "conversation",
     "session-title",
     "workspace-label",
+    "session-guidance",
+    "set-workspace-form",
+    "recovery-workspace-input",
+    "recovery-error",
+    "cancel-workspace",
     "provider-model",
     "elapsed-time",
     "turn-status",
@@ -51,11 +61,16 @@ const ui = Object.fromEntries(
 
 const state = {
   sessionId: window.sessionStorage.getItem(sessionKey),
+  sessions: [],
+  listRefreshBusy: false,
+  listRefreshAgain: false,
+  listRefreshTimer: null,
   snapshot: null,
   active: null,
   cursor: 0,
   streamAbort: null,
   streamGeneration: 0,
+  switchGeneration: 0,
   reconnecting: false,
   pending: null,
   composition: false,
@@ -63,6 +78,9 @@ const state = {
   connectionText: "",
   submitting: false,
   startBusy: false,
+  renamingSessionId: null,
+  renderedSessionSignature: "",
+  restoreReadingPosition: null,
 };
 
 let elapsedTimer = null;
@@ -79,19 +97,254 @@ function storageKey(prefix, sessionId) {
   return `${prefix}${sessionId}`;
 }
 
+function sessionName(session) {
+  return session.name || `Conversation ${String(session.id).slice(0, 8)}`;
+}
+
+function sessionStatus(session) {
+  if (session.recovered) return "Recovered · choose a workspace";
+  if (session.read_only) return "Read-only · start a new conversation to continue";
+  if (sessionWorkspaceMissing(session)) return "Workspace missing · choose a replacement";
+  if (!session.cwd) return "Workspace needed · set one to continue";
+  if (session.run_state === "active" || session.pending_new_turn) return "Busy · turn in progress";
+  if (session.run_state === "unknown") return "Status unavailable · reopen to check";
+  const last = session.turns?.at(-1);
+  if (last?.outcome === "failed") return "Last turn failed";
+  if (last?.outcome === "interrupted") return "Last turn interrupted";
+  if (last?.outcome === "incomplete") return "Last turn incomplete";
+  return session.ended ? "Ended" : "Ready";
+}
+
+function sessionWorkspaceMissing(session) {
+  return !session?.cwd || (session.warnings || []).some((warning) => /recorded workspace .* is missing/i.test(warning));
+}
+
+function relativeRecency(timestamp) {
+  const updated = Number(timestamp);
+  if (!Number.isFinite(updated) || updated <= 0) return "Activity time unavailable";
+  const seconds = Math.max(0, Math.floor((Date.now() - updated) / 1000));
+  if (seconds < 60) return "Updated just now";
+  if (seconds < 3600) return `Updated ${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `Updated ${Math.floor(seconds / 3600)}h ago`;
+  return `Updated ${Math.floor(seconds / 86400)}d ago`;
+}
+
+async function refreshSessionList({ quiet = false } = {}) {
+  if (!token) return false;
+  if (state.listRefreshBusy) {
+    state.listRefreshAgain = true;
+    return false;
+  }
+  state.listRefreshBusy = true;
+  try {
+    const payload = await api("/api/sessions");
+    state.sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+    ui["session-list-error"].hidden = true;
+    ui["session-list-error"].textContent = "";
+    renderSessionList();
+    return true;
+  } catch (error) {
+    if (!quiet) {
+      ui["session-list-error"].textContent = apiErrorText(error.code || "host_unavailable");
+      ui["session-list-error"].hidden = false;
+    }
+    return false;
+  } finally {
+    state.listRefreshBusy = false;
+    if (state.listRefreshAgain) {
+      state.listRefreshAgain = false;
+      void refreshSessionList({ quiet: true });
+    }
+  }
+}
+
+function renderSessionList() {
+  const signature = JSON.stringify({
+    selected: state.sessionId,
+    sessions: state.sessions.map((session) => [
+      session.id,
+      session.name,
+      session.cwd,
+      session.updated_at_ms,
+      session.recovered,
+      session.read_only,
+      session.run_state,
+      session.pending_new_turn,
+      session.ended,
+      session.turns?.at(-1)?.outcome,
+      sessionStatus(session),
+      relativeRecency(session.updated_at_ms),
+    ]),
+  });
+  if (signature === state.renderedSessionSignature) return;
+  state.renderedSessionSignature = signature;
+  const focused = document.activeElement;
+  const focusedId = focused?.dataset?.sessionId;
+  const focusedAction = focused?.dataset?.action;
+  const fragment = document.createDocumentFragment();
+  for (const session of state.sessions) {
+    const item = document.createElement("li");
+    item.className = "session-entry";
+
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "session-select";
+    select.dataset.sessionId = session.id;
+    select.dataset.action = "open";
+    select.setAttribute("aria-current", session.id === state.sessionId ? "page" : "false");
+    select.setAttribute("aria-label", `Open ${sessionName(session)}. ${sessionStatus(session)}. ${relativeRecency(session.updated_at_ms)}.`);
+    select.addEventListener("click", () => void activateSession(session.id));
+
+    const name = document.createElement("strong");
+    name.className = "session-entry-name";
+    name.textContent = sessionName(session);
+    const workspace = document.createElement("span");
+    workspace.className = "session-entry-workspace";
+    workspace.textContent = session.cwd || "Workspace not set";
+    const status = document.createElement("span");
+    status.className = "session-entry-status";
+    status.textContent = `${sessionStatus(session)} · ${relativeRecency(session.updated_at_ms)}`;
+    select.append(name, workspace, status);
+
+    const actions = document.createElement("div");
+    actions.className = "session-entry-actions";
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.className = "session-rename";
+    rename.dataset.sessionId = session.id;
+    rename.dataset.action = "rename";
+    rename.textContent = "Rename";
+    rename.setAttribute("aria-label", `Rename ${sessionName(session)}`);
+    rename.addEventListener("click", () => beginRename(session.id));
+    actions.append(rename);
+
+    item.append(select, actions);
+    fragment.append(item);
+  }
+  ui["session-list"].replaceChildren(fragment);
+  ui["session-list-empty"].hidden = state.sessions.length > 0;
+
+  if (focusedId && focusedAction) {
+    const replacement = [...ui["session-list"].querySelectorAll("[data-session-id]")]
+      .find((element) => element.dataset.sessionId === focusedId && element.dataset.action === focusedAction);
+    replacement?.focus({ preventScroll: true });
+  }
+}
+
+function beginRename(sessionId) {
+  const session = state.sessions.find((item) => item.id === sessionId);
+  if (!session) return;
+  state.renamingSessionId = sessionId;
+  ui["rename-input"].value = session.name || "";
+  ui["rename-error"].hidden = true;
+  ui["rename-error"].textContent = "";
+  ui["rename-form"].hidden = false;
+  ui["rename-input"].focus();
+  ui["rename-input"].select();
+}
+
+function saveReadingPosition() {
+  if (!state.sessionId || state.restoreReadingPosition) return;
+  const scroller = ui.transcript;
+  const bottomGap = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+  const position = bottomGap < 36
+    ? { atBottom: true }
+    : { atBottom: false, ...findScrollAnchor(scroller) };
+  if (position.atBottom || position.key) {
+    window.sessionStorage.setItem(storageKey(readingPrefix, state.sessionId), JSON.stringify(position));
+  }
+}
+
+function readReadingPosition(sessionId) {
+  try {
+    const saved = window.sessionStorage.getItem(storageKey(readingPrefix, sessionId));
+    if (!saved) return null;
+    const position = JSON.parse(saved);
+    if (position?.atBottom === true) return { atBottom: true };
+    if (typeof position?.key === "string" && Number.isFinite(position.offset)) {
+      return { atBottom: false, key: position.key, offset: position.offset };
+    }
+  } catch {
+    // Ignore a damaged local reading-position entry and start at the transcript end.
+  }
+  return null;
+}
+
+function restoreReadingPosition(scroller, position) {
+  if (!position || position.atBottom) {
+    scroller.scrollTop = scroller.scrollHeight;
+    ui["new-content"].hidden = true;
+    return;
+  }
+  const element = [...ui.messages.children].find((node) => node.dataset.key === position.key);
+  if (!element) {
+    scroller.scrollTop = 0;
+    ui["new-content"].hidden = false;
+    return;
+  }
+  const point = scroller.getBoundingClientRect().top;
+  const offset = element.getBoundingClientRect().top - point;
+  scroller.scrollTop += offset - position.offset;
+  ui["new-content"].hidden = false;
+}
+
+function saveCurrentSessionView() {
+  if (!state.sessionId) return;
+  saveDraft();
+  savePending();
+  saveReadingPosition();
+}
+
+function renderSessionGuidance() {
+  const session = state.snapshot?.session;
+  ui["session-guidance"].replaceChildren();
+  ui["session-guidance"].hidden = true;
+  ui["set-workspace-form"].hidden = true;
+  if (!session) return;
+
+  let message = "";
+  const needsWorkspace = session.recovered || sessionWorkspaceMissing(session);
+  if (session.recovered) {
+    message = "This recovered conversation needs its workspace selected before it can continue.";
+  } else if (session.read_only) {
+    message = "This saved transcript is read-only. Start a new conversation to continue working.";
+  } else if (sessionWorkspaceMissing(session)) {
+    message = "Choose a workspace folder before sending a message in this session.";
+  } else if (session.run_state === "active" || session.pending_new_turn) {
+    message = "This session is busy. Wait for its current turn to finish before sending another message.";
+  }
+  if (!message) return;
+
+  const text = document.createElement("span");
+  text.textContent = message;
+  ui["session-guidance"].append(text);
+  if (needsWorkspace && (!session.read_only || session.recovered)) {
+    const choose = document.createElement("button");
+    choose.type = "button";
+    choose.className = "quiet-button";
+    choose.textContent = "Set workspace";
+    choose.addEventListener("click", () => {
+      ui["set-workspace-form"].hidden = false;
+      ui["recovery-workspace-input"].focus();
+    });
+    ui["session-guidance"].append(choose);
+  }
+  ui["session-guidance"].hidden = false;
+}
+
 function apiErrorText(code) {
   const messages = {
     unauthorized: "This tab is no longer authorized. Open the current launch URL to reconnect.",
     host_shutting_down: "The local host is shutting down. Your draft is kept in this tab.",
     session_busy: "This conversation is already running in another tab. Your message is still here.",
-    workspace_required: "Choose an existing workspace folder before sending. The workspace path must be set by creating a new conversation.",
+    workspace_required: "Choose an existing workspace folder for this session or start a new conversation.",
     workspace_must_be_absolute: "Enter an absolute path to an existing folder on the host computer.",
     session_read_only: "This conversation cannot be changed because its saved trail could not be read.",
     submission_id_conflict: "This send ID is already associated with different text. Your draft is preserved; reload the conversation before sending again.",
     submission_id_stale: "This send ID has expired. Your draft is preserved; reload the conversation before sending again.",
     submission_id_unexpected: "Another tab advanced this conversation. Your draft is preserved; reload before sending again.",
     catalog_unavailable: "The host could not start a Leg turn. Check that leg and leg-ui-supervisor are installed, then restart leg-web with --leg-bin and --supervisor-bin if needed. Provider settings come from the environment that starts leg-web.",
-    invalid_request: "The host rejected this request. Check the workspace path and try again.",
+    invalid_request: "The host rejected this request. Check the entered value and try again.",
   };
   return messages[code] || `The local host reported ${code || "an error"}. Your draft is preserved.`;
 }
@@ -168,6 +421,7 @@ function absoluteWorkspace(value) {
 async function startConversation(event) {
   event.preventDefault();
   if (state.startBusy) return;
+  const switchGeneration = state.switchGeneration;
   const cwd = ui["workspace-input"].value.trim();
   if (!absoluteWorkspace(cwd)) {
     showStartError("Enter an absolute path, such as /home/name/project or C:\\Users\\name\\project.");
@@ -180,7 +434,8 @@ async function startConversation(event) {
   try {
     const session = await api("/api/sessions", { method: "POST", body: { cwd } });
     window.sessionStorage.setItem(workspaceKey, cwd);
-    await activateSession(session.id);
+    await refreshSessionList({ quiet: true });
+    if (state.switchGeneration === switchGeneration) await activateSession(session.id);
   } catch (error) {
     showStartError(apiErrorText(error.code || "host_unavailable"));
   } finally {
@@ -190,6 +445,8 @@ async function startConversation(event) {
 }
 
 async function activateSession(sessionId) {
+  if (state.sessionId && state.sessionId !== sessionId) saveCurrentSessionView();
+  const switchGeneration = ++state.switchGeneration;
   state.streamGeneration += 1;
   state.streamAbort?.abort();
   state.sessionId = sessionId;
@@ -197,22 +454,29 @@ async function activateSession(sessionId) {
   state.active = null;
   state.cursor = 0;
   state.pending = readPending(sessionId);
+  state.restoreReadingPosition = readReadingPosition(sessionId) || { atBottom: true };
   window.sessionStorage.setItem(sessionKey, sessionId);
   ui.prompt.value = window.sessionStorage.getItem(storageKey(draftPrefix, sessionId)) || state.pending?.prompt || "";
   adjustTextarea();
   showSendError("");
+  ui["rename-form"].hidden = true;
+  ui["set-workspace-form"].hidden = true;
   ui.welcome.hidden = true;
   ui.conversation.hidden = false;
+  renderSessionList();
   try {
     await api("/api/sessions/select", {
       method: "POST",
       body: { session_id: sessionId, tab_id: tabId },
     });
-    await refreshSnapshot();
+    const snapshot = await refreshSnapshot({ sessionId, switchGeneration });
+    if (!snapshot || state.switchGeneration !== switchGeneration) return;
     setConnection("Connected to local host.");
-    connectEvents(state.cursor);
-    if (state.pending) await reconcilePending();
+    connectEvents(state.cursor, state.sessionId, switchGeneration);
+    if (state.pending) await reconcilePending({ sessionId: state.sessionId, switchGeneration });
+    await refreshSessionList({ quiet: true });
   } catch (error) {
+    if (state.switchGeneration !== switchGeneration || state.sessionId !== sessionId) return;
     if (error.status === 404) {
       window.sessionStorage.removeItem(sessionKey);
       window.sessionStorage.removeItem(storageKey(pendingPrefix, sessionId));
@@ -223,6 +487,7 @@ async function activateSession(sessionId) {
       ui.welcome.hidden = false;
       setConnection("Conversation unavailable.");
       showStartError("This conversation is no longer available. Start a new conversation to continue.");
+      renderSessionList();
       return;
     }
     setConnection("Reconnecting…", true);
@@ -243,31 +508,51 @@ function readPending(sessionId) {
   }
 }
 
-async function refreshSnapshot({ eventsArrived = false } = {}) {
-  if (!state.sessionId) return;
-  const snapshot = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/snapshot`);
+async function refreshSnapshot({ eventsArrived = false, sessionId = state.sessionId, switchGeneration = state.switchGeneration } = {}) {
+  if (!sessionId) return null;
+  const snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/snapshot`);
+  if (state.sessionId !== sessionId || state.switchGeneration !== switchGeneration) return null;
+  const savedId = state.sessionId;
+  if (snapshot.session?.id && snapshot.session.id !== savedId && !state.pending) {
+    bindSessionId(savedId, snapshot.session.id);
+  }
   state.snapshot = snapshot;
   state.active = snapshot.active;
   state.cursor = Number(snapshot.cursor) || 0;
-  if (snapshot.session?.id && snapshot.session.id !== state.sessionId && !state.pending) {
-    state.sessionId = snapshot.session.id;
-    window.sessionStorage.setItem(sessionKey, state.sessionId);
-  }
   renderAll({ eventsArrived });
+  return snapshot;
 }
 
-function connectEvents(after) {
-  if (!state.sessionId || !token) return;
+function bindSessionId(oldId, actualId) {
+  if (!actualId || oldId === actualId) return;
+  for (const prefix of [draftPrefix, pendingPrefix, readingPrefix]) {
+    const oldKey = storageKey(prefix, oldId);
+    const value = window.sessionStorage.getItem(oldKey);
+    if (value !== null && window.sessionStorage.getItem(storageKey(prefix, actualId)) === null) {
+      window.sessionStorage.setItem(storageKey(prefix, actualId), value);
+    }
+    window.sessionStorage.removeItem(oldKey);
+  }
+  state.sessionId = actualId;
+  window.sessionStorage.setItem(sessionKey, actualId);
+}
+
+function isCurrentSession(sessionId, switchGeneration) {
+  return state.sessionId === sessionId && state.switchGeneration === switchGeneration;
+}
+
+function connectEvents(after, sessionId = state.sessionId, switchGeneration = state.switchGeneration) {
+  if (!sessionId || !token) return;
   state.streamAbort?.abort();
   const controller = new AbortController();
   state.streamAbort = controller;
   const generation = ++state.streamGeneration;
-  void eventLoop(state.sessionId, Number(after) || 0, controller, generation);
+  void eventLoop(sessionId, Number(after) || 0, controller, generation, switchGeneration);
 }
 
-async function eventLoop(sessionId, after, controller, generation) {
+async function eventLoop(sessionId, after, controller, generation, switchGeneration) {
   let delayMs = 400;
-  while (!controller.signal.aborted && generation === state.streamGeneration && state.sessionId === sessionId) {
+  while (!controller.signal.aborted && generation === state.streamGeneration && isCurrentSession(sessionId, switchGeneration)) {
     try {
       setConnection("Connected to local host.");
       const response = await fetch(
@@ -292,16 +577,16 @@ async function eventLoop(sessionId, after, controller, generation) {
           const frame = buffer.slice(0, boundary);
           const separator = buffer.slice(boundary).match(/^\r?\n\r?\n/)[0];
           buffer = buffer.slice(boundary + separator.length);
-          handleSseFrame(frame);
+          handleSseFrame(frame, sessionId, switchGeneration);
         }
       }
-      if (controller.signal.aborted || generation !== state.streamGeneration) return;
+      if (controller.signal.aborted || generation !== state.streamGeneration || !isCurrentSession(sessionId, switchGeneration)) return;
       throw new Error("The event stream ended.");
     } catch (error) {
-      if (controller.signal.aborted || generation !== state.streamGeneration) return;
+      if (controller.signal.aborted || generation !== state.streamGeneration || !isCurrentSession(sessionId, switchGeneration)) return;
       setConnection("Reconnecting…", true);
       try {
-        await refreshSnapshot();
+        await refreshSnapshot({ sessionId, switchGeneration });
       } catch {
         // Keep the active snapshot and draft visible until the host returns.
       }
@@ -321,7 +606,8 @@ function wait(milliseconds, signal) {
   });
 }
 
-function handleSseFrame(frame) {
+function handleSseFrame(frame, sessionId, switchGeneration) {
+  if (!isCurrentSession(sessionId, switchGeneration)) return;
   const fields = {};
   const dataLines = [];
   for (const line of frame.split(/\r?\n/)) {
@@ -349,14 +635,15 @@ function handleSseFrame(frame) {
     return;
   }
   if (fields.event !== "update") return;
-  applyHostEvent(data);
+  applyHostEvent(data, sessionId, switchGeneration);
 }
 
-function applyHostEvent(event) {
+function applyHostEvent(event, sessionId, switchGeneration) {
+  if (!isCurrentSession(sessionId, switchGeneration)) return;
   const cursor = Number(event.cursor) || 0;
   if (cursor <= state.cursor) return;
   if (state.cursor && cursor > state.cursor + 1) {
-    void refreshSnapshot({ eventsArrived: true }).catch(() => {});
+    void refreshSnapshot({ eventsArrived: true, sessionId, switchGeneration }).catch(() => {});
     return;
   }
   state.cursor = cursor;
@@ -375,7 +662,12 @@ function applyHostEvent(event) {
   }
   if (event.kind === "stream" && event.data) applyStreamEvent(event.data);
   if (event.kind === "outcome") {
-    void refreshSnapshot({ eventsArrived: true }).then(() => restoreFailedPrompt()).catch(() => {});
+    void refreshSnapshot({ eventsArrived: true, sessionId, switchGeneration }).then((snapshot) => {
+      if (snapshot && isCurrentSession(sessionId, switchGeneration)) {
+        restoreFailedPrompt();
+        void refreshSessionList({ quiet: true });
+      }
+    }).catch(() => {});
   } else {
     renderAll({ eventsArrived: event.kind === "stream" || event.kind === "accepted" });
   }
@@ -442,6 +734,7 @@ function currentStatus() {
 
 function renderStatus() {
   const current = currentStatus();
+  const session = state.snapshot?.session;
   ui["turn-status"].textContent = current.text;
   const activeTool = state.active?.active_tool;
   if (activeTool) {
@@ -453,7 +746,7 @@ function renderStatus() {
   }
   ui["stop-turn"].hidden = !state.active;
   ui["stop-turn"].disabled = state.active?.status === "stopping" || state.reconnecting;
-  ui.send.disabled = current.busy || state.reconnecting || state.submitting || Boolean(state.pending) || !ui.prompt.value.trim();
+  ui.send.disabled = current.busy || state.reconnecting || state.submitting || Boolean(state.pending) || sessionWorkspaceMissing(session) || Boolean(session?.read_only) || !ui.prompt.value.trim();
   ui["new-conversation"].disabled = current.busy || state.reconnecting || state.submitting || Boolean(state.pending);
   const pending = state.pending;
   const canRetry = Boolean(pending && pending.retryAllowed && !current.busy && !state.submitting);
@@ -473,18 +766,18 @@ function renderAll(options = {}) {
   const hasSession = Boolean(state.snapshot && state.sessionId);
   ui.welcome.hidden = hasSession;
   ui.conversation.hidden = !hasSession;
-  ui["current-session-card"].hidden = !hasSession;
+  renderSessionList();
   if (!hasSession) {
     renderStatus();
     return;
   }
   const session = state.snapshot.session;
+  ui["session-title"].dataset.sessionId = session.id;
   ui["session-title"].textContent = session.name || "Conversation";
-  ui["rail-session-name"].textContent = session.name || "Current conversation";
   const cwd = session.cwd || "Workspace not set";
   ui["workspace-label"].textContent = `Workspace: ${cwd}`;
-  ui["rail-workspace"].textContent = cwd;
   ui["workspace-warning"].hidden = Boolean((session.turns || []).length || state.snapshot.high_water > 0);
+  renderSessionGuidance();
   renderProviderModel();
   renderElapsed();
   renderStatus();
@@ -542,7 +835,10 @@ function renderTranscript({ eventsArrived = false } = {}) {
   ui.messages.replaceChildren(fragment);
   ui["empty-transcript"].hidden = ui.messages.childElementCount > 0;
 
-  if (wasAtBottom) {
+  if (state.restoreReadingPosition) {
+    restoreReadingPosition(scroller, state.restoreReadingPosition);
+    state.restoreReadingPosition = null;
+  } else if (wasAtBottom) {
     scroller.scrollTop = scroller.scrollHeight;
     ui["new-content"].hidden = true;
   } else {
@@ -817,14 +1113,16 @@ function promptHash(prompt) {
 
 async function submitPrompt({ retry = false } = {}) {
   if (!state.sessionId || state.submitting || state.active || state.reconnecting) return;
+  const sessionId = state.sessionId;
+  const switchGeneration = state.switchGeneration;
   if (retry) {
     if (!state.pending?.retryAllowed) return;
   } else {
     const prompt = ui.prompt.value;
     if (!prompt.trim()) return;
     if (state.pending) return;
-    if (!state.snapshot?.session?.cwd) {
-      showSendError("Set a workspace before sending. Start a new conversation with an existing absolute folder path.");
+    if (sessionWorkspaceMissing(state.snapshot?.session)) {
+      showSendError("Choose an existing workspace folder for this session before sending.");
       return;
     }
     const requestId = state.snapshot.next_request_id;
@@ -842,18 +1140,22 @@ async function submitPrompt({ retry = false } = {}) {
   showSendError("");
   renderStatus();
   try {
-    const receipt = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/submit`, {
+    const receipt = await api(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
       method: "POST",
       body: { request_id: pending.request_id, prompt: pending.prompt },
     });
-    await acceptSubmission(receipt, pending);
+    if (!isCurrentSession(sessionId, switchGeneration)) return;
+    await acceptSubmission(receipt, pending, { sessionId, switchGeneration });
   } catch (error) {
+    if (!isCurrentSession(sessionId, switchGeneration)) return;
     if (error instanceof HostError) {
       if (error.code === "session_busy") {
         state.pending = null;
         savePending();
+        saveDraft();
         showSendError(apiErrorText(error.code));
-        await refreshSnapshot().catch(() => {});
+        await refreshSnapshot({ sessionId, switchGeneration }).catch(() => {});
+        await refreshSessionList({ quiet: true });
       } else if (error.code === "submission_id_conflict" || error.code === "submission_id_stale" || error.code === "submission_id_unexpected") {
         state.pending.phase = "conflict";
         state.pending.retryAllowed = false;
@@ -869,7 +1171,7 @@ async function submitPrompt({ retry = false } = {}) {
       state.pending.retryAllowed = false;
       savePending();
       setConnection("Checking send status…", true);
-      await reconcilePending();
+      await reconcilePending({ sessionId, switchGeneration });
       if (state.pending) showSendError("The send response was lost. The host status was checked; use Retry same send only if it was not accepted.");
     }
   } finally {
@@ -878,17 +1180,14 @@ async function submitPrompt({ retry = false } = {}) {
   }
 }
 
-async function acceptSubmission(receipt, pending) {
-  const oldId = state.sessionId;
+async function acceptSubmission(receipt, pending, { sessionId, switchGeneration }) {
+  const oldId = sessionId;
+  if (!isCurrentSession(oldId, switchGeneration)) return;
   const actualId = receipt.session_id || oldId;
   if (actualId !== oldId) {
     state.streamGeneration += 1;
     state.streamAbort?.abort();
-    state.sessionId = actualId;
-    window.sessionStorage.setItem(sessionKey, actualId);
-    const draft = window.sessionStorage.getItem(storageKey(draftPrefix, oldId));
-    if (draft !== null) window.sessionStorage.setItem(storageKey(draftPrefix, actualId), draft);
-    window.sessionStorage.removeItem(storageKey(pendingPrefix, oldId));
+    bindSessionId(oldId, actualId);
   }
   const currentPending = state.pending;
   state.pending = null;
@@ -900,13 +1199,17 @@ async function acceptSubmission(receipt, pending) {
     method: "POST",
     body: { session_id: actualId, tab_id: tabId },
   }).catch(() => {});
+  if (!isCurrentSession(actualId, switchGeneration)) return;
   try {
-    await refreshSnapshot();
+    await refreshSnapshot({ sessionId: actualId, switchGeneration });
+    if (!isCurrentSession(actualId, switchGeneration)) return;
     setConnection("Connected to local host.");
   } catch {
     setConnection("Reconnecting…", true);
   }
-  connectEvents(state.cursor);
+  connectEvents(state.cursor, actualId, switchGeneration);
+  await refreshSessionList({ quiet: true });
+  if (!isCurrentSession(actualId, switchGeneration)) return;
   if (receipt.status === "failed" || receipt.status === "incomplete" || receipt.status === "stopped") {
     if (!ui.prompt.value.trim()) ui.prompt.value = pending.prompt;
     saveDraft();
@@ -916,11 +1219,12 @@ async function acceptSubmission(receipt, pending) {
   if (currentPending?.request_id !== pending.request_id) return;
 }
 
-async function reconcilePending() {
-  if (!state.pending || !state.sessionId) return;
+async function reconcilePending({ sessionId = state.sessionId, switchGeneration = state.switchGeneration } = {}) {
+  if (!state.pending || !sessionId || !isCurrentSession(sessionId, switchGeneration)) return;
   const pending = state.pending;
   try {
-    await refreshSnapshot();
+    const snapshot = await refreshSnapshot({ sessionId, switchGeneration });
+    if (!snapshot || !isCurrentSession(sessionId, switchGeneration)) return;
   } catch {
     setConnection("Reconnecting…", true);
     return;
@@ -930,6 +1234,7 @@ async function reconcilePending() {
   if (Number(snapshot.high_water) >= pending.request_id) {
     if (receipt?.request_id === pending.request_id) {
       const expectedHash = await promptHash(pending.prompt);
+      if (!isCurrentSession(sessionId, switchGeneration) || state.pending !== pending) return;
       if (receipt.prompt_sha256 !== expectedHash) {
         pending.phase = "conflict";
         pending.retryAllowed = false;
@@ -939,8 +1244,7 @@ async function reconcilePending() {
       }
       const actualId = receipt.session_id || snapshot.session.id;
       if (actualId && actualId !== state.sessionId) {
-        state.sessionId = actualId;
-        window.sessionStorage.setItem(sessionKey, actualId);
+        bindSessionId(state.sessionId, actualId);
       }
       const completedWithError = ["failed", "incomplete", "stopped"].includes(receipt.status);
       state.pending = null;
@@ -991,15 +1295,19 @@ function restoreFailedPrompt() {
 
 async function stopTurn() {
   if (!state.sessionId || !state.active || state.active.status === "stopping") return;
+  const sessionId = state.sessionId;
+  const switchGeneration = state.switchGeneration;
   state.active.status = "stopping";
   renderAll();
   try {
-    await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/stop`, { method: "POST", body: {} });
-    await refreshSnapshot();
+    await api(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, { method: "POST", body: {} });
+    await refreshSnapshot({ sessionId, switchGeneration });
+    if (!isCurrentSession(sessionId, switchGeneration)) return;
     setConnection("Connected to local host.");
   } catch (error) {
     try {
-      await refreshSnapshot();
+      await refreshSnapshot({ sessionId, switchGeneration });
+      if (!isCurrentSession(sessionId, switchGeneration)) return;
       setConnection("Connected to local host.");
     } catch {
       if (state.active) state.active.status = "running";
@@ -1012,6 +1320,8 @@ async function stopTurn() {
 
 function openNewConversation() {
   if (state.active || state.pending || state.submitting) return;
+  saveCurrentSessionView();
+  state.switchGeneration += 1;
   state.streamGeneration += 1;
   state.streamAbort?.abort();
   state.sessionId = null;
@@ -1019,14 +1329,67 @@ function openNewConversation() {
   state.active = null;
   state.cursor = 0;
   state.pending = null;
+  state.restoreReadingPosition = null;
   window.sessionStorage.removeItem(sessionKey);
   ui.conversation.hidden = true;
   ui.welcome.hidden = false;
-  ui["current-session-card"].hidden = true;
+  ui["rename-form"].hidden = true;
+  ui["set-workspace-form"].hidden = true;
   ui["workspace-input"].value = window.sessionStorage.getItem(workspaceKey) || "";
   clearStartError();
+  renderSessionList();
   setConnection("Connected to local host.");
   ui["workspace-input"].focus();
+}
+
+async function renameSession(event) {
+  event.preventDefault();
+  const sessionId = state.renamingSessionId;
+  if (!sessionId) return;
+  const name = ui["rename-input"].value.trim();
+  if (!name) {
+    ui["rename-error"].textContent = "Enter a name for this session.";
+    ui["rename-error"].hidden = false;
+    ui["rename-input"].focus();
+    return;
+  }
+  try {
+    await api(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", body: { name } });
+    state.renamingSessionId = null;
+    ui["rename-form"].hidden = true;
+    await refreshSessionList();
+    if (sessionId === state.sessionId) await refreshSnapshot();
+  } catch (error) {
+    ui["rename-error"].textContent = apiErrorText(error.code || "host_unavailable");
+    ui["rename-error"].hidden = false;
+  }
+}
+
+async function setSessionWorkspace(event) {
+  event.preventDefault();
+  const sessionId = state.sessionId;
+  const switchGeneration = state.switchGeneration;
+  if (!sessionId) return;
+  const cwd = ui["recovery-workspace-input"].value.trim();
+  if (!absoluteWorkspace(cwd)) {
+    ui["recovery-error"].textContent = "Enter an absolute path to an existing folder on the host computer.";
+    ui["recovery-error"].hidden = false;
+    ui["recovery-workspace-input"].focus();
+    return;
+  }
+  try {
+    await api(`/api/sessions/${encodeURIComponent(sessionId)}/workspace`, { method: "PUT", body: { cwd } });
+    if (!isCurrentSession(sessionId, switchGeneration)) return;
+    ui["recovery-error"].hidden = true;
+    ui["set-workspace-form"].hidden = true;
+    window.sessionStorage.setItem(workspaceKey, cwd);
+    await refreshSessionList({ quiet: true });
+    await refreshSnapshot({ sessionId, switchGeneration });
+  } catch (error) {
+    if (!isCurrentSession(sessionId, switchGeneration)) return;
+    ui["recovery-error"].textContent = apiErrorText(error.code || "host_unavailable");
+    ui["recovery-error"].hidden = false;
+  }
 }
 
 function formatPromptChange() {
@@ -1037,6 +1400,16 @@ function formatPromptChange() {
 
 ui["start-form"].addEventListener("submit", startConversation);
 ui["new-conversation"].addEventListener("click", openNewConversation);
+ui["rename-form"].addEventListener("submit", renameSession);
+ui["cancel-rename"].addEventListener("click", () => {
+  state.renamingSessionId = null;
+  ui["rename-form"].hidden = true;
+});
+ui["set-workspace-form"].addEventListener("submit", setSessionWorkspace);
+ui["cancel-workspace"].addEventListener("click", () => {
+  ui["set-workspace-form"].hidden = true;
+  ui["recovery-error"].hidden = true;
+});
 ui.composer.addEventListener("submit", (event) => {
   event.preventDefault();
   void submitPrompt();
@@ -1057,21 +1430,39 @@ ui["new-content"].addEventListener("click", () => {
   ui["new-content"].hidden = true;
   ui.transcript.focus({ preventScroll: true });
 });
+ui.transcript.addEventListener("scroll", saveReadingPosition);
+window.addEventListener("pagehide", saveCurrentSessionView);
 window.addEventListener("online", () => {
   if (state.sessionId) {
-    void refreshSnapshot().then(() => connectEvents(state.cursor)).catch(() => {});
+    const sessionId = state.sessionId;
+    const switchGeneration = state.switchGeneration;
+    void refreshSnapshot({ sessionId, switchGeneration }).then((snapshot) => {
+      if (snapshot && isCurrentSession(sessionId, switchGeneration)) {
+        connectEvents(state.cursor, sessionId, switchGeneration);
+      }
+    }).catch(() => {});
   }
+  void refreshSessionList({ quiet: true });
 });
 
 ui["workspace-input"].value = window.sessionStorage.getItem(workspaceKey) || "";
 if (!token) {
   setConnection("Open the launch URL to authorize this tab.");
   showStartError("Open the one-time launch URL printed by leg-web. The browser does not store provider credentials.");
-} else if (state.sessionId) {
-  setConnection("Connecting to local host…");
-  void activateSession(state.sessionId);
 } else {
-  setConnection("Connected to local host.");
-  ui.welcome.hidden = false;
-  ui.conversation.hidden = true;
+  setConnection("Connecting to local host…");
+  void refreshSessionList().then((loaded) => {
+    if (state.sessionId) {
+      void activateSession(state.sessionId);
+    } else if (loaded) {
+      setConnection("Connected to local host.");
+      ui.welcome.hidden = false;
+      ui.conversation.hidden = true;
+    } else {
+      setConnection("Reconnecting…", true);
+      ui.welcome.hidden = false;
+      ui.conversation.hidden = true;
+    }
+  });
+  state.listRefreshTimer = window.setInterval(() => void refreshSessionList({ quiet: true }), 2500);
 }

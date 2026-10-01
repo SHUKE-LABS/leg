@@ -458,6 +458,7 @@ fn shared_catalog_controller_contract(
         MockReply::stream(text_reply("first final answer")),
         MockReply::stream(bash_tool_reply("pwd-two", "pwd", "")),
         MockReply::stream(text_reply("second final answer")),
+        MockReply::stream(text_reply("third TUI answer")),
         MockReply::error(
             500,
             json!({"error":{"type":"api_error","message":"temporary fixture failure"}}).to_string(),
@@ -572,6 +573,20 @@ fn shared_catalog_controller_contract(
         } if id == &session_id
     )));
 
+    let mut third = second_controller
+        .start_existing(&session_id, SessionInterface::Tui, "third TUI prompt")
+        .expect("continue the Web session through the TUI interface");
+    let _ = collect_catalog_events(&mut third);
+    assert_success(third.wait().expect("finish TUI continuation"));
+    let after_tui_continuation = second_controller
+        .get(&session_id)
+        .expect("read the session continued through TUI");
+    assert_eq!(after_tui_continuation.turns.len(), 3);
+    assert_eq!(
+        after_tui_continuation.cwd.as_deref(),
+        Some(second_cwd.as_path())
+    );
+
     let failed_prompt = "retry this failed catalog prompt";
     let mut failed = second_controller
         .start_existing(&session_id, SessionInterface::Web, failed_prompt)
@@ -632,7 +647,7 @@ fn shared_catalog_controller_contract(
     assert!(!failed_transcript.contains(sentinel));
 
     let records = provider.finish();
-    assert_eq!(records.len(), 7);
+    assert_eq!(records.len(), 8);
     for record in &records {
         let request = record.body.to_string();
         assert!(!request.contains("shared session"));
@@ -645,7 +660,10 @@ fn shared_catalog_controller_contract(
     assert!(second_turn_request.contains(first_cwd.to_string_lossy().as_ref()));
     let changed_cwd_observation = records[3].body.to_string();
     assert!(changed_cwd_observation.contains(second_cwd.to_string_lossy().as_ref()));
-    let retry_request = records[5].body.to_string();
+    let tui_continuation_request = records[4].body.to_string();
+    assert!(tui_continuation_request.contains("second final answer"));
+    assert!(tui_continuation_request.contains(second_cwd.to_string_lossy().as_ref()));
+    let retry_request = records[6].body.to_string();
     assert_eq!(retry_request.matches(failed_prompt).count(), 1);
     assert!(retry_request.contains("first final answer"));
 
@@ -663,7 +681,7 @@ fn shared_catalog_controller_contract(
     assert!(!transcript.contains("TUI draft survives"));
     let index = fs::read_to_string(state_dir.join("catalog.json")).expect("read catalog index");
     assert!(!index.contains(sentinel));
-    assert_eq!(second_controller.get(&session_id).unwrap().turns.len(), 4);
+    assert_eq!(second_controller.get(&session_id).unwrap().turns.len(), 5);
     assert!(
         sessions_dir
             .join(format!("{first_failed_id}.jsonl"))
