@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use leg::tools::tool_round_limit_warning;
 use serde_json::Value;
 
 /// The scripted rounds: read the file, edit it, run a command that observes
@@ -217,8 +218,12 @@ fn sse_event(name: &str, data: Value) -> String {
 }
 
 fn sse_text_reply(text: &str) -> String {
+    sse_text_reply_with_stop_reason(text, "end_turn")
+}
+
+fn sse_text_reply_with_stop_reason(text: &str, stop_reason: &str) -> String {
     let mut reply = sse_text_start(text);
-    reply.push_str(&sse_text_finish(""));
+    reply.push_str(&sse_text_finish_with_stop_reason("", stop_reason));
     reply
 }
 
@@ -251,6 +256,10 @@ fn sse_text_start(text: &str) -> String {
 }
 
 fn sse_text_finish(text: &str) -> String {
+    sse_text_finish_with_stop_reason(text, "end_turn")
+}
+
+fn sse_text_finish_with_stop_reason(text: &str, stop_reason: &str) -> String {
     let mut reply = String::new();
     reply.push_str(&sse_event(
         "content_block_delta",
@@ -268,7 +277,7 @@ fn sse_text_finish(text: &str) -> String {
         "message_delta",
         serde_json::json!({
             "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
             "usage": {"output_tokens": 1}
         }),
     ));
@@ -398,6 +407,7 @@ fn sse_text_tool_reply(text: &str) -> String {
     reply
 }
 
+#[cfg(target_os = "linux")]
 fn sse_text_bash_reply(text: &str) -> String {
     let mut reply = sse_text_tool_reply(text).replace("\"name\":\"read\"", "\"name\":\"bash\"");
     let previous = serde_json::to_string(&serde_json::json!({"path": "notes.txt"}))
@@ -2415,6 +2425,9 @@ fn exchange_stream_json_preserves_text_tool_text_order_for_all_providers() {
             "{provider} exchange failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("warning: stopped after"), "{stderr}");
+        assert!(!stderr.contains("warning: reply truncated"), "{stderr}");
 
         let stdout = String::from_utf8(output.stdout).expect("stream output is UTF-8");
         let records: Vec<Value> = stdout
@@ -2482,6 +2495,113 @@ fn exchange_stream_json_preserves_text_tool_text_order_for_all_providers() {
 }
 
 #[test]
+fn exchange_stream_json_correlates_envelope_input_ids() {
+    let cwd = fixture_dir("stream-envelope-correlation");
+    let (base_url, requests) = spawn_sse_sequence_server(vec![sse_text_reply("correlated")]);
+    let mut command = leg(&cwd, &base_url);
+    command.arg("exchange").arg("--stream-json");
+    let request = serde_json::json!({
+        "schema": "baton.message/v1",
+        "message_id": "message-known",
+        "conversation_id": "conversation-known",
+        "from": "external",
+        "to": "leg",
+        "in_reply_to": null,
+        "kind": "request",
+        "body": "hello",
+        "ts_ms": 1,
+        "exchange": null
+    })
+    .to_string();
+    let output = run(command, Some(&request));
+    assert!(
+        output.status.success(),
+        "envelope stream exchange failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    let stdout = String::from_utf8(output.stdout).expect("stream output is UTF-8");
+    let records: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each output line is JSON"))
+        .collect();
+    assert_eq!(
+        records.len(),
+        3,
+        "expected start, delta, and terminal records"
+    );
+    for (seq, record) in records.iter().enumerate() {
+        assert_eq!(record["schema"], "leg.exchange.stream/v1");
+        assert_eq!(record["seq"], seq as u64);
+    }
+    assert_eq!(records[0]["event"], "turn_start");
+    assert_eq!(records[0]["request"]["message_id"], "message-known");
+    assert_eq!(
+        records[0]["request"]["conversation_id"],
+        "conversation-known"
+    );
+    assert_eq!(records[2]["event"], "turn_end");
+    assert_eq!(records[2]["response"]["in_reply_to"], "message-known");
+    assert_eq!(
+        records[2]["response"]["conversation_id"],
+        "conversation-known"
+    );
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn exchange_stream_json_warns_once_for_max_tokens_truncation() {
+    let cwd = fixture_dir("stream-max-tokens-warning");
+    let (base_url, requests) = spawn_sse_sequence_server(vec![sse_text_reply_with_stop_reason(
+        "truncated reply",
+        "max_tokens",
+    )]);
+    let mut command = leg(&cwd, &base_url);
+    command.arg("exchange").arg("--stream-json");
+    let output = run(command, Some("hello\n"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "exchange failed: {stderr}");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| *line == "warning: reply truncated (stop_reason: max_tokens)")
+            .count(),
+        1,
+        "truncation warning must appear once: {stderr}"
+    );
+    assert!(!stderr.contains("warning: stopped after"), "{stderr}");
+
+    let stdout = String::from_utf8(output.stdout).expect("stream output is UTF-8");
+    assert!(
+        !stdout.contains("warning:"),
+        "warnings belong on stderr: {stdout}"
+    );
+    let records: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each output line is JSON"))
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["turn_start", "text_delta", "turn_end"]
+    );
+    for (seq, record) in records.iter().enumerate() {
+        assert_eq!(record["schema"], "leg.exchange.stream/v1");
+        assert_eq!(record["seq"], seq as u64);
+    }
+    assert_eq!(records[2]["capped"], false);
+    assert_eq!(
+        records[2]["response"]["exchange"]["exchange"]["outcome"]["stop_reason"],
+        "max_tokens"
+    );
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
 fn exchange_stream_json_marks_tool_round_limit_cap_without_dispatching_capped_tools() {
     let capped_tool_id = "toolu_capped";
     let cwd = fixture_dir("stream-tool-round-cap");
@@ -2508,12 +2628,44 @@ fn exchange_stream_json_marks_tool_round_limit_cap_without_dispatching_capped_to
         "capped stream exchange failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let cap_warning = tool_round_limit_warning(1);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| *line == cap_warning.as_str())
+            .count(),
+        1,
+        "tool-round warning must match the ordinary exchange warning once: {stderr}"
+    );
+    assert!(!stderr.contains("warning: reply truncated"), "{stderr}");
 
     let stdout = String::from_utf8(output.stdout).expect("stream output is UTF-8");
+    assert!(
+        !stdout.contains(&cap_warning),
+        "warnings belong on stderr: {stdout}"
+    );
     let records: Vec<Value> = stdout
         .lines()
         .map(|line| serde_json::from_str(line).expect("each output line is JSON"))
         .collect();
+    for (seq, record) in records.iter().enumerate() {
+        assert_eq!(record["schema"], "leg.exchange.stream/v1");
+        assert_eq!(record["seq"], seq as u64);
+    }
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "turn_start",
+            "tool_round",
+            "tool_call",
+            "tool_result",
+            "turn_end",
+        ]
+    );
     assert_eq!(
         requests.lock().unwrap().len(),
         2,
@@ -2532,6 +2684,10 @@ fn exchange_stream_json_marks_tool_round_limit_cap_without_dispatching_capped_to
         .find(|record| record["event"] == "turn_end")
         .expect("terminal record");
     assert_eq!(terminal["capped"], true);
+    assert_eq!(
+        terminal["response"]["in_reply_to"],
+        records[0]["request"]["message_id"]
+    );
 
     let tool_events: Vec<(&str, &str)> = records
         .iter()
