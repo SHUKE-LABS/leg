@@ -406,6 +406,15 @@ pub(crate) fn creation_lock_is_held(store_dir: &Path) -> Result<bool, String> {
 }
 
 fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
+    lock_is_held_if_present_after_coordination_release(path, label, || {})
+}
+
+/// The callback marks a deterministic test boundary after both locks are released.
+fn lock_is_held_if_present_after_coordination_release(
+    path: &Path,
+    label: &str,
+    after_coordination_release: impl FnOnce(),
+) -> Result<bool, String> {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     let lock = match options.open(path) {
@@ -413,9 +422,15 @@ fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("could not open {label} lock: {error}")),
     };
-    let _coordination = lock_coordination(path, label)?;
+    let coordination = lock_coordination(path, label)?;
     match lock.try_lock_exclusive() {
-        Ok(()) => Ok(false),
+        Ok(()) => {
+            FileExt::unlock(&lock)
+                .map_err(|error| format!("could not release {label} lock probe: {error}"))?;
+            drop(coordination);
+            after_coordination_release();
+            Ok(false)
+        }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
         Err(error) => Err(format!("could not inspect {label} lock: {error}")),
     }
@@ -424,29 +439,20 @@ fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
 fn acquire_creation_lock(store_dir: &Path) -> Result<File, String> {
     let path = store_dir.join(".leg-ui-client-create.lock");
     let lock = open_lock_file(&path)?;
-    loop {
-        let coordination = lock_coordination(&path, "session creation")?;
-        match lock.try_lock_exclusive() {
-            Ok(()) => {
-                drop(coordination);
-                return Ok(lock);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                drop(coordination);
-                // Wait without the coordination guard, then retry acquisition
-                // under it so display probes cannot take the primary lock in
-                // the ownership-claim window.
-                lock.lock_exclusive().map_err(|error| {
-                    format!("could not acquire session creation guard: {error}")
-                })?;
-                FileExt::unlock(&lock).map_err(|error| {
-                    format!("could not release waited session creation guard: {error}")
-                })?;
-            }
-            Err(error) => {
-                return Err(format!("could not acquire session creation guard: {error}"));
-            }
+    let coordination = lock_coordination(&path, "session creation")?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => {
+            drop(coordination);
+            Ok(lock)
         }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            drop(coordination);
+            // Wait without the sidecar; the exclusive primary lock marks ownership to probes.
+            lock.lock_exclusive()
+                .map_err(|error| format!("could not acquire session creation guard: {error}"))?;
+            Ok(lock)
+        }
+        Err(error) => Err(format!("could not acquire session creation guard: {error}")),
     }
 }
 
@@ -838,6 +844,8 @@ fn exit_code(status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn session_ids_match_core_filename_contract() {
@@ -877,5 +885,36 @@ mod tests {
             assert_ne!(token, 0);
             assert!(token < (1_u128 << 64));
         }
+    }
+
+    #[test]
+    fn display_probe_releases_primary_before_coordination_guard() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let store = scratch.path();
+        let session_id = "sess-123-456";
+        let lock_path = store.join(format!(".leg-ui-session-{session_id}.lock"));
+        File::create(&lock_path).expect("create primary lock");
+
+        let (released_tx, released_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let probe_path = lock_path.clone();
+        let probe = std::thread::spawn(move || {
+            lock_is_held_if_present_after_coordination_release(&probe_path, session_id, || {
+                released_tx.send(()).expect("signal guard release");
+                resume_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("resume probe");
+            })
+        });
+
+        released_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe released its coordination guard");
+        let lock = try_session_lock(store, session_id)
+            .expect("acquire session lock after probe")
+            .expect("probe must release the primary lock before its guard");
+        FileExt::unlock(&lock).expect("release session lock");
+        resume_tx.send(()).expect("resume probe");
+        assert!(!probe.join().expect("join probe").expect("probe succeeds"));
     }
 }

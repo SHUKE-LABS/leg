@@ -231,7 +231,10 @@ fn display_lock_probes_do_not_create_primary_locks_or_change_trails() {
         .open(&primary)
         .unwrap();
     assert_eq!(catalog.get(id).unwrap().run_state, CatalogRunState::Idle);
-    assert!(coordination.exists(), "existing primary locks are coordinated");
+    assert!(
+        coordination.exists(),
+        "existing primary locks are coordinated"
+    );
     assert_eq!(fs::read_to_string(&trail_path).unwrap(), trail);
 
     fs::remove_file(&coordination).unwrap();

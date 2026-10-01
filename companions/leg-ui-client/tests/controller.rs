@@ -1061,7 +1061,18 @@ fn main() {
 }
 
 #[test]
-fn new_session_claim_waits_for_a_display_probe_of_the_same_lock() {
+fn display_probe_does_not_block_new_or_idle_existing_session() {
+    assert_display_probe_allows_start(
+        "sess-100-200-108",
+        LegSession::NewWithId("sess-100-200-108".into()),
+    );
+    assert_display_probe_allows_start(
+        "sess-100-200-109",
+        LegSession::Existing("sess-100-200-109".into()),
+    );
+}
+
+fn assert_display_probe_allows_start(id: &'static str, session: LegSession) {
     let scratch = tempfile::tempdir().expect("scratch directory");
     let state = scratch.path().join("state");
     let cwd = scratch.path().join("cwd");
@@ -1071,11 +1082,15 @@ fn new_session_claim_waits_for_a_display_probe_of_the_same_lock() {
         ..SessionCatalogConfig::default()
     })
     .expect("open catalog");
-    let id = "sess-100-200-108";
     let store = catalog.sessions_dir().to_path_buf();
     fs::write(store.join(format!("{id}.jsonl")), "").expect("create existing trail");
-    catalog.set_workspace(id, &cwd).expect("register existing session");
-    assert_eq!(catalog.get(id).unwrap().run_state, leg_ui_client::CatalogRunState::Idle);
+    catalog
+        .set_workspace(id, &cwd)
+        .expect("register existing session");
+    assert_eq!(
+        catalog.get(id).unwrap().run_state,
+        leg_ui_client::CatalogRunState::Idle
+    );
 
     let ready = scratch.path().join("probe-ready");
     let release = scratch.path().join("probe-release");
@@ -1106,7 +1121,7 @@ fn new_session_claim_waits_for_a_display_probe_of_the_same_lock() {
     let start_thread = thread::spawn(move || {
         let _ = started_tx.send(());
         let result = client(Some(leg_for_start), &wrapper_for_start, &store_for_start).start(
-            TurnRequest::new("probe must not defeat this claim", cwd_for_start, LegSession::NewWithId(id.into())),
+            TurnRequest::new("probe must not defeat this claim", cwd_for_start, session),
         );
         let _ = result_tx.send(result);
     });
@@ -1118,17 +1133,27 @@ fn new_session_claim_waits_for_a_display_probe_of_the_same_lock() {
 
     fs::write(&release, "release").expect("release probe process");
     let probe_status = probe.wait().expect("wait for display probe process");
-    assert!(probe_status.success(), "display probe process failed: {probe_status}");
+    assert!(
+        probe_status.success(),
+        "display probe process failed: {probe_status}"
+    );
     let early_description = match &early_result {
-        Ok(Ok(_)) => "supervisor returned success before the display probe released its lock".into(),
-        Ok(Err(error)) => format!("supervisor returned {error:?} before the display probe released its lock"),
+        Ok(Ok(_)) => {
+            "supervisor returned success before the display probe released its lock".into()
+        }
+        Ok(Err(error)) => {
+            format!("supervisor returned {error:?} before the display probe released its lock")
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => String::new(),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             "start thread exited before the display probe released its lock".into()
         }
     };
     assert!(
-        matches!(early_result, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        matches!(
+            early_result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
         "{early_description}"
     );
     let mut turn = result_rx
@@ -1141,7 +1166,11 @@ fn new_session_claim_waits_for_a_display_probe_of_the_same_lock() {
 
 #[test]
 fn catalog_display_process_loops_over_starts_and_probes() {
-    if std::env::var("LEG_UI_CATALOG_DISPLAY_WORKER").ok().as_deref() != Some("1") {
+    if std::env::var("LEG_UI_CATALOG_DISPLAY_WORKER")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         return;
     }
     let state = PathBuf::from(
@@ -1209,11 +1238,8 @@ fn thirty_two_new_and_existing_turns_survive_concurrent_catalog_probes() {
     let mut existing_ids = Vec::new();
     for index in 0..TURN_COUNT {
         let id = format!("sess-stress-{index}");
-        fs::write(
-            catalog.sessions_dir().join(format!("{id}.jsonl")),
-            "",
-        )
-        .expect("create existing-session trail");
+        fs::write(catalog.sessions_dir().join(format!("{id}.jsonl")), "")
+            .expect("create existing-session trail");
         catalog
             .set_workspace(&id, &cwd)
             .expect("register existing session");
@@ -1224,7 +1250,10 @@ fn thirty_two_new_and_existing_turns_survive_concurrent_catalog_probes() {
     let _stop_display_on_drop = ReleaseFile(stop_display.clone());
     let display_progress = scratch.path().join("display-progress");
     let mut display = Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", "catalog_display_process_loops_over_starts_and_probes"])
+        .args([
+            "--exact",
+            "catalog_display_process_loops_over_starts_and_probes",
+        ])
         .env("LEG_UI_CATALOG_DISPLAY_WORKER", "1")
         .env("LEG_UI_CATALOG_DISPLAY_STATE", &state)
         .env("LEG_UI_CATALOG_DISPLAY_STOP", &stop_display)
@@ -1282,7 +1311,10 @@ fn thirty_two_new_and_existing_turns_survive_concurrent_catalog_probes() {
     }
     fs::write(&stop_display, "stop").expect("stop display process");
     let display_status = display.wait().expect("wait for display process");
-    assert!(display_status.success(), "display process failed: {display_status}");
+    assert!(
+        display_status.success(),
+        "display process failed: {display_status}"
+    );
 }
 
 #[test]
@@ -1293,16 +1325,13 @@ fn display_probe_race_process_worker() {
     use fs2::FileExt;
     use std::fs::OpenOptions;
 
-    let state = PathBuf::from(
-        std::env::var_os("LEG_UI_PROBE_RACE_STATE").expect("probe state directory"),
-    );
+    let state =
+        PathBuf::from(std::env::var_os("LEG_UI_PROBE_RACE_STATE").expect("probe state directory"));
     let id = std::env::var("LEG_UI_PROBE_RACE_ID").expect("probe session id");
-    let ready = PathBuf::from(
-        std::env::var_os("LEG_UI_PROBE_RACE_READY").expect("probe ready path"),
-    );
-    let release = PathBuf::from(
-        std::env::var_os("LEG_UI_PROBE_RACE_RELEASE").expect("probe release path"),
-    );
+    let ready =
+        PathBuf::from(std::env::var_os("LEG_UI_PROBE_RACE_READY").expect("probe ready path"));
+    let release =
+        PathBuf::from(std::env::var_os("LEG_UI_PROBE_RACE_RELEASE").expect("probe release path"));
     let catalog = SessionCatalog::open(SessionCatalogConfig {
         state_dir: Some(state.clone()),
         ..SessionCatalogConfig::default()
@@ -1310,6 +1339,8 @@ fn display_probe_race_process_worker() {
     .expect("open probe worker catalog");
     assert!(catalog.get(&id).is_ok(), "probe worker reads the session");
 
+    // Model the short cross-process interval while the production unit test
+    // checks the probe's actual primary-lock and coordination-guard release order.
     let store = state.join("sessions");
     let primary_path = store.join(format!(".leg-ui-session-{id}.lock"));
     let coordination_path = primary_path.with_file_name(format!(".leg-ui-session-{id}.lock.coord"));
@@ -1325,7 +1356,9 @@ fn display_probe_race_process_worker() {
         .write(true)
         .open(coordination_path)
         .expect("open coordination guard");
-    coordination.lock_exclusive().expect("lock probe coordination guard");
+    coordination
+        .lock_exclusive()
+        .expect("lock probe coordination guard");
     primary.lock_exclusive().expect("hold display probe lock");
     fs::write(ready, "ready").expect("signal held display probe");
     wait_until(Duration::from_secs(10), || release.exists());
