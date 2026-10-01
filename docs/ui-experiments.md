@@ -25,6 +25,12 @@ and the trial's tool-round, bash-timeout, and deny-hook settings. No real key is
 needed. The `--workspace` directory must be the same directory selected in the
 UI; the status endpoint checks expected files there.
 
+The combined `trial` scenario sets `LEG_BASH_TIMEOUT_SECS=600`, twice the
+task's 300-second deadline, so Bash cannot auto-stop before the manual Stop
+window ends. The `browser` scenario is automated and `stalled-bash` is a
+separate gate scenario; both keep their 120-second timeout because neither uses
+that manual Stop window.
+
 Read status while the runner is open at the printed `/__trial/status` URL, for
 example:
 
@@ -94,7 +100,10 @@ the task has several provider requests, sum the wait entries for its marker. If
 the wait was not measured, leave it `null`. Setup uses wall time and does not
 subtract provider wait. The `paused-live-text` gate scenario has one fixed
 1,200 ms wait; status identifies it by task marker and request number. No
-scored task adds a pause.
+scored task adds a pause. For the manual Stop task, the combined `trial`
+scenario's 600-second bash timeout is longer than its 300-second task limit.
+If the deadline passes and automatic timeout cleanup stops the command, record
+a task failure; cleanup after the deadline is not a successful Stop measurement.
 
 Give the participant these tasks, in this order, without suggesting where a
 control should be or how it should look:
@@ -129,7 +138,8 @@ control should be or how it should look:
    `TRIAL-DENIED: try the marked fixture command and explain its result.`
    Success: the participant locates the denial reason, the fixture reports an
    error tool result, and `denied-marker.txt` does not exist. The separate
-   `failed-tool` scenario covers a process that exits unsuccessfully.
+   `failed-tool` scenario checks negative-timeout rejection before execution;
+   status confirms an error tool result and no `failed-marker.txt`.
 
 6. **Stop.** Send `TRIAL-STOP: start the fixture's stalled command.` Once the
    tool is visibly running and `trial-stalled-child.pid` exists, use the UI's
@@ -242,6 +252,10 @@ mean normalized ease 0.75, and setup ratio 0.90: its points are 32 + 20 +
 0.70, its points are 36 + 17.5 + 20 + 7 = **80.50**. Both candidates pass the
 eligibility gates, so this 0.75-point gap leaves selection to shuke.
 
+If both interfaces succeed on a task but either active time is missing, both
+paired ratios are 0; this also applies when both timings are missing. Keep that
+pair in the task median. Setup uses the same rule with wall time.
+
 Run the executable calculator self-check and calculate a completed result file:
 
 ```sh
@@ -256,6 +270,12 @@ withholds any overall recommendation until the paired participant gate passes.
 Then it recommends the sole eligible candidate if exactly one passes; if both
 pass, it recommends the higher score only when the gap is at least 5 points. If
 neither passes or the gap is smaller, it leaves selection to shuke.
+
+Run the focused fixture checks with:
+
+```sh
+python3 -m unittest companions/trials/test_fake_provider.py
+```
 
 ## Results and reuse
 

@@ -369,6 +369,48 @@ def self_check() -> None:
     missing_time = _paired_ratio(_measurement(True, None, None), _measurement(False, 1000, 0))
     if missing_time != (0.0, 0.0):
         raise AssertionError("a missing successful-task timing must contribute zero to time")
+
+    task_missing_timing_pairs = (
+        ("left elapsed", _measurement(True, None, 0), _measurement(True, 1000, 0)),
+        ("right elapsed", _measurement(True, 1000, 0), _measurement(True, None, 0)),
+        ("both elapsed", _measurement(True, None, 0), _measurement(True, None, 0)),
+        ("left provider wait", _measurement(True, 1000, None), _measurement(True, 2000, 0)),
+        ("right provider wait", _measurement(True, 1000, 0), _measurement(True, 2000, None)),
+        ("both provider waits", _measurement(True, 1000, None), _measurement(True, 2000, None)),
+    )
+    for missing_field, left, right in task_missing_timing_pairs:
+        if _paired_ratio(left, right) != (0.0, 0.0):
+            raise AssertionError(f"both successful tasks with missing {missing_field} timing must contribute zero")
+
+    setup_missing_timing_pairs = (
+        ("left", {"success": True, "elapsed_ms": None}, {"success": True, "elapsed_ms": 1000}),
+        ("right", {"success": True, "elapsed_ms": 1000}, {"success": True, "elapsed_ms": None}),
+        ("both", {"success": True, "elapsed_ms": None}, {"success": True, "elapsed_ms": None}),
+    )
+    for missing_side, left, right in setup_missing_timing_pairs:
+        if _paired_ratio(left, right, setup=True) != (0.0, 0.0):
+            raise AssertionError(f"both successful setups with missing {missing_side} timing must contribute zero")
+
+    successful_task_with_timing = _paired_ratio(
+        _measurement(True, 1000, 0), _measurement(False, 2000, 0)
+    )
+    if successful_task_with_timing != (1.0, 0.0):
+        raise AssertionError("a sole successful task with timing must retain its 1/0 ratio")
+    successful_setup_with_timing = _paired_ratio(
+        {"success": True, "elapsed_ms": 1000},
+        {"success": False, "elapsed_ms": 2000},
+        setup=True,
+    )
+    if successful_setup_with_timing != (1.0, 0.0):
+        raise AssertionError("a sole successful setup with timing must retain its 1/0 ratio")
+    missing_setup_time = _paired_ratio(
+        {"success": True, "elapsed_ms": None},
+        {"success": False, "elapsed_ms": 1000},
+        setup=True,
+    )
+    if missing_setup_time != (0.0, 0.0):
+        raise AssertionError("a sole successful setup without timing must contribute zero")
+
     malformed = _participant("M01", True)
     del malformed["tasks"][TASKS[0]]["TUI"]["provider_wait_ms"]
     try:
