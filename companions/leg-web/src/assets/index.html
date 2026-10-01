@@ -15,20 +15,26 @@
       </header>
 
       <div class="workbench">
-        <aside class="session-rail" aria-label="Conversation controls">
+        <nav class="session-rail" aria-label="Sessions">
           <div class="rail-heading">
-            <h1>Conversation</h1>
+            <h1>Sessions</h1>
             <button id="new-conversation" class="quiet-button" type="button">New</button>
           </div>
-          <div id="current-session-card" class="current-session-card" hidden>
-            <span class="session-marker" aria-hidden="true">●</span>
-            <div>
-              <strong id="rail-session-name">Current conversation</strong>
-              <p id="rail-workspace">Workspace not set</p>
+          <form id="rename-form" class="rail-form" hidden>
+            <label for="rename-input">Session name</label>
+            <input id="rename-input" type="text" maxlength="120" autocomplete="off" />
+            <div class="rail-form-actions">
+              <button class="primary-button" type="submit">Save name</button>
+              <button id="cancel-rename" class="quiet-button" type="button">Cancel</button>
             </div>
-          </div>
-          <p class="rail-note">One local conversation at a time. The workspace is the working directory for tools.</p>
-        </aside>
+            <p id="rename-error" class="error-message" role="alert" hidden></p>
+          </form>
+          <p id="session-list-heading" class="rail-section-label">Recent sessions</p>
+          <ul id="session-list" class="session-list" aria-labelledby="session-list-heading"></ul>
+          <p id="session-list-empty" class="rail-note" hidden>No saved sessions yet. Choose New to begin.</p>
+          <p id="session-list-error" class="rail-message" role="status" hidden></p>
+          <p class="rail-note rail-help">The workspace is the working directory for tools.</p>
+        </nav>
 
         <main class="main-panel">
           <section id="welcome" class="welcome-panel" aria-labelledby="welcome-title">
@@ -62,6 +68,17 @@
                 <p id="elapsed-time" class="elapsed-time" hidden></p>
               </div>
             </header>
+
+            <aside id="session-guidance" class="session-guidance" role="status" hidden></aside>
+            <form id="set-workspace-form" class="recovery-form" hidden>
+              <label for="recovery-workspace-input">Workspace folder path</label>
+              <input id="recovery-workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace" />
+              <div class="recovery-actions">
+                <button class="primary-button" type="submit">Set workspace</button>
+                <button id="cancel-workspace" class="quiet-button" type="button">Cancel</button>
+              </div>
+              <p id="recovery-error" class="error-message" role="alert" hidden></p>
+            </form>
 
             <div class="activity-bar">
               <div class="activity-copy">

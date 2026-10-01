@@ -110,6 +110,9 @@ class Fixture:
         markers = (
             "TRIAL-CHINESE",
             "TRIAL-SEED-SESSION",
+            "TRIAL-NAV-SEED",
+            "TRIAL-NAV-CONTINUE",
+            "TRIAL-NAV-LOSER",
             "TRIAL-TOOL-TEXT",
             "TRIAL-DENIED",
             "TRIAL-FAILED",
@@ -361,6 +364,38 @@ class Fixture:
             return
         if marker == "TRIAL-SEED-SESSION":
             self.send_stream(handler, [{"type": "text", "text": "Fixture seed: blue lantern."}])
+            return
+        if marker == "TRIAL-NAV-SEED":
+            if self.has_tool_result(payload):
+                self.check("navigation_seed_tool_result_returned")
+                self.send_stream(handler, [{"type": "text", "text": "The navigation seed is complete."}])
+            else:
+                self.send_stream(
+                    handler,
+                    [{"type": "tool_use", "name": "bash", "input": {"command": "pwd && printf 'session-rail-tool-history\\n'"}}],
+                    stop_reason="tool_use",
+                )
+            return
+        if marker == "TRIAL-NAV-CONTINUE":
+            messages = payload.get("messages", [])
+            tool_results = [
+                block
+                for message in messages if isinstance(message, dict) and message.get("role") == "user"
+                for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ]
+            history = json.dumps(payload, ensure_ascii=False)
+            self.check(
+                "navigation_prior_text_and_tool_history_returned",
+                "TRIAL-NAV-SEED" in history
+                and "The navigation seed is complete." in history
+                and any("session-rail-tool-history" in json.dumps(block, ensure_ascii=False) for block in tool_results),
+            )
+            self.check(
+                "navigation_recorded_workspace_returned",
+                self.workspace is not None and str(self.workspace.resolve()) in history,
+            )
+            self.send_stream(handler, [{"type": "text", "text": "The reopened session kept its prior tool history and workspace."}])
             return
         if marker == "TRIAL-CHINESE" or marker == "chinese-multiline":
             all_text = "\n".join(text_content(item.get("content")) for item in payload.get("messages", []) if isinstance(item, dict) and item.get("role") == "user")

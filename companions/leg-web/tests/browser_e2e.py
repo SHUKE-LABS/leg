@@ -115,6 +115,43 @@ def host_snapshot(authority: str, token: str, session_id: str) -> dict[str, obje
     return json.loads(raw)
 
 
+def create_workspace_less_session(authority: str, token: str) -> dict[str, object]:
+    connection = http.client.HTTPConnection(authority, timeout=5)
+    connection.request(
+        "POST",
+        "/api/sessions",
+        body="{}",
+        headers={
+            "Host": authority,
+            "Origin": f"http://{authority}",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    response = connection.getresponse()
+    raw = response.read()
+    status = response.status
+    connection.close()
+    if status != 201:
+        raise AssertionError(f"workspace-less session creation returned {status}: {raw!r}")
+    return json.loads(raw)
+
+
+def recovered_request_event(session_id: str, prompt: str) -> str:
+    return json.dumps(
+        {
+            "schema": "baton.exchange/v1",
+            "event": "request",
+            "ts_ms": 1,
+            "model": "fixture",
+            "base_url": "http://fixture.invalid",
+            "prompt": prompt,
+            "session_id": session_id,
+            "turn_index": 0,
+        }
+    ) + "\n"
+
+
 def wait_until(predicate, description: str, timeout: float = 25):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -278,7 +315,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 await page.goto(launch_url, wait_until="load")
                 assert await page.title() == "Leg Web"
                 assert await page.locator("#workspace-warning").count() == 1
-                await page.get_by_label("Workspace folder path").fill(str(workspace))
+                await page.locator("#workspace-input").fill(str(workspace))
 
                 async def break_first_event_stream(route):
                     if not hasattr(break_first_event_stream, "broken"):
@@ -664,7 +701,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert not page_errors, page_errors
 
                 await page.get_by_role("button", name="New").click()
-                await page.get_by_label("Workspace folder path").fill(str(workspace))
+                await page.locator("#workspace-input").fill(str(workspace))
                 await page.get_by_role("button", name="Start conversation").click()
                 await page.wait_for_function(
                     "() => sessionStorage.getItem('leg-web-current-session')",
@@ -710,11 +747,333 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
             stop_process(provider, graceful=False)
 
 
+async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="leg-web-session-rail-e2e-") as root_string:
+        root = Path(root_string)
+        workspace_a = root / "workspace-a"
+        workspace_b = root / "workspace-b"
+        state_dir = root / "state"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        state_dir.mkdir()
+        sessions_dir = state_dir / "sessions"
+        sessions_dir.mkdir()
+
+        recovered_id = "sess-103-701"
+        readonly_id = "sess-103-702"
+        (sessions_dir / f"{recovered_id}.jsonl").write_text(
+            recovered_request_event(recovered_id, "recovered transcript"), encoding="utf-8"
+        )
+        (sessions_dir / f"{readonly_id}.jsonl").write_text("not json\n", encoding="utf-8")
+
+        provider, provider_lines = start_process(
+            [sys.executable, str(FAKE_PROVIDER), "--scenario", "browser", "--workspace", str(workspace_a)]
+        )
+        host = None
+        browser = None
+        try:
+            provider_line = read_until(provider, provider_lines, "Listening:")
+            provider_url = provider_line.split()[1].removesuffix("/v1/messages")
+            provider_authority = urlsplit(provider_url).netloc
+            host_env = os.environ.copy()
+            host_env.update(
+                {
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": provider_url,
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_MAX_TOOL_ROUNDS": "2",
+                    "LEG_BASH_TIMEOUT_SECS": "120",
+                }
+            )
+            host, host_lines = start_process(
+                [
+                    str(web_bin),
+                    "--no-open",
+                    "--bind",
+                    "127.0.0.1:0",
+                    "--state-dir",
+                    str(state_dir),
+                    "--leg-bin",
+                    str(leg_bin),
+                    "--supervisor-bin",
+                    str(supervisor_bin),
+                ],
+                cwd=workspace_a,
+                env=host_env,
+            )
+            launch_line = read_until(host, host_lines, "Open this one-time launch URL:")
+            launch_url = launch_line.split(": ", 1)[1]
+            authority = urlsplit(launch_url).netloc
+            token = urlsplit(launch_url).fragment
+            missing = create_workspace_less_session(authority, token)
+            missing_id = str(missing["id"])
+
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=True)
+                context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                page = await context.new_page()
+                page_requests: list[tuple[str, str]] = []
+                page_errors: list[str] = []
+                allowed_authorities = {authority}
+                page.on("request", lambda request: page_requests.append((request.method, request.url)))
+                page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+                async def local_only(route):
+                    request_authority = urlsplit(route.request.url).netloc
+                    if request_authority and request_authority not in allowed_authorities:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route("**/*", local_only)
+                await page.goto(launch_url, wait_until="load")
+
+                async def open_session(target_page, session_id: str, title: str) -> None:
+                    await target_page.locator(
+                        f'#session-list .session-select[data-session-id="{session_id}"]'
+                    ).click()
+                    await target_page.wait_for_function(
+                        "({id, title}) => !document.querySelector('#conversation').hidden && "
+                        "document.querySelector('#session-title')?.dataset.sessionId === id && "
+                        "document.querySelector('#session-title')?.textContent === title",
+                        arg={"id": session_id, "title": title},
+                        timeout=10000,
+                    )
+
+                async def rename_session(target_page, session_id: str, name: str) -> None:
+                    entry = target_page.locator(
+                        f'#session-list .session-entry:has(.session-select[data-session-id="{session_id}"])'
+                    )
+                    await entry.locator(".session-rename").click()
+                    await target_page.locator("#rename-input").fill(name)
+                    await target_page.get_by_role("button", name="Save name").click()
+                    await target_page.wait_for_function(
+                        "({id, name}) => [...document.querySelectorAll('#session-list .session-entry')].some("
+                        "entry => entry.querySelector('.session-select')?.dataset.sessionId === id && "
+                        "entry.querySelector('.session-entry-name')?.textContent === name)",
+                        arg={"id": session_id, "name": name},
+                    )
+
+                async def create_session(target_page, workspace: Path) -> str:
+                    await target_page.get_by_role("button", name="New", exact=True).click()
+                    await target_page.locator("#workspace-input").fill(str(workspace))
+                    await target_page.get_by_role("button", name="Start conversation").click()
+                    await target_page.locator("#conversation").wait_for(state="visible")
+                    await target_page.wait_for_function(
+                        "() => sessionStorage.getItem('leg-web-current-session') !== null"
+                    )
+                    return str(await target_page.evaluate("sessionStorage.getItem('leg-web-current-session')"))
+
+                async def send_and_wait(target_page, request_id: int, prompt: str, session_id: str) -> dict[str, object]:
+                    await target_page.locator("#prompt").fill(prompt)
+                    await target_page.get_by_role("button", name="Send").click()
+                    result = await asyncio.to_thread(
+                        wait_completed_submission, authority, token, session_id, request_id
+                    )
+                    await wait_status(target_page, "Succeeded")
+                    return result
+
+                await page.locator(f'#session-list .session-select[data-session-id="{missing_id}"]').wait_for()
+                await open_session(page, missing_id, "Conversation")
+                assert "Choose a workspace folder" in await page.locator("#session-guidance").inner_text()
+                assert await page.get_by_role("button", name="Send").is_disabled()
+                await page.locator("#session-guidance").get_by_role("button", name="Set workspace").click()
+                await page.locator("#recovery-workspace-input").fill(str(workspace_a))
+                await page.locator("#set-workspace-form").get_by_role("button", name="Set workspace").click()
+                await page.wait_for_function(
+                    "() => document.querySelector('#workspace-label')?.textContent.includes('workspace-a')"
+                )
+                assert await page.locator("#session-guidance").is_hidden()
+
+                await open_session(page, recovered_id, "Conversation")
+                assert "recovered conversation" in (await page.locator("#session-guidance").inner_text()).lower()
+                await page.locator("#session-guidance").get_by_role("button", name="Set workspace").click()
+                await page.locator("#recovery-workspace-input").fill(str(workspace_a))
+                await page.locator("#set-workspace-form").get_by_role("button", name="Set workspace").click()
+                await page.wait_for_function(
+                    "() => document.querySelector('#workspace-label')?.textContent.includes('workspace-a') && "
+                    "document.querySelector('#session-guidance')?.hidden"
+                )
+
+                await open_session(page, readonly_id, "Conversation")
+                assert "recovered conversation" in (await page.locator("#session-guidance").inner_text()).lower()
+                await page.locator("#session-guidance").get_by_role("button", name="Set workspace").click()
+                await page.locator("#recovery-workspace-input").fill(str(workspace_a))
+                await page.locator("#set-workspace-form").get_by_role("button", name="Set workspace").click()
+                await page.wait_for_function(
+                    "() => document.querySelector('#session-guidance')?.textContent.includes('read-only')"
+                )
+                assert "start a new conversation" in (await page.locator("#session-guidance").inner_text()).lower()
+                assert await page.get_by_role("button", name="Send").is_disabled()
+
+                alpha_draft_id = await create_session(page, workspace_a)
+                await rename_session(page, alpha_draft_id, "Alpha")
+                await page.locator("#prompt").fill("TRIAL-NAV-SEED: create prior tool history")
+                await page.get_by_role("button", name="Send").click()
+                await page.wait_for_function(
+                    "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
+                    timeout=15000,
+                )
+                alpha_id = str(await page.evaluate("sessionStorage.getItem('leg-web-current-session')"))
+                seed = await asyncio.to_thread(wait_completed_submission, authority, token, alpha_id, 1)
+                await wait_status(page, "Succeeded")
+                assert seed["session"]["turns"][0]["outcome"] == "succeeded", seed
+                assert seed["session"]["turns"][0]["tools"], seed
+                await send_and_wait(page, 2, "TRIAL-LONG: add a long transcript for reading position", alpha_id)
+
+                alpha_draft = "Alpha draft remains exact while switching."
+                await page.locator("#prompt").fill(alpha_draft)
+                await page.locator("#transcript").evaluate("element => { element.scrollTop = 0; }")
+                await page.wait_for_function(
+                    "key => { const saved = JSON.parse(sessionStorage.getItem(key) || 'null'); return saved && !saved.atBottom && saved.key; }",
+                    arg=f"leg-web-reading:{alpha_id}",
+                )
+                reading_position = await page.evaluate(
+                    "key => JSON.parse(sessionStorage.getItem(key))", f"leg-web-reading:{alpha_id}"
+                )
+                assert reading_position["key"] == "turn-0-user", reading_position
+                offset_expression = "node => node.getBoundingClientRect().top - document.querySelector('#transcript').getBoundingClientRect().top"
+                offset_before = await page.locator(
+                    f"#messages [data-key=\"{reading_position['key']}\"]"
+                ).evaluate(offset_expression)
+
+                beta_draft_id = await create_session(page, workspace_b)
+                await rename_session(page, beta_draft_id, "Beta")
+                beta_draft = "Beta keeps its own draft."
+                await page.locator("#prompt").fill(beta_draft)
+                await open_session(page, alpha_id, "Alpha")
+                assert await page.locator("#prompt").input_value() == alpha_draft
+                offset_after = await page.locator(
+                    f"#messages [data-key=\"{reading_position['key']}\"]"
+                ).evaluate(offset_expression)
+                assert abs(offset_after - offset_before) <= 2, (offset_before, offset_after)
+                await open_session(page, beta_draft_id, "Beta")
+                assert await page.locator("#prompt").input_value() == beta_draft
+
+                await open_session(page, alpha_id, "Alpha")
+                page2 = await context.new_page()
+                page2.on("pageerror", lambda error: page_errors.append(str(error)))
+
+                async def hold_events(route):
+                    try:
+                        await asyncio.sleep(30)
+                        await route.continue_()
+                    except Exception:
+                        return
+
+                await page2.route(f"**/api/sessions/{alpha_id}/events**", hold_events)
+                await page2.goto(launch_url, wait_until="load")
+                await open_session(page2, alpha_id, "Alpha")
+                loser_draft = "TRIAL-NAV-LOSER: keep this rejected draft"
+                await page2.locator("#prompt").fill(loser_draft)
+
+                submits_before_running = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                await page.locator("#prompt").fill("TRIAL-PAUSE: keep the background run visible")
+                await page.get_by_role("button", name="Send").click()
+                await page.get_by_text("The first live text is visible", exact=False).wait_for()
+                await wait_status(page, "Running")
+                busy_rejection = await page2.evaluate(
+                    """async ({sessionId, token, prompt}) => {
+                      const headers = {Authorization: `Bearer ${token}`};
+                      const snapshotResponse = await fetch(
+                        `/api/sessions/${encodeURIComponent(sessionId)}/snapshot`, {headers},
+                      );
+                      const snapshot = await snapshotResponse.json();
+                      const response = await fetch(
+                        `/api/sessions/${encodeURIComponent(sessionId)}/submit`,
+                        {
+                          method: "POST",
+                          headers: {...headers, "Content-Type": "application/json"},
+                          body: JSON.stringify({request_id: snapshot.next_request_id, prompt}),
+                        },
+                      );
+                      return {status: response.status, body: await response.json()};
+                    }""",
+                    {"sessionId": alpha_id, "token": token, "prompt": loser_draft},
+                )
+                assert busy_rejection == {"status": 409, "body": {"error": "session_busy"}}, busy_rejection
+                await page2.reload(wait_until="load")
+                await open_session(page2, alpha_id, "Alpha")
+                await page2.wait_for_function(
+                    "() => document.querySelector('#session-guidance')?.textContent.includes('busy')"
+                )
+                assert await page2.locator("#prompt").input_value() == loser_draft
+                assert await page2.get_by_role("button", name="Send").is_disabled()
+                await open_session(page, beta_draft_id, "Beta")
+                await page.wait_for_function(
+                    "id => [...document.querySelectorAll('#session-list .session-entry')].some(entry => "
+                    "entry.querySelector('.session-select')?.dataset.sessionId === id && entry.textContent.includes('Busy'))",
+                    arg=alpha_id,
+                    timeout=4000,
+                )
+                await open_session(page, alpha_id, "Alpha")
+                await wait_status(page, "Succeeded")
+                await page.get_by_text("The first live text is visible", exact=False).wait_for()
+                assert (await page.locator("#messages").inner_text()).count("The first live text is visible") == 1
+                submits_after_running = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                assert submits_after_running - submits_before_running == 1
+                assert "TRIAL-NAV-LOSER" not in fixture_status(provider_authority)["scenario_requests"]
+                await page2.close()
+
+                stop_process(host, graceful=True)
+                host, host_lines = start_process(
+                    [
+                        str(web_bin),
+                        "--no-open",
+                        "--bind",
+                        "127.0.0.1:0",
+                        "--state-dir",
+                        str(state_dir),
+                        "--leg-bin",
+                        str(leg_bin),
+                        "--supervisor-bin",
+                        str(supervisor_bin),
+                    ],
+                    cwd=workspace_a,
+                    env=host_env,
+                )
+                restart_line = read_until(host, host_lines, "Open this one-time launch URL:")
+                restart_url = restart_line.split(": ", 1)[1]
+                restart_authority = urlsplit(restart_url).netloc
+                restart_token = urlsplit(restart_url).fragment
+                allowed_authorities.add(restart_authority)
+                authority = restart_authority
+                token = restart_token
+                launch_url = restart_url
+                await page.goto(restart_url, wait_until="load")
+                await open_session(page, alpha_id, "Alpha")
+                reopened = host_snapshot(restart_authority, restart_token, alpha_id)
+                assert reopened["session"]["cwd"] == str(workspace_a.resolve()), reopened
+                assert reopened["session"]["turns"][0]["outcome"] == "succeeded", reopened
+                assert reopened["session"]["turns"][0]["tools"], reopened
+                await send_and_wait(page, 4, "TRIAL-NAV-CONTINUE: inspect history after host restart", alpha_id)
+
+                provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert provider_status["input_checks"].get("navigation_seed_tool_result_returned") is True
+                assert provider_status["input_checks"].get("navigation_prior_text_and_tool_history_returned") is True
+                assert provider_status["input_checks"].get("navigation_recorded_workspace_returned") is True
+                assert "TRIAL-NAV-LOSER" not in provider_status["scenario_requests"]
+                assert not page_errors, page_errors
+
+                await context.close()
+                await browser.close()
+        finally:
+            stop_process(host, graceful=True)
+            stop_process(provider, graceful=False)
+
+
 async def main() -> int:
     if len(sys.argv) != 4:
         print("usage: browser_e2e.py LEG_WEB_BIN LEG_BIN SUPERVISOR_BIN", file=sys.stderr)
         return 2
     await run(*(Path(value).resolve() for value in sys.argv[1:]))
+    await run_session_navigation(*(Path(value).resolve() for value in sys.argv[1:]))
     print("leg-web browser E2E passed")
     return 0
 
