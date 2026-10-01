@@ -17,6 +17,7 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,9 @@ WARNING = (
     "Leg can run shell commands and modify files as your OS user. "
     "The workspace is its working directory, not a sandbox."
 )
-PROMPT = "one exact PTY prompt"
+PASTED_TEXT = "first line: 中文\r\nsecond: 👩‍👩‍👧‍👦 e\u0301\rthird line\x13\x03\x1b\x7f\nfourth line?"
+PROMPT = "?typed line\nfirst line: 中文\nsecond: 👩‍👩‍👧‍👦 e\u0301\nthird line\nfourth line?"
+NEXT_DRAFT = "next draft"
 LIVE_TEXT = "The first live text is visible."
 
 
@@ -48,6 +51,37 @@ def read_until(
         if remaining <= 0:
             raise AssertionError(
                 f"timed out waiting for {needle!r}; "
+                f"screen text={terminal_text(bytes(output))[-1200:]!r}"
+            )
+        ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, 8192)
+        except OSError:
+            continue
+        if chunk:
+            output.extend(chunk)
+
+
+def read_until_screen_text(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    output: bytearray,
+    needle: str,
+    timeout: float = 8.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while needle not in terminal_screen_text(bytes(output)):
+        if child.poll() is not None:
+            raise AssertionError(
+                f"TUI exited before screen text {needle!r}; exit={child.returncode}; "
+                f"screen text={terminal_text(bytes(output))[-1200:]!r}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"timed out waiting for screen text {needle!r}; "
                 f"screen text={terminal_text(bytes(output))[-1200:]!r}"
             )
         ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
@@ -142,6 +176,76 @@ def terminal_text(output: bytes) -> str:
     return plain.decode("utf-8", errors="replace")
 
 
+def terminal_screen_text(output: bytes, rows: int = 40, columns: int = 160) -> str:
+    """Replay the cursor and erase controls used by ratatui into a small screen."""
+    screen = [[" " for _ in range(columns)] for _ in range(rows)]
+    row = 0
+    column = 0
+    index = 0
+    while index < len(output):
+        byte = output[index]
+        if byte == 0x1B:
+            if index + 1 < len(output) and output[index + 1] == ord("["):
+                end = index + 2
+                while end < len(output) and not 0x40 <= output[end] <= 0x7E:
+                    end += 1
+                if end == len(output):
+                    break
+                params = output[index + 2 : end].decode("ascii", errors="ignore")
+                final = chr(output[end])
+                values = [value for value in params.lstrip("?").split(";") if value]
+                if final == "H":
+                    row = max(0, int(values[0]) - 1) if values else 0
+                    column = max(0, int(values[1]) - 1) if len(values) > 1 else 0
+                elif final == "J" and values and values[0] in ("2", "3"):
+                    screen = [[" " for _ in range(columns)] for _ in range(rows)]
+                elif final == "K":
+                    mode = values[0] if values else "0"
+                    start, stop = (0, columns) if mode == "2" else (column, columns)
+                    for cell in range(start, stop):
+                        screen[row][cell] = " "
+                index = end + 1
+                continue
+            index += min(2, len(output) - index)
+            continue
+        if byte == 0x0D:
+            column = 0
+            index += 1
+            continue
+        if byte == 0x0A:
+            row += 1
+            column = 0
+            index += 1
+            continue
+        if byte < 0x20 or byte == 0x7F:
+            index += 1
+            continue
+        width = 1
+        for size in range(1, min(4, len(output) - index) + 1):
+            try:
+                character = output[index : index + size].decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            character = "�"
+            size = 1
+        if unicodedata.combining(character):
+            width = 0
+        elif unicodedata.east_asian_width(character) in ("W", "F"):
+            width = 2
+        if column >= columns:
+            row += 1
+            column = 0
+        if row < rows and column < columns:
+            screen[row][column] = character
+            if width == 2 and column + 1 < columns:
+                screen[row][column + 1] = ""
+        column += width
+        index += size
+    return "\n".join("".join(line) for line in screen)
+
+
 def contains_string(value: Any, expected: str) -> bool:
     if isinstance(value, str):
         return value == expected
@@ -159,6 +263,8 @@ def assert_terminal_restored(
     assert actual == initial_termios, f"terminal attributes were not restored: {actual!r}"
     assert b"\x1b[?1049l" in output, "alternate screen was not left"
     assert b"\x1b[?25h" in output, "cursor was not shown"
+    assert b"\x1b[?2004h" in output, f"bracketed paste was not enabled: {output[:240]!r}"
+    assert b"\x1b[?2004l" in output, f"bracketed paste was not disabled: {output[-240:]!r}"
     assert child.returncode is not None
 
 
@@ -226,6 +332,22 @@ def run_smoke(args: argparse.Namespace) -> None:
                 read_until(master_fd, child, output, b"Path:")
                 os.write(master_fd, str(workspace).encode() + b"\r")
                 read_until(master_fd, child, output, WARNING.encode())
+                drain_for(master_fd, output, 0.1)
+                first_run_help = terminal_screen_text(bytes(output))
+                for hint in (
+                    "Enter newline",
+                    "Ctrl-S send",
+                    "Backspace/Delete edit",
+                    "Ctrl-Z undo",
+                    "Ctrl-Y redo",
+                    "Ctrl-C stops",
+                    "F1 help",
+                    "F2 keyboard actions",
+                    "? is prompt text",
+                ):
+                    assert hint in first_run_help, (
+                        f"first-run help omitted {hint!r}: {first_run_help[-1800:]!r}"
+                    )
                 before_ack = request_status(status_url)
                 assert before_ack["requests"] == 0, "a provider request ran before warning acknowledgement"
 
@@ -236,11 +358,78 @@ def run_smoke(args: argparse.Namespace) -> None:
                 assert request_status(status_url)["requests"] == 0, (
                     "a blank prompt started a provider request"
                 )
-                os.write(master_fd, PROMPT.encode() + b"\x13")
+
+                # Help and the action menu are overlays: input cannot edit or submit there.
+                os.write(master_fd, b"\x1bOP")
+                read_until_screen_text(master_fd, child, output, "Keyboard help")
+                os.write(master_fd, b"ignored-help")
+                os.write(master_fd, b"\x1b")
+                drain_for(master_fd, output, 0.15)
+                os.write(master_fd, b"\x1bOQ")
+                read_until_screen_text(master_fd, child, output, "Keyboard actions")
+                action_menu = terminal_screen_text(bytes(output))
+                for action in (
+                    "Insert a newline",
+                    "Send the complete nonblank prompt",
+                    "Move by grapheme",
+                    "Remove one grapheme",
+                    "Ctrl-Z / Ctrl-Y",
+                    "Stop the turn",
+                    "F1 / F2",
+                ):
+                    assert action in action_menu, f"keyboard action menu omitted {action!r}"
+                os.write(master_fd, b"ignored-menu")
+                os.write(master_fd, b"\x1b[200~ignored-paste\x1b[201~")
+                os.write(master_fd, b"\x1b")
+                drain_for(master_fd, output, 0.15)
+                assert request_status(status_url)["requests"] == 0, (
+                    "opening help or the action menu started a provider request"
+                )
+
+                # A question mark is literal prompt text. Control bytes in this one
+                # bracketed paste must never become send, stop, or help key events.
+                os.write(master_fd, b"?typed line\r")
+                drain_for(master_fd, output, 0.1)
+                question_screen = terminal_screen_text(bytes(output))
+                assert "?typed line" in question_screen, (
+                    "? or Enter did not insert literal text and a newline in the composer"
+                )
+                assert "Keyboard help" not in question_screen, "? opened help instead of entering the draft"
+                os.write(master_fd, b"\x1b[200~" + PASTED_TEXT.encode() + b"\x1b[201~")
+                drain_for(master_fd, output)
+                assert child.poll() is None, "a control byte in bracketed paste exited the TUI"
+                assert request_status(status_url)["requests"] == 0, (
+                    "paste content invoked a provider or keyboard shortcut"
+                )
+                os.write(master_fd, b"\x13")
                 read_until(master_fd, child, output, b"visible.")
                 assert LIVE_TEXT in terminal_text(bytes(output)), (
                     f"streamed response was not visible: {terminal_text(bytes(output))[-2000:]!r}"
                 )
+                os.write(master_fd, NEXT_DRAFT.encode() + b"\x13")
+                read_until_screen_text(
+                    master_fd, child, output, "Busy: wait for the active turn"
+                )
+                assert request_status(status_url)["requests"] == 1, (
+                    "busy Ctrl-S started a second provider request"
+                )
+
+                read_until_screen_text(master_fd, child, output, "Succeeded")
+                assert request_status(status_url)["requests"] == 1, (
+                    "the pasted prompt caused more than one exchange invocation"
+                )
+                assert NEXT_DRAFT in terminal_screen_text(bytes(output)), (
+                    "the next draft typed during the turn was lost on success"
+                )
+
+                # Submit the preserved next draft, then verify Ctrl-C stops a live turn.
+                os.write(master_fd, b"\x13")
+                deadline = time.monotonic() + 5.0
+                fixture_status = request_status(status_url)
+                while fixture_status["requests"] < 2 and time.monotonic() < deadline:
+                    drain_for(master_fd, output, 0.05)
+                    fixture_status = request_status(status_url)
+                assert fixture_status["requests"] == 2, fixture_status
                 os.write(master_fd, b"\x03")
                 read_until(master_fd, child, output, b"Stopped")
                 os.write(master_fd, b"\x03")
@@ -255,31 +444,34 @@ def run_smoke(args: argparse.Namespace) -> None:
                 os.close(slave_fd)
 
             fixture_status = request_status(status_url)
-            assert fixture_status["requests"] == 1, fixture_status
-            assert fixture_status["scenario_requests"] == {"paused-live-text": 1}, fixture_status
-            assert "paused_response_completed" not in fixture_status["input_checks"], (
-                "Ctrl-C did not stop the active paused turn"
+            assert fixture_status["requests"] == 2, fixture_status
+            assert fixture_status["scenario_requests"] == {"paused-live-text": 2}, fixture_status
+            assert fixture_status["input_checks"].get("paused_response_completed") is True, (
+                "the first paused turn did not complete while preserving the active draft"
             )
 
             exchange_events = [
                 json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()
             ]
             requests = [event for event in exchange_events if event.get("event") == "request"]
-            assert len(requests) == 1, f"expected one exchange request event, found {requests!r}"
+            assert len(requests) == 2, f"expected two exchange request events, found {requests!r}"
             assert requests[0]["prompt"] == PROMPT, (
                 f"exchange request carried the wrong prompt: {requests[0]!r}"
+            )
+            assert requests[1]["prompt"] == NEXT_DRAFT, (
+                f"follow-up exchange carried the wrong prompt: {requests[1]!r}"
             )
 
             trails = list((state_dir / "sessions").glob("*.jsonl"))
             assert len(trails) == 1, f"expected one session trail, found {trails!r}"
             records = [json.loads(line) for line in trails[0].read_text(encoding="utf-8").splitlines()]
             assert any(contains_string(record, PROMPT) for record in records), (
-                "the one provider exchange did not carry the exact submitted prompt"
+                "the pasted provider exchange did not carry the exact submitted prompt"
             )
             session_id = trails[0].stem
             catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
-            assert catalog["sessions"][session_id]["drafts"]["tui"] == PROMPT, (
-                "Ctrl-C exit did not preserve the submitted draft"
+            assert catalog["sessions"][session_id]["drafts"]["tui"] == NEXT_DRAFT, (
+                "the stopped follow-up prompt was not restored as the composer draft"
             )
 
             # A catalog startup error occurs after raw/alternate mode begins.
@@ -303,7 +495,7 @@ def run_smoke(args: argparse.Namespace) -> None:
                 os.close(error_slave)
 
             after_error = request_status(status_url)
-            assert after_error["requests"] == 1, after_error
+            assert after_error["requests"] == 2, after_error
         finally:
             fixture.send_signal(signal.SIGTERM)
             try:
