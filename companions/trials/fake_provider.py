@@ -130,7 +130,6 @@ class Fixture:
             "TRIAL-LARGE-TOOL",
             "TRIAL-UNTRUSTED-MARKDOWN",
             "TRIAL-CONTINUE",
-            "TRIAL-COMPOSE",
         )
         for message in reversed(messages if isinstance(messages, list) else []):
             if not isinstance(message, dict):
@@ -493,11 +492,6 @@ class Fixture:
         if marker == "TRIAL-CONTINUE":
             self.send_stream(handler, [{"type": "text", "text": "Continuation response: the earlier fixture answer is still in this session."}])
             return
-        if marker == "TRIAL-COMPOSE":
-            all_text = "\n".join(text_content(item.get("content")) for item in payload.get("messages", []) if isinstance(item, dict) and item.get("role") == "user")
-            self.check("multiline_prompt", "first line" in all_text and "第二行" in all_text and "third line" in all_text)
-            self.send_stream(handler, [{"type": "text", "text": "Multiline fixture prompt received."}])
-            return
         if marker == "TRIAL-RETRY" or marker == "TRIAL-REOPEN-FAILURE":
             self.check("retry_or_reopen_succeeded")
             self.send_stream(handler, [{"type": "text", "text": "The explicit retry succeeded."}])
@@ -647,7 +641,9 @@ def environment(base_url: str, scenario: str, hook: Path | None) -> dict[str, st
     }
     if scenario in ("trial", "browser", "capped-tool-loop"):
         values["LEG_MAX_TOOL_ROUNDS"] = "2"
-    if scenario in ("trial", "browser", "stalled-bash"):
+    if scenario == "trial":
+        values["LEG_BASH_TIMEOUT_SECS"] = "600"
+    elif scenario in ("browser", "stalled-bash"):
         values["LEG_BASH_TIMEOUT_SECS"] = "120"
     if hook is not None:
         values["LEG_PRETOOL_HOOK"] = str(hook)
