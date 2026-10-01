@@ -12,8 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use leg_ui_client::{
-    Client, ClientConfig, LegSession, ResolveError, SessionCatalog, SessionCatalogConfig,
-    SessionInterface, StartError, StreamEvent, TurnOutcome, TurnRequest,
+    CatalogError, Client, ClientConfig, LegSession, ResolveError, SessionCatalog,
+    SessionCatalogConfig, SessionInterface, StartError, StreamEvent, TurnOutcome, TurnRequest,
 };
 use serde_json::{Value, json};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -423,6 +423,97 @@ fn client(leg: Option<PathBuf>, supervisor: &Path, store: &Path) -> Client {
         supervisor_bin: Some(supervisor.to_path_buf()),
         session_store_dir: Some(store.to_path_buf()),
     })
+}
+
+fn write_fixture_leg(path: &Path, exchange_log: Option<&Path>, release_file: Option<&Path>) {
+    let source_path = path.with_extension("rs");
+    let mut source = String::from(
+        r##"
+use std::env;
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {
+        println!("leg 0.14.0");
+        return;
+    }
+    if args == ["--help"] {
+        println!("leg exchange --stream-json --new-session-id");
+        return;
+    }
+    let session_id = args
+        .windows(2)
+        .find(|pair| pair[0] == "--new-session-id" || pair[0] == "--session")
+        .map(|pair| pair[1].clone())
+        .expect("session argument");
+    let mut prompt = String::new();
+io::stdin().read_to_string(&mut prompt).unwrap();
+"##,
+    );
+    if let Some(exchange_log) = exchange_log {
+        source.push_str(&format!(
+            "    let mut log = OpenOptions::new().create(true).append(true).open(PathBuf::from({:?})).unwrap();\n    writeln!(log, \"{{session_id}}\").unwrap();\n",
+            exchange_log.to_string_lossy()
+        ));
+    }
+    source.push_str(
+        r##"
+    let turn_start = r#"{"schema":"leg.exchange.stream/v1","event":"turn_start","seq":0,"provider":"fixture","model":"fixture","session_id":"__SESSION_ID__","turn_index":0,"request":{"schema":"baton.message/v1","message_id":"request-1","conversation_id":"conversation-1","kind":"request","body":"fixture"}}"#.replace("__SESSION_ID__", &session_id);
+    println!("{turn_start}");
+"##,
+    );
+    if let Some(release_file) = release_file {
+        source.push_str(&format!(
+            "    while ! Path::new({:?}).exists() {{ thread::sleep(Duration::from_millis(5)); }}\n",
+            release_file.to_string_lossy()
+        ));
+    }
+    source.push_str(
+        r##"
+    let turn_end = r#"{"schema":"leg.exchange.stream/v1","event":"turn_end","seq":1,"capped":false,"session_id":"__SESSION_ID__","turn_index":0,"response":{"schema":"baton.message/v1","message_id":"response-1","conversation_id":"conversation-1","in_reply_to":"request-1","kind":"response","body":"ok"}}"#.replace("__SESSION_ID__", &session_id);
+    println!("{turn_end}");
+}
+"##,
+    );
+    fs::write(&source_path, source).expect("write fixture leg source");
+    let compiled = Command::new("rustc")
+        .args(["--edition=2021"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(path)
+        .output()
+        .expect("rustc is available to build the native fixture");
+    assert!(
+        compiled.status.success(),
+        "failed to compile fixture leg: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+}
+
+fn write_supervisor_wrapper(path: &Path, supervisor: &Path, started_file: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = format!(
+        "#!/bin/sh\nprintf started > {}\nexec {} \"$@\"\n",
+        shell_quote(started_file),
+        shell_quote(supervisor)
+    );
+    fs::write(path, script).expect("write supervisor wrapper");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("make supervisor wrapper executable");
+}
+
+struct ReleaseFile(PathBuf);
+
+impl Drop for ReleaseFile {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release");
+    }
 }
 
 fn collect_events(turn: &mut leg_ui_client::TurnHandle) -> Vec<StreamEvent> {
@@ -967,6 +1058,279 @@ fn main() {
 
     fs::write(cwd.join("release-preallocated"), "release").unwrap();
     assert_success(new_turn.wait().expect("new session completes"));
+}
+
+#[test]
+fn new_session_claim_waits_for_a_display_probe_of_the_same_lock() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let state = scratch.path().join("state");
+    let cwd = scratch.path().join("cwd");
+    fs::create_dir_all(&cwd).expect("create workspace");
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state.clone()),
+        ..SessionCatalogConfig::default()
+    })
+    .expect("open catalog");
+    let id = "sess-100-200-108";
+    let store = catalog.sessions_dir().to_path_buf();
+    fs::write(store.join(format!("{id}.jsonl")), "").expect("create existing trail");
+    catalog.set_workspace(id, &cwd).expect("register existing session");
+    assert_eq!(catalog.get(id).unwrap().run_state, leg_ui_client::CatalogRunState::Idle);
+
+    let ready = scratch.path().join("probe-ready");
+    let release = scratch.path().join("probe-release");
+    let _release_on_drop = ReleaseFile(release.clone());
+    let mut probe = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "display_probe_race_process_worker"])
+        .env("LEG_UI_PROBE_RACE_WORKER", "1")
+        .env("LEG_UI_PROBE_RACE_STATE", &state)
+        .env("LEG_UI_PROBE_RACE_ID", id)
+        .env("LEG_UI_PROBE_RACE_READY", &ready)
+        .env("LEG_UI_PROBE_RACE_RELEASE", &release)
+        .spawn()
+        .expect("spawn display probe process");
+    wait_for_file(&ready, Duration::from_secs(5));
+
+    let leg = scratch.path().join("fixture-leg");
+    write_fixture_leg(&leg, None, None);
+    let wrapper_started = scratch.path().join("supervisor-wrapper-started");
+    let wrapper = scratch.path().join("supervisor-wrapper");
+    write_supervisor_wrapper(&wrapper, &supervisor_binary(), &wrapper_started);
+
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let leg_for_start = leg.clone();
+    let wrapper_for_start = wrapper.clone();
+    let store_for_start = store.clone();
+    let cwd_for_start = cwd.clone();
+    let start_thread = thread::spawn(move || {
+        let _ = started_tx.send(());
+        let result = client(Some(leg_for_start), &wrapper_for_start, &store_for_start).start(
+            TurnRequest::new("probe must not defeat this claim", cwd_for_start, LegSession::NewWithId(id.into())),
+        );
+        let _ = result_tx.send(result);
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("start attempt began");
+    wait_for_file(&wrapper_started, Duration::from_secs(5));
+    let early_result = result_rx.recv_timeout(Duration::from_millis(300));
+
+    fs::write(&release, "release").expect("release probe process");
+    let probe_status = probe.wait().expect("wait for display probe process");
+    assert!(probe_status.success(), "display probe process failed: {probe_status}");
+    let early_description = match &early_result {
+        Ok(Ok(_)) => "supervisor returned success before the display probe released its lock".into(),
+        Ok(Err(error)) => format!("supervisor returned {error:?} before the display probe released its lock"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => String::new(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            "start thread exited before the display probe released its lock".into()
+        }
+    };
+    assert!(
+        matches!(early_result, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "{early_description}"
+    );
+    let mut turn = result_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("supervisor proceeds after the display probe")
+        .expect("display probe must not make the new turn busy");
+    start_thread.join().expect("join start thread");
+    assert_success(turn.wait().expect("new turn completes"));
+}
+
+#[test]
+fn catalog_display_process_loops_over_starts_and_probes() {
+    if std::env::var("LEG_UI_CATALOG_DISPLAY_WORKER").ok().as_deref() != Some("1") {
+        return;
+    }
+    let state = PathBuf::from(
+        std::env::var_os("LEG_UI_CATALOG_DISPLAY_STATE").expect("display worker state"),
+    );
+    let stop = PathBuf::from(
+        std::env::var_os("LEG_UI_CATALOG_DISPLAY_STOP").expect("display worker stop file"),
+    );
+    let progress = PathBuf::from(
+        std::env::var_os("LEG_UI_CATALOG_DISPLAY_PROGRESS").expect("display worker progress"),
+    );
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state),
+        ..SessionCatalogConfig::default()
+    })
+    .expect("open display worker catalog");
+    let mut iterations = 0;
+    while !stop.exists() {
+        let entries = catalog.list().expect("list sessions during stress");
+        for entry in entries {
+            match catalog.get(&entry.id) {
+                Ok(_) | Err(CatalogError::NotFound(_)) => {}
+                Err(error) => panic!("get session during stress: {error}"),
+            }
+        }
+        iterations += 1;
+        fs::write(&progress, iterations.to_string()).expect("write display progress");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn thirty_two_new_and_existing_turns_survive_concurrent_catalog_probes() {
+    const TURN_COUNT: usize = 32;
+
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let cwd = scratch.path().join("cwd");
+    let state = scratch.path().join("state");
+    fs::create_dir_all(&cwd).expect("create workspace");
+    let leg = scratch.path().join("fixture-leg");
+    let exchange_log = scratch.path().join("exchanges.log");
+    let release = scratch.path().join("turn-release");
+    let _release_turns_on_drop = ReleaseFile(release.clone());
+    write_fixture_leg(&leg, Some(&exchange_log), Some(&release));
+    let supervisor = supervisor_binary();
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state.clone()),
+        leg_bin: Some(leg),
+        supervisor_bin: Some(supervisor),
+    })
+    .expect("open stress catalog");
+
+    let mut drafts = Vec::new();
+    for index in 0..TURN_COUNT {
+        drafts.push(
+            catalog
+                .create_draft(
+                    SessionInterface::Web,
+                    Some(format!("new-{index}")),
+                    Some(&cwd),
+                )
+                .expect("create new-session draft"),
+        );
+    }
+    let mut existing_ids = Vec::new();
+    for index in 0..TURN_COUNT {
+        let id = format!("sess-stress-{index}");
+        fs::write(
+            catalog.sessions_dir().join(format!("{id}.jsonl")),
+            "",
+        )
+        .expect("create existing-session trail");
+        catalog
+            .set_workspace(&id, &cwd)
+            .expect("register existing session");
+        existing_ids.push(id);
+    }
+
+    let stop_display = scratch.path().join("display-stop");
+    let _stop_display_on_drop = ReleaseFile(stop_display.clone());
+    let display_progress = scratch.path().join("display-progress");
+    let mut display = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "catalog_display_process_loops_over_starts_and_probes"])
+        .env("LEG_UI_CATALOG_DISPLAY_WORKER", "1")
+        .env("LEG_UI_CATALOG_DISPLAY_STATE", &state)
+        .env("LEG_UI_CATALOG_DISPLAY_STOP", &stop_display)
+        .env("LEG_UI_CATALOG_DISPLAY_PROGRESS", &display_progress)
+        .spawn()
+        .expect("spawn display process");
+    wait_for_file(&display_progress, Duration::from_secs(5));
+    let initial_iterations = fs::read_to_string(&display_progress)
+        .expect("read initial display progress")
+        .parse::<usize>()
+        .expect("parse initial display progress");
+
+    let mut turns = Vec::with_capacity(TURN_COUNT * 2);
+    for draft in drafts {
+        let mut turn = catalog
+            .start_new(&draft.id, SessionInterface::Web, "new stress turn")
+            .expect("start new turn during display probes");
+        let event = turn
+            .observe()
+            .expect("observe new turn")
+            .expect("new turn event");
+        assert!(matches!(event, StreamEvent::TurnStart { .. }));
+        turns.push(turn);
+    }
+    for id in existing_ids {
+        let mut turn = catalog
+            .start_existing(&id, SessionInterface::Web, "existing stress turn")
+            .expect("start existing turn during display probes");
+        let event = turn
+            .observe()
+            .expect("observe existing turn")
+            .expect("existing turn event");
+        assert!(matches!(event, StreamEvent::TurnStart { .. }));
+        turns.push(turn);
+    }
+    assert_eq!(turns.len(), TURN_COUNT * 2);
+    assert_eq!(
+        fs::read_to_string(&exchange_log)
+            .expect("read exchange log")
+            .lines()
+            .count(),
+        TURN_COUNT * 2,
+        "each deliberate start must run exactly one exchange"
+    );
+    wait_until(Duration::from_secs(20), || {
+        fs::read_to_string(&display_progress)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|iterations| iterations > initial_iterations)
+    });
+
+    fs::write(&release, "release").expect("release all turns");
+    for mut turn in turns {
+        assert_success(turn.wait().expect("stress turn completes"));
+    }
+    fs::write(&stop_display, "stop").expect("stop display process");
+    let display_status = display.wait().expect("wait for display process");
+    assert!(display_status.success(), "display process failed: {display_status}");
+}
+
+#[test]
+fn display_probe_race_process_worker() {
+    if std::env::var("LEG_UI_PROBE_RACE_WORKER").ok().as_deref() != Some("1") {
+        return;
+    }
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let state = PathBuf::from(
+        std::env::var_os("LEG_UI_PROBE_RACE_STATE").expect("probe state directory"),
+    );
+    let id = std::env::var("LEG_UI_PROBE_RACE_ID").expect("probe session id");
+    let ready = PathBuf::from(
+        std::env::var_os("LEG_UI_PROBE_RACE_READY").expect("probe ready path"),
+    );
+    let release = PathBuf::from(
+        std::env::var_os("LEG_UI_PROBE_RACE_RELEASE").expect("probe release path"),
+    );
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state.clone()),
+        ..SessionCatalogConfig::default()
+    })
+    .expect("open probe worker catalog");
+    assert!(catalog.get(&id).is_ok(), "probe worker reads the session");
+
+    let store = state.join("sessions");
+    let primary_path = store.join(format!(".leg-ui-session-{id}.lock"));
+    let coordination_path = primary_path.with_file_name(format!(".leg-ui-session-{id}.lock.coord"));
+    let primary = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(primary_path)
+        .expect("open primary lock");
+    let coordination = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(coordination_path)
+        .expect("open coordination guard");
+    coordination.lock_exclusive().expect("lock probe coordination guard");
+    primary.lock_exclusive().expect("hold display probe lock");
+    fs::write(ready, "ready").expect("signal held display probe");
+    wait_until(Duration::from_secs(10), || release.exists());
+    FileExt::unlock(&primary).expect("release primary probe lock");
+    FileExt::unlock(&coordination).expect("release probe coordination guard");
 }
 
 #[test]

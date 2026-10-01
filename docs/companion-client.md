@@ -72,6 +72,14 @@ and returns the shared warning
 `Retry sends this prompt again and may repeat tool side effects.` The
 supervisor's session lock is held until owned leg and tool processes finish;
 catalog workspace changes and retries require that lock to be idle.
+Display status inspects an existing primary lock while holding its short-lived
+coordination sidecar, named by appending `.coord` to the primary `.lock` path.
+A missing primary lock means idle and creates neither that primary lock nor a
+coordination sidecar. Supervisors use the same sidecar only while inspecting or
+initially acquiring the primary lock, then release it immediately; waiting for
+session creation happens outside it. The sidecar coordinates inspection, while
+only the persistent primary session lock represents ownership through leg and
+tool cleanup.
 
 Use `SessionCatalog::export_transcript` to export the parsed leg trail. It
 contains trail events only, without catalog metadata or inherited environment

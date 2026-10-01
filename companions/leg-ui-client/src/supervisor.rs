@@ -94,10 +94,7 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
             if !safe_session_id(session_id) || !native_session_id(session_id) {
                 return Err("invalid preallocated session id".to_string());
             }
-            let creation_lock = open_lock_file(&store_dir.join(".leg-ui-client-create.lock"))?;
-            creation_lock
-                .lock_exclusive()
-                .map_err(|error| format!("could not acquire session creation guard: {error}"))?;
+            let creation_lock = acquire_creation_lock(&store_dir)?;
             let session_lock = match try_session_lock(&store_dir, session_id)? {
                 Some(lock) => lock,
                 None => {
@@ -383,7 +380,9 @@ fn open_lock_file(path: &Path) -> Result<File, String> {
 }
 
 pub(crate) fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Option<File>, String> {
-    let lock = open_lock_file(&store_dir.join(format!(".leg-ui-session-{session_id}.lock")))?;
+    let path = store_dir.join(format!(".leg-ui-session-{session_id}.lock"));
+    let _coordination = lock_coordination(&path, session_id)?;
+    let lock = open_lock_file(&path)?;
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock)),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -391,9 +390,9 @@ pub(crate) fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Opt
     }
 }
 
-/// Reads whether a driver lock is held without creating a lock file. This is
-/// for catalog display only; state-changing operations use the guard methods
-/// above and hold the guard through their metadata update.
+/// Reads whether a driver lock is held without creating the primary lock. The
+/// short coordination sidecar keeps this display probe from reserving the
+/// primary lock while a supervisor is claiming ownership.
 pub(crate) fn session_lock_is_held(store_dir: &Path, session_id: &str) -> Result<bool, String> {
     let path = store_dir.join(format!(".leg-ui-session-{session_id}.lock"));
     lock_is_held_if_present(&path, session_id)
@@ -414,11 +413,56 @@ fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("could not open {label} lock: {error}")),
     };
+    let _coordination = lock_coordination(path, label)?;
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(false),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
         Err(error) => Err(format!("could not inspect {label} lock: {error}")),
     }
+}
+
+fn acquire_creation_lock(store_dir: &Path) -> Result<File, String> {
+    let path = store_dir.join(".leg-ui-client-create.lock");
+    let lock = open_lock_file(&path)?;
+    loop {
+        let coordination = lock_coordination(&path, "session creation")?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => {
+                drop(coordination);
+                return Ok(lock);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                drop(coordination);
+                // Wait without the coordination guard, then retry acquisition
+                // under it so display probes cannot take the primary lock in
+                // the ownership-claim window.
+                lock.lock_exclusive().map_err(|error| {
+                    format!("could not acquire session creation guard: {error}")
+                })?;
+                FileExt::unlock(&lock).map_err(|error| {
+                    format!("could not release waited session creation guard: {error}")
+                })?;
+            }
+            Err(error) => {
+                return Err(format!("could not acquire session creation guard: {error}"));
+            }
+        }
+    }
+}
+
+fn lock_coordination(path: &Path, label: &str) -> Result<File, String> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid {label} lock path"))?
+        .to_os_string();
+    name.push(".coord");
+    let guard_path = path.with_file_name(name);
+    let guard = open_lock_file(&guard_path)
+        .map_err(|error| format!("could not open {label} lock coordination guard: {error}"))?;
+    guard
+        .lock_exclusive()
+        .map_err(|error| format!("could not acquire {label} lock coordination guard: {error}"))?;
+    Ok(guard)
 }
 
 fn safe_session_id(id: &str) -> bool {
