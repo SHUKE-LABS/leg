@@ -1821,6 +1821,109 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 assert busy_turn["last_submission"]["request_id"] == 3, busy_turn
                 await wait_status(page, "Succeeded")
 
+                interrupted_session_id = await create_session(page, workspace_a)
+                interrupted_prompt = "TRIAL-PAUSE: retry this interrupted prompt"
+                await page.locator("#prompt").fill(interrupted_prompt)
+                submit_count_before_interrupted_turn = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                provider_before_interrupted_turn = await asyncio.to_thread(
+                    fixture_status, provider_authority
+                )
+                paused_provider_calls_before_interruption = provider_before_interrupted_turn[
+                    "scenario_requests"
+                ].get("TRIAL-PAUSE", 0)
+                await page.get_by_role("button", name="Send").click()
+                await page.get_by_text("The first live text is visible", exact=False).wait_for()
+                await page.wait_for_function(
+                    "!document.querySelector('#stop-turn').hidden"
+                )
+                await page.wait_for_function(
+                    "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
+                    timeout=15000,
+                )
+                interrupted_session_id = str(
+                    await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
+                )
+                async with page.expect_response(
+                    lambda response: response.url.endswith("/stop")
+                ) as interrupted_stop_info:
+                    await page.get_by_role("button", name="Stop").click()
+                interrupted_stop = await interrupted_stop_info.value
+                assert interrupted_stop.status == 200, await interrupted_stop.text()
+                interrupted_stop_result = await interrupted_stop.json()
+                assert interrupted_stop_result["status"] == "stop_requested", interrupted_stop_result
+                interrupted = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, interrupted_session_id, 1
+                )
+                assert interrupted["last_submission"]["status"] == "stopped", interrupted
+                assert interrupted["session"]["turns"][0]["prompt"] == interrupted_prompt
+                assert interrupted["session"]["turns"][0]["outcome"] == "interrupted", interrupted
+                assert interrupted["next_request_id"] == 2, interrupted
+                await wait_status(page, "Interrupted")
+                interrupted_retry = page.locator(
+                    '#messages [data-key="turn-0-assistant"] .retry-turn-button'
+                )
+                await interrupted_retry.wait_for(state="visible")
+                assert not await interrupted_retry.is_disabled()
+                interrupted_provider_status = await asyncio.to_thread(
+                    fixture_status, provider_authority
+                )
+                assert interrupted_provider_status["requests"] == provider_before_interrupted_turn["requests"] + 1
+                assert interrupted_provider_status["scenario_requests"].get("TRIAL-PAUSE") == (
+                    paused_provider_calls_before_interruption + 1
+                )
+                submit_count_after_interrupted_turn = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                assert submit_count_after_interrupted_turn - submit_count_before_interrupted_turn == 1
+
+                interrupted_composer_draft = "Keep this draft while retrying the interrupted turn."
+                await page.locator("#prompt").fill(interrupted_composer_draft)
+                submit_count_before_interrupted_retry = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                provider_before_interrupted_retry = await asyncio.to_thread(
+                    fixture_status, provider_authority
+                )
+                interrupted_submit_started = asyncio.Event()
+                release_interrupted_submit = asyncio.Event()
+
+                async def hold_interrupted_retry_submit(route):
+                    interrupted_submit_started.set()
+                    await release_interrupted_submit.wait()
+                    await route.continue_()
+
+                interrupted_submit_pattern = (
+                    f"**/api/sessions/{interrupted_session_id}/submit"
+                )
+                await page.route(interrupted_submit_pattern, hold_interrupted_retry_submit)
+                await interrupted_retry.click()
+                await interrupted_submit_started.wait()
+                assert await interrupted_retry.is_disabled()
+                assert await page.locator("#prompt").input_value() == interrupted_composer_draft
+                release_interrupted_submit.set()
+                await page.unroute(interrupted_submit_pattern, hold_interrupted_retry_submit)
+                retried_interrupted = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, interrupted_session_id, 2
+                )
+                await wait_status(page, "Succeeded")
+                assert retried_interrupted["last_submission"]["request_id"] == 2, retried_interrupted
+                assert retried_interrupted["high_water"] == 2, retried_interrupted
+                assert retried_interrupted["session"]["turns"][-1]["prompt"] == interrupted_prompt
+                assert await page.locator("#prompt").input_value() == interrupted_composer_draft
+                retried_interrupted_provider_status = await asyncio.to_thread(
+                    fixture_status, provider_authority
+                )
+                assert retried_interrupted_provider_status["requests"] == provider_before_interrupted_retry["requests"] + 1
+                assert retried_interrupted_provider_status["scenario_requests"].get("TRIAL-PAUSE") == (
+                    paused_provider_calls_before_interruption + 2
+                )
+                submit_count_after_interrupted_retry = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                assert submit_count_after_interrupted_retry - submit_count_before_interrupted_retry == 1
+
                 await create_session(page, workspace_a)
                 await page.locator("#prompt").fill("TRIAL-HISTORY-SEED: create selectable historical link")
                 await page.get_by_role("button", name="Send").click()
