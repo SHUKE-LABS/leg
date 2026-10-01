@@ -278,6 +278,88 @@ fn missing_workspace_blocks_submission_until_explicit_replacement() {
 }
 
 #[test]
+fn legacy_pending_draft_stays_unknown_and_preserves_its_orphan_trail() {
+    let scratch = tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let workspace = scratch.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let catalog = SessionCatalog::open(config(&state)).unwrap();
+    let draft = catalog
+        .create_draft(
+            SessionInterface::Web,
+            Some("legacy work".into()),
+            Some(&workspace),
+        )
+        .unwrap();
+    catalog
+        .save_draft(&draft.id, SessionInterface::Web, "keep this prompt".into())
+        .unwrap();
+    catalog
+        .save_draft(
+            &draft.id,
+            SessionInterface::Tui,
+            "other interface text".into(),
+        )
+        .unwrap();
+    catalog
+        .save_display_metadata(&draft.id, "color".into(), json!("violet"))
+        .unwrap();
+    let orphan_id = "sess-707-909";
+    fs::write(
+        catalog.sessions_dir().join(format!("{orphan_id}.jsonl")),
+        request_event(orphan_id, 0, "orphan prompt"),
+    )
+    .unwrap();
+
+    let catalog_path = state.join("catalog.json");
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    index["sessions"][&draft.id]["pending_new_turn"] = json!(true);
+    fs::write(&catalog_path, serde_json::to_vec(&index).unwrap()).unwrap();
+    drop(catalog);
+
+    let reopened = SessionCatalog::open(config(&state)).unwrap();
+    let pending = reopened.get(&draft.id).unwrap();
+    assert!(pending.pending_new_turn);
+    assert_eq!(pending.run_state, CatalogRunState::Unknown);
+    assert!(pending.read_only);
+    assert_eq!(pending.name.as_deref(), Some("legacy work"));
+    assert_eq!(pending.drafts[&SessionInterface::Web], "keep this prompt");
+    assert_eq!(
+        pending.drafts[&SessionInterface::Tui],
+        "other interface text"
+    );
+    assert_eq!(pending.display["color"], json!("violet"));
+    assert!(pending.warnings.iter().any(|warning| {
+        warning.contains("confirming its original companion and supervisor have stopped")
+            && warning.contains("copy the saved prompt and workspace")
+    }));
+    assert!(matches!(
+        reopened.start_new_with_id(
+            &draft.id,
+            "sess-111-222".into(),
+            SessionInterface::Web,
+            "must not resubmit",
+        ),
+        Err(CatalogError::Busy)
+    ));
+
+    reopened
+        .recover_pending_new_session(&draft.id)
+        .expect("legacy recovery retains an ambiguous reservation");
+    assert!(reopened.get(&draft.id).unwrap().pending_new_turn);
+    let orphan = reopened.get(orphan_id).unwrap();
+    assert!(orphan.recovered);
+    assert!(orphan.read_only);
+    assert!(
+        reopened
+            .sessions_dir()
+            .join(format!("{orphan_id}.jsonl"))
+            .exists()
+    );
+}
+
+#[test]
 fn catalog_process_worker() {
     let Ok(role) = std::env::var("LEG_UI_CATALOG_PROCESS_WORKER") else {
         return;
