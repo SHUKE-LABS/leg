@@ -150,6 +150,25 @@ and failed prompts remain available. Markdown formatting uses local DOM
 rendering: raw HTML is shown as text, unsupported or unsafe links remain text,
 and model/tool output cannot load remote images or other resources.
 
+Each turn's tool inspector is opened with its **Show details** button. It shows
+the tool name and ID, literal arguments, result or error, and call/result
+observation times. The local companion records times for new streamed tool
+events; older saved calls without time metadata say **Timestamp unavailable**.
+Calls in a running turn are **Pending**. A call with no result in an
+interrupted, incomplete, or failed turn is labeled **Interrupted** or
+**Missing outcome**. Denied and failed results remain separate, and capped,
+incomplete, and catalog warnings remain visible apart from normal success.
+Expanding a card only renders the saved display data; it does not contact the
+provider.
+
+Long histories use a bounded scrolling window so the page does not mount every
+turn or tool detail at once. Focus the transcript and use Home, End, Page Up,
+or Page Down to reach any part of the conversation. Unmounted turns are not
+included in the browser's Find search (Ctrl+F); use transcript navigation to
+reach older content first. The browser E2E reports session-selection and
+inspector feedback through the first animation frame, plus mounted turn/detail
+counts and the Chromium version.
+
 Session history browsing and detailed execution inspection are covered by
 #85. The manual keyboard and screen-reader checklist is
 [`companions/leg-web/tests/keyboard-screen-reader-checklist.md`](../companions/leg-web/tests/keyboard-screen-reader-checklist.md).

@@ -5,6 +5,9 @@ const workspaceKey = "leg-web-last-workspace";
 const draftPrefix = "leg-web-draft:";
 const pendingPrefix = "leg-web-pending:";
 const readingPrefix = "leg-web-reading:";
+const inspectionPrefix = "leg-web-inspection:";
+const INITIAL_TURN_HEIGHT = 280;
+const TURN_OVERSCAN = 2;
 
 const bootstrap = window.location.hash.slice(1);
 if (/^[0-9a-f]{64}$/i.test(bootstrap)) {
@@ -46,6 +49,7 @@ const ui = Object.fromEntries(
     "stop-turn",
     "workspace-warning",
     "connection-message",
+    "transcript-warnings",
     "transcript",
     "messages",
     "empty-transcript",
@@ -82,6 +86,12 @@ const state = {
   renderedSessionSignature: "",
   transcriptSessionId: null,
   restoreReadingPosition: null,
+  expandedTools: new Set(),
+  transcriptItems: [],
+  transcriptHeights: new Map(),
+  transcriptAverageHeight: INITIAL_TURN_HEIGHT,
+  transcriptRange: null,
+  transcriptRenderQueued: false,
 };
 
 let elapsedTimer = null;
@@ -97,6 +107,24 @@ class HostError extends Error {
 
 function storageKey(prefix, sessionId) {
   return `${prefix}${sessionId}`;
+}
+
+function readExpandedTools(sessionId) {
+  try {
+    const saved = window.sessionStorage.getItem(storageKey(inspectionPrefix, sessionId));
+    const keys = JSON.parse(saved || "[]");
+    return new Set(Array.isArray(keys) ? keys.filter((key) => typeof key === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveExpandedTools() {
+  if (!state.sessionId) return;
+  window.sessionStorage.setItem(
+    storageKey(inspectionPrefix, state.sessionId),
+    JSON.stringify([...state.expandedTools]),
+  );
 }
 
 function sessionName(session) {
@@ -278,7 +306,8 @@ function restoreReadingPosition(scroller, position) {
     ui["new-content"].hidden = true;
     return;
   }
-  const element = [...ui.messages.children].find((node) => node.dataset.key === position.key);
+  const element = [...ui.messages.querySelectorAll(".transcript-turn")]
+    .find((node) => node.dataset.key === position.key);
   if (!element) {
     scroller.scrollTop = 0;
     ui["new-content"].hidden = false;
@@ -295,6 +324,7 @@ function saveCurrentSessionView() {
   saveDraft();
   savePending();
   saveReadingPosition();
+  saveExpandedTools();
 }
 
 function renderSessionGuidance() {
@@ -308,12 +338,12 @@ function renderSessionGuidance() {
   const needsWorkspace = session.recovered || sessionWorkspaceMissing(session);
   if (session.recovered) {
     message = "This recovered conversation needs its workspace selected before it can continue.";
+  } else if (session.run_state === "active" || session.pending_new_turn) {
+    message = "This session is busy. Wait for its current turn to finish before sending another message.";
   } else if (session.read_only) {
     message = "This saved transcript is read-only. Start a new conversation to continue working.";
   } else if (sessionWorkspaceMissing(session)) {
     message = "Choose a workspace folder before sending a message in this session.";
-  } else if (session.run_state === "active" || session.pending_new_turn) {
-    message = "This session is busy. Wait for its current turn to finish before sending another message.";
   }
   if (!message) return;
 
@@ -457,6 +487,11 @@ async function activateSession(sessionId) {
   state.active = null;
   state.cursor = 0;
   state.pending = readPending(sessionId);
+  state.expandedTools = readExpandedTools(sessionId);
+  state.transcriptItems = [];
+  state.transcriptHeights = new Map();
+  state.transcriptAverageHeight = INITIAL_TURN_HEIGHT;
+  state.transcriptRange = null;
   state.restoreReadingPosition = readReadingPosition(sessionId) || { atBottom: true };
   window.sessionStorage.setItem(sessionKey, sessionId);
   if (transcriptChanged) {
@@ -472,6 +507,14 @@ async function activateSession(sessionId) {
   ui["set-workspace-form"].hidden = true;
   ui.welcome.hidden = true;
   ui.conversation.hidden = false;
+  const selected = state.sessions.find((session) => session.id === sessionId);
+  ui["session-title"].textContent = selected ? sessionName(selected) : "Opening conversation…";
+  ui["empty-transcript"].textContent = "Opening conversation…";
+  ui["empty-transcript"].hidden = false;
+  ui["transcript-warnings"].replaceChildren();
+  ui["transcript-warnings"].hidden = true;
+  ui.messages.replaceChildren();
+  setConnection("Opening conversation…");
   renderSessionList();
   try {
     await api("/api/sessions/select", {
@@ -535,7 +578,7 @@ async function refreshSnapshot({ eventsArrived = false, sessionId = state.sessio
 
 function bindSessionId(oldId, actualId) {
   if (!actualId || oldId === actualId) return;
-  for (const prefix of [draftPrefix, pendingPrefix, readingPrefix]) {
+  for (const prefix of [draftPrefix, pendingPrefix, readingPrefix, inspectionPrefix]) {
     const oldKey = storageKey(prefix, oldId);
     const value = window.sessionStorage.getItem(oldKey);
     if (value !== null && window.sessionStorage.getItem(storageKey(prefix, actualId)) === null) {
@@ -543,10 +586,21 @@ function bindSessionId(oldId, actualId) {
     }
     window.sessionStorage.removeItem(oldKey);
   }
+  state.expandedTools = new Set([...state.expandedTools].map((key) => {
+    try {
+      const identity = JSON.parse(key);
+      return Array.isArray(identity) && identity[0] === oldId
+        ? JSON.stringify([actualId, ...identity.slice(1)])
+        : key;
+    } catch {
+      return key;
+    }
+  }));
   state.sessionId = actualId;
   if (state.transcriptSessionId === oldId) state.transcriptSessionId = actualId;
   if (state.snapshot?.session?.id === oldId) state.snapshot.session.id = actualId;
   window.sessionStorage.setItem(sessionKey, actualId);
+  saveExpandedTools();
 }
 
 function adoptBoundSession(oldId, actualId, switchGeneration) {
@@ -693,6 +747,7 @@ function applyHostEvent(event, sessionId, switchGeneration) {
       : null;
     const provisional = {
       turn_id: event.turn_id,
+      turn_index: null,
       prompt: pendingPrompt,
       text: "",
       status: "starting",
@@ -740,9 +795,11 @@ function applyStreamEvent(event) {
   if (event.event === "turn_start") {
     state.active.provider = event.provider || null;
     state.active.model = event.model || null;
+    state.active.turn_index = Number.isSafeInteger(event.turn_index) ? event.turn_index : null;
     if (event.turn_index !== undefined && state.snapshot?.session?.display) {
       const metadata = state.snapshot.session.display["web.turn_metadata"] || {};
       metadata[String(event.turn_index)] = {
+        ...metadata[String(event.turn_index)],
         provider: event.provider,
         model: event.model,
         started_at_ms: Date.now(),
@@ -757,6 +814,7 @@ function applyStreamEvent(event) {
       tool_name: event.tool_name,
       input: event.input,
       status: "running",
+      call_observed_at_ms: event.observed_at_ms,
     };
     state.active.tools ||= [];
     state.active.tools.push(tool);
@@ -766,10 +824,11 @@ function applyStreamEvent(event) {
     if (tool) {
       tool.status = event.status;
       tool.output = event.output;
+      tool.result_observed_at_ms = event.observed_at_ms;
     }
     state.active.active_tool = null;
   } else if (event.event === "turn_end") {
-    state.active.provider ||= null;
+    state.active.capped = Boolean(event.capped);
   }
 }
 
@@ -842,7 +901,19 @@ function renderAll(options = {}) {
   renderProviderModel();
   renderElapsed();
   renderStatus();
+  renderTranscriptWarnings();
   renderTranscript(options);
+}
+
+function renderTranscriptWarnings() {
+  const warnings = state.snapshot?.session?.warnings || [];
+  ui["transcript-warnings"].replaceChildren();
+  for (const warning of warnings) {
+    const item = document.createElement("p");
+    item.textContent = String(warning);
+    ui["transcript-warnings"].append(item);
+  }
+  ui["transcript-warnings"].hidden = warnings.length === 0;
 }
 
 function renderProviderModel() {
@@ -879,43 +950,252 @@ function renderElapsed() {
   if (!elapsedTimer) elapsedTimer = window.setInterval(update, 1000);
 }
 
-function renderTranscript({ eventsArrived = false } = {}) {
+function buildTranscriptItems() {
+  const session = state.snapshot?.session;
+  if (!session) return [];
+  const metadataByIndex = session.display?.["web.turn_metadata"] || {};
+  const observationsByIndex = session.display?.["web.tool_observations"] || {};
+  const turns = session.turns || [];
+  const items = [];
+  let activeAttached = false;
+
+  for (const turn of turns) {
+    const turnIndex = Number(turn.turn_index);
+    const metadata = metadataByIndex[String(turn.turn_index)] || {};
+    let live = null;
+    if (state.active && Number.isSafeInteger(state.active.turn_index)) {
+      live = state.active.turn_index === turnIndex ? state.active : null;
+    } else if (
+      state.active &&
+      !activeAttached &&
+      turn === turns.at(-1) &&
+      turn.outcome === "incomplete" &&
+      turn.prompt === state.active.prompt
+    ) {
+      live = state.active;
+    }
+    if (live) activeAttached = true;
+    const key = `turn-${turn.turn_index}-user`;
+    items.push({
+      key,
+      assistantKey: `turn-${turn.turn_index}-assistant`,
+      turnIndex,
+      prompt: turn.prompt || "",
+      reply: live?.text || turn.reply || "",
+      failureMessage: turn.failure_message || "",
+      outcome: turn.outcome || "incomplete",
+      active: live,
+      provider: live?.provider || metadata.provider,
+      model: live?.model || metadata.model,
+      capped: Boolean(live?.capped || metadata.capped),
+      tools: mergeTurnTools({
+        sessionId: session.id,
+        turnIndex,
+        turn,
+        live,
+        observations: observationsByIndex[String(turn.turn_index)] || {},
+      }),
+    });
+  }
+
+  if (state.active && !activeAttached) {
+    const turnIndex = Number.isSafeInteger(state.active.turn_index) ? state.active.turn_index : null;
+    const metadata = turnIndex === null ? null : metadataByIndex[String(turnIndex)] || null;
+    const observation = turnIndex === null ? {} : observationsByIndex[String(turnIndex)] || {};
+    items.push({
+      key: turnIndex === null
+        ? `active-${state.active.turn_id || "current"}-user`
+        : `turn-${turnIndex}-user`,
+      assistantKey: turnIndex === null
+        ? `active-${state.active.turn_id || "current"}-assistant`
+        : `turn-${turnIndex}-assistant`,
+      turnIndex,
+      prompt: state.active.prompt || "",
+      reply: state.active.text || "",
+      failureMessage: "",
+      outcome: "incomplete",
+      active: state.active,
+      provider: state.active.provider || metadata?.provider,
+      model: state.active.model || metadata?.model,
+      capped: Boolean(state.active.capped || metadata?.capped),
+      tools: mergeTurnTools({
+        sessionId: session.id,
+        turnIndex: turnIndex ?? `active:${state.active.turn_id || "current"}`,
+        turn: { tools: [] },
+        live: state.active,
+        observations: observation,
+      }),
+    });
+  }
+  return items;
+}
+
+function mergeTurnTools({ sessionId, turnIndex, turn, live, observations }) {
+  const toolsById = new Map();
+  const outcome = turn.outcome || "incomplete";
+  const currentlyRunning = Boolean(live && ["starting", "running", "stopping"].includes(live.status));
+  for (const saved of turn.tools || []) {
+    const id = String(saved.tool_use_id ?? "");
+    const result = saved.result || null;
+    const status = result?.status || (currentlyRunning
+      ? "pending"
+      : outcome === "interrupted"
+        ? "interrupted"
+        : ["incomplete", "failed"].includes(outcome)
+          ? "missing"
+          : "unavailable");
+    const observation = observations && Object.hasOwn(observations, id) ? observations[id] : {};
+    const failedResult = result && ["failed", "denied"].includes(result.status);
+    toolsById.set(id, {
+      id,
+      name: saved.tool_name || "tool",
+      input: saved.input,
+      status,
+      output: failedResult ? undefined : result?.result,
+      error: result?.error ?? (failedResult ? result?.result : undefined),
+      callObservedAt: observation.call_observed_at_ms,
+      resultObservedAt: observation.result_observed_at_ms,
+      identity: disclosureKey(sessionId, turnIndex, id),
+    });
+  }
+  for (const streamed of live?.tools || []) {
+    const id = String(streamed.tool_use_id ?? "");
+    const previous = toolsById.get(id) || {
+      id,
+      name: streamed.tool_name || "tool",
+      input: streamed.input,
+      status: "pending",
+      output: undefined,
+      error: undefined,
+      callObservedAt: undefined,
+      resultObservedAt: undefined,
+      identity: disclosureKey(sessionId, turnIndex, id),
+    };
+    const hasSavedResult = previous.status === "completed" || previous.status === "failed" || previous.status === "denied";
+    const streamedStatus = streamed.status === "running" ? "pending" : streamed.status || previous.status;
+    const streamedFailure = ["failed", "denied"].includes(streamedStatus);
+    toolsById.set(id, {
+      ...previous,
+      name: streamed.tool_name || previous.name,
+      input: streamed.input === undefined ? previous.input : streamed.input,
+      status: hasSavedResult ? previous.status : streamedStatus,
+      output: streamed.output === undefined || streamedFailure ? previous.output : streamed.output,
+      error: streamed.error === undefined
+        ? streamedFailure && streamed.output !== undefined ? streamed.output : previous.error
+        : streamed.error,
+      callObservedAt: streamed.call_observed_at_ms ?? previous.callObservedAt,
+      resultObservedAt: streamed.result_observed_at_ms ?? previous.resultObservedAt,
+    });
+  }
+  return [...toolsById.values()];
+}
+
+function disclosureKey(sessionId, turnIndex, toolUseId) {
+  return JSON.stringify([sessionId, turnIndex, toolUseId]);
+}
+
+function renderTranscript({ eventsArrived = false, force = true } = {}) {
   if (!state.snapshot) return;
   const scroller = ui.transcript;
+  const items = buildTranscriptItems();
   const previousTop = scroller.scrollTop;
   const previousBottomGap = scroller.scrollHeight - scroller.clientHeight - previousTop;
   const wasAtBottom = previousBottomGap < 36;
   const anchor = findScrollAnchor(scroller);
+  const restore = state.restoreReadingPosition;
+  state.transcriptItems = items;
 
   if (state.transcriptSessionId !== state.sessionId) {
     ui.messages.replaceChildren();
+    state.transcriptHeights.clear();
+    state.transcriptAverageHeight = INITIAL_TURN_HEIGHT;
+    state.transcriptRange = null;
     state.transcriptSessionId = state.sessionId;
   }
 
-  const existing = new Map([...ui.messages.children].map((node) => [node.dataset.key, node]));
-  const desired = [];
-  const turns = state.snapshot.session?.turns || [];
-  for (const turn of turns) {
-    desired.push(...renderTurn(existing, turn, state.snapshot.session?.display?.["web.turn_metadata"] || {}));
+  if (restore?.atBottom) {
+    scroller.scrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
+  } else if (restore?.key) {
+    const restoreIndex = items.findIndex((item) => item.key === restore.key);
+    if (restoreIndex >= 0) {
+      scroller.scrollTop = Math.max(0, estimatedHeightBefore(items, restoreIndex) - restore.offset);
+    }
+  } else if (wasAtBottom) {
+    scroller.scrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
   }
-  if (state.active) desired.push(...renderActiveTurn(existing, state.active));
 
-  const desiredSet = new Set(desired);
-  for (const node of [...ui.messages.children]) {
-    if (!desiredSet.has(node)) node.remove();
-  }
-  let current = ui.messages.firstElementChild;
-  for (const node of desired) {
-    if (node === current) {
-      current = current.nextElementSibling;
-    } else {
-      ui.messages.insertBefore(node, current);
+  let { start, end } = transcriptWindow(items, scroller.scrollTop, scroller.clientHeight);
+  const focusedTurn = document.activeElement?.closest?.(".transcript-turn");
+  if (focusedTurn) {
+    const focusedIndex = items.findIndex((item) => item.key === focusedTurn.dataset.key);
+    if (focusedIndex >= 0) {
+      if (focusedIndex < start || focusedIndex >= end) {
+        scroller.focus({ preventScroll: true });
+      } else {
+        start = Math.min(start, focusedIndex);
+        end = Math.max(end, focusedIndex + 1);
+      }
     }
   }
-  ui["empty-transcript"].hidden = ui.messages.childElementCount > 0;
+  const sameRange = state.transcriptRange?.start === start && state.transcriptRange?.end === end;
+  if (!force && sameRange) return;
 
-  if (state.restoreReadingPosition) {
-    restoreReadingPosition(scroller, state.restoreReadingPosition);
+  const focusedKey = ui.messages.contains(document.activeElement)
+    ? document.activeElement.dataset?.focusKey || null
+    : null;
+  const existing = new Map(
+    [...ui.messages.querySelectorAll(":scope > .transcript-turn")]
+      .map((turn) => [turn.dataset.key, turn]),
+  );
+
+  if (sameRange) {
+    const visibleKeys = new Set(items.slice(start, end).map((item) => item.key));
+    for (const [key, turn] of existing) {
+      if (!visibleKeys.has(key)) turn.remove();
+    }
+    for (let index = start; index < end; index += 1) {
+      appendTurn(ui.messages, items[index], index < items.length - 1, existing.get(items[index].key));
+    }
+    measureTranscriptTurns();
+    refreshTranscriptSpacers();
+    if (restore) {
+      restoreReadingPosition(scroller, restore);
+      state.restoreReadingPosition = null;
+    } else if (wasAtBottom) {
+      scroller.scrollTop = scroller.scrollHeight;
+      ui["new-content"].hidden = true;
+    } else {
+      restoreScrollAnchor(scroller, anchor, previousTop);
+      if (eventsArrived) ui["new-content"].hidden = false;
+    }
+    if (focusedKey) {
+      [...ui.messages.querySelectorAll("[data-focus-key]")]
+        .find((element) => element.dataset.focusKey === focusedKey)
+        ?.focus({ preventScroll: true });
+    }
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  const topSpacer = createTranscriptSpacer(estimatedHeightBefore(items, start), "top");
+  fragment.append(topSpacer);
+  for (let index = start; index < end; index += 1) {
+    appendTurn(fragment, items[index], index < items.length - 1, existing.get(items[index].key));
+  }
+  const bottomSpacer = createTranscriptSpacer(
+    Math.max(0, estimatedTranscriptHeight(items) - estimatedHeightBefore(items, end)),
+    "bottom",
+  );
+  fragment.append(bottomSpacer);
+  ui.messages.replaceChildren(fragment);
+  ui["empty-transcript"].hidden = items.length > 0;
+  if (!items.length) ui["empty-transcript"].textContent = "Your conversation will appear here.";
+  state.transcriptRange = { start, end };
+  measureTranscriptTurns();
+  refreshTranscriptSpacers();
+
+  if (restore) {
+    restoreReadingPosition(scroller, restore);
     state.restoreReadingPosition = null;
   } else if (wasAtBottom) {
     scroller.scrollTop = scroller.scrollHeight;
@@ -924,11 +1204,94 @@ function renderTranscript({ eventsArrived = false } = {}) {
     restoreScrollAnchor(scroller, anchor, previousTop);
     if (eventsArrived) ui["new-content"].hidden = false;
   }
+  if (focusedKey) {
+    const replacement = [...ui.messages.querySelectorAll("[data-focus-key]")]
+      .find((element) => element.dataset.focusKey === focusedKey);
+    replacement?.focus({ preventScroll: true });
+  }
+}
+
+function estimatedHeightBefore(items, endIndex) {
+  let height = 0;
+  for (let index = 0; index < endIndex; index += 1) {
+    height += state.transcriptHeights.get(items[index].key) || state.transcriptAverageHeight;
+  }
+  return height;
+}
+
+function estimatedTranscriptHeight(items) {
+  return estimatedHeightBefore(items, items.length);
+}
+
+function transcriptIndexAtOffset(items, offset) {
+  let height = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    height += state.transcriptHeights.get(items[index].key) || state.transcriptAverageHeight;
+    if (height >= offset) return index;
+  }
+  return Math.max(0, items.length - 1);
+}
+
+function transcriptWindow(items, scrollTop, viewportHeight) {
+  if (items.length <= 1) return { start: 0, end: items.length };
+  const viewport = Math.max(320, viewportHeight || 600);
+  const startAt = transcriptIndexAtOffset(items, Math.max(0, scrollTop - viewport));
+  const endAt = transcriptIndexAtOffset(items, scrollTop + viewport * 2);
+  return {
+    start: Math.max(0, startAt - TURN_OVERSCAN),
+    end: Math.min(items.length, Math.max(startAt + 1, endAt + TURN_OVERSCAN + 1)),
+  };
+}
+
+function createTranscriptSpacer(height, position) {
+  const spacer = document.createElement("div");
+  spacer.className = `transcript-spacer transcript-spacer-${position}`;
+  spacer.setAttribute("aria-hidden", "true");
+  spacer.style.height = `${Math.max(0, height)}px`;
+  return spacer;
+}
+
+function measureTranscriptTurns() {
+  let total = 0;
+  let count = 0;
+  for (const turn of ui.messages.querySelectorAll(".transcript-turn")) {
+    const margin = Number.parseFloat(window.getComputedStyle(turn).marginBottom) || 0;
+    const height = turn.getBoundingClientRect().height + margin;
+    if (height > 0) {
+      state.transcriptHeights.set(turn.dataset.key, height);
+      total += height;
+      count += 1;
+    }
+  }
+  if (count) state.transcriptAverageHeight = Math.max(120, total / count);
+}
+
+function refreshTranscriptSpacers() {
+  const range = state.transcriptRange;
+  if (!range) return;
+  const top = ui.messages.querySelector(".transcript-spacer-top");
+  const bottom = ui.messages.querySelector(".transcript-spacer-bottom");
+  if (top) top.style.height = `${estimatedHeightBefore(state.transcriptItems, range.start)}px`;
+  if (bottom) {
+    bottom.style.height = `${Math.max(
+      0,
+      estimatedTranscriptHeight(state.transcriptItems) - estimatedHeightBefore(state.transcriptItems, range.end),
+    )}px`;
+  }
+}
+
+function scheduleTranscriptRender() {
+  if (state.transcriptRenderQueued) return;
+  state.transcriptRenderQueued = true;
+  window.requestAnimationFrame(() => {
+    state.transcriptRenderQueued = false;
+    renderTranscript({ force: false });
+  });
 }
 
 function findScrollAnchor(scroller) {
   const point = scroller.getBoundingClientRect().top;
-  for (const element of ui.messages.children) {
+  for (const element of ui.messages.querySelectorAll(".transcript-turn")) {
     const bounds = element.getBoundingClientRect();
     if (bounds.bottom > point) {
       return { key: element.dataset.key, offset: bounds.top - point };
@@ -939,7 +1302,8 @@ function findScrollAnchor(scroller) {
 
 function restoreScrollAnchor(scroller, anchor, previousTop) {
   if (anchor?.key) {
-    const element = [...ui.messages.children].find((node) => node.dataset.key === anchor.key);
+    const element = [...ui.messages.querySelectorAll(".transcript-turn")]
+      .find((node) => node.dataset.key === anchor.key);
     if (element) {
       const point = scroller.getBoundingClientRect().top;
       const offset = element.getBoundingClientRect().top - point;
@@ -950,43 +1314,58 @@ function restoreScrollAnchor(scroller, anchor, previousTop) {
   scroller.scrollTop = previousTop;
 }
 
-function renderTurn(existing, turn, metadataByIndex) {
-  const metadata = metadataByIndex?.[String(turn.turn_index)] || null;
-  const user = getMessage(existing, "user", `turn-${turn.turn_index}-user`);
-  updateMessageBody(user, turn.prompt || "");
+function appendTurn(parent, item, hasLaterTurn, existingWrapper = null) {
+  const wrapper = existingWrapper || document.createElement("section");
+  wrapper.className = hasLaterTurn ? "transcript-turn transcript-turn-spaced" : "transcript-turn";
+  wrapper.dataset.key = item.key;
+  if (item.turnIndex !== null) wrapper.dataset.turnIndex = String(item.turnIndex);
+  const existingMessages = new Map([...wrapper.children].map((node) => [node.dataset.key, node]));
+  const user = getMessage(existingMessages, "user", `${item.key}-message`);
+  if (item.active && typeof item.active.prompt !== "string") {
+    updateMessageBody(user, "Submitted prompt is loading…", "placeholder");
+  } else {
+    updateMessageBody(user, item.prompt || "");
+  }
 
-  const assistant = getMessage(existing, "assistant", `turn-${turn.turn_index}-assistant`);
-  updateMessageMetadata(assistant, metadata);
-  if (turn.reply) updateMessageBody(assistant, turn.reply);
-  else if (turn.failure_message) updateMessageBody(assistant, turn.failure_message, "text");
+  const assistant = getMessage(existingMessages, "assistant", item.assistantKey);
+  updateMessageMetadata(assistant, { provider: item.provider, model: item.model });
+  if (item.reply) updateMessageBody(assistant, item.reply);
+  else if (item.failureMessage) updateMessageBody(assistant, item.failureMessage, "text");
+  else if (item.active?.status === "starting") updateMessageBody(assistant, "Starting this turn…", "text");
+  else if (item.active) updateMessageBody(assistant, "Waiting for Leg's first response…", "text");
   else updateMessageBody(assistant, "No final reply was recorded for this turn.", "text");
-  const status = turn.outcome === "succeeded"
-    ? "Succeeded"
-    : turn.outcome === "failed"
-      ? "Failed"
-      : turn.outcome === "interrupted"
-        ? "Interrupted"
-        : "Incomplete";
-  updateMessageDetails(assistant, turn.tools || [], status);
-  return [user, assistant];
-}
 
-function renderActiveTurn(existing, active) {
-  const key = active.turn_id || "active";
-  const user = getMessage(existing, "user", `active-${key}-user`);
-  if (typeof active.prompt === "string") updateMessageBody(user, active.prompt);
-  else updateMessageBody(user, "Submitted prompt is loading…", "placeholder");
+  const status = item.active?.status === "stopping"
+    ? "Stopping"
+    : item.active?.status === "starting"
+      ? "Starting"
+      : item.active
+        ? "Running"
+        : item.outcome === "succeeded"
+          ? "Succeeded"
+          : item.outcome === "failed"
+            ? "Failed"
+            : item.outcome === "interrupted"
+              ? "Interrupted"
+              : "Incomplete";
+  updateMessageDetails(assistant, item, status);
 
-  const assistant = getMessage(existing, "assistant", `active-${key}-assistant`);
-  updateMessageMetadata(assistant, {
-    provider: active.provider,
-    model: active.model,
-  });
-  if (active.text) updateMessageBody(assistant, active.text);
-  else updateMessageBody(assistant, active.status === "starting" ? "Starting this turn…" : "Waiting for leg's first response…", "text");
-  const status = active.status === "stopping" ? "Stopping" : active.status === "starting" ? "Starting" : "Running";
-  updateMessageDetails(assistant, active.tools || [], status);
-  return [user, assistant];
+  const desired = [user, assistant];
+  const desiredSet = new Set(desired);
+  for (const node of [...wrapper.children]) {
+    if (!desiredSet.has(node)) node.remove();
+  }
+  let current = wrapper.firstElementChild;
+  for (const node of desired) {
+    if (node === current) current = current.nextElementSibling;
+    else wrapper.insertBefore(node, current);
+  }
+  if (parent !== ui.messages) {
+    parent.append(wrapper);
+  } else if (wrapper.parentElement !== parent) {
+    const bottomSpacer = parent.querySelector(":scope > .transcript-spacer-bottom");
+    parent.insertBefore(wrapper, bottomSpacer);
+  }
 }
 
 function getMessage(existing, role, key) {
@@ -1043,14 +1422,30 @@ function updateMessageBody(article, text, mode = "markdown") {
   else if (value) appendTextParagraph(content, value);
 }
 
-function updateMessageDetails(article, tools, status) {
-  const signature = JSON.stringify([tools, status]);
+function updateMessageDetails(article, item, status) {
+  const signature = JSON.stringify([item.tools, status, item.capped, item.outcome, Boolean(item.active)]);
   const rendered = messageRenderState.get(article);
   if (rendered.details === signature) return;
   rendered.details = signature;
-  for (const detail of article.querySelectorAll(".tool-summary, .turn-outcome")) detail.remove();
-  for (const tool of tools) appendToolSummary(article, tool);
+  for (const detail of article.querySelectorAll(".tool-summary, .tool-inspector, .turn-outcome, .turn-warning")) {
+    detail.remove();
+  }
+  for (const tool of item.tools) appendToolInspector(article, tool);
   appendOutcome(article, status);
+  if (item.capped) {
+    const warning = document.createElement("p");
+    warning.className = "turn-warning";
+    warning.textContent = "Output capped by Leg. The available reply and tool results are shown above.";
+    article.append(warning);
+  }
+  if (!item.active && ["incomplete", "interrupted", "failed"].includes(item.outcome)) {
+    const warning = document.createElement("p");
+    warning.className = "turn-warning";
+    warning.textContent = item.outcome === "interrupted"
+      ? "Turn interrupted. Tool calls without results are marked Interrupted."
+      : `Turn ${item.outcome}. Tool calls without results are marked Missing outcome.`;
+    article.append(warning);
+  }
 }
 
 function appendOutcome(article, text) {
@@ -1060,26 +1455,137 @@ function appendOutcome(article, text) {
   article.append(status);
 }
 
-function appendToolSummary(article, tool) {
+function toolStatusLabel(status) {
+  if (status === "completed") return "Completed";
+  if (status === "failed") return "Failed";
+  if (status === "denied") return "Denied";
+  if (status === "pending") return "Pending";
+  if (status === "interrupted") return "Interrupted";
+  if (status === "missing") return "Missing outcome";
+  return "Outcome unavailable";
+}
+
+function appendToolInspector(article, tool) {
   const card = document.createElement("section");
-  card.className = "tool-summary";
-  const name = document.createElement("strong");
-  const stateText = tool.status === "running" ? "running" : tool.status || "finished";
-  name.textContent = `Tool activity: ${tool.tool_name || "tool"} · ${stateText}`;
-  card.append(name);
-  if (tool.output !== undefined || tool.result?.result || tool.result?.error) {
-    const raw = tool.output ?? tool.result?.result ?? tool.result?.error ?? "";
-    const output = typeof raw === "string" ? raw : JSON.stringify(raw);
-    const summary = document.createElement("p");
-    if (output.length > 360) {
-      summary.dataset.outputChars = String(output.length);
-      summary.textContent = `Large tool result summarized (${output.length.toLocaleString()} characters): ${output.slice(0, 220)}…`;
-    } else {
-      summary.textContent = output;
-    }
-    card.append(summary);
+  card.className = `tool-inspector tool-inspector-${tool.status}`;
+  const disclosureId = `tool-details-${Math.random().toString(36).slice(2)}`;
+  const expanded = state.expandedTools.has(tool.identity);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "tool-disclosure";
+  button.dataset.focusKey = tool.identity;
+  button.setAttribute("aria-expanded", String(expanded));
+  button.setAttribute("aria-controls", disclosureId);
+  button.textContent = `Tool ${tool.name} · ${tool.id || "ID unavailable"} · ${toolStatusLabel(tool.status)} · ${expanded ? "Hide details" : "Show details"}`;
+
+  const preview = document.createElement("p");
+  preview.className = "tool-preview";
+  if (tool.output !== undefined || tool.error !== undefined) {
+    const raw = tool.error ?? tool.output;
+    const output = toolLiteralText(raw);
+    const prefix = tool.error !== undefined || ["failed", "denied"].includes(tool.status)
+      ? "Error preview"
+      : "Output preview";
+    if (output.length > 180) preview.dataset.outputChars = String(output.length);
+    preview.textContent = output.length > 180
+      ? `${prefix} (${output.length.toLocaleString()} characters; full text in details): ${output.slice(0, 150)}…`
+      : `${tool.error !== undefined || ["failed", "denied"].includes(tool.status) ? "Error" : "Output"}: ${output}`;
+  } else if (tool.status !== "pending") {
+    preview.textContent = "No tool result was recorded.";
+  } else {
+    preview.textContent = "Tool result is pending.";
   }
+  const omission = toolOmissionSummary(tool.output ?? tool.error);
+  if (omission) preview.textContent = `${preview.textContent} · ${omission}`;
+
+  const details = document.createElement("div");
+  details.className = "tool-detail-body";
+  details.id = disclosureId;
+  details.hidden = !expanded;
+  card.append(button, preview, details);
+  if (expanded) appendToolDetails(details, tool);
+  button.addEventListener("click", () => {
+    const open = button.getAttribute("aria-expanded") !== "true";
+    button.setAttribute("aria-expanded", String(open));
+    button.textContent = `Tool ${tool.name} · ${tool.id || "ID unavailable"} · ${toolStatusLabel(tool.status)} · ${open ? "Hide details" : "Show details"}`;
+    details.hidden = !open;
+    if (open) {
+      state.expandedTools.add(tool.identity);
+      details.replaceChildren();
+      appendToolDetails(details, tool);
+    } else {
+      state.expandedTools.delete(tool.identity);
+    }
+    saveExpandedTools();
+    measureTranscriptTurns();
+    refreshTranscriptSpacers();
+  });
   article.append(card);
+}
+
+function toolLiteralText(value) {
+  if (value === undefined) return "Unavailable";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function appendToolDetails(parent, tool) {
+  appendToolField(parent, "Arguments", toolLiteralText(tool.input));
+  if (tool.error !== undefined || (["failed", "denied"].includes(tool.status) && tool.output !== undefined)) {
+    appendToolField(parent, "Error", toolLiteralText(tool.error ?? tool.output));
+  }
+  else if (tool.output !== undefined) appendToolField(parent, "Result", toolLiteralText(tool.output));
+  else appendToolField(parent, "Result", "No result was recorded.");
+  const omission = toolOmissionSummary(tool.output ?? tool.error);
+  if (omission) appendToolField(parent, "Output omission", omission);
+  appendToolField(parent, "Call observed", formatToolTimestamp(tool.callObservedAt));
+  appendToolField(parent, "Result observed", formatToolTimestamp(tool.resultObservedAt));
+}
+
+function toolOmissionSummary(value) {
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return "";
+    }
+  }
+  const omissions = [];
+  const visit = (node, path, depth) => {
+    if (!node || typeof node !== "object" || depth > 5) return;
+    for (const [key, nested] of Object.entries(node)) {
+      const name = path ? `${path}.${key}` : key;
+      if (/_omitted(?:_bytes|_chars)?$/i.test(key) && Number.isFinite(Number(nested)) && Number(nested) > 0) {
+        omissions.push(`${name}: ${Number(nested).toLocaleString()} omitted`);
+      } else if (nested && typeof nested === "object") {
+        visit(nested, name, depth + 1);
+      }
+    }
+  };
+  visit(value, "", 0);
+  return omissions.join(" · ");
+}
+
+function appendToolField(parent, label, value) {
+  const field = document.createElement("div");
+  field.className = "tool-detail-field";
+  const heading = document.createElement("strong");
+  heading.textContent = label;
+  const literal = document.createElement("pre");
+  literal.textContent = value;
+  field.append(heading, literal);
+  parent.append(field);
+}
+
+function formatToolTimestamp(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "Timestamp unavailable";
+  const formatted = new Date(timestamp).toLocaleString();
+  return `${formatted} (${timestamp} ms since Unix epoch)`;
 }
 
 function appendTextParagraph(parent, text) {
@@ -1448,6 +1954,9 @@ function openNewConversation() {
   state.active = null;
   state.cursor = 0;
   state.pending = null;
+  state.expandedTools = new Set();
+  state.transcriptItems = [];
+  state.transcriptRange = null;
   state.restoreReadingPosition = null;
   state.transcriptSessionId = null;
   ui.messages.replaceChildren();
@@ -1548,11 +2057,31 @@ ui.prompt.addEventListener("keydown", (event) => {
 ui["retry-submission"].addEventListener("click", () => void submitPrompt({ retry: true }));
 ui["stop-turn"].addEventListener("click", () => void stopTurn());
 ui["new-content"].addEventListener("click", () => {
-  ui.transcript.scrollTop = ui.transcript.scrollHeight;
   ui["new-content"].hidden = true;
+  ui.transcript.scrollTop = ui.transcript.scrollHeight;
   ui.transcript.focus({ preventScroll: true });
 });
-ui.transcript.addEventListener("scroll", saveReadingPosition);
+ui.transcript.addEventListener("keydown", (event) => {
+  if (event.target !== ui.transcript) return;
+  const page = Math.max(120, Math.floor(ui.transcript.clientHeight * 0.8));
+  if (event.key === "Home") {
+    event.preventDefault();
+    ui.transcript.scrollTop = 0;
+  } else if (event.key === "End") {
+    event.preventDefault();
+    ui.transcript.scrollTop = ui.transcript.scrollHeight;
+  } else if (event.key === "PageUp") {
+    event.preventDefault();
+    ui.transcript.scrollTop = Math.max(0, ui.transcript.scrollTop - page);
+  } else if (event.key === "PageDown") {
+    event.preventDefault();
+    ui.transcript.scrollTop += page;
+  }
+});
+ui.transcript.addEventListener("scroll", () => {
+  saveReadingPosition();
+  scheduleTranscriptRender();
+});
 window.addEventListener("pagehide", saveCurrentSessionView);
 window.addEventListener("online", () => {
   if (state.sessionId) {
