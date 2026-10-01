@@ -1465,6 +1465,112 @@ fn catalog_crash_window_worker() {
     let _ = turn.wait();
 }
 
+#[test]
+fn stale_attempt_controller_worker() {
+    if std::env::var("LEG_UI_STALE_ATTEMPT_WORKER").ok().as_deref() != Some("1") {
+        return;
+    }
+    let state = PathBuf::from(std::env::var_os("LEG_UI_STALE_STATE").expect("state"));
+    let leg = PathBuf::from(std::env::var_os("LEG_UI_STALE_LEG").expect("leg fixture"));
+    let supervisor =
+        PathBuf::from(std::env::var_os("LEG_UI_STALE_SUPERVISOR").expect("supervisor binary"));
+    let draft_id = std::env::var("LEG_UI_STALE_DRAFT").expect("draft ID");
+    let session_id = std::env::var("LEG_UI_STALE_SESSION").expect("session ID");
+    let ready = PathBuf::from(std::env::var_os("LEG_UI_STALE_READY").expect("ready file"));
+    let result_path = PathBuf::from(std::env::var_os("LEG_UI_STALE_RESULT").expect("result file"));
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state),
+        leg_bin: Some(leg),
+        supervisor_bin: Some(supervisor),
+    })
+    .expect("open stale-attempt worker catalog");
+    let mut turn = catalog
+        .start_new_with_id(
+            &draft_id,
+            session_id,
+            SessionInterface::Web,
+            "prompt for stale-attempt interleave",
+        )
+        .expect("start catalog turn in stale-attempt worker");
+    fs::write(ready, "ready").expect("signal controller started");
+    let result = loop {
+        match turn.observe() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                break match turn.wait() {
+                    Ok(outcome) => format!("outcome:{outcome:?}"),
+                    Err(error) => format!("wait-error:{error}"),
+                };
+            }
+            Err(error) => break format!("observe-error:{error}"),
+        }
+    };
+    fs::write(result_path, result).expect("record catalog turn result");
+}
+
+struct StaleAttemptWorker<'a> {
+    state: &'a Path,
+    leg: &'a Path,
+    supervisor: &'a Path,
+    draft_id: &'a str,
+    session_id: &'a str,
+    ready: &'a Path,
+    result: &'a Path,
+    invocation_log: &'a Path,
+    handoff_pause: Option<(&'a Path, &'a Path)>,
+    pre_turn_start: Option<(&'a Path, &'a Path)>,
+}
+
+fn spawn_stale_attempt_worker(worker: StaleAttemptWorker<'_>) -> std::process::Child {
+    let StaleAttemptWorker {
+        state,
+        leg,
+        supervisor,
+        draft_id,
+        session_id,
+        ready,
+        result,
+        invocation_log,
+        handoff_pause,
+        pre_turn_start,
+    } = worker;
+    let mut command = Command::new(std::env::current_exe().expect("integration test executable"));
+    command
+        .args(["--exact", "stale_attempt_controller_worker", "--nocapture"])
+        .env("LEG_UI_STALE_ATTEMPT_WORKER", "1")
+        .env("LEG_UI_STALE_STATE", state)
+        .env("LEG_UI_STALE_LEG", leg)
+        .env("LEG_UI_STALE_SUPERVISOR", supervisor)
+        .env("LEG_UI_STALE_DRAFT", draft_id)
+        .env("LEG_UI_STALE_SESSION", session_id)
+        .env("LEG_UI_STALE_READY", ready)
+        .env("LEG_UI_STALE_RESULT", result)
+        .env("LEG_UI_FIXTURE_INVOCATION_LOG", invocation_log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if let Some((pause_ready, pause_release)) = handoff_pause {
+        command
+            .env("LEG_UI_TEST_HANDOFF_PAUSE_READY", pause_ready)
+            .env("LEG_UI_TEST_HANDOFF_PAUSE_RELEASE", pause_release);
+    } else {
+        command
+            .env_remove("LEG_UI_TEST_HANDOFF_PAUSE_READY")
+            .env_remove("LEG_UI_TEST_HANDOFF_PAUSE_RELEASE");
+    }
+    if let Some((turn_start_ready, turn_start_release)) = pre_turn_start {
+        command
+            .env("LEG_UI_FIXTURE_PRE_TURN_START_FILE", turn_start_ready)
+            .env("LEG_UI_FIXTURE_RELEASE_TURN_START", turn_start_release);
+    } else {
+        command
+            .env_remove("LEG_UI_FIXTURE_PRE_TURN_START_FILE")
+            .env_remove("LEG_UI_FIXTURE_RELEASE_TURN_START");
+    }
+    command
+        .spawn()
+        .expect("spawn stale-attempt controller worker")
+}
+
 fn spawn_catalog_crash_worker(
     state: &Path,
     cwd: &Path,
@@ -1914,6 +2020,200 @@ fn pending_catalog_drafts_recover_at_each_controller_crash_window() {
         );
         drop(catalog);
     }
+}
+
+#[test]
+fn delayed_stale_supervisor_and_controller_leave_new_pending_attempt_untouched() {
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let cwd = scratch.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("create workspace");
+    let state = scratch.path().join("state");
+    let supervisor = supervisor_binary();
+    let fixture_leg = scratch.path().join("fixture-leg");
+    write_fixture_leg(&fixture_leg, None, None);
+    let (_catalog, draft_id) =
+        create_crash_draft(&state, &cwd, &fixture_leg, &supervisor, "stale interleave");
+
+    let invocation_log = scratch.path().join("invocations");
+    let old_session = "sess-109-201";
+    let new_session = "sess-109-202";
+    let old_ready = scratch.path().join("old-controller-ready");
+    let old_result = scratch.path().join("old-controller-result");
+    let old_handoff_ready = scratch.path().join("old-handoff-ready");
+    let old_handoff_release = scratch.path().join("old-handoff-release");
+    let _old_handoff_release = ReleaseFileOnDrop(old_handoff_release.clone());
+    let mut old_controller = spawn_stale_attempt_worker(StaleAttemptWorker {
+        state: &state,
+        leg: &fixture_leg,
+        supervisor: &supervisor,
+        draft_id: &draft_id,
+        session_id: old_session,
+        ready: &old_ready,
+        result: &old_result,
+        invocation_log: &invocation_log,
+        handoff_pause: Some((&old_handoff_ready, &old_handoff_release)),
+        pre_turn_start: None,
+    });
+    wait_for_file(&old_ready, Duration::from_secs(5));
+    wait_for_file(&old_handoff_ready, Duration::from_secs(5));
+    wait_for_file(
+        &state.join("sessions").join(format!("{old_session}.jsonl")),
+        Duration::from_secs(5),
+    );
+    wait_until(Duration::from_secs(5), || {
+        fs::read_to_string(&invocation_log)
+            .ok()
+            .is_some_and(|log| log.lines().count() == 1)
+    });
+
+    let catalog_path = state.join("catalog.json");
+    let old_index: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    let old_attempt = &old_index["sessions"][&draft_id]["pending_attempt"];
+    let old_token = old_attempt["token"].as_str().unwrap().to_string();
+    let old_supervisor_pid = old_attempt["supervisor"]["pid"].as_u64().unwrap() as u32;
+    assert!(old_attempt["native_session_id"].is_null());
+
+    // Model a newer reservation replacing the old lease while its supervisor
+    // is delayed before the token-matched handoff. Both attempts below still
+    // run through the real catalog client, supervisor, and leg fixture.
+    let catalog_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join(".catalog.lock"))
+        .expect("open catalog lock");
+    catalog_lock.lock_exclusive().expect("hold catalog lock");
+    let mut index: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    let record = index["sessions"][&draft_id]
+        .as_object_mut()
+        .expect("draft record");
+    record.insert("pending_new_turn".into(), Value::Bool(false));
+    record.insert("pending_attempt".into(), Value::Null);
+    fs::write(&catalog_path, serde_json::to_vec_pretty(&index).unwrap())
+        .expect("write superseded reservation");
+    FileExt::unlock(&catalog_lock).expect("release catalog lock");
+    let cleared_index: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    assert!(
+        !cleared_index["sessions"][&draft_id]["pending_new_turn"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(cleared_index["sessions"][&draft_id]["pending_attempt"].is_null());
+
+    let new_ready = scratch.path().join("new-controller-ready");
+    let new_result = scratch.path().join("new-controller-result");
+    let new_turn_start_ready = scratch.path().join("new-turn-start-ready");
+    let new_turn_start_release = scratch.path().join("new-turn-start-release");
+    let _new_turn_start_release = ReleaseFileOnDrop(new_turn_start_release.clone());
+    let mut new_controller = spawn_stale_attempt_worker(StaleAttemptWorker {
+        state: &state,
+        leg: &fixture_leg,
+        supervisor: &supervisor,
+        draft_id: &draft_id,
+        session_id: new_session,
+        ready: &new_ready,
+        result: &new_result,
+        invocation_log: &invocation_log,
+        handoff_pause: None,
+        pre_turn_start: Some((&new_turn_start_ready, &new_turn_start_release)),
+    });
+    wait_until(Duration::from_secs(5), || {
+        fs::read(&catalog_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|index| {
+                let attempt = &index["sessions"][&draft_id]["pending_attempt"];
+                attempt["token"]
+                    .as_str()
+                    .is_some_and(|token| token != old_token)
+                    && attempt["candidate_session_id"] == new_session
+            })
+    });
+    assert_eq!(
+        fs::read_to_string(&invocation_log).unwrap().lines().count(),
+        1,
+        "the newer supervisor waits behind the old creation lock"
+    );
+
+    fs::write(&old_handoff_release, "release").expect("release stale handoff");
+    wait_for_file(&new_ready, Duration::from_secs(5));
+    wait_for_file(&new_turn_start_ready, Duration::from_secs(5));
+    wait_for_session_handoff(&state, &draft_id, new_session);
+    wait_for_file(&old_result, Duration::from_secs(5));
+    let old_status = wait_for_child_status(&mut old_controller, Duration::from_secs(5));
+    assert!(
+        old_status.success(),
+        "stale controller worker: {old_status}"
+    );
+    let old_outcome = fs::read_to_string(&old_result).unwrap();
+    assert!(
+        !old_outcome.contains("Succeeded"),
+        "superseded attempt unexpectedly succeeded: {old_outcome}"
+    );
+    wait_until(Duration::from_secs(5), || {
+        !process_is_running(old_supervisor_pid)
+    });
+
+    let pending_index: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    let new_attempt = &pending_index["sessions"][&draft_id]["pending_attempt"];
+    let new_token = new_attempt["token"].as_str().unwrap().to_string();
+    assert_ne!(new_token, old_token);
+    assert_eq!(new_attempt["candidate_session_id"], new_session);
+    assert_eq!(new_attempt["native_session_id"], new_session);
+    assert!(
+        pending_index["sessions"][&draft_id]["pending_new_turn"]
+            .as_bool()
+            .unwrap()
+    );
+    let pending = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state.clone()),
+        ..SessionCatalogConfig::default()
+    })
+    .unwrap()
+    .get(&draft_id)
+    .expect("stale failure must leave the newer reservation readable");
+    assert_eq!(pending.run_state, leg_ui_client::CatalogRunState::Active);
+    assert!(pending.pending_new_turn);
+    assert_eq!(
+        fs::read_to_string(&invocation_log).unwrap().lines().count(),
+        2,
+        "the stale handoff and failure must not start another exchange"
+    );
+
+    fs::write(&new_turn_start_release, "release").expect("release newer turn_start");
+    wait_for_file(&new_result, Duration::from_secs(5));
+    let new_status = wait_for_child_status(&mut new_controller, Duration::from_secs(5));
+    assert!(new_status.success(), "new controller worker: {new_status}");
+    assert!(
+        fs::read_to_string(&new_result)
+            .unwrap()
+            .starts_with("outcome:Succeeded"),
+        "newer attempt did not finish successfully"
+    );
+
+    let recovered = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state.clone()),
+        ..SessionCatalogConfig::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        recovered.get(&draft_id),
+        Err(CatalogError::NotFound(_))
+    ));
+    let index = fs::read(&catalog_path).unwrap();
+    let index: Value = serde_json::from_slice(&index).unwrap();
+    assert_eq!(
+        index["sessions"][&new_session]["bound_attempt_token"],
+        new_token
+    );
+    assert!(index["sessions"].get(old_session).is_none());
+    assert_eq!(
+        fs::read_to_string(&invocation_log).unwrap().lines().count(),
+        2,
+        "only the old and the new intentional exchanges ran"
+    );
 }
 
 #[test]
@@ -2461,6 +2761,19 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[track_caller]
+fn wait_for_child_status(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::process::ExitStatus {
+    let mut status = None;
+    wait_until(timeout, || {
+        status = child.try_wait().expect("inspect child status");
+        status.is_some()
+    });
+    status.expect("child exited before deadline")
 }
 
 #[track_caller]

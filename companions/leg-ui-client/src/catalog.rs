@@ -258,6 +258,8 @@ struct PendingAttempt {
     native_session_id: Option<String>,
     #[serde(default)]
     controller_released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,6 +281,37 @@ impl SessionMetadata {
             ..Self::default()
         }
     }
+}
+
+fn merge_pending_session_metadata(
+    mut session: SessionMetadata,
+    draft: SessionMetadata,
+    attempt_token: &str,
+) -> SessionMetadata {
+    // Keep edits made on the recovered candidate; fill only metadata it lacks from the draft.
+    if session.name.is_none() {
+        session.name = draft.name;
+    }
+    if session.cwd.is_none() {
+        session.cwd = draft.cwd;
+    }
+    if session.created_at_ms == 0
+        || (draft.created_at_ms != 0 && draft.created_at_ms < session.created_at_ms)
+    {
+        session.created_at_ms = draft.created_at_ms;
+    }
+    for (interface, text) in draft.drafts {
+        session.drafts.entry(interface).or_insert(text);
+    }
+    for (key, value) in draft.display {
+        session.display.entry(key).or_insert(value);
+    }
+    session.pending_new_turn = false;
+    session.pending_attempt = None;
+    session.bound_attempt_token = Some(attempt_token.to_string());
+    session.recovered = false;
+    session.updated_at_ms = now_ms();
+    session
 }
 
 struct TrailSnapshot {
@@ -531,6 +564,7 @@ impl SessionCatalog {
             candidate_session_id: session_id.clone(),
             native_session_id: None,
             controller_released: false,
+            recovery_warning: None,
         });
         record.updated_at_ms = now_ms();
         self.write_index_unlocked(&index)?;
@@ -775,9 +809,9 @@ impl SessionCatalog {
             );
         };
 
-        let mut warnings = Vec::new();
+        let mut warnings = attempt.recovery_warning.iter().cloned().collect::<Vec<_>>();
         let mut active = false;
-        let mut unknown = false;
+        let mut unknown = attempt.recovery_warning.is_some();
         if attempt.token.is_empty()
             || attempt.controller.is_none()
             || !safe_session_id(&attempt.candidate_session_id)
@@ -879,24 +913,54 @@ impl SessionCatalog {
 
         for (draft_id, attempt) in pending {
             let decision = self.recovery_decision(&attempt);
-            match decision {
-                RecoveryDecision::Active | RecoveryDecision::Unknown => {}
-                RecoveryDecision::Clear => {
-                    self.clear_pending_attempt_if_current(
-                        &draft_id,
-                        &attempt.token,
-                        attempt.revision,
-                    )?;
-                }
-                RecoveryDecision::Bind(session_id) => {
-                    self.bind_session_id(
-                        &draft_id,
-                        &session_id,
-                        &attempt.token,
-                        Some(attempt.revision),
-                    )?;
-                }
+            let result = match decision {
+                RecoveryDecision::Active | RecoveryDecision::Unknown => Ok(()),
+                RecoveryDecision::Clear => self.clear_pending_attempt_if_current(
+                    &draft_id,
+                    &attempt.token,
+                    attempt.revision,
+                ),
+                RecoveryDecision::Bind(session_id) => self.bind_session_id(
+                    &draft_id,
+                    &session_id,
+                    &attempt.token,
+                    Some(attempt.revision),
+                ),
+            };
+            if let Err(error) = result {
+                self.record_recovery_failure(&draft_id, &attempt, &error.to_string())?;
             }
+        }
+        Ok(())
+    }
+
+    fn record_recovery_failure(
+        &self,
+        draft_id: &str,
+        expected: &PendingAttempt,
+        error: &str,
+    ) -> Result<(), CatalogError> {
+        let warning = format!(
+            "could not safely recover draft {draft_id} into session {}: {error}. The saved draft and workspace are preserved; start a new conversation and copy them there. No prompt was replayed",
+            expected.candidate_session_id
+        );
+        let _guard = self.lock_index()?;
+        let mut index = self.read_index_unlocked()?;
+        let Some(record) = index.sessions.get_mut(draft_id) else {
+            return Ok(());
+        };
+        let Some(attempt) = record.pending_attempt.as_mut().filter(|attempt| {
+            record.pending_new_turn
+                && attempt.token == expected.token
+                && attempt.revision == expected.revision
+        }) else {
+            return Ok(());
+        };
+        if attempt.recovery_warning.as_deref() != Some(warning.as_str()) {
+            attempt.recovery_warning = Some(warning);
+            attempt.revision = attempt.revision.saturating_add(1);
+            record.updated_at_ms = now_ms();
+            self.write_index_unlocked(&index)?;
         }
         Ok(())
     }
@@ -1147,7 +1211,12 @@ impl SessionCatalog {
             if existing.bound_attempt_token.as_deref() == Some(attempt_token) {
                 return Ok(());
             }
-            return Err(CatalogError::AlreadyExists(session_id.into()));
+            if existing.bound_attempt_token.is_some()
+                || existing.pending_new_turn
+                || existing.pending_attempt.is_some()
+            {
+                return Err(CatalogError::AlreadyExists(session_id.into()));
+            }
         }
         let current_attempt = index
             .sessions
@@ -1162,13 +1231,18 @@ impl SessionCatalog {
                 "pending session attempt changed before binding".into(),
             ));
         }
-        let mut record = index
+        let draft_record = index
             .sessions
             .remove(draft_id)
             .ok_or_else(|| CatalogError::NotFound(draft_id.into()))?;
+        let mut record = match index.sessions.remove(session_id) {
+            Some(existing) => merge_pending_session_metadata(existing, draft_record, attempt_token),
+            None => draft_record,
+        };
         record.pending_new_turn = false;
         record.pending_attempt = None;
         record.bound_attempt_token = Some(attempt_token.to_string());
+        record.recovered = false;
         record.updated_at_ms = now_ms();
         index.sessions.insert(session_id.to_string(), record);
         self.write_index_unlocked(&index)
@@ -1213,6 +1287,7 @@ impl SessionCatalog {
             {
                 attempt.controller_released = true;
                 attempt.revision = attempt.revision.saturating_add(1);
+                attempt.recovery_warning = None;
                 record.updated_at_ms = now_ms();
                 self.write_index_unlocked(&index)?;
             }
@@ -1307,6 +1382,7 @@ impl SessionCatalog {
             })?;
         if mutate(attempt)? {
             attempt.revision = attempt.revision.saturating_add(1);
+            attempt.recovery_warning = None;
             record.updated_at_ms = now_ms();
             self.write_index_unlocked(&index)?;
         }
@@ -2043,6 +2119,7 @@ mod tests {
             candidate_session_id: candidate.to_string(),
             native_session_id: None,
             controller_released: false,
+            recovery_warning: None,
         }
     }
 
@@ -2373,6 +2450,202 @@ mod tests {
                 .as_deref(),
             Some("second-token")
         );
+    }
+
+    #[test]
+    fn pending_handoff_merges_metadata_written_to_recovered_candidate() {
+        let scratch = tempdir().unwrap();
+        let state = scratch.path().join("state");
+        let draft_workspace = scratch.path().join("draft-workspace");
+        let candidate_workspace = scratch.path().join("candidate-workspace");
+        fs::create_dir_all(&draft_workspace).unwrap();
+        fs::create_dir_all(&candidate_workspace).unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let draft = catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("draft title".into()),
+                Some(&draft_workspace),
+            )
+            .unwrap();
+        catalog
+            .save_draft(&draft.id, SessionInterface::Web, "saved web prompt".into())
+            .unwrap();
+        catalog
+            .save_display_metadata(&draft.id, "draft-color".into(), serde_json::json!("blue"))
+            .unwrap();
+
+        let candidate = "sess-91-78";
+        let owner = ProcessOwner::current().unwrap();
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt = Some(attempt("token-merge", candidate, owner.clone()));
+                Ok(())
+            })
+            .unwrap();
+        fs::write(
+            catalog.trail_path(candidate),
+            sample_trail(candidate, "session_end"),
+        )
+        .unwrap();
+        catalog
+            .record_supervisor_owner(&draft.id, "token-merge", candidate, owner.clone())
+            .unwrap();
+        catalog
+            .record_native_session_handoff(&draft.id, "token-merge", candidate, candidate, &owner)
+            .unwrap();
+
+        let visible = catalog.list().unwrap();
+        assert!(visible.iter().any(|session| session.id == candidate));
+        catalog
+            .rename(candidate, Some("candidate title".into()))
+            .unwrap();
+        catalog
+            .save_draft(candidate, SessionInterface::Tui, "edited TUI draft".into())
+            .unwrap();
+        catalog
+            .save_display_metadata(
+                candidate,
+                "candidate-color".into(),
+                serde_json::json!("red"),
+            )
+            .unwrap();
+        catalog
+            .set_workspace(candidate, &candidate_workspace)
+            .unwrap();
+
+        let mut dead_owner = owner;
+        dead_owner.birth_token.push_str("-old-incarnation");
+        catalog
+            .update_index(|index| {
+                let attempt = index
+                    .sessions
+                    .get_mut(&draft.id)
+                    .unwrap()
+                    .pending_attempt
+                    .as_mut()
+                    .unwrap();
+                attempt.controller = Some(dead_owner.clone());
+                attempt.supervisor = Some(dead_owner);
+                Ok(())
+            })
+            .unwrap();
+
+        let reopened = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("metadata on a visible trail must not brick catalog recovery");
+        let adopted = reopened
+            .get(candidate)
+            .expect("adopted session remains readable");
+        assert_eq!(adopted.name.as_deref(), Some("candidate title"));
+        assert_eq!(
+            adopted.cwd.as_deref(),
+            Some(fs::canonicalize(candidate_workspace).unwrap().as_path())
+        );
+        assert_eq!(adopted.drafts[&SessionInterface::Web], "saved web prompt");
+        assert_eq!(adopted.drafts[&SessionInterface::Tui], "edited TUI draft");
+        assert_eq!(adopted.display["draft-color"], serde_json::json!("blue"));
+        assert_eq!(adopted.display["candidate-color"], serde_json::json!("red"));
+        assert!(!adopted.pending_new_turn);
+        assert!(!adopted.recovered);
+        let index = reopened.read_index().unwrap();
+        assert!(!index.sessions.contains_key(&draft.id));
+        assert_eq!(
+            index.sessions[candidate].bound_attempt_token.as_deref(),
+            Some("token-merge")
+        );
+    }
+
+    #[test]
+    fn pending_recovery_failure_degrades_only_its_draft_to_unknown() {
+        let scratch = tempdir().unwrap();
+        let state = scratch.path().join("state");
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let blocked = catalog
+            .create_draft(SessionInterface::Web, Some("blocked".into()), None)
+            .unwrap();
+        let recoverable = catalog
+            .create_draft(SessionInterface::Tui, Some("recoverable".into()), None)
+            .unwrap();
+        let current_owner = ProcessOwner::current().unwrap();
+        let mut dead_owner = current_owner;
+        dead_owner.birth_token.push_str("-old-incarnation");
+
+        for (draft_id, token, candidate) in [
+            (&blocked.id, "blocked-token", "sess-91-79"),
+            (&recoverable.id, "recoverable-token", "sess-91-80"),
+        ] {
+            catalog
+                .update_index(|index| {
+                    let record = index.sessions.get_mut(draft_id).unwrap();
+                    record.pending_new_turn = true;
+                    record.pending_attempt = Some(attempt(token, candidate, dead_owner.clone()));
+                    Ok(())
+                })
+                .unwrap();
+            fs::write(
+                catalog.trail_path(candidate),
+                sample_trail(candidate, "session_end"),
+            )
+            .unwrap();
+            catalog
+                .record_supervisor_owner(draft_id, token, candidate, dead_owner.clone())
+                .unwrap();
+            catalog
+                .record_native_session_handoff(draft_id, token, candidate, candidate, &dead_owner)
+                .unwrap();
+        }
+        catalog
+            .rename("sess-91-79", Some("conflicting record".into()))
+            .unwrap();
+        catalog
+            .update_index(|index| {
+                index
+                    .sessions
+                    .get_mut("sess-91-79")
+                    .unwrap()
+                    .bound_attempt_token = Some("different-token".into());
+                Ok(())
+            })
+            .unwrap();
+
+        let reopened = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("one conflicting recovery must not prevent catalog startup");
+        let blocked_session = reopened
+            .get(&blocked.id)
+            .expect("the unrecoverable draft remains readable");
+        assert_eq!(blocked_session.run_state, CatalogRunState::Unknown);
+        assert!(blocked_session.warnings.iter().any(|warning| {
+            warning.contains("start a new conversation and copy them")
+                && warning.contains("No prompt was replayed")
+        }));
+        assert!(reopened.list().is_ok());
+        assert!(reopened.get("sess-91-79").is_ok());
+        let adopted = reopened
+            .get("sess-91-80")
+            .expect("another draft must still recover");
+        assert_eq!(
+            reopened.read_index().unwrap().sessions["sess-91-80"]
+                .bound_attempt_token
+                .as_deref(),
+            Some("recoverable-token")
+        );
+        assert_eq!(adopted.id, "sess-91-80");
     }
 
     #[test]
