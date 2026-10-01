@@ -4,9 +4,12 @@ mod transcript;
 
 use std::env;
 use std::error::Error;
-use std::io;
+use std::ffi::OsStr;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,12 +34,19 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use signal_hook::SigId;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::flag;
+use signal_hook::low_level::unregister;
 use transcript::TranscriptTurn;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
-const HELP: &str = "Enter newline | Ctrl-S send | PageUp/PageDown scroll | Ctrl-End newest\n←/→ Home/End edit | Ctrl-Z undo | Ctrl-Y redo | F1 help | F2 actions | Ctrl-C stop/exit";
+const HELP: &str = "Enter newline | Ctrl-S send | Ctrl-C stop/exit | F1 help\nArrows/Home/End edit | Ctrl-Z/Y undo/redo | PgUp/Dn scroll | Ctrl-End newest";
+const MIN_TERMINAL_COLUMNS: u16 = 80;
+const MIN_TERMINAL_ROWS: u16 = 24;
+const SMALL_TERMINAL_REJECTION: &str = "Send rejected: terminal must be at least 80x24.";
 
 struct Args {
     leg_bin: Option<PathBuf>,
@@ -106,6 +116,8 @@ fn print_help() {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn Error>> {
+    require_interactive_terminal()?;
+    let signals = ProcessSignals::install()?;
     let _terminal_guard = TerminalGuard::enter()?;
     let catalog = SessionCatalog::open(SessionCatalogConfig {
         leg_bin: args.leg_bin,
@@ -116,19 +128,97 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     while !app.quit {
+        let area = terminal.size()?;
+        app.set_terminal_size(area.width, area.height);
         terminal.draw(|frame| draw(frame, &mut app))?;
         app.receive_turn_messages();
+        if let Some(signal) = signals.take() {
+            app.handle_external_signal(signal);
+        }
+        if app.quit {
+            break;
+        }
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
                 Event::Paste(text) => app.handle_paste(&text),
-                Event::Resize(_, _) => {}
+                Event::Resize(columns, rows) => app.set_terminal_size(columns, rows),
                 _ => {}
             }
         }
     }
     app.persist_draft()?;
     Ok(())
+}
+
+fn require_interactive_terminal() -> io::Result<()> {
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "leg-tui requires a terminal for both stdin and stdout; run it in a terminal or use --help for usage",
+    ))
+}
+
+fn should_use_color(no_color: Option<&OsStr>, term: Option<&OsStr>) -> bool {
+    !no_color.is_some_and(|value| !value.is_empty()) && term != Some(OsStr::new("dumb"))
+}
+
+fn terminal_color_enabled() -> bool {
+    let no_color = env::var_os("NO_COLOR");
+    let term = env::var_os("TERM");
+    should_use_color(no_color.as_deref(), term.as_deref())
+}
+
+#[derive(Clone, Copy)]
+enum ExternalSignal {
+    Interrupt,
+    Terminate,
+}
+
+struct ProcessSignals {
+    interrupt: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    registrations: Vec<SigId>,
+}
+
+impl ProcessSignals {
+    fn install() -> io::Result<Self> {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let terminate = Arc::new(AtomicBool::new(false));
+        let interrupt_id = flag::register(SIGINT, Arc::clone(&interrupt))?;
+        let terminate_id = match flag::register(SIGTERM, Arc::clone(&terminate)) {
+            Ok(id) => id,
+            Err(error) => {
+                unregister(interrupt_id);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            interrupt,
+            terminate,
+            registrations: vec![interrupt_id, terminate_id],
+        })
+    }
+
+    fn take(&self) -> Option<ExternalSignal> {
+        if self.terminate.swap(false, Ordering::Relaxed) {
+            Some(ExternalSignal::Terminate)
+        } else if self.interrupt.swap(false, Ordering::Relaxed) {
+            Some(ExternalSignal::Interrupt)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ProcessSignals {
+    fn drop(&mut self) {
+        for id in self.registrations.drain(..) {
+            unregister(id);
+        }
+    }
 }
 
 struct TerminalGuard;
@@ -190,9 +280,13 @@ struct App {
     transcript_max_scroll: usize,
     transcript_page_rows: usize,
     transcript_new_content: bool,
+    terminal_columns: u16,
+    terminal_rows: u16,
+    use_color: bool,
     show_help: bool,
     show_menu: bool,
     quit: bool,
+    exit_after_turn: bool,
     model: String,
     stop_handle: Option<TurnStopHandle>,
     turn_tx: Sender<TurnMessage>,
@@ -277,9 +371,13 @@ impl App {
             transcript_max_scroll: 0,
             transcript_page_rows: 1,
             transcript_new_content: false,
+            terminal_columns: MIN_TERMINAL_COLUMNS,
+            terminal_rows: MIN_TERMINAL_ROWS,
+            use_color: terminal_color_enabled(),
             show_help: false,
             show_menu: false,
             quit: false,
+            exit_after_turn: false,
             model: env::var("LEG_MODEL").unwrap_or_else(|_| "provider default".to_string()),
             stop_handle: None,
             turn_tx,
@@ -494,7 +592,56 @@ impl App {
         self.quit = true;
     }
 
+    fn set_terminal_size(&mut self, columns: u16, rows: u16) {
+        let was_too_small = self.terminal_too_small();
+        self.terminal_columns = columns;
+        self.terminal_rows = rows;
+        if was_too_small && !self.terminal_too_small() && self.status == SMALL_TERMINAL_REJECTION {
+            self.status = "Ready".to_string();
+        }
+    }
+
+    fn terminal_too_small(&self) -> bool {
+        self.terminal_columns < MIN_TERMINAL_COLUMNS || self.terminal_rows < MIN_TERMINAL_ROWS
+    }
+
+    fn handle_external_signal(&mut self, signal: ExternalSignal) {
+        self.exit_after_turn = true;
+        if self.turn_status.is_active() {
+            let name = match signal {
+                ExternalSignal::Interrupt => "SIGINT",
+                ExternalSignal::Terminate => "SIGTERM",
+            };
+            if self.turn_status.is_stopping() {
+                self.status = format!("{name} received; waiting for turn cleanup");
+            } else {
+                match &self.stop_handle {
+                    Some(handle) => match handle.stop() {
+                        Ok(()) => {
+                            self.turn_status = TurnStatus::Stopping;
+                            self.status = format!("{name} received; waiting for turn cleanup");
+                        }
+                        Err(error) => {
+                            self.status = format!(
+                                "{name} received; stop request failed: {error}; waiting for turn cleanup"
+                            );
+                        }
+                    },
+                    None => {
+                        self.status = format!("{name} received; waiting for turn cleanup");
+                    }
+                }
+            }
+            return;
+        }
+        self.quit = true;
+    }
+
     fn submit(&mut self) {
+        if self.terminal_too_small() {
+            self.status = SMALL_TERMINAL_REJECTION.to_string();
+            return;
+        }
         if self.turn_status.is_active() {
             self.status = "Busy: wait for the active turn".to_string();
             return;
@@ -744,6 +891,9 @@ impl App {
             }
         }
         let _ = self.persist_draft();
+        if self.exit_after_turn {
+            self.quit = true;
+        }
     }
 
     fn restore_unedited_prompt(&mut self, prompt: Option<String>, draft_edited: bool) {
@@ -847,9 +997,13 @@ fn restored_draft(current: &str, submitted: Option<String>, draft_edited: bool) 
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    if app.terminal_too_small() {
+        draw_small_terminal(frame, app);
+        return;
+    }
     match app.screen {
         Screen::Workspace => draw_workspace(frame, app),
-        Screen::Warning => draw_warning(frame),
+        Screen::Warning => draw_warning(frame, app.use_color),
         Screen::Conversation => draw_conversation(frame, app),
     }
 }
@@ -881,14 +1035,15 @@ fn draw_workspace(frame: &mut Frame<'_>, app: &App) {
     ));
 }
 
-fn draw_warning(frame: &mut Frame<'_>) {
-    let area = centered_rect(96, 46, frame.area());
+fn draw_warning(frame: &mut Frame<'_>, use_color: bool) {
+    let terminal_area = frame.area();
+    let area = if terminal_area.height < 32 {
+        centered_rect(96, 92, terminal_area)
+    } else {
+        centered_rect(96, 46, terminal_area)
+    };
     let lines = vec![
-        Line::from(WARNING).style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        warning_line(use_color),
         Line::from(""),
         Line::from("Press Enter to acknowledge and open the composer."),
         Line::from("Press Esc to choose another workspace."),
@@ -913,6 +1068,40 @@ fn draw_warning(frame: &mut Frame<'_>) {
             )
             .wrap(Wrap { trim: false }),
         area,
+    );
+}
+
+fn warning_line(use_color: bool) -> Line<'static> {
+    let line = Line::from(WARNING);
+    if use_color {
+        line.style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        line
+    }
+}
+
+fn draw_small_terminal(frame: &mut Frame<'_>, app: &App) {
+    let mut lines = vec![
+        Line::from("Terminal too small"),
+        Line::from("Minimum supported size: 80 columns x 24 rows."),
+        Line::from("Resize to continue. Draft and active-turn state are preserved."),
+    ];
+    if app.status == SMALL_TERMINAL_REJECTION {
+        lines.push(Line::from(app.status.clone()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Resize terminal"),
+            )
+            .wrap(Wrap { trim: false }),
+        frame.area(),
     );
 }
 
@@ -949,10 +1138,14 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
         app.model,
         app.turn_status.display(),
     );
+    let header = Paragraph::new(sanitize::terminal_safe_text(&header))
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(
-        Paragraph::new(sanitize::terminal_safe_text(&header))
-            .block(Block::default().borders(Borders::ALL))
-            .style(Style::default().fg(Color::Cyan)),
+        if app.use_color {
+            header.style(Style::default().fg(Color::Cyan))
+        } else {
+            header
+        },
         chunks[0],
     );
 
@@ -1033,8 +1226,13 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         chunks[2],
     );
+    let help = Paragraph::new(HELP);
     frame.render_widget(
-        Paragraph::new(HELP).style(Style::default().fg(Color::DarkGray)),
+        if app.use_color {
+            help.style(Style::default().fg(Color::DarkGray))
+        } else {
+            help
+        },
         chunks[3],
     );
 
@@ -1131,11 +1329,28 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::time::Duration;
 
     use serde_json::json;
 
-    use super::{TurnStatus, response_stop_reason, restored_draft, successful_status};
+    use super::{
+        TurnStatus, response_stop_reason, restored_draft, should_use_color, successful_status,
+    };
+
+    #[test]
+    fn color_policy_respects_no_color_and_dumb_term() {
+        assert!(should_use_color(None, Some(OsStr::new("xterm-256color"))));
+        assert!(!should_use_color(
+            Some(OsStr::new("1")),
+            Some(OsStr::new("xterm"))
+        ));
+        assert!(!should_use_color(None, Some(OsStr::new("dumb"))));
+        assert!(should_use_color(
+            Some(OsStr::new("")),
+            Some(OsStr::new("xterm"))
+        ));
+    }
 
     #[test]
     fn queued_stream_events_cannot_replace_stopping_with_running() {
