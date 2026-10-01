@@ -9,7 +9,7 @@ import fcntl
 import json
 import os
 import pty
-import pyte
+import re
 import select
 import signal
 import struct
@@ -22,6 +22,8 @@ import urllib.request
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+
+import pyte
 
 
 WARNING = (
@@ -398,6 +400,8 @@ def start_prompt(
             "F1 help",
             "F2 keyboard actions",
             "? is prompt text",
+            "PageUp/PageDown scroll",
+            "Ctrl-End newest",
         ):
             assert hint in first_run_help, (
                 f"first-run help omitted {hint!r}: {first_run_help[-1800:]!r}"
@@ -430,6 +434,7 @@ def start_prompt(
             "Remove one grapheme",
             "Ctrl-Z / Ctrl-Y",
             "Stop the turn",
+            "Scroll transcript",
             "F1 / F2",
         ):
             assert action in action_menu, f"keyboard action menu omitted {action!r}"
@@ -590,8 +595,8 @@ def run_smoke(args: argparse.Namespace) -> None:
                 assert capture.contains(STOP_LIVE_TEXT), capture.text()
 
                 os.write(master_fd, b"\x03")
-                read_until(master_fd, child, capture, "Stopped")
-                assert capture.contains("Stopped"), capture.text()
+                read_until(master_fd, child, capture, "Interrupted")
+                assert capture.contains("Interrupted"), capture.text()
                 os.write(master_fd, b"\x03")
                 status = drain_until_exit(master_fd, child, capture)
                 assert status == 0, f"TUI exit status was {status}: {bytes(capture.raw)!r}"
@@ -716,7 +721,7 @@ def run_smoke(args: argparse.Namespace) -> None:
                 assert completed_negative["pause_gates"].get("3") == "completed", completed_negative
                 read_until(negative_master, negative_child, negative_capture, "Succeeded")
                 assert negative_capture.contains(RESUMED_TEXT), negative_capture.text()
-                assert not negative_capture.contains("Stopped"), negative_capture.text()
+                assert not negative_capture.contains("Interrupted"), negative_capture.text()
 
                 os.write(negative_master, b"\x03")
                 negative_status = drain_until_exit(
@@ -770,6 +775,299 @@ def run_smoke(args: argparse.Namespace) -> None:
                     fixture.wait(timeout=2)
 
 
+def start_fixture(
+    fixture_path: Path, scenario: str, workspace: Path | None
+) -> tuple[subprocess.Popen[str], str]:
+    fixture = subprocess.Popen(
+        [
+            sys.executable,
+            str(fixture_path),
+            "--scenario",
+            scenario,
+            "--workspace",
+            str(workspace) if workspace is not None else "",
+            "--port",
+            "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        status_url = wait_for_fixture_start(fixture)
+    except BaseException:
+        if fixture.poll() is None:
+            fixture.kill()
+        try:
+            fixture.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            fixture.kill()
+            fixture.wait(timeout=2)
+        raise
+    return fixture, status_url
+
+
+def launch_conversation(
+    args: argparse.Namespace, env: dict[str, str], workspace: Path
+) -> tuple[int, int, subprocess.Popen[bytes], list[Any], TerminalCapture]:
+    command = [
+        str(Path(args.tui_bin).resolve()),
+        "--leg-bin",
+        str(Path(args.leg_bin).resolve()),
+        "--supervisor-bin",
+        str(Path(args.supervisor_bin).resolve()),
+    ]
+    master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+    capture = TerminalCapture()
+    try:
+        read_until(master_fd, child, capture, "Path:")
+        os.write(master_fd, str(workspace).encode() + b"\r")
+        read_until(master_fd, child, capture, WARNING)
+        os.write(master_fd, b"\r")
+        read_until(master_fd, child, capture, "Idle")
+        return master_fd, slave_fd, child, initial_termios, capture
+    except BaseException:
+        kill_owned_process_group(child)
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+
+
+def stop_fixture(fixture: subprocess.Popen[str]) -> None:
+    if fixture.poll() is None:
+        with suppress(ProcessLookupError):
+            fixture.send_signal(signal.SIGTERM)
+    try:
+        fixture.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        fixture.kill()
+        fixture.wait(timeout=2)
+
+
+def run_turn_contract_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+    with tempfile.TemporaryDirectory(prefix="leg-tui-contract-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_MAX_TOOL_ROUNDS": "2",
+                    "LEG_UI_STATE_DIR": str(root / "state"),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                    "LEG_EVENT_LOG": str(root / "leg-events.jsonl"),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+
+            os.write(master_fd, b"TRIAL-TOOL-TEXT\x13")
+            read_until(
+                master_fd, child, output, "The write result returned; this is the final text."
+            )
+            read_until(master_fd, child, output, "Succeeded")
+            screen = output.text()
+            assert screen.count("First the text, then a verified fixture write.") == 1, screen
+            assert screen.count("The write result returned; this is the final text.") == 1, screen
+            assert "Tool completed: write" in screen, screen
+            status = request_status(status_url)
+            assert status["requests"] == 2, status
+
+            os.write(master_fd, b"TRIAL-TUI-MULTI-TOOL\x13")
+            read_until(master_fd, child, output, "Final multi-round text.")
+            drain_for(master_fd, output, 0.25)
+            multi_round_screen = output.text()
+            for segment in (
+                "First multi-round text.",
+                "Second multi-round text.",
+                "Final multi-round text.",
+            ):
+                assert multi_round_screen.count(segment) == 1, multi_round_screen
+            assert request_status(status_url)["requests"] == 5
+
+            os.write(master_fd, b"TRIAL-TUI-MAX-TOKENS\x13")
+            read_until(master_fd, child, output, "Reply truncated at max tokens.")
+            assert request_status(status_url)["requests"] == 6
+
+            os.write(master_fd, b"TRIAL-CAP\x13")
+            read_until(master_fd, child, output, "Capped")
+            read_until(master_fd, child, output, "Tool-round limit reached.")
+            assert request_status(status_url)["requests"] == 9
+
+            os.write(master_fd, b"TRIAL-TUI-ANSI\x13")
+            read_until(master_fd, child, output, "Before red after Ω")
+            drain_for(master_fd, output, 0.25)
+            ansi_screen = output.text()
+            assert "secret title" not in ansi_screen, ansi_screen
+            assert "Before red after Ω" in ansi_screen, ansi_screen
+            assert request_status(status_url)["requests"] == 10
+
+            os.write(master_fd, b"TRIAL-LARGE-TOOL\x13")
+            read_until(master_fd, child, output, "The large tool result was returned.")
+            drain_for(master_fd, output, 0.25)
+            large_tool_screen = output.text()
+            assert "more characters" in large_tool_screen, large_tool_screen
+            assert request_status(status_url)["requests"] == 12
+
+            os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE\x13")
+            read_until(master_fd, child, output, "Long fixture line 090")
+            os.write(master_fd, b"\x1b[5~")
+            drain_for(master_fd, output, 0.15)
+            history_screen = output.text()
+            visible_rows = re.findall(r"Long fixture line \d{3}", history_screen)
+            assert visible_rows, f"PageUp did not reveal transcript history: {history_screen!r}"
+            anchor = visible_rows[len(visible_rows) // 2]
+            read_until(master_fd, child, output, "new content below")
+            preserved_screen = output.text()
+            assert anchor in preserved_screen, (
+                f"streaming moved the historical viewport away from {anchor!r}: {preserved_screen!r}"
+            )
+            os.write(master_fd, b"\x1b[1;5F")
+            read_until(master_fd, child, output, "END OF FIXTURE ANSWER")
+            newest_screen = output.text()
+            assert "new content below" not in newest_screen, newest_screen
+            assert request_status(status_url)["requests"] == 13
+
+            status = drain_until_exit_after_close(master_fd, child, output, slave_fd, initial_termios)
+            master_fd = slave_fd = None
+            assert status == 0
+            final_status = request_status(status_url)
+            assert final_status["scenario_requests"] == {
+                "TRIAL-TOOL-TEXT": 2,
+                "TRIAL-TUI-MULTI-TOOL": 3,
+                "TRIAL-TUI-MAX-TOKENS": 1,
+                "TRIAL-CAP": 3,
+                "TRIAL-TUI-ANSI": 1,
+                "TRIAL-LARGE-TOOL": 2,
+                "TRIAL-TUI-LONG-PAUSE": 1,
+            }, final_status
+            for check in (
+                "tool_result_returned",
+                "multi_tool_results_returned",
+                "large_tool_result_returned",
+            ):
+                assert final_status["input_checks"].get(check) is True, final_status
+            assert any(
+                check["path"] == "trial-rounds.txt" and check["ok"]
+                for check in final_status["workspace_checks"]
+            ), final_status
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
+
+
+def drain_until_exit_after_close(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    output: TerminalCapture,
+    slave_fd: int,
+    initial_termios: list[Any],
+) -> int:
+    os.write(master_fd, b"\x03")
+    status = drain_until_exit(master_fd, child, output)
+    assert_terminal_restored(bytes(output.raw), slave_fd, initial_termios, child)
+    os.close(master_fd)
+    os.close(slave_fd)
+    return status
+
+
+def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+    with tempfile.TemporaryDirectory(prefix="leg-tui-retry-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_UI_STATE_DIR": str(root / "state"),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                    "LEG_EVENT_LOG": str(root / "leg-events.jsonl"),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+            retry_prompt = "TRIAL-REOPEN-FAILURE retry this failed prompt"
+            os.write(master_fd, retry_prompt.encode() + b"\x13")
+            read_until(master_fd, child, output, "Failed")
+            assert request_status(status_url)["requests"] == 1
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "reading a failure retried it"
+
+            os.write(master_fd, b"\r")
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "Enter retried a failed prompt"
+            os.write(master_fd, b"\x7f")
+            drain_for(master_fd, output, 0.1)
+
+            warning = "Retry sends this prompt again and may repeat tool side effects."
+            os.write(master_fd, b"\x13")
+            read_until(master_fd, child, output, warning)
+            assert request_status(status_url)["requests"] == 1
+            os.write(master_fd, b"\r")
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "Enter confirmed a retry"
+            assert warning in output.text()
+
+            os.write(master_fd, b"n")
+            drain_for(master_fd, output, 0.1)
+            assert request_status(status_url)["requests"] == 1
+            assert "Explicit retry confirmation" not in output.text()
+            os.write(master_fd, b"\x13")
+            read_until(master_fd, child, output, warning)
+            assert request_status(status_url)["requests"] == 1
+            os.write(master_fd, b"y")
+            read_until(master_fd, child, output, "The explicit retry succeeded.")
+            drain_for(master_fd, output, 0.25)
+            assert request_status(status_url)["requests"] == 2
+
+            status = drain_until_exit_after_close(master_fd, child, output, slave_fd, initial_termios)
+            master_fd = slave_fd = None
+            assert status == 0
+            final_status = request_status(status_url)
+            assert final_status["scenario_requests"] == {"TRIAL-REOPEN-FAILURE": 2}, final_status
+            assert final_status["input_checks"].get("retry_or_reopen_succeeded") is True, final_status
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
+
+
 def main() -> None:
     if sys.platform != "linux":
         raise SystemExit("pty_smoke.py is Linux-only")
@@ -780,6 +1078,8 @@ def main() -> None:
     args = parser.parse_args()
     test_terminal_screen_redraw()
     run_smoke(args)
+    run_turn_contract_smoke(args)
+    run_retry_confirmation_smoke(args)
     print("leg-tui Linux PTY smoke passed")
 
 

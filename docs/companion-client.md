@@ -68,9 +68,10 @@ sessions remain draft records until leg emits the session id at `turn_start`;
 that id is recorded before later turn success or failure. Reopening or importing
 a session only reads its trail. Starting another prompt and retrying a failed
 or incomplete prompt are explicit operations. Retry keeps the original prompt
-and returns a warning that tools may run again. The supervisor's session lock
-is held until owned leg and tool processes finish; catalog workspace changes
-and retries require that lock to be idle.
+and returns the shared warning
+`Retry sends this prompt again and may repeat tool side effects.` The
+supervisor's session lock is held until owned leg and tool processes finish;
+catalog workspace changes and retries require that lock to be idle.
 
 Use `SessionCatalog::export_transcript` to export the parsed leg trail. It
 contains trail events only, without catalog metadata or inherited environment
@@ -135,11 +136,13 @@ are surfaced as `StreamEvent::Unknown`; an unsupported schema or malformed
 record is a protocol error. The terminal response is authoritative; deltas
 are provisional. `wait` returns success only for a correlated response with a
 zero leg exit status; its `capped` flag carries the core tool-round warning for
-the UI to display. Provider/error responses remain failures, interrupted turns
-are `Stopped`, and EOF without `turn_end`, malformed framing, or an
-exit/outcome disagreement is incomplete. The client never retries or replays
-the prompt. Provider credentials are never included in client metadata, and
-stderr/error diagnostics redact inherited credential values.
+the UI to display. The wrapped response also carries the provider's
+`stop_reason`, including `max_tokens`, so a UI can distinguish a truncated
+answer. Provider/error responses remain failures, interrupted turns are
+`Stopped`, and EOF without `turn_end`, malformed framing, or an exit/outcome
+disagreement is incomplete. The client never retries or replays the prompt.
+Provider credentials are never included in client metadata, and stderr/error
+diagnostics redact inherited credential values.
 
 CI runs the companion suite on native Linux and macOS hosts. Its Stop and
 abrupt-controller cleanup tests check for an interrupted session trail and
@@ -180,8 +183,26 @@ help, F2 opens the keyboard action menu, and Esc closes either overlay. Ctrl-C
 stops a running turn; when idle it exits and keeps the draft. Editing stays
 available during a turn, but another Ctrl-S is rejected while busy. The first-run
 warning explains that the workspace is the tool working directory, not a
-sandbox. Sending clears the editor for the next draft; if a turn stops or fails
-before you edit that draft, the submitted prompt is restored.
+sandbox.
+
+The conversation header shows Idle, Starting, Running, Stopping, Succeeded,
+Failed, Interrupted, Incomplete, Capped, or `Succeeded (truncated)`,
+along with elapsed time and the active tool where applicable. A missing terminal
+outcome is incomplete; forced cleanup is labeled separately from a graceful
+interruption. Streamed text is grouped by round and block, then reconciled with
+the authoritative terminal response so earlier tool rounds stay visible once.
+Tool names and data are shown as text, with large tool output summarized. The
+TUI removes whole ANSI, CSI, and OSC sequences, including sequences split across
+stream deltas, from provider text, tool data, errors, and stderr.
+
+PageUp and PageDown scroll the transcript; Ctrl-End follows the newest text.
+New events keep a reader's historical position and mark that newer content is
+available. Wrapped and long lines remain navigable. Sending clears the editor
+for a new draft. On failure, interruption, or incomplete cleanup, the submitted
+prompt returns only when the editor has not changed; a newer editable draft is
+kept. Ctrl-S on the unchanged failed prompt opens an explicit retry confirmation
+with `Retry sends this prompt again and may repeat tool side effects.` Press Y
+to retry or N/Esc to cancel. Enter remains a newline and never retries.
 
 The Linux PTY smoke test uses the local fake provider and explicit native
 binary paths. It uses the pinned Python VT parser in

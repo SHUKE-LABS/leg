@@ -127,6 +127,7 @@ class Fixture:
             "TRIAL-NAV-CONTINUE",
             "TRIAL-NAV-LOSER",
             "TRIAL-TOOL-TEXT",
+            "TRIAL-TUI-MULTI-TOOL",
             "TRIAL-DENIED",
             "TRIAL-FAILED",
             "TRIAL-CAP",
@@ -141,6 +142,9 @@ class Fixture:
             "TRIAL-RUNNING",
             "TRIAL-LONG",
             "TRIAL-LARGE-TOOL",
+            "TRIAL-TUI-ANSI",
+            "TRIAL-TUI-LONG-PAUSE",
+            "TRIAL-TUI-MAX-TOKENS",
             "TRIAL-UNTRUSTED-MARKDOWN",
             "TRIAL-CONTINUE",
         )
@@ -314,8 +318,10 @@ class Fixture:
                     )
                 )
                 value = block["text"]
-                midpoint = max(1, len(value) // 2)
-                chunks = [value[:midpoint], value[midpoint:]]
+                chunks = block.get("chunks")
+                if not isinstance(chunks, list):
+                    midpoint = max(1, len(value) // 2)
+                    chunks = [value[:midpoint], value[midpoint:]]
                 for chunk_index, chunk in enumerate(chunks):
                     if chunk:
                         write(
@@ -512,6 +518,29 @@ class Fixture:
                 self.check("tool_result_returned", self.has_tool_result(payload))
                 self.send_stream(handler, [{"type": "text", "text": "The write result returned; this is the final text."}])
             return
+        if marker == "TRIAL-TUI-MULTI-TOOL":
+            if occurrence == 1:
+                self.send_stream(
+                    handler,
+                    [
+                        {"type": "text", "text": "First multi-round text."},
+                        {"type": "tool_use", "name": "bash", "input": {"command": "printf tool-one"}},
+                    ],
+                    stop_reason="tool_use",
+                )
+            elif occurrence == 2:
+                self.send_stream(
+                    handler,
+                    [
+                        {"type": "text", "text": "Second multi-round text."},
+                        {"type": "tool_use", "name": "bash", "input": {"command": "printf tool-two"}},
+                    ],
+                    stop_reason="tool_use",
+                )
+            else:
+                self.check("multi_tool_results_returned", self.has_tool_result(payload))
+                self.send_stream(handler, [{"type": "text", "text": "Final multi-round text."}])
+            return
         if marker == "denied-tool" or marker == "TRIAL-DENIED":
             self.effect("denied-marker.txt", "absent")
             if occurrence > 1 and self.has_error_tool_result(payload):
@@ -562,6 +591,30 @@ class Fixture:
         if marker == "TRIAL-LONG":
             long_text = "\n".join(f"Long fixture line {i:03d}: the complete answer remains available to browse and copy." for i in range(1, 181)) + "\nEND OF FIXTURE ANSWER"
             self.send_stream(handler, [{"type": "text", "text": long_text}])
+            return
+        if marker == "TRIAL-TUI-LONG-PAUSE":
+            long_text = "\n".join(
+                f"Long fixture line {i:03d}: preserve this historical row while new content arrives."
+                for i in range(1, 181)
+            ) + "\nEND OF FIXTURE ANSWER"
+            self.send_stream(handler, [{"type": "text", "text": long_text}], pause_ms=900, marker=marker)
+            return
+        if marker == "TRIAL-TUI-MAX-TOKENS":
+            self.send_stream(
+                handler,
+                [{"type": "text", "text": "The reply was truncated at the provider token limit."}],
+                stop_reason="max_tokens",
+            )
+            return
+        if marker == "TRIAL-TUI-ANSI":
+            self.send_stream(
+                handler,
+                [{
+                    "type": "text",
+                    "text": "Before red after Ω",
+                    "chunks": ["Before \x1b[", "31mred\x1b]0;secret title", "\x07 after Ω"],
+                }],
+            )
             return
         if marker == "TRIAL-LARGE-TOOL":
             if self.has_tool_result(payload):

@@ -193,7 +193,7 @@ impl RetryIntent {
     }
 
     pub fn warning(&self) -> &'static str {
-        "Retry can run tools again; side effects may be repeated."
+        "Retry sends this prompt again and may repeat tool side effects."
     }
 }
 

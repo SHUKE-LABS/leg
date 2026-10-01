@@ -1,5 +1,6 @@
 mod editor;
 mod sanitize;
+mod transcript;
 
 use std::env;
 use std::error::Error;
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -21,8 +22,8 @@ use crossterm::terminal::{
 };
 use editor::{ComposerEditor, normalize_paste};
 use leg_ui_client::{
-    CatalogTurn, SessionCatalog, SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome,
-    TurnStopHandle,
+    CatalogTurn, RetryIntent, SessionCatalog, SessionCatalogConfig, SessionInterface, StreamEvent,
+    TurnOutcome, TurnStopHandle,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -30,9 +31,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use transcript::TranscriptTurn;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
-const HELP: &str = "Enter newline | Ctrl-S send | ←/→ Home/End Backspace/Delete edit | Ctrl-Z undo | Ctrl-Y redo | F1 help | F2 actions | Ctrl-C stop/exit";
+const HELP: &str = "Enter newline | Ctrl-S send | PageUp/PageDown scroll | Ctrl-End newest\n←/→ Home/End edit | Ctrl-Z undo | Ctrl-Y redo | F1 help | F2 actions | Ctrl-C stop/exit";
 
 struct Args {
     leg_bin: Option<PathBuf>,
@@ -112,7 +116,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     while !app.quit {
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
         app.receive_turn_messages();
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
@@ -171,13 +175,21 @@ struct App {
     draft_id: Option<String>,
     session_id: Option<String>,
     composer: ComposerEditor,
-    transcript: Vec<(String, String)>,
+    transcript: Vec<TranscriptTurn>,
     status: String,
     active_tool: Option<String>,
-    active: bool,
-    stopping: bool,
+    turn_status: TurnStatus,
+    started_at: Option<Instant>,
+    last_elapsed: Duration,
+    terminal_detail: Option<String>,
     active_prompt: Option<String>,
     active_draft_edited: bool,
+    retry_confirmation: Option<RetryIntent>,
+    transcript_follow_tail: bool,
+    transcript_scroll: usize,
+    transcript_max_scroll: usize,
+    transcript_page_rows: usize,
+    transcript_new_content: bool,
     show_help: bool,
     show_menu: bool,
     quit: bool,
@@ -185,6 +197,58 @@ struct App {
     stop_handle: Option<TurnStopHandle>,
     turn_tx: Sender<TurnMessage>,
     turn_rx: Receiver<TurnMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TurnStatus {
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+    Succeeded,
+    Failed,
+    Interrupted,
+    Incomplete { forced: bool },
+    Capped,
+    Truncated,
+}
+
+impl TurnStatus {
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+    }
+
+    fn is_stopping(&self) -> bool {
+        matches!(self, Self::Stopping)
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Starting => "Starting",
+            Self::Running => "Running",
+            Self::Stopping => "Stopping",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Interrupted => "Interrupted",
+            Self::Incomplete { .. } => "Incomplete",
+            Self::Capped => "Capped",
+            Self::Truncated => "Succeeded (truncated)",
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Self::Incomplete { forced: true } => "Incomplete (forced cleanup)".to_string(),
+            _ => self.label().to_string(),
+        }
+    }
+
+    fn mark_running_unless_stopping(&mut self) {
+        if !self.is_stopping() {
+            *self = Self::Running;
+        }
+    }
 }
 
 impl App {
@@ -201,10 +265,18 @@ impl App {
             transcript: Vec::new(),
             status: "Choose a workspace".to_string(),
             active_tool: None,
-            active: false,
-            stopping: false,
+            turn_status: TurnStatus::Idle,
+            started_at: None,
+            last_elapsed: Duration::ZERO,
+            terminal_detail: None,
             active_prompt: None,
             active_draft_edited: false,
+            retry_confirmation: None,
+            transcript_follow_tail: true,
+            transcript_scroll: 0,
+            transcript_max_scroll: 0,
+            transcript_page_rows: 1,
+            transcript_new_content: false,
             show_help: false,
             show_menu: false,
             quit: false,
@@ -303,6 +375,10 @@ impl App {
     }
 
     fn handle_conversation_key(&mut self, key: KeyEvent) {
+        if self.retry_confirmation.is_some() {
+            self.handle_retry_confirmation_key(key);
+            return;
+        }
         if self.show_help {
             if key.code == KeyCode::Esc {
                 self.show_help = false;
@@ -333,10 +409,16 @@ impl App {
             self.status = "Ready".to_string();
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::End {
+            self.scroll_to_newest();
+            return;
+        }
         match key.code {
             KeyCode::Esc => self.status = "Composer focused".to_string(),
             KeyCode::F(1) => self.show_help = true,
             KeyCode::F(2) => self.show_menu = true,
+            KeyCode::PageUp => self.scroll_transcript_up(),
+            KeyCode::PageDown => self.scroll_transcript_down(),
             KeyCode::Left => self.composer.move_left(),
             KeyCode::Right => self.composer.move_right(),
             KeyCode::Home => self.composer.move_home(),
@@ -371,7 +453,11 @@ impl App {
     }
 
     fn handle_paste(&mut self, pasted: &str) {
-        if self.screen != Screen::Conversation || self.show_help || self.show_menu {
+        if self.screen != Screen::Conversation
+            || self.show_help
+            || self.show_menu
+            || self.retry_confirmation.is_some()
+        {
             return;
         }
         let text = normalize_paste(pasted);
@@ -383,21 +469,21 @@ impl App {
     }
 
     fn mark_active_draft_edited(&mut self, changed: bool) {
-        if self.active && changed {
+        if self.turn_status.is_active() && changed {
             self.active_draft_edited = true;
         }
     }
 
     fn handle_ctrl_c(&mut self) {
-        if self.active {
-            if self.stopping {
+        if self.turn_status.is_active() {
+            if self.turn_status.is_stopping() {
                 return;
             }
             match &self.stop_handle {
                 Some(handle) => match handle.stop() {
                     Ok(()) => {
-                        self.stopping = true;
-                        self.status = "Stopping active turn…".to_string();
+                        self.turn_status = TurnStatus::Stopping;
+                        self.status.clear();
                     }
                     Err(error) => self.status = format!("Stop failed: {error}"),
                 },
@@ -409,7 +495,7 @@ impl App {
     }
 
     fn submit(&mut self) {
-        if self.active {
+        if self.turn_status.is_active() {
             self.status = "Busy: wait for the active turn".to_string();
             return;
         }
@@ -417,11 +503,47 @@ impl App {
             self.status = "Blank prompts are not sent".to_string();
             return;
         }
+        if self.draft_id.is_none() {
+            self.status = "Choose a workspace before sending".to_string();
+            return;
+        }
+        let prompt = self.composer.text().to_string();
+        if let Some(session_id) = self.session_id.as_deref()
+            && let Ok(intent) = self.catalog.prepare_retry(session_id)
+            && intent.prompt() == prompt
+        {
+            self.retry_confirmation = Some(intent);
+            self.status.clear();
+            return;
+        }
+        self.start_prompt(prompt, None);
+    }
+
+    fn handle_retry_confirmation_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(intent) = self.retry_confirmation.take() {
+                    let prompt = intent.prompt().to_string();
+                    self.start_prompt(prompt, Some(intent));
+                }
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.retry_confirmation = None;
+                self.status = "Retry cancelled".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    fn start_prompt(&mut self, prompt: String, retry: Option<RetryIntent>) {
         let Some(draft_id) = self.draft_id.as_deref() else {
             self.status = "Choose a workspace before sending".to_string();
             return;
         };
-        let prompt = self.composer.text().to_string();
         let session_id = self.session_id.clone();
         let record_id = session_id.as_deref().unwrap_or(draft_id);
         if let Err(error) =
@@ -431,14 +553,17 @@ impl App {
             self.status = format!("Could not save the prompt draft: {error}");
             return;
         }
-        let started = match session_id {
-            Some(session_id) => {
-                self.catalog
-                    .start_existing(&session_id, SessionInterface::Tui, prompt.clone())
-            }
-            None => self
-                .catalog
-                .start_new(draft_id, SessionInterface::Tui, prompt.clone()),
+        let started = match retry {
+            Some(intent) => self.catalog.confirm_retry(&intent, SessionInterface::Tui),
+            None => match session_id {
+                Some(session_id) => {
+                    self.catalog
+                        .start_existing(&session_id, SessionInterface::Tui, prompt.clone())
+                }
+                None => self
+                    .catalog
+                    .start_new(draft_id, SessionInterface::Tui, prompt.clone()),
+            },
         };
         let turn = match started {
             Ok(turn) => turn,
@@ -450,15 +575,17 @@ impl App {
         let stop_handle = turn.stop_handle();
         match spawn_turn_reader(turn, self.turn_tx.clone()) {
             Ok(()) => {
-                self.transcript
-                    .push(("You".to_string(), sanitize::terminal_safe_text(&prompt)));
+                self.transcript.push(TranscriptTurn::new(&prompt));
+                self.note_transcript_change();
                 self.stop_handle = Some(stop_handle);
-                self.active = true;
-                self.stopping = false;
+                self.turn_status = TurnStatus::Starting;
+                self.started_at = Some(Instant::now());
+                self.last_elapsed = Duration::ZERO;
+                self.terminal_detail = None;
                 self.active_prompt = Some(prompt);
                 self.active_draft_edited = false;
                 self.composer.clear();
-                self.status = "Starting turn".to_string();
+                self.status.clear();
                 self.active_tool = None;
             }
             Err(error) => {
@@ -466,6 +593,42 @@ impl App {
                 self.status = format!("Could not observe the turn: {error}");
             }
         }
+    }
+
+    fn note_transcript_change(&mut self) {
+        if !self.transcript_follow_tail {
+            self.transcript_new_content = true;
+        }
+    }
+
+    fn scroll_transcript_up(&mut self) {
+        if self.transcript_follow_tail {
+            self.transcript_follow_tail = false;
+            self.transcript_scroll = self
+                .transcript_max_scroll
+                .saturating_sub(self.transcript_page_rows);
+        } else {
+            self.transcript_scroll = self
+                .transcript_scroll
+                .saturating_sub(self.transcript_page_rows);
+        }
+    }
+
+    fn scroll_transcript_down(&mut self) {
+        let next = self
+            .transcript_scroll
+            .saturating_add(self.transcript_page_rows);
+        if next >= self.transcript_max_scroll {
+            self.scroll_to_newest();
+        } else {
+            self.transcript_follow_tail = false;
+            self.transcript_scroll = next;
+        }
+    }
+
+    fn scroll_to_newest(&mut self) {
+        self.transcript_follow_tail = true;
+        self.transcript_new_content = false;
     }
 
     fn receive_turn_messages(&mut self) {
@@ -479,6 +642,13 @@ impl App {
     }
 
     fn handle_stream_event(&mut self, event: StreamEvent) {
+        let visible = self
+            .transcript
+            .last_mut()
+            .is_some_and(|turn| turn.observe(&event));
+        if visible {
+            self.note_transcript_change();
+        }
         match event {
             StreamEvent::TurnStart {
                 provider,
@@ -490,43 +660,35 @@ impl App {
                 if session_id.is_some() {
                     self.session_id = session_id;
                 }
-                self.status = "Running".to_string();
+                self.turn_status.mark_running_unless_stopping();
+                self.status.clear();
             }
-            StreamEvent::TextDelta { text, .. } => {
-                let safe = sanitize::terminal_safe_text(&text);
-                if let Some((role, body)) = self.transcript.last_mut()
-                    && role == "Assistant"
-                {
-                    body.push_str(&safe);
-                } else {
-                    self.transcript.push(("Assistant".to_string(), safe));
-                }
-                self.status = "Running".to_string();
+            StreamEvent::TextDelta { .. } => {
+                self.turn_status.mark_running_unless_stopping();
             }
             StreamEvent::ToolCall { tool_name, .. } => {
                 let name = sanitize::terminal_safe_text(&tool_name);
                 self.active_tool = Some(name.clone());
-                self.transcript
-                    .push(("Activity".to_string(), format!("Tool running: {name}")));
-                self.status = format!("Tool running: {name}");
+                self.turn_status.mark_running_unless_stopping();
+                if !self.turn_status.is_stopping() {
+                    self.status = format!("Tool running: {name}");
+                }
             }
-            StreamEvent::ToolResult {
-                tool_name, status, ..
-            } => {
-                let name = sanitize::terminal_safe_text(&tool_name);
-                let status = sanitize::terminal_safe_text(&status);
+            StreamEvent::ToolResult { .. } => {
                 self.active_tool = None;
-                self.transcript
-                    .push(("Activity".to_string(), format!("Tool {status}: {name}")));
-                self.status = format!("Tool {status}: {name}");
+                self.turn_status.mark_running_unless_stopping();
+                self.status.clear();
             }
-            StreamEvent::ToolRound { .. } => self.status = "Tool activity".to_string(),
-            StreamEvent::TurnEnd { capped, .. } => {
-                self.status = if capped {
-                    "Turn reached its tool-round cap".to_string()
-                } else {
-                    "Finishing turn".to_string()
-                };
+            StreamEvent::ToolRound { .. } => {
+                self.turn_status.mark_running_unless_stopping();
+            }
+            StreamEvent::TurnEnd { response, .. } => {
+                if response.get("kind").and_then(serde_json::Value::as_str) == Some("response")
+                    && let Some(turn) = self.transcript.last_mut()
+                {
+                    turn.reconcile_final(&response);
+                    self.note_transcript_change();
+                }
             }
             StreamEvent::Unknown { .. } => {}
         }
@@ -536,42 +698,65 @@ impl App {
         let submitted_prompt = self.active_prompt.take();
         let draft_edited = self.active_draft_edited;
         self.active_draft_edited = false;
-        self.active = false;
-        self.stopping = false;
         self.stop_handle = None;
         self.active_tool = None;
+        self.last_elapsed = self
+            .started_at
+            .take()
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if let Some(turn) = self.transcript.last_mut() {
+            turn.finish_stream();
+        }
+        self.status.clear();
         match result {
-            Ok(TurnOutcome::Succeeded { .. }) => {
-                self.status = "Succeeded".to_string();
+            Ok(TurnOutcome::Succeeded { response, capped }) => {
+                let truncated = response_stop_reason(&response) == Some("max_tokens");
+                self.turn_status = successful_status(capped, truncated);
+                self.terminal_detail = match (capped, truncated) {
+                    (true, true) => Some(
+                        "Tool-round limit reached; reply also truncated at max tokens.".to_string(),
+                    ),
+                    (true, false) => Some("Tool-round limit reached.".to_string()),
+                    (false, true) => Some("Reply truncated at max tokens.".to_string()),
+                    (false, false) => None,
+                };
             }
             Ok(TurnOutcome::Stopped { .. }) => {
                 self.restore_unedited_prompt(submitted_prompt, draft_edited);
-                self.status = "Stopped".to_string();
+                self.turn_status = TurnStatus::Interrupted;
+                self.terminal_detail = Some("Turn interrupted gracefully.".to_string());
             }
             Ok(TurnOutcome::Failed { message, .. }) => {
                 self.restore_unedited_prompt(submitted_prompt, draft_edited);
-                self.status = format!("Failed: {}", sanitize::terminal_safe_text(&message));
+                self.turn_status = TurnStatus::Failed;
+                self.terminal_detail = Some(sanitize::terminal_safe_text(&message));
             }
             Ok(TurnOutcome::Incomplete { message, forced }) => {
                 self.restore_unedited_prompt(submitted_prompt, draft_edited);
-                self.status = format!(
-                    "Incomplete{}: {}",
-                    if forced { " (forced stop)" } else { "" },
-                    sanitize::terminal_safe_text(&message)
-                );
+                self.turn_status = TurnStatus::Incomplete { forced };
+                self.terminal_detail = Some(sanitize::terminal_safe_text(&message));
             }
             Err(message) => {
                 self.restore_unedited_prompt(submitted_prompt, draft_edited);
-                self.status = format!("Turn error: {}", sanitize::terminal_safe_text(&message));
+                self.turn_status = TurnStatus::Incomplete { forced: false };
+                self.terminal_detail = Some(sanitize::terminal_safe_text(&message));
             }
         }
         let _ = self.persist_draft();
     }
 
     fn restore_unedited_prompt(&mut self, prompt: Option<String>, draft_edited: bool) {
-        if !draft_edited && let Some(prompt) = prompt {
-            self.composer.set_text(prompt);
+        let restored = restored_draft(self.composer.text(), prompt, draft_edited);
+        if restored != self.composer.text() {
+            self.composer.set_text(restored);
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started_at
+            .map(|started| started.elapsed())
+            .unwrap_or(self.last_elapsed)
     }
 
     fn persist_draft(&self) -> Result<(), Box<dyn Error>> {
@@ -612,7 +797,56 @@ fn spawn_turn_reader(mut turn: CatalogTurn, tx: Sender<TurnMessage>) -> io::Resu
         .map(|_| ())
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) {
+fn response_stop_reason(response: &serde_json::Value) -> Option<&str> {
+    response
+        .pointer("/exchange/exchange/outcome/stop_reason")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn successful_status(capped: bool, truncated: bool) -> TurnStatus {
+    if capped {
+        TurnStatus::Capped
+    } else if truncated {
+        TurnStatus::Truncated
+    } else {
+        TurnStatus::Succeeded
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
+}
+
+fn wrap_transcript(text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for logical_line in text.split('\n') {
+        let mut row = String::new();
+        let mut row_width = 0_usize;
+        for grapheme in UnicodeSegmentation::graphemes(logical_line, true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            row.push_str(grapheme);
+            row_width = row_width.saturating_add(grapheme_width);
+        }
+        rows.push(row);
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
+fn restored_draft(current: &str, submitted: Option<String>, draft_edited: bool) -> String {
+    if draft_edited {
+        current.to_string()
+    } else {
+        submitted.unwrap_or_else(|| current.to_string())
+    }
+}
+
+fn draw(frame: &mut Frame<'_>, app: &mut App) {
     match app.screen {
         Screen::Workspace => draw_workspace(frame, app),
         Screen::Warning => draw_warning(frame),
@@ -664,6 +898,7 @@ fn draw_warning(frame: &mut Frame<'_>) {
         ),
         Line::from("Ctrl-Z undo; Ctrl-Y redo. Ctrl-C stops a turn or exits when idle."),
         Line::from("F1 help; F2 keyboard actions; Esc closes overlays. ? is prompt text."),
+        Line::from("PageUp/PageDown scroll history; Ctrl-End newest text."),
         Line::from(
             "Bracketed paste preserves Unicode and lines; other control characters are removed.",
         ),
@@ -681,14 +916,14 @@ fn draw_warning(frame: &mut Frame<'_>) {
     );
 }
 
-fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
+fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(4),
             Constraint::Length(4),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(frame.area());
 
@@ -703,9 +938,16 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
         .as_deref()
         .map(|tool| format!("  |  tool: {tool}"))
         .unwrap_or_default();
+    let elapsed = format_duration(app.elapsed());
+    let detail = app
+        .terminal_detail
+        .as_deref()
+        .or_else(|| (!app.status.is_empty()).then_some(app.status.as_str()))
+        .unwrap_or_default();
     let header = format!(
-        "leg-tui  |  model: {}  |  status: {}{}\nworkspace: {workspace}",
-        app.model, app.status, activity
+        "leg-tui  |  model: {}  |  status: {}  |  elapsed: {elapsed}{activity}\nworkspace: {workspace}\n{detail}",
+        app.model,
+        app.turn_status.display(),
     );
     frame.render_widget(
         Paragraph::new(sanitize::terminal_safe_text(&header))
@@ -740,18 +982,39 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
     } else {
         app.transcript
             .iter()
-            .map(|(role, text)| format!("{role}: {text}"))
+            .map(|turn| turn.lines().join("\n"))
             .collect::<Vec<_>>()
             .join("\n\n")
     };
-    frame.render_widget(
-        Paragraph::new(sanitize::terminal_safe_text(&transcript))
-            .block(Block::default().borders(Borders::ALL).title("Conversation"))
-            .wrap(Wrap { trim: false }),
-        body[1],
+    let transcript_width = body[1].width.saturating_sub(2).max(1);
+    let transcript_height = body[1].height.saturating_sub(2).max(1) as usize;
+    let wrapped_transcript = wrap_transcript(
+        &sanitize::terminal_safe_text(&transcript),
+        transcript_width as usize,
     );
+    let visual_lines = wrapped_transcript.len();
+    app.transcript_max_scroll = visual_lines.saturating_sub(transcript_height);
+    app.transcript_page_rows = transcript_height.max(1);
+    if app.transcript_follow_tail {
+        app.transcript_scroll = app.transcript_max_scroll;
+    } else {
+        app.transcript_scroll = app.transcript_scroll.min(app.transcript_max_scroll);
+    }
+    let transcript_title = if app.transcript_new_content {
+        "Conversation · new content below (Ctrl-End)"
+    } else {
+        "Conversation"
+    };
+    let transcript_paragraph = Paragraph::new(wrapped_transcript)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(transcript_title),
+        )
+        .scroll((app.transcript_scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(transcript_paragraph, body[1]);
 
-    let composer_title = if app.active {
+    let composer_title = if app.turn_status.is_active() {
         "Composer (busy)"
     } else {
         "Composer (Ctrl-S send)"
@@ -775,7 +1038,27 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
         chunks[3],
     );
 
-    if app.show_help {
+    if app.retry_confirmation.is_some() {
+        let area = centered_rect(76, 28, frame.area());
+        frame.render_widget(Clear, area);
+        let warning = app
+            .retry_confirmation
+            .as_ref()
+            .map(RetryIntent::warning)
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from("Explicit retry confirmation"),
+                Line::from(""),
+                Line::from(sanitize::terminal_safe_text(warning)),
+                Line::from(""),
+                Line::from("Press Y to resend, N or Esc to cancel. Enter does not confirm."),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("Retry"))
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+    } else if app.show_help {
         let area = centered_rect(62, 40, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
@@ -786,6 +1069,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
                 Line::from("Ctrl-Z undoes; Ctrl-Y redoes. F2 opens keyboard actions."),
                 Line::from("Ctrl-C stops an active turn; when idle it exits and keeps the draft."),
                 Line::from("Bracketed paste inserts Unicode and lines as one undoable edit."),
+                Line::from("PageUp/PageDown scroll history; Ctrl-End returns to newest text."),
                 Line::from("? is prompt text. Esc closes help and restores composer focus."),
             ])
             .block(Block::default().borders(Borders::ALL).title("Help"))
@@ -804,6 +1088,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
                 Line::from("Backspace/Delete  Remove one grapheme"),
                 Line::from("Ctrl-Z / Ctrl-Y  Undo / redo"),
                 Line::from("Ctrl-C    Stop the turn, or exit when idle"),
+                Line::from("PageUp/PageDown  Scroll transcript; Ctrl-End  Newest text"),
                 Line::from("F1 / F2   Help / keyboard actions"),
                 Line::from("? is ordinary prompt text. Esc closes this menu."),
             ])
@@ -842,4 +1127,86 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::{TurnStatus, response_stop_reason, restored_draft, successful_status};
+
+    #[test]
+    fn queued_stream_events_cannot_replace_stopping_with_running() {
+        let mut status = TurnStatus::Stopping;
+        status.mark_running_unless_stopping();
+        assert_eq!(status, TurnStatus::Stopping);
+        status = TurnStatus::Starting;
+        status.mark_running_unless_stopping();
+        assert_eq!(status, TurnStatus::Running);
+    }
+
+    #[test]
+    fn lifecycle_and_completion_warnings_have_distinct_text_states() {
+        assert_eq!(TurnStatus::Idle.label(), "Idle");
+        assert_eq!(TurnStatus::Starting.label(), "Starting");
+        assert_eq!(TurnStatus::Running.label(), "Running");
+        assert_eq!(TurnStatus::Stopping.label(), "Stopping");
+        assert_eq!(TurnStatus::Succeeded.label(), "Succeeded");
+        assert_eq!(TurnStatus::Failed.label(), "Failed");
+        assert_eq!(TurnStatus::Interrupted.label(), "Interrupted");
+        assert_eq!(
+            TurnStatus::Incomplete { forced: false }.display(),
+            "Incomplete"
+        );
+        assert_eq!(
+            TurnStatus::Incomplete { forced: true }.display(),
+            "Incomplete (forced cleanup)"
+        );
+        assert_eq!(TurnStatus::Capped.label(), "Capped");
+
+        assert_eq!(successful_status(false, false), TurnStatus::Succeeded);
+        assert_eq!(successful_status(false, true), TurnStatus::Truncated);
+        assert_eq!(successful_status(true, false), TurnStatus::Capped);
+    }
+
+    #[test]
+    fn max_token_truncation_comes_from_the_authoritative_response() {
+        let response = json!({
+            "exchange": {"exchange": {"outcome": {"stop_reason": "max_tokens"}}}
+        });
+        assert_eq!(response_stop_reason(&response), Some("max_tokens"));
+        assert_eq!(successful_status(false, true), TurnStatus::Truncated);
+        assert_eq!(successful_status(true, false), TurnStatus::Capped);
+        assert_eq!(successful_status(false, false), TurnStatus::Succeeded);
+    }
+
+    #[test]
+    fn restoration_keeps_a_newer_editable_draft() {
+        assert_eq!(
+            restored_draft("", Some("failed prompt".into()), false),
+            "failed prompt"
+        );
+        assert_eq!(
+            restored_draft("newer draft", Some("failed prompt".into()), true),
+            "newer draft"
+        );
+    }
+
+    #[test]
+    fn transcript_wrap_keeps_long_and_wide_graphemes_navigable() {
+        let rows = super::wrap_transcript("ab界cd\n", 4);
+        let rows = rows
+            .into_iter()
+            .map(|row| row.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["ab界", "cd", ""]);
+    }
+
+    #[test]
+    fn elapsed_time_is_rendered_as_minutes_and_seconds() {
+        assert_eq!(super::format_duration(Duration::from_secs(0)), "0:00");
+        assert_eq!(super::format_duration(Duration::from_secs(83)), "1:23");
+    }
 }
