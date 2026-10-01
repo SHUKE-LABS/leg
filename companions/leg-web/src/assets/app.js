@@ -25,7 +25,9 @@ const ui = Object.fromEntries(
     "new-conversation",
     "session-list",
     "session-list-empty",
+    "session-list-no-results",
     "session-list-error",
+    "session-filter",
     "rename-form",
     "rename-input",
     "rename-error",
@@ -54,6 +56,14 @@ const ui = Object.fromEntries(
     "messages",
     "empty-transcript",
     "new-content",
+    "transcript-search",
+    "transcript-search-prev",
+    "transcript-search-next",
+    "transcript-search-clear",
+    "transcript-search-status",
+    "download-transcript",
+    "download-status",
+    "copy-status",
     "composer",
     "prompt",
     "retry-submission",
@@ -92,6 +102,9 @@ const state = {
   transcriptAverageHeight: INITIAL_TURN_HEIGHT,
   transcriptRange: null,
   transcriptRenderQueued: false,
+  transcriptSearchMatches: [],
+  transcriptSearchIndex: -1,
+  preserveDraftRetry: null,
 };
 
 let elapsedTimer = null;
@@ -189,8 +202,11 @@ async function refreshSessionList({ quiet = false } = {}) {
 }
 
 function renderSessionList() {
+  const filter = ui["session-filter"].value.trim().toLocaleLowerCase();
+  const filteredSessions = state.sessions.filter((session) => sessionName(session).toLocaleLowerCase().includes(filter));
   const signature = JSON.stringify({
     selected: state.sessionId,
+    filter,
     sessions: state.sessions.map((session) => [
       session.id,
       session.name,
@@ -212,7 +228,7 @@ function renderSessionList() {
   const focusedId = focused?.dataset?.sessionId;
   const focusedAction = focused?.dataset?.action;
   const fragment = document.createDocumentFragment();
-  for (const session of state.sessions) {
+  for (const session of filteredSessions) {
     const item = document.createElement("li");
     item.className = "session-entry";
 
@@ -253,6 +269,7 @@ function renderSessionList() {
   }
   ui["session-list"].replaceChildren(fragment);
   ui["session-list-empty"].hidden = state.sessions.length > 0;
+  ui["session-list-no-results"].hidden = !filter || state.sessions.length === 0 || filteredSessions.length > 0;
 
   if (focusedId && focusedAction) {
     const replacement = [...ui["session-list"].querySelectorAll("[data-session-id]")]
@@ -499,8 +516,18 @@ async function activateSession(sessionId) {
     ui.messages.replaceChildren();
     ui["empty-transcript"].hidden = false;
     ui.transcript.scrollTop = 0;
+    ui["transcript-search"].value = "";
+    state.transcriptSearchMatches = [];
+    state.transcriptSearchIndex = -1;
+    renderTranscriptSearch();
+    ui["copy-status"].hidden = true;
+    ui["copy-status"].textContent = "";
+    ui["download-status"].textContent = "";
   }
-  ui.prompt.value = window.sessionStorage.getItem(storageKey(draftPrefix, sessionId)) || state.pending?.prompt || "";
+  const savedDraft = window.sessionStorage.getItem(storageKey(draftPrefix, sessionId));
+  ui.prompt.value = savedDraft !== null
+    ? savedDraft
+    : state.pending?.preserveDraft ? "" : state.pending?.prompt || "";
   adjustTextarea();
   showSendError("");
   ui["rename-form"].hidden = true;
@@ -866,12 +893,18 @@ function renderStatus() {
   }
   ui["stop-turn"].hidden = !state.active;
   ui["stop-turn"].disabled = state.active?.status === "stopping" || state.reconnecting;
+  ui["download-transcript"].disabled = !state.snapshot;
   ui.send.disabled = current.busy || state.reconnecting || state.submitting || Boolean(state.pending) || sessionWorkspaceMissing(session) || Boolean(session?.read_only) || !ui.prompt.value.trim();
   ui["new-conversation"].disabled = current.busy || state.reconnecting || state.submitting || Boolean(state.pending);
   const pending = state.pending;
   const canRetry = Boolean(pending && pending.retryAllowed && !current.busy && !state.submitting);
   ui["retry-submission"].hidden = !canRetry;
   ui["retry-submission"].disabled = !canRetry;
+  for (const button of ui.messages.querySelectorAll(".retry-turn-button")) {
+    const turnIndex = Number(button.dataset.turnIndex);
+    const turn = state.snapshot?.session?.turns?.find((item) => Number(item.turn_index) === turnIndex);
+    button.disabled = !canRetryTurn(turn);
+  }
 
   const statusKey = `${current.text}:${activeTool?.tool_name || ""}`;
   if (statusKey !== state.lastAnnouncedStatus) {
@@ -1138,7 +1171,10 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
     }
   }
   const sameRange = state.transcriptRange?.start === start && state.transcriptRange?.end === end;
-  if (!force && sameRange) return;
+  if (!force && sameRange) {
+    renderTranscriptSearch();
+    return;
+  }
 
   const focusedKey = ui.messages.contains(document.activeElement)
     ? document.activeElement.dataset?.focusKey || null
@@ -1173,6 +1209,7 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
         .find((element) => element.dataset.focusKey === focusedKey)
         ?.focus({ preventScroll: true });
     }
+    renderTranscriptSearch();
     return;
   }
 
@@ -1209,6 +1246,7 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
       .find((element) => element.dataset.focusKey === focusedKey);
     replacement?.focus({ preventScroll: true });
   }
+  renderTranscriptSearch();
 }
 
 function estimatedHeightBefore(items, endIndex) {
@@ -1287,6 +1325,167 @@ function scheduleTranscriptRender() {
     state.transcriptRenderQueued = false;
     renderTranscript({ force: false });
   });
+}
+
+function searchableTranscriptFields() {
+  const fields = [];
+  const add = (key, messageKey, label, text, toolIndex = null) => {
+    if (typeof text === "string" && text.length) fields.push({ key, messageKey, label, text, toolIndex });
+  };
+  for (const item of state.transcriptItems) {
+    add(item.key, `${item.key}-message`, "Prompt", item.prompt);
+    add(item.key, item.assistantKey, "Reply", item.reply);
+    add(item.key, item.assistantKey, "Failure details", item.failureMessage);
+    add(item.key, item.assistantKey, "Outcome", item.outcome);
+    for (const [toolIndex, tool] of (item.tools || []).entries()) {
+      add(item.key, item.assistantKey, "Tool name", tool.name, toolIndex);
+      if (tool.input !== undefined) add(item.key, item.assistantKey, "Tool input", toolLiteralText(tool.input), toolIndex);
+      add(item.key, item.assistantKey, "Tool status", tool.status, toolIndex);
+      if (tool.output !== undefined) add(item.key, item.assistantKey, "Tool result", toolLiteralText(tool.output), toolIndex);
+      if (tool.error !== undefined) add(item.key, item.assistantKey, "Tool error", toolLiteralText(tool.error), toolIndex);
+    }
+  }
+  return fields;
+}
+
+function collectTranscriptMatches(query) {
+  const needle = query.toLocaleLowerCase();
+  if (!needle) return [];
+  const matches = [];
+  for (const field of searchableTranscriptFields()) {
+    const haystack = field.text.toLocaleLowerCase();
+    let from = 0;
+    while (from <= haystack.length - needle.length) {
+      const start = haystack.indexOf(needle, from);
+      if (start < 0) break;
+      matches.push({ ...field, start, end: start + needle.length });
+      from = start + Math.max(needle.length, 1);
+    }
+  }
+  return matches;
+}
+
+function renderTranscriptSearch({ reset = false, navigate = false } = {}) {
+  const query = ui["transcript-search"].value.trim();
+  state.transcriptSearchMatches = collectTranscriptMatches(query);
+  const matches = state.transcriptSearchMatches;
+  const count = matches.length;
+  for (const turn of ui.messages.querySelectorAll(".transcript-turn")) turn.classList.remove("search-match-current");
+  ui["transcript-search-clear"].disabled = !ui["transcript-search"].value;
+  ui["transcript-search-prev"].disabled = !count;
+  ui["transcript-search-next"].disabled = !count;
+
+  if (!query) {
+    state.transcriptSearchIndex = -1;
+    ui["transcript-search-status"].textContent = "Enter text to search this transcript.";
+    return;
+  }
+  if (!count) {
+    state.transcriptSearchIndex = -1;
+    ui["transcript-search-status"].textContent = "No matches found in this transcript.";
+    return;
+  }
+  if (reset || state.transcriptSearchIndex < 0) state.transcriptSearchIndex = 0;
+  state.transcriptSearchIndex %= count;
+  const match = matches[state.transcriptSearchIndex];
+  const excerptStart = Math.max(0, match.start - 36);
+  const excerptEnd = Math.min(match.text.length, match.end + 52);
+  const excerpt = `${excerptStart ? "…" : ""}${match.text.slice(excerptStart, excerptEnd).replace(/\s+/g, " ")}${excerptEnd < match.text.length ? "…" : ""}`;
+  ui["transcript-search-status"].textContent = `Match ${state.transcriptSearchIndex + 1} of ${count} · ${match.label}: ${excerpt}`;
+
+  const turn = [...ui.messages.querySelectorAll(".transcript-turn")].find((node) => node.dataset.key === match.key);
+  if (turn) {
+    turn.classList.add("search-match-current");
+    [...turn.querySelectorAll("article.message")]
+      .find((node) => node.dataset.key === match.messageKey)
+      ?.classList.add("search-match-current");
+    if (navigate) scrollToSearchMatch(match);
+  } else if (navigate) {
+    scrollToSearchMatch(match);
+  }
+}
+
+function scrollToSearchMatch(match) {
+  const index = state.transcriptItems.findIndex((item) => item.key === match.key);
+  if (index < 0) return;
+  const query = ui["transcript-search"].value.trim();
+  const searchIndex = state.transcriptSearchIndex;
+  ui.transcript.scrollTop = Math.max(0, estimatedHeightBefore(state.transcriptItems, index));
+  renderTranscript({ force: true });
+  window.requestAnimationFrame(() => {
+    if (ui["transcript-search"].value.trim() !== query || state.transcriptSearchIndex !== searchIndex) return;
+    const turn = [...ui.messages.querySelectorAll(".transcript-turn")].find((node) => node.dataset.key === match.key);
+    if (!turn) return;
+    const target = match.toolIndex === null
+      ? turn
+      : turn.querySelector(`.tool-inspector[data-tool-index="${match.toolIndex}"]`) || turn;
+    const scrollerBounds = ui.transcript.getBoundingClientRect();
+    const targetBounds = target.getBoundingClientRect();
+    ui.transcript.scrollTop += targetBounds.top - scrollerBounds.top - (ui.transcript.clientHeight - targetBounds.height) / 2;
+    scheduleTranscriptRender();
+  });
+}
+
+function moveTranscriptSearch(direction) {
+  const count = state.transcriptSearchMatches.length;
+  if (!count) return;
+  state.transcriptSearchIndex = (state.transcriptSearchIndex + direction + count) % count;
+  renderTranscriptSearch({ navigate: true });
+}
+
+function transcriptExportValue(value) {
+  if (Array.isArray(value)) return value.map(transcriptExportValue);
+  if (!value || typeof value !== "object") return value;
+  const credentialKey = /(?:^|[_-])(?:authorization(?:[_-]?(?:header|headers|key|keys))?|auth(?:[_-]?(?:header|headers|key|keys))?|api[_-]?key|access[_-]?token|launch[_-]?token|client[_-]?secret|secret|credential|credentials|password)$/i;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !credentialKey.test(key))
+      .map(([key, nested]) => [key, transcriptExportValue(nested)]),
+  );
+}
+
+function allowedTranscriptExport(snapshot) {
+  const turns = snapshot?.session?.turns || [];
+  return {
+    schema: "leg-web.transcript/v1",
+    turns: turns.map((turn) => ({
+      turn_index: turn.turn_index,
+      prompt: turn.prompt,
+      ...(typeof turn.reply === "string" ? { reply: turn.reply } : {}),
+      ...(typeof turn.failure_message === "string" ? { failure_message: turn.failure_message } : {}),
+      outcome: turn.outcome,
+      tools: (turn.tools || []).map((tool) => ({
+        tool_name: tool.tool_name,
+        input: transcriptExportValue(tool.input),
+        ...(tool.result ? {
+          result: {
+            status: tool.result.status,
+            ...(typeof tool.result.result === "string" ? { result: transcriptExportValue(tool.result.result) } : {}),
+            ...(typeof tool.result.error === "string" ? { error: transcriptExportValue(tool.result.error) } : {}),
+          },
+        } : {}),
+      })),
+    })),
+  };
+}
+
+function downloadTranscript() {
+  if (!state.snapshot) return;
+  try {
+    const content = `${JSON.stringify(allowedTranscriptExport(state.snapshot), null, 2)}\n`;
+    const url = URL.createObjectURL(new Blob([content], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "leg-web-transcript.json";
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    ui["download-status"].textContent = "Transcript download started.";
+  } catch {
+    ui["download-status"].textContent = "Transcript download could not be created.";
+  }
 }
 
 function findScrollAnchor(scroller) {
@@ -1381,6 +1580,16 @@ function createMessage(role, key) {
   const speaker = document.createElement("span");
   speaker.textContent = role === "user" ? "You" : "Leg";
   heading.append(speaker);
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "message-copy-button";
+  copy.textContent = role === "user" ? "Copy prompt" : "Copy reply";
+  copy.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const text = messageRenderState.get(article)?.bodyText || "";
+    void copyTranscriptText(text, article);
+  });
+  heading.append(copy);
   article.append(heading);
   const content = document.createElement("div");
   content.className = "message-content";
@@ -1405,7 +1614,7 @@ function updateMessageMetadata(article, metadata) {
   if (!engine) {
     engine = document.createElement("span");
     engine.className = "message-engine";
-    heading.append(engine);
+    heading.insertBefore(engine, heading.querySelector(".message-copy-button"));
   }
   engine.textContent = `${metadata.provider} · ${metadata.model}`;
 }
@@ -1423,14 +1632,17 @@ function updateMessageBody(article, text, mode = "markdown") {
 }
 
 function updateMessageDetails(article, item, status) {
-  const signature = JSON.stringify([item.tools, status, item.capped, item.outcome, Boolean(item.active)]);
+  const sourceTurn = Number.isSafeInteger(item.turnIndex)
+    ? state.snapshot?.session?.turns?.find((turn) => Number(turn.turn_index) === item.turnIndex)
+    : null;
+  const signature = JSON.stringify([item.tools, status, item.capped, item.outcome, Boolean(item.active), canRetryTurn(sourceTurn)]);
   const rendered = messageRenderState.get(article);
   if (rendered.details === signature) return;
   rendered.details = signature;
-  for (const detail of article.querySelectorAll(".tool-summary, .tool-inspector, .turn-outcome, .turn-warning")) {
+  for (const detail of article.querySelectorAll(".tool-summary, .tool-inspector, .turn-outcome, .turn-warning, .retry-turn-control")) {
     detail.remove();
   }
-  for (const tool of item.tools) appendToolInspector(article, tool);
+  for (const [toolIndex, tool] of item.tools.entries()) appendToolInspector(article, tool, toolIndex);
   appendOutcome(article, status);
   if (item.capped) {
     const warning = document.createElement("p");
@@ -1446,6 +1658,9 @@ function updateMessageDetails(article, item, status) {
       : `Turn ${item.outcome}. Tool calls without results are marked Missing outcome.`;
     article.append(warning);
   }
+  if (sourceTurn && ["failed", "interrupted"].includes(sourceTurn.outcome)) {
+    appendRetryTurnControl(article, sourceTurn);
+  }
 }
 
 function appendOutcome(article, text) {
@@ -1453,6 +1668,43 @@ function appendOutcome(article, text) {
   status.className = "turn-outcome";
   status.textContent = text;
   article.append(status);
+}
+
+function canRetryTurn(turn) {
+  const session = state.snapshot?.session;
+  const lastStatus = state.snapshot?.last_submission?.status;
+  return Boolean(
+    turn && ["failed", "interrupted"].includes(turn.outcome) &&
+    state.snapshot && !state.snapshot.recovery_required && Number.isSafeInteger(state.snapshot.next_request_id) &&
+    !["running", "accepted"].includes(lastStatus) &&
+    !currentStatus().busy && !state.active && !state.reconnecting && !state.submitting && !state.pending &&
+    !session?.read_only && !sessionWorkspaceMissing(session) &&
+    session?.run_state !== "active" && !session?.pending_new_turn
+  );
+}
+
+function appendRetryTurnControl(article, turn) {
+  const control = document.createElement("div");
+  control.className = "retry-turn-control";
+  const warning = document.createElement("p");
+  warning.className = "retry-turn-warning";
+  warning.textContent = "Retry sends this prompt again and may repeat tool side effects.";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "retry-turn-button";
+  retry.dataset.turnIndex = String(turn.turn_index);
+  retry.textContent = "Retry turn";
+  retry.setAttribute("aria-label", `Retry turn ${turn.turn_index}`);
+  retry.disabled = !canRetryTurn(turn);
+  retry.addEventListener("click", () => submitRecordedTurn(turn));
+  control.append(warning, retry);
+  article.append(control);
+}
+
+function submitRecordedTurn(turn) {
+  const currentTurn = state.snapshot?.session?.turns?.find((item) => Number(item.turn_index) === Number(turn.turn_index));
+  if (!currentTurn || currentTurn.prompt !== turn.prompt || !canRetryTurn(currentTurn)) return;
+  void submitPrompt({ recordedPrompt: currentTurn.prompt, preserveDraft: true });
 }
 
 function toolStatusLabel(status) {
@@ -1465,9 +1717,10 @@ function toolStatusLabel(status) {
   return "Outcome unavailable";
 }
 
-function appendToolInspector(article, tool) {
+function appendToolInspector(article, tool, toolIndex) {
   const card = document.createElement("section");
   card.className = `tool-inspector tool-inspector-${tool.status}`;
+  card.dataset.toolIndex = String(toolIndex);
   const disclosureId = `tool-details-${Math.random().toString(36).slice(2)}`;
   const expanded = state.expandedTools.has(tool.identity);
   const button = document.createElement("button");
@@ -1498,11 +1751,24 @@ function appendToolInspector(article, tool) {
   const omission = toolOmissionSummary(tool.output ?? tool.error);
   if (omission) preview.textContent = `${preview.textContent} · ${omission}`;
 
+  const copyActions = document.createElement("div");
+  copyActions.className = "tool-copy-actions";
+  if (tool.input !== undefined) {
+    copyActions.append(makeCopyButton("Copy tool input", toolLiteralText(tool.input), card, "tool-copy-button"));
+  }
+  if (tool.output !== undefined) {
+    copyActions.append(makeCopyButton("Copy tool result", toolLiteralText(tool.output), card, "tool-copy-button"));
+  }
+  if (tool.error !== undefined) {
+    copyActions.append(makeCopyButton("Copy tool error", toolLiteralText(tool.error), card, "tool-copy-button"));
+  }
   const details = document.createElement("div");
   details.className = "tool-detail-body";
   details.id = disclosureId;
   details.hidden = !expanded;
-  card.append(button, preview, details);
+  card.append(button, preview);
+  if (copyActions.childElementCount) card.append(copyActions);
+  card.append(details);
   if (expanded) appendToolDetails(details, tool);
   button.addEventListener("click", () => {
     const open = button.getAttribute("aria-expanded") !== "true";
@@ -1521,6 +1787,49 @@ function appendToolInspector(article, tool) {
     refreshTranscriptSpacers();
   });
   article.append(card);
+}
+
+function makeCopyButton(label, text, fallbackContainer, className) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void copyTranscriptText(text, fallbackContainer);
+  });
+  return button;
+}
+
+async function copyTranscriptText(text, fallbackContainer) {
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+      throw new Error("clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(text);
+    fallbackContainer.querySelector(".copy-fallback")?.remove();
+    ui["copy-status"].textContent = "Copied to clipboard.";
+    ui["copy-status"].hidden = false;
+  } catch {
+    fallbackContainer.querySelector(".copy-fallback")?.remove();
+    const fallback = document.createElement("div");
+    fallback.className = "copy-fallback";
+    const label = document.createElement("label");
+    label.htmlFor = `manual-copy-${crypto.randomUUID()}`;
+    label.textContent = "Clipboard unavailable or permission denied. Select this text and copy it manually.";
+    const textarea = document.createElement("textarea");
+    textarea.id = label.htmlFor;
+    textarea.readOnly = true;
+    textarea.rows = 4;
+    textarea.setAttribute("aria-label", "Text to copy manually");
+    textarea.value = text;
+    fallback.append(label, textarea);
+    fallbackContainer.append(fallback);
+    textarea.focus();
+    textarea.select();
+    ui["copy-status"].textContent = "Clipboard copy failed. Select the displayed text and copy it manually.";
+    ui["copy-status"].hidden = false;
+  }
 }
 
 function toolLiteralText(value) {
@@ -1595,7 +1904,10 @@ function appendTextParagraph(parent, text) {
 }
 
 function appendMarkdown(parent, source) {
-  const lines = String(source).replace(/\r\n?/g, "\n").split("\n");
+  const sourceText = String(source);
+  const codeBlocks = extractFencedCodeBlocks(sourceText);
+  let codeBlockIndex = 0;
+  const lines = sourceText.replace(/\r\n?/g, "\n").split("\n");
   let paragraph = [];
   let codeLines = null;
   let list = null;
@@ -1616,11 +1928,8 @@ function appendMarkdown(parent, source) {
       flushParagraph();
       flushList();
       if (codeLines) {
-        const pre = document.createElement("pre");
-        const code = document.createElement("code");
-        code.textContent = codeLines.join("\n");
-        pre.append(code);
-        parent.append(pre);
+        appendCodeBlock(parent, codeBlocks[codeBlockIndex] ?? codeLines.join("\n"));
+        codeBlockIndex += 1;
         codeLines = null;
       } else {
         codeLines = [];
@@ -1670,14 +1979,29 @@ function appendMarkdown(parent, source) {
     }
   }
   if (codeLines) {
-    const pre = document.createElement("pre");
-    const code = document.createElement("code");
-    code.textContent = codeLines.join("\n");
-    pre.append(code);
-    parent.append(pre);
+    appendCodeBlock(parent, codeBlocks[codeBlockIndex] ?? codeLines.join("\n"));
   }
   flushParagraph();
   flushList();
+}
+
+function extractFencedCodeBlocks(source) {
+  const blocks = [];
+  const pattern = /^[ \t]*```[^\r\n]*(?:\r\n|\r|\n)([\s\S]*?)^[ \t]*```[^\r\n]*(?:\r\n|\r|\n|$)/gm;
+  for (const match of source.matchAll(pattern)) blocks.push(match[1]);
+  return blocks;
+}
+
+function appendCodeBlock(parent, rawCodeText) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "message-code-block";
+  wrapper.append(makeCopyButton("Copy code", rawCodeText, wrapper, "code-copy-button"));
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.textContent = rawCodeText;
+  pre.append(code);
+  wrapper.append(pre);
+  parent.append(wrapper);
 }
 
 function appendInline(parent, text) {
@@ -1736,14 +2060,14 @@ function promptHash(prompt) {
   );
 }
 
-async function submitPrompt({ retry = false } = {}) {
+async function submitPrompt({ retry = false, recordedPrompt = null, preserveDraft = false } = {}) {
   if (!state.sessionId || state.submitting || state.active || state.reconnecting) return;
   const sessionId = state.sessionId;
   const switchGeneration = state.switchGeneration;
   if (retry) {
     if (!state.pending?.retryAllowed) return;
   } else {
-    const prompt = ui.prompt.value;
+    const prompt = typeof recordedPrompt === "string" ? recordedPrompt : ui.prompt.value;
     if (!prompt.trim()) return;
     if (state.pending) return;
     if (sessionWorkspaceMissing(state.snapshot?.session)) {
@@ -1755,7 +2079,9 @@ async function submitPrompt({ retry = false } = {}) {
       showSendError("The host cannot provide a new send ID. Reload the conversation before sending.");
       return;
     }
-    state.pending = { request_id: requestId, prompt, phase: "sending", retryAllowed: false };
+    if (preserveDraft) saveDraft();
+    state.preserveDraftRetry = preserveDraft ? { sessionId, requestId } : null;
+    state.pending = { request_id: requestId, prompt, phase: "sending", retryAllowed: false, preserveDraft };
     savePending();
   }
 
@@ -1817,7 +2143,7 @@ async function acceptSubmission(receipt, pending, { sessionId, switchGeneration 
   const currentPending = state.pending;
   state.pending = null;
   savePending();
-  if (ui.prompt.value === pending.prompt) ui.prompt.value = "";
+  if (!pending.preserveDraft && ui.prompt.value === pending.prompt) ui.prompt.value = "";
   saveDraft();
   adjustTextarea();
   await api("/api/sessions/select", {
@@ -1836,10 +2162,12 @@ async function acceptSubmission(receipt, pending, { sessionId, switchGeneration 
   await refreshSessionList({ quiet: true });
   if (!isCurrentSession(actualId, switchGeneration)) return;
   if (receipt.status === "failed" || receipt.status === "incomplete" || receipt.status === "stopped") {
-    if (!ui.prompt.value.trim()) ui.prompt.value = pending.prompt;
+    if (!pending.preserveDraft && !ui.prompt.value.trim()) ui.prompt.value = pending.prompt;
     saveDraft();
     adjustTextarea();
-    showSendError("The turn did not complete. Its prompt is kept so you can edit or send it again deliberately.");
+    showSendError(pending.preserveDraft
+      ? "The retry did not complete. Your separate composer draft is preserved."
+      : "The turn did not complete. Its prompt is kept so you can edit or send it again deliberately.");
   }
   if (currentPending?.request_id !== pending.request_id) return;
 }
@@ -1874,11 +2202,15 @@ async function reconcilePending({ sessionId = state.sessionId, switchGeneration 
       const completedWithError = ["failed", "incomplete", "stopped"].includes(receipt.status);
       state.pending = null;
       savePending();
-      if (!completedWithError && ui.prompt.value === pending.prompt) ui.prompt.value = "";
-      if (completedWithError && !ui.prompt.value.trim()) ui.prompt.value = pending.prompt;
+      if (!pending.preserveDraft && !completedWithError && ui.prompt.value === pending.prompt) ui.prompt.value = "";
+      if (!pending.preserveDraft && completedWithError && !ui.prompt.value.trim()) ui.prompt.value = pending.prompt;
       saveDraft();
       adjustTextarea();
-      showSendError(completedWithError ? "The turn did not complete. Its prompt is kept so you can edit or send it again deliberately." : "");
+      showSendError(completedWithError
+        ? pending.preserveDraft
+          ? "The retry did not complete. Your separate composer draft is preserved."
+          : "The turn did not complete. Its prompt is kept so you can edit or send it again deliberately."
+        : "");
       setConnection("Connected to local host.");
       renderAll();
       return;
@@ -1908,6 +2240,7 @@ function restoreFailedPrompt() {
   if (!state.snapshot || ui.prompt.value.trim()) return;
   const last = state.snapshot.last_submission;
   if (!last || !["failed", "incomplete", "stopped"].includes(last.status)) return;
+  if (state.preserveDraftRetry?.sessionId === state.sessionId && state.preserveDraftRetry.requestId === last.request_id) return;
   const turns = state.snapshot.session?.turns || [];
   const turn = turns[turns.length - 1];
   if (turn?.prompt) {
@@ -2031,6 +2364,7 @@ function formatPromptChange() {
 
 ui["start-form"].addEventListener("submit", startConversation);
 ui["new-conversation"].addEventListener("click", openNewConversation);
+ui["session-filter"].addEventListener("input", renderSessionList);
 ui["rename-form"].addEventListener("submit", renameSession);
 ui["cancel-rename"].addEventListener("click", () => {
   state.renamingSessionId = null;
@@ -2055,6 +2389,15 @@ ui.prompt.addEventListener("keydown", (event) => {
   void submitPrompt();
 });
 ui["retry-submission"].addEventListener("click", () => void submitPrompt({ retry: true }));
+ui["transcript-search"].addEventListener("input", () => renderTranscriptSearch({ reset: true, navigate: true }));
+ui["transcript-search-prev"].addEventListener("click", () => moveTranscriptSearch(-1));
+ui["transcript-search-next"].addEventListener("click", () => moveTranscriptSearch(1));
+ui["transcript-search-clear"].addEventListener("click", () => {
+  ui["transcript-search"].value = "";
+  renderTranscriptSearch();
+  ui["transcript-search"].focus();
+});
+ui["download-transcript"].addEventListener("click", downloadTranscript);
 ui["stop-turn"].addEventListener("click", () => void stopTurn());
 ui["new-content"].addEventListener("click", () => {
   ui["new-content"].hidden = true;

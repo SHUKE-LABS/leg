@@ -787,11 +787,47 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert failed_stream["last_submission"]["status"] == "failed", failed_stream
                 await wait_status(page, "Failed")
 
+                await page.locator("#transcript").evaluate(
+                    "element => { element.scrollTop = element.scrollHeight; }"
+                )
+                await page.wait_for_function(
+                    "() => { const element = document.querySelector('#transcript'); "
+                    "return element.scrollHeight - element.clientHeight - element.scrollTop <= 5; }"
+                )
                 await composer.fill("TRIAL-STOP: leave this turn incomplete on host restart")
                 await page.get_by_role("button", name="Send").click()
                 await page.locator("#active-tool").wait_for(state="visible")
                 pending_turn = page.locator(".transcript-turn").last
                 pending_tool = pending_turn.locator(".tool-disclosure")
+                try:
+                    await pending_tool.wait_for(state="visible", timeout=5000)
+                except PlaywrightTimeoutError as error:
+                    page_state = await page.evaluate(
+                        """() => ({
+                          status: document.querySelector('#turn-status')?.textContent,
+                          activeTool: document.querySelector('#active-tool')?.textContent,
+                          activeToolHidden: document.querySelector('#active-tool')?.hidden,
+                          newContentHidden: document.querySelector('#new-content')?.hidden,
+                          scroll: (() => {
+                            const element = document.querySelector('#transcript');
+                            return {
+                              top: element.scrollTop,
+                              height: element.scrollHeight,
+                              clientHeight: element.clientHeight,
+                              bottomGap: element.scrollHeight - element.clientHeight - element.scrollTop,
+                            };
+                          })(),
+                          turns: [...document.querySelectorAll('.transcript-turn')].map(turn => ({
+                            key: turn.dataset.key,
+                            prompt: turn.querySelector('.message-user .message-content')?.textContent.slice(0, 120),
+                            outcome: turn.querySelector('.turn-outcome')?.textContent,
+                            disclosures: turn.querySelectorAll('.tool-disclosure').length,
+                          })),
+                        })"""
+                    )
+                    raise AssertionError(
+                        f"pending tool disclosure did not render; state={page_state}; page errors={page_errors}"
+                    ) from error
                 assert "Pending" in await pending_tool.inner_text()
                 await pending_tool.click()
                 assert await pending_tool.get_attribute("aria-expanded") == "true"
@@ -998,6 +1034,7 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.launch(headless=True)
                 context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=f"http://{authority}")
                 page = await context.new_page()
                 await page.add_init_script(
                     """(() => {
@@ -1045,7 +1082,8 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     await target_page.wait_for_function(
                         "({id, title}) => !document.querySelector('#conversation').hidden && "
                         "document.querySelector('#session-title')?.dataset.sessionId === id && "
-                        "document.querySelector('#session-title')?.textContent === title",
+                        "document.querySelector('#session-title')?.textContent === title && "
+                        "document.querySelector('#connection-state')?.textContent === 'Connected to local host.'",
                         arg={"id": session_id, "title": title},
                         timeout=10000,
                     )
@@ -1102,12 +1140,48 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                             f"browser state after request {request_id} timed out: {page_state}; "
                             f"requests={page_requests}"
                         ) from error
-                    await target_page.wait_for_function(
-                        "prompt => [...document.querySelectorAll('#messages .transcript-turn')].some(turn => "
-                        "turn.querySelector('.message-user .message-content')?.textContent === prompt && "
-                        "turn.querySelector('.turn-outcome')?.textContent === 'Succeeded')",
-                        arg=prompt,
-                    )
+                    receipt = result.get("last_submission") or {}
+                    if receipt.get("status") != "succeeded":
+                        raise AssertionError(
+                            f"request {request_id} completed without success: "
+                            f"receipt={receipt}; turns={result.get('session', {}).get('turns', [])}; "
+                            f"requests={page_requests}; page errors={page_errors}"
+                        )
+                    try:
+                        await target_page.wait_for_function(
+                            "prompt => [...document.querySelectorAll('#messages .transcript-turn')].some(turn => "
+                            "turn.querySelector('.message-user .message-content')?.textContent === prompt && "
+                            "turn.querySelector('.turn-outcome')?.textContent === 'Succeeded')",
+                            arg=prompt,
+                            timeout=5000,
+                        )
+                    except PlaywrightTimeoutError as error:
+                        page_state = await target_page.evaluate(
+                            """() => ({
+                              sessionId: sessionStorage.getItem('leg-web-current-session'),
+                              titleId: document.querySelector('#session-title')?.dataset.sessionId,
+                              status: document.querySelector('#turn-status')?.textContent,
+                              searchStatus: document.querySelector('#transcript-search-status')?.textContent,
+                              scroll: (() => {
+                                const element = document.querySelector('#transcript');
+                                return {
+                                  top: element.scrollTop,
+                                  height: element.scrollHeight,
+                                  clientHeight: element.clientHeight,
+                                  bottomGap: element.scrollHeight - element.clientHeight - element.scrollTop,
+                                };
+                              })(),
+                              turns: [...document.querySelectorAll('#messages .transcript-turn')].map(turn => ({
+                                key: turn.dataset.key,
+                                prompt: turn.querySelector('.message-user .message-content')?.textContent.slice(0, 120),
+                                outcome: turn.querySelector('.turn-outcome')?.textContent,
+                              })),
+                            })"""
+                        )
+                        raise AssertionError(
+                            f"successful request {request_id} was not rendered; "
+                            f"receipt={receipt}; browser={page_state}; page errors={page_errors}"
+                        ) from error
                     await wait_status(target_page, "Succeeded")
                     return result
 
@@ -1188,6 +1262,23 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 await open_session(page, beta_draft_id, "Beta")
                 assert await page.locator("#prompt").input_value() == beta_draft
 
+                session_filter = page.locator("#session-filter")
+                await session_filter.fill("alpha")
+                assert await page.locator("#session-list .session-entry").count() == 1
+                assert await page.locator("#session-list .session-entry-name").inner_text() == "Alpha"
+                await open_session(page, alpha_id, "Alpha")
+                assert await page.locator("#prompt").input_value() == alpha_draft
+                await session_filter.fill("beta")
+                assert await page.locator("#session-list .session-entry").count() == 1
+                assert await page.locator("#session-list .session-entry-name").inner_text() == "Beta"
+                await open_session(page, beta_draft_id, "Beta")
+                assert await page.locator("#prompt").input_value() == beta_draft
+                await session_filter.fill("no-title-matches-this")
+                await page.locator("#session-list-no-results").wait_for(state="visible")
+                await session_filter.fill("")
+                await open_session(page, alpha_id, "Alpha")
+                assert await page.locator("#prompt").input_value() == alpha_draft
+
                 await open_session(page, alpha_id, "Alpha")
                 page2 = await context.new_page()
                 page2.on("pageerror", lambda error: page_errors.append(str(error)))
@@ -1236,7 +1327,8 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 await open_session(page2, alpha_id, "Alpha")
                 try:
                     await page2.wait_for_function(
-                        "() => document.querySelector('#session-guidance')?.textContent.includes('busy')"
+                        "() => document.querySelector('#session-guidance')?.textContent.includes('busy')",
+                        timeout=5000,
                     )
                 except PlaywrightTimeoutError as error:
                     page_state = await page2.evaluate(
@@ -1248,7 +1340,11 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                           guidance: document.querySelector('#session-guidance')?.textContent,
                           prompt: document.querySelector('#prompt')?.value,
                           sendDisabled: document.querySelector('#send')?.disabled,
-                          messages: document.querySelector('#messages')?.innerText,
+                          turns: [...document.querySelectorAll('.transcript-turn')].map(turn => ({
+                            key: turn.dataset.key,
+                            prompt: turn.querySelector('.message-user .message-content')?.textContent.slice(0, 120),
+                            outcome: turn.querySelector('.turn-outcome')?.textContent,
+                          })),
                         })"""
                     )
                     host_state = await asyncio.to_thread(host_snapshot, authority, token, alpha_id)
@@ -1303,6 +1399,7 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 token = restart_token
                 launch_url = restart_url
                 await page.goto(restart_url, wait_until="load")
+                await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=f"http://{restart_authority}")
                 await open_session(page, alpha_id, "Alpha")
                 reopened = host_snapshot(restart_authority, restart_token, alpha_id)
                 assert reopened["session"]["cwd"] == str(workspace_a.resolve()), reopened
@@ -1315,6 +1412,396 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 assert provider_status["input_checks"].get("navigation_prior_text_and_tool_history_returned") is True
                 assert provider_status["input_checks"].get("navigation_recorded_workspace_returned") is True
                 assert "TRIAL-NAV-LOSER" not in provider_status["scenario_requests"]
+
+                alpha_local_draft = "Search, copy, and download leave this draft intact."
+                await page.locator("#prompt").fill(alpha_local_draft)
+                await page.evaluate("() => navigator.clipboard.writeText('NO_AUTO_COPY_SENTINEL')")
+                await open_session(page, beta_draft_id, "Beta")
+                await open_session(page, alpha_id, "Alpha")
+                assert await page.locator("#prompt").input_value() == alpha_local_draft
+                assert await page.evaluate("() => navigator.clipboard.readText()") == "NO_AUTO_COPY_SENTINEL"
+                assert "Title and transcript searches stay local" in await page.locator(".workbench-help").inner_text()
+
+                provider_before_search = await asyncio.to_thread(fixture_status, provider_authority)
+                submit_count_before_search = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                transcript_search = page.locator("#transcript-search")
+                await transcript_search.fill("Long fixture line")
+                try:
+                    await page.wait_for_function(
+                        "() => document.querySelector('#transcript-search-status')?.textContent.includes('Match 1 of 180')",
+                        timeout=5000,
+                    )
+                except PlaywrightTimeoutError as error:
+                    browser_state = await page.evaluate(
+                        """() => ({
+                          title: document.querySelector('#session-title')?.textContent,
+                          titleSessionId: document.querySelector('#session-title')?.dataset.sessionId,
+                          connection: document.querySelector('#connection-state')?.textContent,
+                          searchStatus: document.querySelector('#transcript-search-status')?.textContent,
+                          turns: [...document.querySelectorAll('#messages .transcript-turn')].map(turn => ({
+                            key: turn.dataset.key,
+                            prompt: turn.querySelector('.message-user .message-content')?.textContent.slice(0, 120),
+                            replyChars: turn.querySelector('.message-assistant .message-content')?.textContent.length,
+                          })),
+                        })"""
+                    )
+                    snapshot = await asyncio.to_thread(host_snapshot, authority, token, alpha_id)
+                    snapshot_turns = [
+                        {
+                            "turn_index": turn.get("turn_index"),
+                            "prompt": turn.get("prompt", "")[:120],
+                            "reply_chars": len(turn.get("reply", "")),
+                            "has_long_fixture": "Long fixture line" in turn.get("reply", ""),
+                        }
+                        for turn in snapshot["session"].get("turns", [])
+                    ]
+                    raise AssertionError(
+                        f"transcript search did not load; browser={browser_state}; "
+                        f"snapshot_turns={snapshot_turns}; page errors={page_errors}"
+                    ) from error
+                search_status = await page.locator("#transcript-search-status").inner_text()
+                await page.locator("#transcript-search-next").click()
+                assert "Match 2 of 180" in await page.locator("#transcript-search-status").inner_text()
+                await page.locator("#transcript-search-prev").click()
+                assert "Match 1 of 180" in await page.locator("#transcript-search-status").inner_text()
+                await transcript_search.fill("no-match-sentinel")
+                await page.get_by_text("No matches found in this transcript.", exact=True).wait_for()
+                await page.locator("#transcript-search-clear").click()
+                assert await page.evaluate("() => navigator.clipboard.readText()") == "NO_AUTO_COPY_SENTINEL"
+                assert await page.locator("#prompt").input_value() == alpha_local_draft
+                assert await page.evaluate("() => navigator.clipboard.readText()") == "NO_AUTO_COPY_SENTINEL"
+                provider_after_search = await asyncio.to_thread(fixture_status, provider_authority)
+                submit_count_after_search = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                assert provider_after_search["requests"] == provider_before_search["requests"]
+                assert submit_count_after_search == submit_count_before_search
+
+                await page.locator("#prompt").fill("TRIAL-SEARCH-LARGE-TOOL: keep its long result out of the DOM")
+                await page.get_by_role("button", name="Send").click()
+                large_search_turn = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, alpha_id, 5
+                )
+                assert large_search_turn["last_submission"]["status"] == "succeeded", large_search_turn
+                hidden_tool_text = large_search_turn["session"]["turns"][-1]["tools"][0]["result"]["result"]
+                assert "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" in hidden_tool_text
+                await open_session(page, alpha_id, "Alpha")
+                await wait_status(page, "Succeeded")
+                assert "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" not in await page.locator("#messages").inner_text()
+                await transcript_search.fill("HIDDEN_TOOL_SEARCH_SENTINEL_Ω")
+                await page.wait_for_function(
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool input') && "
+                    "document.querySelector('#transcript-search-status')?.textContent.includes('HIDDEN_TOOL_SEARCH_SENTINEL_Ω')",
+                    timeout=5000,
+                )
+                await page.locator("#transcript-search-next").click()
+                try:
+                    await page.wait_for_function(
+                        "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool result') && "
+                        "document.querySelector('#transcript-search-status')?.textContent.includes('HIDDEN_TOOL_SEARCH_SENTINEL_Ω')",
+                        timeout=5000,
+                    )
+                except PlaywrightTimeoutError as error:
+                    browser_state = await page.evaluate(
+                        """() => ({
+                          title: document.querySelector('#session-title')?.textContent,
+                          titleSessionId: document.querySelector('#session-title')?.dataset.sessionId,
+                          connection: document.querySelector('#connection-state')?.textContent,
+                          query: document.querySelector('#transcript-search')?.value,
+                          searchStatus: document.querySelector('#transcript-search-status')?.textContent,
+                          turns: [...document.querySelectorAll('#messages .transcript-turn')].map(turn => ({
+                            key: turn.dataset.key,
+                            prompt: turn.querySelector('.message-user .message-content')?.textContent.slice(0, 120),
+                            text: turn.innerText.slice(0, 220),
+                          })),
+                        })"""
+                    )
+                    snapshot = await asyncio.to_thread(host_snapshot, authority, token, alpha_id)
+                    snapshot_turns = [
+                        {
+                            "turn_index": turn.get("turn_index"),
+                            "prompt": turn.get("prompt", "")[:120],
+                            "tools": [
+                                {
+                                    "name": tool.get("tool_name"),
+                                    "status": (tool.get("result") or {}).get("status"),
+                                    "has_sentinel": "HIDDEN_TOOL_SEARCH_SENTINEL_Ω"
+                                    in str((tool.get("result") or {}).get("result", "")),
+                                }
+                                for tool in turn.get("tools", [])
+                            ],
+                        }
+                        for turn in snapshot["session"].get("turns", [])
+                    ]
+                    raise AssertionError(
+                        f"hidden tool search did not load; browser={browser_state}; "
+                        f"snapshot_turns={snapshot_turns}; page errors={page_errors}"
+                    ) from error
+                search_status = await page.locator("#transcript-search-status").inner_text()
+                assert "Tool result" in search_status and "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" in search_status
+                assert await page.locator('#messages [data-key="turn-4-assistant"]').evaluate(
+                    "element => element.classList.contains('search-match-current')"
+                )
+                assert "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" not in await page.locator("#messages").inner_text()
+                await page.locator("#transcript-search-clear").click()
+
+                copy_prompt = "TRIAL-COPY-UNICODE: copy this prompt\nsecond line Ω"
+                await page.locator("#prompt").fill(copy_prompt)
+                await page.get_by_role("button", name="Send").click()
+                unicode_turn = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, alpha_id, 6
+                )
+                assert unicode_turn["last_submission"]["status"] == "succeeded", unicode_turn
+                unicode_reply = unicode_turn["session"]["turns"][-1]["reply"]
+                assert unicode_reply == (
+                    "Unicode reply Ω with two lines.\n\n```text\n"
+                    "const greeting = '你好';\nsecond line Δ\n```\nFinal line."
+                )
+                await open_session(page, alpha_id, "Alpha")
+                await wait_status(page, "Succeeded")
+                await transcript_search.fill("TRIAL-COPY-UNICODE")
+                await page.wait_for_function(
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Prompt') && "
+                    "document.querySelector('#transcript-search-status')?.textContent.includes('TRIAL-COPY-UNICODE')",
+                    timeout=5000,
+                )
+                await page.locator("#prompt").fill(alpha_local_draft)
+                provider_before_local_controls = await asyncio.to_thread(fixture_status, provider_authority)
+                submit_count_before_local_controls = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+
+                await page.locator('#messages [data-key="turn-5-assistant"] .message-copy-button').click()
+                await page.locator("#copy-status").wait_for(state="visible")
+                assert await page.locator("#copy-status").inner_text() == "Copied to clipboard."
+                assert await page.evaluate("() => navigator.clipboard.readText()") == unicode_reply
+                await page.locator('#messages [data-key="turn-5-assistant"] .code-copy-button').click()
+                assert await page.evaluate("() => navigator.clipboard.readText()") == "const greeting = '你好';\nsecond line Δ\n"
+                tool_result_text = seed["session"]["turns"][0]["tools"][0]["result"]["result"]
+                await transcript_search.fill("session-rail-tool-history")
+                await page.wait_for_function(
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool input')",
+                    timeout=5000,
+                )
+                await page.locator("#transcript-search-next").click()
+                await page.wait_for_function(
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool result')",
+                    timeout=5000,
+                )
+                await page.locator('#messages [data-key="turn-0-assistant"] .tool-copy-button').filter(
+                    has_text="Copy tool result"
+                ).click()
+                assert await page.evaluate("() => navigator.clipboard.readText()") == tool_result_text
+
+                await transcript_search.fill("TRIAL-COPY-UNICODE")
+                await page.wait_for_function(
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Prompt')",
+                    timeout=5000,
+                )
+                await page.evaluate(
+                    """() => {
+                      window.__savedClipboard = navigator.clipboard;
+                      Object.defineProperty(navigator, 'clipboard', {
+                        configurable: true,
+                        value: {writeText: async () => { throw new Error('permission denied'); }},
+                      });
+                    }"""
+                )
+                await page.locator('article.message[data-key="turn-5-user-message"] .message-copy-button').click()
+                fallback_text = page.locator('article.message[data-key="turn-5-user-message"] .copy-fallback textarea')
+                await fallback_text.wait_for(state="visible")
+                assert await fallback_text.input_value() == copy_prompt
+                assert "copy failed" in (await page.locator("#copy-status").inner_text()).lower()
+                await page.evaluate(
+                    """() => {
+                      Object.defineProperty(navigator, 'clipboard', {configurable: true, value: window.__savedClipboard});
+                      delete window.__savedClipboard;
+                    }"""
+                )
+
+                export_pattern = f"**/api/sessions/{alpha_id}/snapshot"
+
+                async def inject_export_sentinels(route):
+                    response = await route.fetch()
+                    payload = await response.json()
+                    session = payload["session"]
+                    session.setdefault("display", {})["private_export_sentinel"] = "TRIAL-EXPORT-DISPLAY-SECRET"
+                    session["private_catalog_sentinel"] = "TRIAL-EXPORT-CATALOG-SECRET"
+                    session["authorization_header"] = "TRIAL-EXPORT-AUTH-HEADER"
+                    session["turns"][-1]["private_turn_sentinel"] = "TRIAL-EXPORT-TURN-SECRET"
+                    session["turns"][0]["tools"][0]["authorization_key"] = "TRIAL-EXPORT-AUTH-KEY"
+                    session["turns"][0]["tools"][0]["input"]["nested"] = {
+                        "api_key": "TRIAL-EXPORT-NESTED-API-KEY",
+                        "deeper": [{"accessToken": "TRIAL-EXPORT-NESTED-ACCESS-TOKEN"}],
+                    }
+                    await route.fulfill(
+                        status=response.status,
+                        headers={"content-type": "application/json"},
+                        body=json.dumps(payload, ensure_ascii=False),
+                    )
+
+                await page.route(export_pattern, inject_export_sentinels)
+                await page.reload(wait_until="load")
+                await page.wait_for_function(
+                    "id => document.querySelector('#session-title')?.dataset.sessionId === id",
+                    arg=alpha_id,
+                )
+                assert await page.locator("#prompt").input_value() == alpha_local_draft
+                async with page.expect_download() as download_info:
+                    await page.locator("#download-transcript").click()
+                download = await download_info.value
+                await page.locator("#download-status").get_by_text("Transcript download started.").wait_for()
+                exported_path = await download.path()
+                exported_text = Path(exported_path).read_text(encoding="utf-8")
+                exported = json.loads(exported_text)
+                assert exported["schema"] == "leg-web.transcript/v1", exported
+                assert set(exported) == {"schema", "turns"}, exported
+                allowed_turn_fields = {"turn_index", "prompt", "reply", "failure_message", "outcome", "tools"}
+                allowed_tool_fields = {"tool_name", "input", "result"}
+                allowed_result_fields = {"status", "result", "error"}
+                for exported_turn in exported["turns"]:
+                    assert set(exported_turn) <= allowed_turn_fields, exported_turn
+                    for exported_tool in exported_turn["tools"]:
+                        assert set(exported_tool) <= allowed_tool_fields, exported_tool
+                        if "result" in exported_tool:
+                            assert set(exported_tool["result"]) <= allowed_result_fields, exported_tool
+                for secret in (
+                    "TRIAL-EXPORT-DISPLAY-SECRET",
+                    "TRIAL-EXPORT-CATALOG-SECRET",
+                    "TRIAL-EXPORT-AUTH-HEADER",
+                    "TRIAL-EXPORT-TURN-SECRET",
+                    "TRIAL-EXPORT-AUTH-KEY",
+                    "TRIAL-EXPORT-NESTED-API-KEY",
+                    "TRIAL-EXPORT-NESTED-ACCESS-TOKEN",
+                    restart_token,
+                    "trial-only-not-a-secret",
+                ):
+                    assert secret not in exported_text, secret
+                await page.unroute(export_pattern, inject_export_sentinels)
+                provider_after_local_controls = await asyncio.to_thread(fixture_status, provider_authority)
+                submit_count_after_local_controls = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                assert provider_after_local_controls["requests"] == provider_before_local_controls["requests"]
+                assert submit_count_after_local_controls == submit_count_before_local_controls
+
+                retry_draft_id = await create_session(page, workspace_a)
+                await rename_session(page, retry_draft_id, "Retry source")
+                failed_prompt = "TRIAL-REOPEN-FAILURE: retry this recorded prompt"
+                await page.locator("#prompt").fill(failed_prompt)
+                await page.get_by_role("button", name="Send").click()
+                await page.wait_for_function(
+                    "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
+                    timeout=15000,
+                )
+                retry_session_id = str(await page.evaluate("sessionStorage.getItem('leg-web-current-session')"))
+                first_failed_retry = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, retry_session_id, 1
+                )
+                assert first_failed_retry["session"]["turns"][0]["prompt"] == failed_prompt
+                await wait_status(page, "Failed")
+                retry_action = page.locator('#messages [data-key="turn-0-assistant"] .retry-turn-button')
+                await retry_action.wait_for(state="visible")
+                assert await retry_action.inner_text() == "Retry turn"
+                assert await page.get_by_text(
+                    "Retry sends this prompt again and may repeat tool side effects.", exact=True
+                ).is_visible()
+                failed_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert failed_provider_status["scenario_requests"].get("TRIAL-REOPEN-FAILURE") == 1
+
+                await page.reload(wait_until="load")
+                await wait_status(page, "Failed")
+                assert await retry_action.is_visible()
+                viewed_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert viewed_provider_status["scenario_requests"].get("TRIAL-REOPEN-FAILURE") == 1
+
+                async def inject_read_only_snapshot(route):
+                    response = await route.fetch()
+                    payload = await response.json()
+                    payload["session"]["read_only"] = True
+                    await route.fulfill(
+                        status=response.status,
+                        headers={"content-type": "application/json"},
+                        body=json.dumps(payload, ensure_ascii=False),
+                    )
+
+                retry_snapshot_pattern = f"**/api/sessions/{retry_session_id}/snapshot"
+                async def inject_recovery_required_snapshot(route):
+                    response = await route.fetch()
+                    payload = await response.json()
+                    payload["recovery_required"] = True
+                    await route.fulfill(
+                        status=response.status,
+                        headers={"content-type": "application/json"},
+                        body=json.dumps(payload, ensure_ascii=False),
+                    )
+
+                await page.route(retry_snapshot_pattern, inject_recovery_required_snapshot)
+                await page.reload(wait_until="load")
+                unresolved_retry = page.locator('#messages [data-key="turn-0-assistant"] .retry-turn-button')
+                await unresolved_retry.wait_for(state="visible")
+                assert await unresolved_retry.is_disabled()
+                await page.unroute(retry_snapshot_pattern, inject_recovery_required_snapshot)
+
+                await page.route(retry_snapshot_pattern, inject_read_only_snapshot)
+                await page.reload(wait_until="load")
+                readonly_retry = page.locator('#messages [data-key="turn-0-assistant"] .retry-turn-button')
+                await readonly_retry.wait_for(state="visible")
+                assert await readonly_retry.is_disabled()
+                await page.unroute(retry_snapshot_pattern, inject_read_only_snapshot)
+                await page.reload(wait_until="load")
+                await wait_status(page, "Failed")
+                retry_action = page.locator('#messages [data-key="turn-0-assistant"] .retry-turn-button')
+                await retry_action.wait_for(state="visible")
+                assert not await retry_action.is_disabled()
+
+                retry_composer_draft = "Keep this independently edited draft."
+                await page.locator("#prompt").fill(retry_composer_draft)
+                submit_count_before_turn_retry = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                submit_started = asyncio.Event()
+                release_submit = asyncio.Event()
+
+                async def hold_retry_submit(route):
+                    submit_started.set()
+                    await release_submit.wait()
+                    await route.continue_()
+
+                retry_submit_pattern = f"**/api/sessions/{retry_session_id}/submit"
+                await page.route(retry_submit_pattern, hold_retry_submit)
+                await retry_action.click()
+                await submit_started.wait()
+                assert await retry_action.is_disabled()
+                assert await page.locator("#prompt").input_value() == retry_composer_draft
+                release_submit.set()
+                await page.unroute(retry_submit_pattern, hold_retry_submit)
+                retried = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, retry_session_id, 2
+                )
+                await wait_status(page, "Succeeded")
+                assert retried["last_submission"]["request_id"] == 2, retried
+                assert any(turn["prompt"] == failed_prompt for turn in retried["session"]["turns"]), retried
+                assert await page.locator("#prompt").input_value() == retry_composer_draft
+                retried_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert retried_provider_status["scenario_requests"].get("TRIAL-REOPEN-FAILURE") == 2
+                submit_count_after_turn_retry = len(
+                    [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
+                )
+                assert submit_count_after_turn_retry - submit_count_before_turn_retry == 1
+
+                await page.locator("#prompt").fill("TRIAL-RUNNING: verify retry is disabled while busy")
+                await page.get_by_role("button", name="Send").click()
+                await page.locator("#active-tool").wait_for(state="visible")
+                retry_action = page.locator('#messages [data-key="turn-0-assistant"] .retry-turn-button')
+                assert await retry_action.is_disabled()
+                busy_turn = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, retry_session_id, 3
+                )
+                assert busy_turn["last_submission"]["request_id"] == 3, busy_turn
+                await wait_status(page, "Succeeded")
 
                 await create_session(page, workspace_a)
                 await page.locator("#prompt").fill("TRIAL-HISTORY-SEED: create selectable historical link")
