@@ -470,33 +470,62 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert await composer.input_value() == chinese_prompt
 
                 before_first_send = len([url for method, url in browser_requests if method == "POST" and url.endswith("/submit")])
+                draft_session_id = session_id
+                assert draft_session_id.startswith("draft-"), draft_session_id
 
-                async def delay_first_send(route):
-                    await asyncio.sleep(0.4)
-                    await route.continue_()
+                first_send_intercepted = asyncio.Event()
+                release_first_send = asyncio.Event()
+                first_send_route_completed = asyncio.Event()
+                receipt_wait_started = threading.Event()
 
-                await page.route("**/submit", delay_first_send)
-                await page.evaluate(
-                    """() => {
-                      const send = document.querySelector('#send');
-                      send.click();
-                      send.click();
-                    }"""
-                )
-                await page.wait_for_function(
-                    "() => document.querySelector('#turn-status')?.textContent === 'Starting'",
-                    timeout=5000,
-                )
-                await page.wait_for_function(
-                    "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
-                    timeout=15000,
-                )
-                session_id = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
-                first = wait_completed_submission(authority, token, session_id, 1)
-                await page.unroute("**/submit", delay_first_send)
+                async def hold_first_send(route):
+                    first_send_intercepted.set()
+                    try:
+                        await release_first_send.wait()
+                        await route.continue_()
+                    finally:
+                        first_send_route_completed.set()
+
+                def wait_for_first_receipt():
+                    receipt_wait_started.set()
+                    return wait_completed_submission(authority, token, draft_session_id, 1)
+
+                await page.route("**/submit", hold_first_send)
+                first_receipt_task = None
+                try:
+                    await page.evaluate(
+                        """() => {
+                          const send = document.querySelector('#send');
+                          send.click();
+                          send.click();
+                        }"""
+                    )
+                    await page.wait_for_function(
+                        "() => document.querySelector('#turn-status')?.textContent === 'Starting'",
+                        timeout=5000,
+                    )
+                    await asyncio.wait_for(first_send_intercepted.wait(), timeout=5)
+                    first_receipt_task = asyncio.create_task(asyncio.to_thread(wait_for_first_receipt))
+                    assert await asyncio.to_thread(receipt_wait_started.wait, 5), "receipt wait did not start"
+                    release_first_send.set()
+                    await asyncio.wait_for(first_send_route_completed.wait(), timeout=5)
+                    first = await first_receipt_task
+                    # The host binds a draft ID only after it accepts /submit, so keep waiting for
+                    # the non-draft ID after releasing the route and completing the receipt wait.
+                    await page.wait_for_function(
+                        "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
+                        timeout=15000,
+                    )
+                    session_id = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
+                finally:
+                    release_first_send.set()
+                    await page.unroute("**/submit", hold_first_send)
+                    if first_receipt_task is not None and not first_receipt_task.done():
+                        await first_receipt_task
                 await wait_status(page, "Succeeded")
-                wait_fixture_count(provider_authority, 1)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 1)
                 assert first["last_submission"]["status"] == "succeeded", first
+                assert first["high_water"] == 1, first
                 assert fixture_status(provider_authority)["input_checks"].get("chinese_multiline_prompt") is True
                 assert len([url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]) - before_first_send == 1
                 assert "anthropic · trial-fixture" in (await page.locator("#provider-model").inner_text())
@@ -526,9 +555,9 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 await page.get_by_role("button", name="Retry same send").click()
                 await page.unroute("**/submit", abort_before_accept)
                 assert len(retry_ids) == 2 and retry_ids[0] == retry_ids[1] == 2, retry_ids
-                wait_completed_submission(authority, token, session_id, 2)
+                await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 2)
                 await wait_status(page, "Succeeded")
-                wait_fixture_count(provider_authority, 2)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 2)
 
                 async def lose_response_after_accept(route):
                     await route.fetch()
@@ -574,8 +603,8 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert await composer.is_enabled()
                 assert await composer.input_value() == active_draft
                 assert await page.get_by_role("button", name="Send").is_disabled()
-                wait_high_water(authority, token, session_id, 3)
-                wait_fixture_count(provider_authority, 3)
+                await asyncio.to_thread(wait_high_water, authority, token, session_id, 3)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 3)
                 assert len([url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]) == submit_count_before_lost_response_reload
                 await page.unroute("**/submit", lose_response_after_accept)
 
@@ -597,7 +626,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                     timeout=5000,
                 )
                 await page.unroute("**/stop", delay_stop)
-                stopped = wait_completed_submission(authority, token, session_id, 3)
+                stopped = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 3)
                 try:
                     await wait_status(page, "Interrupted")
                 except Exception:
@@ -613,9 +642,9 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
 
                 await composer.fill("TRIAL-TOOL-TEXT: write and confirm a fixture file")
                 await page.get_by_role("button", name="Send").click()
-                tool_turn = wait_completed_submission(authority, token, session_id, 4)
+                tool_turn = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 4)
                 await wait_status(page, "Succeeded")
-                wait_fixture_count(provider_authority, 5)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 5)
                 write_card = page.locator(".tool-inspector").last
                 write_button = write_card.locator(".tool-disclosure")
                 assert "Tool write" in await write_button.inner_text()
@@ -639,9 +668,9 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
 
                 await composer.fill("TRIAL-LARGE-TOOL: summarize the large tool result")
                 await page.get_by_role("button", name="Send").click()
-                large_turn = wait_completed_submission(authority, token, session_id, 5)
+                large_turn = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 5)
                 await wait_status(page, "Succeeded")
-                wait_fixture_count(provider_authority, 7)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 7)
                 await page.wait_for_function(
                     "identity => [...document.querySelectorAll('.tool-disclosure')].some(button => "
                     "button.dataset.focusKey === identity && button.getAttribute('aria-expanded') === 'true')",
@@ -667,9 +696,9 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 )
                 await composer.fill("TRIAL-UNTRUSTED-MARKDOWN: read the malicious fixture as plain content")
                 await page.get_by_role("button", name="Send").click()
-                xss_turn = wait_completed_submission(authority, token, session_id, 6)
+                xss_turn = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 6)
                 await wait_status(page, "Succeeded")
-                wait_fixture_count(provider_authority, 9)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 9)
                 xss_transcript = await page.locator("#messages").inner_text()
                 assistant_markdown = await page.locator(
                     "#messages .message-assistant .message-content"
@@ -716,9 +745,9 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
 
                 await composer.fill("TRIAL-LONG: create a long readable history")
                 await page.get_by_role("button", name="Send").click()
-                wait_completed_submission(authority, token, session_id, 7)
+                await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 7)
                 await wait_status(page, "Succeeded")
-                wait_fixture_count(provider_authority, 10)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 10)
                 await page.get_by_text("END OF FIXTURE ANSWER", exact=False).wait_for()
 
                 transcript = page.locator("#transcript")
@@ -748,21 +777,21 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert await page.locator("#new-content").is_hidden()
                 scroll_metrics = await transcript.evaluate("element => element.scrollHeight - element.clientHeight - element.scrollTop")
                 assert scroll_metrics <= 5, scroll_metrics
-                final = wait_completed_submission(authority, token, session_id, 8)
+                final = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 8)
                 await wait_status(page, "Succeeded")
-                wait_fixture_count(provider_authority, 11)
+                await asyncio.to_thread(wait_fixture_count, provider_authority, 11)
                 assert final["last_submission"]["status"] == "succeeded", final
 
                 await composer.fill("TRIAL-AUTH: retain this failed prompt")
                 await page.get_by_role("button", name="Send").click()
-                failed = wait_completed_submission(authority, token, session_id, 9)
+                failed = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 9)
                 await wait_status(page, "Failed")
                 assert failed["last_submission"]["status"] == "failed", failed
                 assert await composer.input_value() == "TRIAL-AUTH: retain this failed prompt"
 
                 await composer.fill("TRIAL-CAP: show the host's capped status")
                 await page.get_by_role("button", name="Send").click()
-                capped = wait_completed_submission(authority, token, session_id, 10)
+                capped = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 10)
                 await wait_status(page, "Capped")
                 assert capped["last_submission"]["outcome"]["capped"] is True, capped
                 assert "Output capped by Leg" in await page.locator(".turn-warning").last.inner_text()
@@ -770,7 +799,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 await composer.fill("TRIAL-REOPEN-INTERRUPTION: expose an incomplete stream")
                 await page.get_by_role("button", name="Send").click()
                 try:
-                    failed_stream = wait_completed_submission(authority, token, session_id, 11)
+                    failed_stream = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 11)
                 except AssertionError as error:
                     ui_state = await page.evaluate(
                         """() => ({
@@ -845,7 +874,8 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 )
                 assert await pending_tool.get_attribute("aria-expanded") == "true"
                 stalled_pid_path = workspace / "trial-stalled-child.pid"
-                child_pid = wait_until(
+                child_pid = await asyncio.to_thread(
+                    wait_until,
                     lambda: int(stalled_pid_path.read_text(encoding="utf-8").strip())
                     if stalled_pid_path.exists()
                     else None,
@@ -854,7 +884,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 before_crash = host_snapshot(authority, token, session_id)
                 assert before_crash["high_water"] == 12 and before_crash["active"], before_crash
                 os.kill(host.pid, signal.SIGKILL)
-                host.wait(timeout=8)
+                await asyncio.to_thread(host.wait, timeout=8)
                 host = None
 
                 def child_is_gone():
@@ -866,7 +896,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                         return False
                     return False
 
-                wait_until(child_is_gone, "owned tool cleanup after host crash", timeout=15)
+                await asyncio.to_thread(wait_until, child_is_gone, "owned tool cleanup after host crash", timeout=15)
                 retry_host_env = host_env.copy()
                 retry_host_env["LEG_MAX_RETRIES"] = "1"
                 retry_host_env["LEG_RETRY_BASE_DELAY_MS"] = "10"
@@ -886,7 +916,9 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                     cwd=workspace,
                     env=retry_host_env,
                 )
-                restart_line = read_until(host, host_lines, "Open this one-time launch URL:")
+                restart_line = await asyncio.to_thread(
+                    read_until, host, host_lines, "Open this one-time launch URL:"
+                )
                 restart_url = restart_line.split(": ", 1)[1]
                 restart_authority = urlsplit(restart_url).netloc
                 allowed_authorities.add(restart_authority)
@@ -942,7 +974,8 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                     timeout=15000,
                 )
                 retry_session_id = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
-                retried = wait_completed_submission(
+                retried = await asyncio.to_thread(
+                    wait_completed_submission,
                     restart_authority,
                     urlsplit(restart_url).fragment,
                     retry_session_id,
