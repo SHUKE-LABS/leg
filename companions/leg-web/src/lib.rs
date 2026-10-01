@@ -1395,6 +1395,12 @@ impl HostState {
         let Some(session_id) = &submission.bound_session_id else {
             return;
         };
+        // A failed stream can leave a native trail before it emits turn_start.
+        // The catalog may adopt that exact trail during recovery, so keep the
+        // submitted draft ID resolvable through its reserved session alias.
+        if self.inner.catalog.get(session_id).is_ok() {
+            return;
+        }
         let _ = self.inner.durable.transact(|data| {
             if data.aliases.get(session_id) == Some(&submission.ledger_id) {
                 data.aliases.remove(session_id);
