@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1080,6 +1080,234 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 assert provider_status["input_checks"].get("navigation_prior_text_and_tool_history_returned") is True
                 assert provider_status["input_checks"].get("navigation_recorded_workspace_returned") is True
                 assert "TRIAL-NAV-LOSER" not in provider_status["scenario_requests"]
+
+                await create_session(page, workspace_a)
+                await page.locator("#prompt").fill("TRIAL-HISTORY-SEED: create selectable historical link")
+                await page.get_by_role("button", name="Send").click()
+                await page.wait_for_function(
+                    "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
+                    timeout=15000,
+                )
+                history_id = str(await page.evaluate("sessionStorage.getItem('leg-web-current-session')"))
+                history_seed = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, history_id, 1
+                )
+                await wait_status(page, "Succeeded")
+                assert history_seed["session"]["turns"][0]["outcome"] == "succeeded", history_seed
+                history_link = page.locator(
+                    '#messages [data-key="turn-0-assistant"] .message-content a'
+                )
+                await history_link.wait_for()
+                await page.locator("#transcript").evaluate(
+                    """scroller => {
+                      const article = document.querySelector('#messages [data-key="turn-0-assistant"]');
+                      scroller.scrollTop += article.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 2;
+                    }"""
+                )
+                history_anchor_before = await page.locator("#messages [data-key='turn-0-assistant']").evaluate(
+                    "node => node.getBoundingClientRect().top - document.querySelector('#transcript').getBoundingClientRect().top"
+                )
+                await page.locator("#prompt").fill("TRIAL-HISTORY-STREAM: stream several later deltas")
+                await page.get_by_role("button", name="Send").click()
+                await page.get_by_text("The first live text is visible", exact=False).wait_for()
+                await page.evaluate(
+                    """() => {
+                      const article = document.querySelector('#messages [data-key="turn-0-assistant"]');
+                      const content = article.querySelector('.message-content');
+                      const link = content.querySelector('a');
+                      link.focus({preventScroll: true});
+                      const range = document.createRange();
+                      range.selectNodeContents(link);
+                      const selection = window.getSelection();
+                      selection.removeAllRanges();
+                      selection.addRange(range);
+                      const createElement = document.createElement.bind(document);
+                      window.__historyLinkParseCount = 0;
+                      document.createElement = (name, options) => {
+                        if (String(name).toLowerCase() === 'a') window.__historyLinkParseCount += 1;
+                        return createElement(name, options);
+                      };
+                      window.__historyNodes = {
+                        article,
+                        content,
+                        paragraph: content.querySelector('p'),
+                        link,
+                        linkText: link.firstChild,
+                      };
+                    }"""
+                )
+                await page.get_by_text("Second streamed delta.", exact=False).wait_for()
+                await page.get_by_text("Third streamed delta.", exact=False).wait_for()
+                await wait_status(page, "Succeeded")
+                history_dom = await page.evaluate(
+                    """() => {
+                      const before = window.__historyNodes;
+                      const after = document.querySelector('#messages [data-key="turn-0-assistant"]');
+                      const link = after?.querySelector('.message-content a');
+                      const selection = window.getSelection();
+                      const scroller = document.querySelector('#transcript');
+                      return {
+                        articleSame: before.article === after,
+                        contentSame: before.content === after?.querySelector('.message-content'),
+                        paragraphSame: before.paragraph === after?.querySelector('.message-content p'),
+                        linkSame: before.link === link,
+                        linkTextSame: before.linkText === link?.firstChild,
+                        focused: document.activeElement === before.link,
+                        selectedText: selection.toString(),
+                        linkParseCount: window.__historyLinkParseCount,
+                        anchorOffset: after.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+                        liveOccurrences: (document.querySelector('#messages').innerText.match(/The first live text is visible\\./g) || []).length,
+                      };
+                    }"""
+                )
+                assert history_dom["articleSame"], history_dom
+                assert history_dom["contentSame"], history_dom
+                assert history_dom["paragraphSame"], history_dom
+                assert history_dom["linkSame"], history_dom
+                assert history_dom["linkTextSame"], history_dom
+                assert history_dom["focused"], history_dom
+                assert history_dom["selectedText"] == "Stable history link", history_dom
+                assert history_dom["linkParseCount"] == 0, history_dom
+                assert abs(history_dom["anchorOffset"] - history_anchor_before) <= 5, (
+                    history_anchor_before,
+                    history_dom,
+                )
+                assert history_dom["liveOccurrences"] == 1, history_dom
+
+                cross_tab_id = await create_session(page, workspace_a)
+                assert "Stable history link" not in await page.locator("#messages").inner_text()
+                page2 = await context.new_page()
+                page2.on("pageerror", lambda error: page_errors.append(str(error)))
+                await page2.goto(launch_url, wait_until="load")
+                await open_session(page2, cross_tab_id, "Conversation")
+                cross_tab_draft = "TRIAL-TAB-DRAFT: preserve this local text"
+                cross_tab_prompt = "TRIAL-CROSS-TAB: show the host-accepted prompt"
+                await page.locator("#prompt").fill(cross_tab_draft)
+
+                snapshot_started = asyncio.Event()
+                release_snapshot = asyncio.Event()
+
+                async def hold_first_snapshot(route):
+                    response = await route.fetch()
+                    if not snapshot_started.is_set():
+                        snapshot_started.set()
+                        await release_snapshot.wait()
+                    await route.fulfill(response=response)
+
+                await page.route(f"**/api/sessions/{cross_tab_id}/snapshot", hold_first_snapshot)
+                provider_requests_before_cross_tab = (
+                    await asyncio.to_thread(fixture_status, provider_authority)
+                )["requests"]
+                await page2.locator("#prompt").fill(cross_tab_prompt)
+                await page2.get_by_role("button", name="Send").click()
+                await snapshot_started.wait()
+                await page.get_by_text("Submitted prompt is loading…", exact=True).wait_for()
+                assert await page.locator("#prompt").input_value() == cross_tab_draft
+                assert cross_tab_draft not in await page.locator("#messages").inner_text()
+                release_snapshot.set()
+                try:
+                    await page.get_by_text(cross_tab_prompt, exact=True).wait_for()
+                except PlaywrightTimeoutError as error:
+                    page_state = await page.evaluate(
+                        """() => ({
+                          sessionId: sessionStorage.getItem('leg-web-current-session'),
+                          prompt: document.querySelector('#prompt')?.value,
+                          connection: document.querySelector('#connection-state')?.textContent,
+                          status: document.querySelector('#turn-status')?.textContent,
+                          messages: document.querySelector('#messages')?.innerText,
+                        })"""
+                    )
+                    try:
+                        host_snapshot_value = await asyncio.to_thread(
+                            host_snapshot, authority, token, page_state["sessionId"] or cross_tab_id
+                        )
+                        host_state = {
+                            "sessionId": host_snapshot_value["session"]["id"],
+                            "activePrompt": (host_snapshot_value.get("active") or {}).get("prompt"),
+                            "lastSubmission": host_snapshot_value.get("last_submission"),
+                            "turnId": host_snapshot_value.get("turn_id"),
+                            "cursor": host_snapshot_value.get("cursor"),
+                            "turnPrompts": [
+                                turn.get("prompt") for turn in host_snapshot_value["session"].get("turns", [])
+                            ],
+                        }
+                    except AssertionError as host_error:
+                        host_state = str(host_error)
+                    raise AssertionError(
+                        f"cross-tab accepted prompt did not appear; page={page_state}; "
+                        f"host={host_state}; page errors={page_errors}"
+                    ) from error
+                await page2.wait_for_function(
+                    "() => { const id = sessionStorage.getItem('leg-web-current-session'); "
+                    "return id && !id.startsWith('draft-'); }",
+                    timeout=15000,
+                )
+                cross_tab_actual_id = str(
+                    await page2.evaluate("sessionStorage.getItem('leg-web-current-session')")
+                )
+                cross_tab_result = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, cross_tab_actual_id, 1
+                )
+                await wait_status(page2, "Succeeded")
+                assert cross_tab_result["session"]["turns"][0]["prompt"] == cross_tab_prompt
+                cross_tab_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert cross_tab_provider_status["requests"] == provider_requests_before_cross_tab + 1, (
+                    provider_requests_before_cross_tab,
+                    cross_tab_provider_status,
+                )
+                assert cross_tab_draft not in await page.locator("#messages").inner_text()
+                assert await page.locator("#prompt").input_value() == cross_tab_draft
+                await page.unroute(f"**/api/sessions/{cross_tab_id}/snapshot", hold_first_snapshot)
+                await page2.close()
+
+                local_id = await create_session(page, workspace_a)
+                local_prompt = "TRIAL-LOCAL-PROVENANCE: exact submitted text"
+                local_draft = "TRIAL-DRAFT-ONLY: changed after Send"
+                submit_intercepted = asyncio.Event()
+                release_submit = asyncio.Event()
+
+                async def delay_submit_until_draft_edit(route):
+                    submit_intercepted.set()
+                    await release_submit.wait()
+                    await route.continue_()
+
+                await page.route(f"**/api/sessions/{local_id}/submit", delay_submit_until_draft_edit)
+                provider_requests_before_local = (
+                    await asyncio.to_thread(fixture_status, provider_authority)
+                )["requests"]
+                await page.locator("#prompt").fill(local_prompt)
+                await page.get_by_role("button", name="Send").click()
+                await submit_intercepted.wait()
+                assert host_snapshot(authority, token, local_id)["high_water"] == 0
+                await page.locator("#prompt").fill(local_draft)
+                release_submit.set()
+                await page.unroute(f"**/api/sessions/{local_id}/submit", delay_submit_until_draft_edit)
+                await page.wait_for_function(
+                    "() => { const id = sessionStorage.getItem('leg-web-current-session'); "
+                    "return id && !id.startsWith('draft-'); }",
+                    timeout=15000,
+                )
+                local_actual_id = str(
+                    await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
+                )
+                local_result = await asyncio.to_thread(
+                    wait_completed_submission, authority, token, local_actual_id, 1
+                )
+                await wait_status(page, "Succeeded")
+                assert local_result["session"]["turns"][0]["prompt"] == local_prompt
+                assert await page.locator("#prompt").input_value() == local_draft
+                assert (await page.locator("#messages").inner_text()).count(local_prompt) == 1
+                assert local_draft not in await page.locator("#messages").inner_text()
+
+                final_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert final_provider_status["requests"] == provider_requests_before_local + 1, (
+                    provider_requests_before_local,
+                    final_provider_status,
+                )
+                assert final_provider_status["scenario_requests"].get("TRIAL-HISTORY-SEED") == 1
+                assert final_provider_status["scenario_requests"].get("TRIAL-HISTORY-STREAM") == 1
+                assert final_provider_status["scenario_requests"].get("TRIAL-CROSS-TAB") == 1
+                assert final_provider_status["scenario_requests"].get("TRIAL-LOCAL-PROVENANCE") == 1
                 assert not page_errors, page_errors
 
                 await context.close()

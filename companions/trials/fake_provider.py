@@ -126,6 +126,10 @@ class Fixture:
             "TRIAL-NAV-SEED",
             "TRIAL-NAV-CONTINUE",
             "TRIAL-NAV-LOSER",
+            "TRIAL-HISTORY-SEED",
+            "TRIAL-HISTORY-STREAM",
+            "TRIAL-CROSS-TAB",
+            "TRIAL-LOCAL-PROVENANCE",
             "TRIAL-TOOL-TEXT",
             "TRIAL-TUI-MULTI-TOOL",
             "TRIAL-DENIED",
@@ -591,6 +595,26 @@ class Fixture:
         if marker == "TRIAL-LONG":
             long_text = "\n".join(f"Long fixture line {i:03d}: the complete answer remains available to browse and copy." for i in range(1, 181)) + "\nEND OF FIXTURE ANSWER"
             self.send_stream(handler, [{"type": "text", "text": long_text}])
+            return
+        if marker == "TRIAL-HISTORY-SEED":
+            history = "[Stable history link](https://example.com/history)\n\n" + "\n\n".join(
+                f"Earlier history passage {i:03d}: keep this reply available while later text streams."
+                for i in range(1, 81)
+            )
+            self.send_stream(handler, [{"type": "text", "text": history}])
+            return
+        if marker == "TRIAL-HISTORY-STREAM":
+            chunks = [
+                "The first live text is visible. ",
+                "Second streamed delta. ",
+                "Third streamed delta.",
+            ]
+            self.send_stream(
+                handler,
+                [{"type": "text", "text": "".join(chunks), "chunks": chunks}],
+                pause_ms=2500,
+                marker=marker,
+            )
             return
         if marker == "TRIAL-TUI-LONG-PAUSE":
             long_text = "\n".join(

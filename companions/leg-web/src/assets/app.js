@@ -80,10 +80,12 @@ const state = {
   startBusy: false,
   renamingSessionId: null,
   renderedSessionSignature: "",
+  transcriptSessionId: null,
   restoreReadingPosition: null,
 };
 
 let elapsedTimer = null;
+const messageRenderState = new WeakMap();
 
 class HostError extends Error {
   constructor(code, status) {
@@ -446,6 +448,7 @@ async function startConversation(event) {
 
 async function activateSession(sessionId) {
   if (state.sessionId && state.sessionId !== sessionId) saveCurrentSessionView();
+  const transcriptChanged = state.transcriptSessionId !== sessionId;
   const switchGeneration = ++state.switchGeneration;
   state.streamGeneration += 1;
   state.streamAbort?.abort();
@@ -456,6 +459,12 @@ async function activateSession(sessionId) {
   state.pending = readPending(sessionId);
   state.restoreReadingPosition = readReadingPosition(sessionId) || { atBottom: true };
   window.sessionStorage.setItem(sessionKey, sessionId);
+  if (transcriptChanged) {
+    state.transcriptSessionId = sessionId;
+    ui.messages.replaceChildren();
+    ui["empty-transcript"].hidden = false;
+    ui.transcript.scrollTop = 0;
+  }
   ui.prompt.value = window.sessionStorage.getItem(storageKey(draftPrefix, sessionId)) || state.pending?.prompt || "";
   adjustTextarea();
   showSendError("");
@@ -535,6 +544,8 @@ function bindSessionId(oldId, actualId) {
     window.sessionStorage.removeItem(oldKey);
   }
   state.sessionId = actualId;
+  if (state.transcriptSessionId === oldId) state.transcriptSessionId = actualId;
+  if (state.snapshot?.session?.id === oldId) state.snapshot.session.id = actualId;
   window.sessionStorage.setItem(sessionKey, actualId);
 }
 
@@ -676,9 +687,13 @@ function applyHostEvent(event, sessionId, switchGeneration) {
       .catch(() => {});
   }
   if (!state.active && event.kind === "accepted") {
-    state.active = {
+    const requestId = Number(event.data?.request_id);
+    const pendingPrompt = Number.isSafeInteger(requestId) && state.pending?.request_id === requestId
+      ? state.pending.prompt
+      : null;
+    const provisional = {
       turn_id: event.turn_id,
-      prompt: ui.prompt.value,
+      prompt: pendingPrompt,
       text: "",
       status: "starting",
       started_at_ms: Date.now(),
@@ -687,6 +702,24 @@ function applyHostEvent(event, sessionId, switchGeneration) {
       active_tool: null,
       tools: [],
     };
+    state.active = provisional;
+    if (pendingPrompt === null) {
+      void refreshSnapshot({ eventsArrived: true, sessionId, switchGeneration }).then((snapshot) => {
+        const snapshotSessionId = snapshot?.session?.id || sessionId;
+        if (!snapshot || !isCurrentSession(snapshotSessionId, switchGeneration)) return;
+        const receipt = snapshot.last_submission;
+        const terminal = receipt?.request_id === requestId
+          && !["accepted", "running"].includes(receipt.status);
+        if (
+          !snapshot.active
+          && snapshot.turn_id === event.turn_id
+          && !terminal
+        ) {
+          state.active = provisional;
+          renderAll({ eventsArrived: true });
+        }
+      }).catch(() => {});
+    }
   }
   if (event.kind === "stream" && event.data) applyStreamEvent(event.data);
   if (event.kind === "outcome") {
@@ -854,13 +887,31 @@ function renderTranscript({ eventsArrived = false } = {}) {
   const wasAtBottom = previousBottomGap < 36;
   const anchor = findScrollAnchor(scroller);
 
-  const fragment = document.createDocumentFragment();
+  if (state.transcriptSessionId !== state.sessionId) {
+    ui.messages.replaceChildren();
+    state.transcriptSessionId = state.sessionId;
+  }
+
+  const existing = new Map([...ui.messages.children].map((node) => [node.dataset.key, node]));
+  const desired = [];
   const turns = state.snapshot.session?.turns || [];
   for (const turn of turns) {
-    appendTurn(fragment, turn, state.snapshot.session?.display?.["web.turn_metadata"] || {});
+    desired.push(...renderTurn(existing, turn, state.snapshot.session?.display?.["web.turn_metadata"] || {}));
   }
-  if (state.active) appendActiveTurn(fragment, state.active);
-  ui.messages.replaceChildren(fragment);
+  if (state.active) desired.push(...renderActiveTurn(existing, state.active));
+
+  const desiredSet = new Set(desired);
+  for (const node of [...ui.messages.children]) {
+    if (!desiredSet.has(node)) node.remove();
+  }
+  let current = ui.messages.firstElementChild;
+  for (const node of desired) {
+    if (node === current) {
+      current = current.nextElementSibling;
+    } else {
+      ui.messages.insertBefore(node, current);
+    }
+  }
   ui["empty-transcript"].hidden = ui.messages.childElementCount > 0;
 
   if (state.restoreReadingPosition) {
@@ -899,15 +950,16 @@ function restoreScrollAnchor(scroller, anchor, previousTop) {
   scroller.scrollTop = previousTop;
 }
 
-function appendTurn(parent, turn, metadataByIndex) {
+function renderTurn(existing, turn, metadataByIndex) {
   const metadata = metadataByIndex?.[String(turn.turn_index)] || null;
-  appendMessage(parent, "user", turn.prompt || "", `turn-${turn.turn_index}-user`, null);
-  const assistant = createMessage("assistant", `turn-${turn.turn_index}-assistant`, metadata);
-  const content = assistant.querySelector(".message-content");
-  if (turn.reply) appendMarkdown(content, turn.reply);
-  else if (turn.failure_message) appendTextParagraph(content, turn.failure_message);
-  if (!turn.reply && !turn.failure_message) appendTextParagraph(content, "No final reply was recorded for this turn.");
-  for (const tool of turn.tools || []) appendToolSummary(assistant, tool);
+  const user = getMessage(existing, "user", `turn-${turn.turn_index}-user`);
+  updateMessageBody(user, turn.prompt || "");
+
+  const assistant = getMessage(existing, "assistant", `turn-${turn.turn_index}-assistant`);
+  updateMessageMetadata(assistant, metadata);
+  if (turn.reply) updateMessageBody(assistant, turn.reply);
+  else if (turn.failure_message) updateMessageBody(assistant, turn.failure_message, "text");
+  else updateMessageBody(assistant, "No final reply was recorded for this turn.", "text");
   const status = turn.outcome === "succeeded"
     ? "Succeeded"
     : turn.outcome === "failed"
@@ -915,33 +967,33 @@ function appendTurn(parent, turn, metadataByIndex) {
       : turn.outcome === "interrupted"
         ? "Interrupted"
         : "Incomplete";
-  appendOutcome(assistant, status);
-  parent.append(assistant);
+  updateMessageDetails(assistant, turn.tools || [], status);
+  return [user, assistant];
 }
 
-function appendActiveTurn(parent, active) {
+function renderActiveTurn(existing, active) {
   const key = active.turn_id || "active";
-  appendMessage(parent, "user", active.prompt || "", `active-${key}-user`, null);
-  const assistant = createMessage("assistant", `active-${key}-assistant`, {
+  const user = getMessage(existing, "user", `active-${key}-user`);
+  if (typeof active.prompt === "string") updateMessageBody(user, active.prompt);
+  else updateMessageBody(user, "Submitted prompt is loading…", "placeholder");
+
+  const assistant = getMessage(existing, "assistant", `active-${key}-assistant`);
+  updateMessageMetadata(assistant, {
     provider: active.provider,
     model: active.model,
   });
-  const content = assistant.querySelector(".message-content");
-  if (active.text) appendMarkdown(content, active.text);
-  else appendTextParagraph(content, active.status === "starting" ? "Starting this turn…" : "Waiting for leg's first response…");
-  for (const tool of active.tools || []) appendToolSummary(assistant, tool);
+  if (active.text) updateMessageBody(assistant, active.text);
+  else updateMessageBody(assistant, active.status === "starting" ? "Starting this turn…" : "Waiting for leg's first response…", "text");
   const status = active.status === "stopping" ? "Stopping" : active.status === "starting" ? "Starting" : "Running";
-  appendOutcome(assistant, status);
-  parent.append(assistant);
+  updateMessageDetails(assistant, active.tools || [], status);
+  return [user, assistant];
 }
 
-function appendMessage(parent, role, text, key, metadata) {
-  const message = createMessage(role, key, metadata);
-  appendMarkdown(message.querySelector(".message-content"), text);
-  parent.append(message);
+function getMessage(existing, role, key) {
+  return existing.get(key) || createMessage(role, key);
 }
 
-function createMessage(role, key, metadata) {
+function createMessage(role, key) {
   const article = document.createElement("article");
   article.className = `message message-${role}`;
   article.dataset.key = key;
@@ -950,16 +1002,55 @@ function createMessage(role, key, metadata) {
   const speaker = document.createElement("span");
   speaker.textContent = role === "user" ? "You" : "Leg";
   heading.append(speaker);
-  if (metadata?.provider && metadata?.model) {
-    const engine = document.createElement("span");
-    engine.textContent = `${metadata.provider} · ${metadata.model}`;
-    heading.append(engine);
-  }
   article.append(heading);
   const content = document.createElement("div");
   content.className = "message-content";
   article.append(content);
+  messageRenderState.set(article, { bodyMode: null, bodyText: null, metadata: null, details: null });
   return article;
+}
+
+function updateMessageMetadata(article, metadata) {
+  const signature = metadata?.provider && metadata?.model
+    ? `${metadata.provider}\u0000${metadata.model}`
+    : "";
+  const rendered = messageRenderState.get(article);
+  if (rendered.metadata === signature) return;
+  rendered.metadata = signature;
+  const heading = article.querySelector(".message-heading");
+  let engine = heading.querySelector(".message-engine");
+  if (!signature) {
+    engine?.remove();
+    return;
+  }
+  if (!engine) {
+    engine = document.createElement("span");
+    engine.className = "message-engine";
+    heading.append(engine);
+  }
+  engine.textContent = `${metadata.provider} · ${metadata.model}`;
+}
+
+function updateMessageBody(article, text, mode = "markdown") {
+  const rendered = messageRenderState.get(article);
+  const value = String(text);
+  if (rendered.bodyMode === mode && rendered.bodyText === value) return;
+  rendered.bodyMode = mode;
+  rendered.bodyText = value;
+  const content = article.querySelector(".message-content");
+  content.replaceChildren();
+  if (mode === "markdown") appendMarkdown(content, value);
+  else if (value) appendTextParagraph(content, value);
+}
+
+function updateMessageDetails(article, tools, status) {
+  const signature = JSON.stringify([tools, status]);
+  const rendered = messageRenderState.get(article);
+  if (rendered.details === signature) return;
+  rendered.details = signature;
+  for (const detail of article.querySelectorAll(".tool-summary, .turn-outcome")) detail.remove();
+  for (const tool of tools) appendToolSummary(article, tool);
+  appendOutcome(article, status);
 }
 
 function appendOutcome(article, text) {
@@ -1358,6 +1449,9 @@ function openNewConversation() {
   state.cursor = 0;
   state.pending = null;
   state.restoreReadingPosition = null;
+  state.transcriptSessionId = null;
+  ui.messages.replaceChildren();
+  ui["empty-transcript"].hidden = false;
   window.sessionStorage.removeItem(sessionKey);
   ui.conversation.hidden = true;
   ui.welcome.hidden = false;
