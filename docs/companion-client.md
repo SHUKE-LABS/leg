@@ -170,11 +170,18 @@ cargo run --locked --manifest-path companions/Cargo.toml -p leg-tui -- --leg-bin
 ```
 
 The UI inherits provider configuration from its launching environment. Choose
-an existing workspace directory, review and acknowledge the first-run warning,
-then type a prompt. Ctrl-S sends a nonblank prompt. Ctrl-C stops a running turn;
-when idle it exits and keeps the draft. Press `?` for keyboard help and Esc to
-close the overlay. The first-run warning explains that the workspace is the
-tool working directory, not a sandbox.
+an existing workspace directory, review the first-run warning and its keyboard
+guide, then compose a prompt. Enter inserts a newline; Ctrl-S sends a nonblank
+prompt. Left/Right move by grapheme, Home/End move within the current line, and
+Backspace/Delete remove a grapheme. Ctrl-Z undoes and Ctrl-Y redoes; a bracketed
+paste is one edit, preserves Unicode and line breaks, normalizes CRLF/CR to LF,
+and discards other control characters. A literal `?` is prompt text. F1 opens
+help, F2 opens the keyboard action menu, and Esc closes either overlay. Ctrl-C
+stops a running turn; when idle it exits and keeps the draft. Editing stays
+available during a turn, but another Ctrl-S is rejected while busy. The first-run
+warning explains that the workspace is the tool working directory, not a
+sandbox. Sending clears the editor for the next draft; if a turn stops or fails
+before you edit that draft, the submitted prompt is restored.
 
 The Linux PTY smoke test uses the local fake provider and explicit native
 binary paths:

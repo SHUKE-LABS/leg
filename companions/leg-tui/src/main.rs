@@ -1,3 +1,4 @@
+mod editor;
 mod sanitize;
 
 use std::env;
@@ -10,11 +11,15 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use editor::{ComposerEditor, normalize_paste};
 use leg_ui_client::{
     CatalogTurn, SessionCatalog, SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome,
     TurnStopHandle,
@@ -27,7 +32,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 const WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
-const HELP: &str = "Ctrl-S send  |  Ctrl-C stop or exit  |  Esc close help  |  ? help";
+const HELP: &str = "Enter newline | Ctrl-S send | ←/→ Home/End Backspace/Delete edit | Ctrl-Z undo | Ctrl-Y redo | F1 help | F2 actions | Ctrl-C stop/exit";
 
 struct Args {
     leg_bin: Option<PathBuf>,
@@ -112,6 +117,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                Event::Paste(text) => app.handle_paste(&text),
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -127,15 +133,21 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            Hide
+        )?;
         Ok(guard)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
     }
 }
 
@@ -158,13 +170,16 @@ struct App {
     workspace: Option<PathBuf>,
     draft_id: Option<String>,
     session_id: Option<String>,
-    composer: String,
+    composer: ComposerEditor,
     transcript: Vec<(String, String)>,
     status: String,
     active_tool: Option<String>,
     active: bool,
     stopping: bool,
+    active_prompt: Option<String>,
+    active_draft_edited: bool,
     show_help: bool,
+    show_menu: bool,
     quit: bool,
     model: String,
     stop_handle: Option<TurnStopHandle>,
@@ -182,13 +197,16 @@ impl App {
             workspace: None,
             draft_id: None,
             session_id: None,
-            composer: String::new(),
+            composer: ComposerEditor::default(),
             transcript: Vec::new(),
             status: "Choose a workspace".to_string(),
             active_tool: None,
             active: false,
             stopping: false,
+            active_prompt: None,
+            active_draft_edited: false,
             show_help: false,
+            show_menu: false,
             quit: false,
             model: env::var("LEG_MODEL").unwrap_or_else(|_| "provider default".to_string()),
             stop_handle: None,
@@ -199,6 +217,8 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.show_help = false;
+            self.show_menu = false;
             self.handle_ctrl_c();
             return;
         }
@@ -284,8 +304,16 @@ impl App {
 
     fn handle_conversation_key(&mut self, key: KeyEvent) {
         if self.show_help {
-            if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') {
+            if key.code == KeyCode::Esc {
                 self.show_help = false;
+                self.status = "Composer focused".to_string();
+            }
+            return;
+        }
+        if self.show_menu {
+            if key.code == KeyCode::Esc {
+                self.show_menu = false;
+                self.status = "Composer focused".to_string();
             }
             return;
         }
@@ -293,24 +321,70 @@ impl App {
             self.submit();
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
+            let changed = self.composer.undo();
+            self.mark_active_draft_edited(changed);
+            self.status = "Ready".to_string();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            let changed = self.composer.redo();
+            self.mark_active_draft_edited(changed);
+            self.status = "Ready".to_string();
+            return;
+        }
         match key.code {
             KeyCode::Esc => self.status = "Composer focused".to_string(),
-            KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Backspace if !self.active => {
-                self.composer.pop();
+            KeyCode::F(1) => self.show_help = true,
+            KeyCode::F(2) => self.show_menu = true,
+            KeyCode::Left => self.composer.move_left(),
+            KeyCode::Right => self.composer.move_right(),
+            KeyCode::Home => self.composer.move_home(),
+            KeyCode::End => self.composer.move_end(),
+            KeyCode::Backspace => {
+                let changed = self.composer.backspace();
+                self.mark_active_draft_edited(changed);
+                self.status = "Ready".to_string();
+            }
+            KeyCode::Delete => {
+                let changed = self.composer.delete();
+                self.mark_active_draft_edited(changed);
+                self.status = "Ready".to_string();
+            }
+            KeyCode::Enter => {
+                let changed = self.composer.insert("\n");
+                self.mark_active_draft_edited(changed);
                 self.status = "Ready".to_string();
             }
             KeyCode::Char(character)
-                if !self.active
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     && !character.is_control() =>
             {
-                self.composer.push(character);
+                let changed = self.composer.insert(&character.to_string());
+                self.mark_active_draft_edited(changed);
                 self.status = "Ready".to_string();
             }
             _ => {}
+        }
+    }
+
+    fn handle_paste(&mut self, pasted: &str) {
+        if self.screen != Screen::Conversation || self.show_help || self.show_menu {
+            return;
+        }
+        let text = normalize_paste(pasted);
+        let changed = self.composer.insert(&text);
+        self.mark_active_draft_edited(changed);
+        if changed {
+            self.status = "Ready".to_string();
+        }
+    }
+
+    fn mark_active_draft_edited(&mut self, changed: bool) {
+        if self.active && changed {
+            self.active_draft_edited = true;
         }
     }
 
@@ -339,7 +413,7 @@ impl App {
             self.status = "Busy: wait for the active turn".to_string();
             return;
         }
-        if self.composer.trim().is_empty() {
+        if self.composer.text().trim().is_empty() {
             self.status = "Blank prompts are not sent".to_string();
             return;
         }
@@ -347,7 +421,7 @@ impl App {
             self.status = "Choose a workspace before sending".to_string();
             return;
         };
-        let prompt = self.composer.clone();
+        let prompt = self.composer.text().to_string();
         let session_id = self.session_id.clone();
         let record_id = session_id.as_deref().unwrap_or(draft_id);
         if let Err(error) =
@@ -381,6 +455,9 @@ impl App {
                 self.stop_handle = Some(stop_handle);
                 self.active = true;
                 self.stopping = false;
+                self.active_prompt = Some(prompt);
+                self.active_draft_edited = false;
+                self.composer.clear();
                 self.status = "Starting turn".to_string();
                 self.active_tool = None;
             }
@@ -456,20 +533,27 @@ impl App {
     }
 
     fn finish_turn(&mut self, result: Result<TurnOutcome, String>) {
+        let submitted_prompt = self.active_prompt.take();
+        let draft_edited = self.active_draft_edited;
+        self.active_draft_edited = false;
         self.active = false;
         self.stopping = false;
         self.stop_handle = None;
         self.active_tool = None;
         match result {
             Ok(TurnOutcome::Succeeded { .. }) => {
-                self.composer.clear();
                 self.status = "Succeeded".to_string();
             }
-            Ok(TurnOutcome::Stopped { .. }) => self.status = "Stopped".to_string(),
+            Ok(TurnOutcome::Stopped { .. }) => {
+                self.restore_unedited_prompt(submitted_prompt, draft_edited);
+                self.status = "Stopped".to_string();
+            }
             Ok(TurnOutcome::Failed { message, .. }) => {
+                self.restore_unedited_prompt(submitted_prompt, draft_edited);
                 self.status = format!("Failed: {}", sanitize::terminal_safe_text(&message));
             }
             Ok(TurnOutcome::Incomplete { message, forced }) => {
+                self.restore_unedited_prompt(submitted_prompt, draft_edited);
                 self.status = format!(
                     "Incomplete{}: {}",
                     if forced { " (forced stop)" } else { "" },
@@ -477,17 +561,27 @@ impl App {
                 );
             }
             Err(message) => {
+                self.restore_unedited_prompt(submitted_prompt, draft_edited);
                 self.status = format!("Turn error: {}", sanitize::terminal_safe_text(&message));
             }
         }
         let _ = self.persist_draft();
     }
 
+    fn restore_unedited_prompt(&mut self, prompt: Option<String>, draft_edited: bool) {
+        if !draft_edited && let Some(prompt) = prompt {
+            self.composer.set_text(prompt);
+        }
+    }
+
     fn persist_draft(&self) -> Result<(), Box<dyn Error>> {
         let record_id = self.session_id.as_deref().or(self.draft_id.as_deref());
         if let Some(record_id) = record_id {
-            self.catalog
-                .save_draft(record_id, SessionInterface::Tui, self.composer.clone())?;
+            self.catalog.save_draft(
+                record_id,
+                SessionInterface::Tui,
+                self.composer.text().to_string(),
+            )?;
         }
         Ok(())
     }
@@ -564,6 +658,15 @@ fn draw_warning(frame: &mut Frame<'_>) {
         Line::from(""),
         Line::from("Press Enter to acknowledge and open the composer."),
         Line::from("Press Esc to choose another workspace."),
+        Line::from(""),
+        Line::from(
+            "Composer: Enter newline; Ctrl-S send; arrows, Home/End, Backspace/Delete edit.",
+        ),
+        Line::from("Ctrl-Z undo; Ctrl-Y redo. Ctrl-C stops a turn or exits when idle."),
+        Line::from("F1 help; F2 keyboard actions; Esc closes overlays. ? is prompt text."),
+        Line::from(
+            "Bracketed paste preserves Unicode and lines; other control characters are removed.",
+        ),
     ];
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -653,10 +756,18 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
     } else {
         "Composer (Ctrl-S send)"
     };
+    let composer_width = chunks[2].width.saturating_sub(2).max(1) as usize;
+    let composer_height = chunks[2].height.saturating_sub(2).max(1) as usize;
+    let (composer_lines, (cursor_row, cursor_column)) = app.composer.layout(composer_width);
+    let composer_text = composer_lines
+        .into_iter()
+        .map(|line| Line::from(sanitize::terminal_safe_text(&line)))
+        .collect::<Vec<_>>();
+    let scroll = cursor_row.saturating_sub(composer_height.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(sanitize::terminal_safe_text(&app.composer))
+        Paragraph::new(composer_text)
             .block(Block::default().borders(Borders::ALL).title(composer_title))
-            .wrap(Wrap { trim: false }),
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         chunks[2],
     );
     frame.render_widget(
@@ -670,21 +781,47 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from("Keyboard help"),
-                Line::from("Ctrl-S sends a nonblank prompt."),
+                Line::from("Enter inserts a newline; Ctrl-S sends a nonblank prompt."),
+                Line::from("Arrows, Home/End and Backspace/Delete edit by grapheme."),
+                Line::from("Ctrl-Z undoes; Ctrl-Y redoes. F2 opens keyboard actions."),
                 Line::from("Ctrl-C stops an active turn; when idle it exits and keeps the draft."),
-                Line::from("Esc closes this help overlay."),
-                Line::from("Press Esc or ? to return."),
+                Line::from("Bracketed paste inserts Unicode and lines as one undoable edit."),
+                Line::from("? is prompt text. Esc closes help and restores composer focus."),
             ])
             .block(Block::default().borders(Borders::ALL).title("Help"))
             .wrap(Wrap { trim: false }),
             area,
         );
-    } else if !app.active {
+    } else if app.show_menu {
+        let area = centered_rect(70, 52, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from("Keyboard actions"),
+                Line::from("Enter     Insert a newline"),
+                Line::from("Ctrl-S    Send the complete nonblank prompt"),
+                Line::from("←/→      Move by grapheme; Home/End move within this line"),
+                Line::from("Backspace/Delete  Remove one grapheme"),
+                Line::from("Ctrl-Z / Ctrl-Y  Undo / redo"),
+                Line::from("Ctrl-C    Stop the turn, or exit when idle"),
+                Line::from("F1 / F2   Help / keyboard actions"),
+                Line::from("? is ordinary prompt text. Esc closes this menu."),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("Actions"))
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+    } else {
+        let visible_row = cursor_row.saturating_sub(scroll);
         let x = chunks[2]
             .x
-            .saturating_add(1 + app.composer.chars().count() as u16)
+            .saturating_add(1 + cursor_column.min(u16::MAX as usize) as u16)
             .min(chunks[2].right().saturating_sub(2));
-        frame.set_cursor_position((x, chunks[2].y.saturating_add(1)));
+        let y = chunks[2]
+            .y
+            .saturating_add(1 + visible_row.min(u16::MAX as usize) as u16)
+            .min(chunks[2].bottom().saturating_sub(2));
+        frame.set_cursor_position((x, y));
     }
 }
 
