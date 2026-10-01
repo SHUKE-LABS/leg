@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -208,7 +208,7 @@ struct HostInner {
     authority: Arc<Mutex<Option<String>>>,
     durable: DurableStore,
     runtime: Mutex<Runtime>,
-    acceptance_gates: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    acceptance_gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     shutdown_tx: broadcast::Sender<()>,
     shutting_down: AtomicBool,
@@ -890,7 +890,7 @@ async fn stop_turn(
         })));
     }
 
-    let session = state.catalog_session(&id)?;
+    let session = state.catalog_session_or_bound_alias(&id)?;
     let latest = state.latest_receipt(&ledger_id);
     Ok(Json(json!({
         "session_id": id,
@@ -952,11 +952,13 @@ async fn events(
 impl HostState {
     fn acceptance_gate(&self, ledger_id: &str) -> Arc<AsyncMutex<()>> {
         let mut gates = lock(&self.inner.acceptance_gates);
-        Arc::clone(
-            gates
-                .entry(ledger_id.to_string())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-        )
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(ledger_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(AsyncMutex::new(()));
+        gates.insert(ledger_id.to_string(), Arc::downgrade(&gate));
+        gate
     }
 
     fn catalog_session(&self, id: &str) -> Result<CatalogSession, ApiError> {
@@ -1235,6 +1237,7 @@ impl HostState {
             Ok(worker) => worker,
             Err(_) => {
                 let incomplete = json!({"status": "incomplete"});
+                self.release_unbound_session_alias(&submission);
                 self.finish_submission(
                     &submission,
                     id,
@@ -1277,10 +1280,8 @@ impl HostState {
     }
 
     fn run_submission_owner(&self, submission: NewSubmission) {
-        let mut bound_id = submission
-            .bound_session_id
-            .clone()
-            .unwrap_or_else(|| submission.requested_id.clone());
+        let mut bound_id = submission.requested_id.clone();
+        let mut session_bound = false;
         let mut turn = match self.start_turn(
             &submission.requested_id,
             &submission.prompt,
@@ -1289,6 +1290,7 @@ impl HostState {
             Ok(turn) => turn,
             Err(_) => {
                 let outcome = json!({"status": "incomplete", "reason": "startup_failed"});
+                self.release_unbound_session_alias(&submission);
                 self.finish_submission(
                     &submission,
                     &submission.requested_id,
@@ -1308,46 +1310,41 @@ impl HostState {
         };
         submission.stop.attach(turn.stop_handle());
         let mut binding_failed = false;
-        loop {
-            match turn.observe() {
-                Ok(Some(event)) => {
-                    if let StreamEvent::TurnStart {
-                        session_id: Some(session_id),
-                        ..
-                    } = &event
+        while let Ok(Some(event)) = turn.observe() {
+            if let StreamEvent::TurnStart {
+                session_id: Some(session_id),
+                ..
+            } = &event
+            {
+                if submission
+                    .bound_session_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != session_id)
+                {
+                    binding_failed = true;
+                    let _ = submission.stop.stop();
+                } else if submission.requested_id.starts_with("draft-") {
+                    if self
+                        .bind_alias(&submission.requested_id, session_id, submission.request_id)
+                        .is_err()
                     {
-                        if submission
-                            .bound_session_id
-                            .as_deref()
-                            .is_some_and(|expected| expected != session_id)
-                        {
-                            binding_failed = true;
-                            let _ = submission.stop.stop();
-                        } else {
-                            bound_id = session_id.clone();
-                            if submission.requested_id.starts_with("draft-")
-                                && self
-                                    .bind_alias(
-                                        &submission.requested_id,
-                                        &bound_id,
-                                        submission.request_id,
-                                    )
-                                    .is_err()
-                            {
-                                binding_failed = true;
-                                let _ = submission.stop.stop();
-                            }
-                        }
+                        binding_failed = true;
+                        let _ = submission.stop.stop();
+                    } else {
+                        bound_id = session_id.clone();
+                        session_bound = true;
                     }
-                    let _ = self.record_stream_event(
-                        &submission.ledger_id,
-                        &bound_id,
-                        &submission.turn_id,
-                        event,
-                    );
+                } else {
+                    bound_id = session_id.clone();
+                    session_bound = true;
                 }
-                Ok(None) | Err(_) => break,
             }
+            let _ = self.record_stream_event(
+                &submission.ledger_id,
+                &bound_id,
+                &submission.turn_id,
+                event,
+            );
         }
         // EOF is not success; wait() supplies the driver's terminal result.
         let (status, outcome) = match turn.wait() {
@@ -1362,6 +1359,9 @@ impl HostState {
         } else {
             (status, outcome)
         };
+        if !session_bound {
+            self.release_unbound_session_alias(&submission);
+        }
         self.finish_submission(&submission, &bound_id, status, outcome.clone());
         self.clear_active_run(&submission);
         let _ = self.append_event(
@@ -1387,6 +1387,22 @@ impl HostState {
             Some(session_id.to_string()),
             outcome,
         );
+    }
+
+    fn release_unbound_session_alias(&self, submission: &NewSubmission) {
+        let Some(session_id) = &submission.bound_session_id else {
+            return;
+        };
+        let _ = self.inner.durable.transact(|data| {
+            if data.aliases.get(session_id) == Some(&submission.ledger_id) {
+                data.aliases.remove(session_id);
+            }
+            Ok(())
+        });
+        let mut runtime = lock(&self.inner.runtime);
+        if runtime.aliases.get(session_id) == Some(&submission.ledger_id) {
+            runtime.aliases.remove(session_id);
+        }
     }
 
     fn clear_active_run(&self, submission: &NewSubmission) {
@@ -1738,15 +1754,11 @@ impl HostState {
             if !active {
                 continue;
             }
-            let session_id = self.inner.durable.read(|data| {
-                data.aliases
-                    .iter()
-                    .find_map(|(actual, draft)| (draft == &id).then(|| actual.clone()))
-                    .unwrap_or_else(|| id.clone())
-            });
-            if id.starts_with("draft-") {
-                self.inner.catalog.recover_pending_new_session(&id)?;
-            }
+            let session_id = if id.starts_with("draft-") {
+                self.recover_draft_alias(&id)?
+            } else {
+                id.clone()
+            };
             let evidence = self
                 .inner
                 .catalog
@@ -1783,6 +1795,62 @@ impl HostState {
             );
         }
         Ok(())
+    }
+
+    fn recover_draft_alias(&self, draft_id: &str) -> Result<String, HostError> {
+        self.inner.catalog.recover_pending_new_session(draft_id)?;
+        // A reserved alias is confirmed only after the catalog moves the draft record.
+        let draft_exists = match self.inner.catalog.get(draft_id) {
+            Ok(_) => true,
+            Err(CatalogError::NotFound(_)) => false,
+            Err(error) => return Err(error.into()),
+        };
+        let reserved_ids = self.inner.durable.read(|data| {
+            data.aliases
+                .iter()
+                .filter(|&(_, ledger_id)| ledger_id == draft_id)
+                .map(|(actual, _)| actual.clone())
+                .collect::<Vec<_>>()
+        });
+        let mut bound_ids = Vec::new();
+        for actual in reserved_ids {
+            match self.inner.catalog.get(&actual) {
+                Ok(_) => bound_ids.push(actual),
+                Err(CatalogError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bound_ids.sort();
+        let receipt_session_id = self
+            .latest_receipt(draft_id)
+            .and_then(|receipt| receipt.session_id);
+        let bound_id = if draft_exists {
+            None
+        } else {
+            receipt_session_id
+                .filter(|session_id| bound_ids.contains(session_id))
+                .or_else(|| bound_ids.first().cloned())
+        };
+        let session_id = bound_id.clone().unwrap_or_else(|| draft_id.to_string());
+
+        self.inner.durable.transact(|data| {
+            data.aliases.retain(|actual, ledger_id| {
+                ledger_id != draft_id || bound_id.as_deref() == Some(actual.as_str())
+            });
+            if let Some(bound_id) = &bound_id {
+                data.aliases.insert(bound_id.clone(), draft_id.to_string());
+            }
+            if let Some(receipt) = data
+                .sessions
+                .get_mut(draft_id)
+                .and_then(|ledger| ledger.receipts.back_mut())
+                && matches!(receipt.status, ReceiptStatus::Incomplete)
+            {
+                receipt.session_id = Some(session_id.clone());
+            }
+            Ok(())
+        })?;
+        Ok(session_id)
     }
 
     fn shutdown(&self) {
@@ -2103,6 +2171,131 @@ mod tests {
         .unwrap();
         *lock(&host.state.inner.authority) = Some("127.0.0.1:43127".into());
         host
+    }
+
+    #[test]
+    fn restart_recovers_pending_incomplete_draft_receipt() {
+        let (host, temp) = test_host();
+        let draft = host
+            .state
+            .inner
+            .catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("pending draft".into()),
+                Some(temp.path()),
+            )
+            .unwrap();
+        let bound_draft = host
+            .state
+            .inner
+            .catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("bound pending draft".into()),
+                Some(temp.path()),
+            )
+            .unwrap();
+        let bound_id = "sess-pending-bound";
+        let catalog_path = temp.path().join("catalog.json");
+        let mut catalog: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        catalog["sessions"][&draft.id]["pending_new_turn"] = json!(true);
+        let sessions = catalog["sessions"].as_object_mut().unwrap();
+        let bound_metadata = sessions.remove(&bound_draft.id).unwrap();
+        sessions.insert(bound_id.to_string(), bound_metadata);
+        fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        host.state
+            .inner
+            .durable
+            .transact(|data| {
+                let ledger = data.sessions.entry(draft.id.clone()).or_default();
+                ledger.high_water = 1;
+                ledger.receipts.push_back(Receipt {
+                    request_id: 1,
+                    prompt_sha256: "00".into(),
+                    turn_id: "turn-pending".into(),
+                    status: ReceiptStatus::Running,
+                    session_id: Some(draft.id.clone()),
+                    outcome: Some(json!({"status": "running"})),
+                    recovery_evidence: None,
+                });
+                let bound_ledger = data.sessions.entry(bound_draft.id.clone()).or_default();
+                bound_ledger.high_water = 1;
+                bound_ledger.receipts.push_back(Receipt {
+                    request_id: 1,
+                    prompt_sha256: "11".into(),
+                    turn_id: "turn-bound-pending".into(),
+                    status: ReceiptStatus::Running,
+                    session_id: Some(bound_id.into()),
+                    outcome: Some(json!({"status": "running"})),
+                    recovery_evidence: None,
+                });
+                data.aliases.insert(bound_id.into(), bound_draft.id.clone());
+                Ok(())
+            })
+            .unwrap();
+        host.state
+            .inner
+            .durable
+            .transact(|data| {
+                data.aliases
+                    .insert("sess-pending-reserved".into(), draft.id.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            host.state
+                .inner
+                .catalog
+                .get(&draft.id)
+                .unwrap()
+                .pending_new_turn
+        );
+        host.state.shutdown();
+        drop(host);
+
+        let recovered = Host::open(HostConfig {
+            catalog: SessionCatalogConfig {
+                state_dir: Some(temp.path().to_path_buf()),
+                ..SessionCatalogConfig::default()
+            },
+            ..HostConfig::default()
+        })
+        .unwrap();
+        let recovered_draft = recovered.state.inner.catalog.get(&draft.id).unwrap();
+        assert!(!recovered_draft.pending_new_turn);
+        assert_eq!(
+            recovered.state.snapshot(&draft.id).unwrap().session.id,
+            draft.id
+        );
+        assert_eq!(
+            recovered
+                .state
+                .snapshot(&bound_draft.id)
+                .unwrap()
+                .session
+                .id,
+            bound_id
+        );
+        assert_eq!(
+            recovered
+                .state
+                .inner
+                .durable
+                .read(|data| data.aliases.clone()),
+            HashMap::from([(bound_id.to_string(), bound_draft.id.clone())])
+        );
+        let receipt = recovered.state.latest_receipt(&draft.id).unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Incomplete);
+        assert_eq!(receipt.session_id.as_deref(), Some(draft.id.as_str()));
+        assert_eq!(
+            receipt.recovery_evidence.as_deref(),
+            Some("driver_reports_idle_after_restart")
+        );
+        let bound_receipt = recovered.state.latest_receipt(&bound_draft.id).unwrap();
+        assert_eq!(bound_receipt.status, ReceiptStatus::Incomplete);
+        assert_eq!(bound_receipt.session_id.as_deref(), Some(bound_id));
+        recovered.state.shutdown();
     }
 
     async fn round_trip_json(router: &Router, request: HttpRequest<Body>) -> (StatusCode, Value) {
@@ -2774,6 +2967,15 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+unsafe extern "C" {
+    fn signal(signal: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+    fn _exit(status: i32) -> !;
+}
+
+extern "C" fn exit_on_interrupt(signal: i32) {
+    unsafe { _exit(128 + signal) }
+}
+
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args == ["--version"] {
@@ -2794,9 +2996,15 @@ fn main() {
         .expect("session argument");
     let mut prompt = String::new();
     io::stdin().read_to_string(&mut prompt).unwrap();
+    if prompt == "HOLD-PENDING-STOP" {
+        unsafe { signal(2, exit_on_interrupt); }
+    }
     let fixture = env::current_dir().unwrap().join("fixture");
     let log = OpenOptions::new().create(true).append(true).open(fixture.join("turns.log")).unwrap();
     writeln!(&log, "{session_id}|{prompt}").unwrap();
+    if prompt == "FAIL-BEFORE-TRAIL" {
+        std::process::exit(1);
+    }
     let session_dir = PathBuf::from(env::var_os("LEG_SESSION_DIR").unwrap());
     fs::create_dir_all(&session_dir).unwrap();
     OpenOptions::new()
@@ -2814,6 +3022,7 @@ fn main() {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    fs::write(fixture.join(format!("{prompt}.finished")), "finished").unwrap();
     let start = format!(
         "{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_start\",\"seq\":0,\"provider\":\"fixture\",\"model\":\"fixture\",\"session_id\":\"{session_id}\",\"turn_index\":0,\"request\":{{\"schema\":\"baton.message/v1\",\"message_id\":\"request-{prompt}\",\"conversation_id\":\"conversation-{prompt}\",\"kind\":\"request\",\"body\":\"{prompt}\"}}}}"
     );
@@ -2924,6 +3133,71 @@ fn main() {
             1
         );
 
+        let (status, failed_before_trail) =
+            round_trip_json(&router, create_draft("failed-before-trail")).await;
+        assert_eq!(status, StatusCode::CREATED, "{failed_before_trail}");
+        let failed_draft = failed_before_trail["id"].as_str().unwrap().to_string();
+        let (status, accepted_failure) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{failed_draft}/submit"),
+                r#"{"request_id":1,"prompt":"FAIL-BEFORE-TRAIL"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted_failure}");
+        let failed_snapshot = wait_for_receipt(&host, &router, &failed_draft, 1).await;
+        assert_eq!(failed_snapshot["last_submission"]["status"], "incomplete");
+        assert_eq!(
+            failed_snapshot["last_submission"]["session_id"],
+            failed_draft
+        );
+        let aliases = host.state.inner.durable.read(|data| {
+            data.aliases
+                .iter()
+                .filter(|(_, ledger_id)| *ledger_id == &failed_draft)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            aliases.is_empty(),
+            "failed start left ghost aliases: {aliases:?}"
+        );
+
+        let (status, retry_acceptance) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{failed_draft}/submit"),
+                r#"{"request_id":2,"prompt":"RETRY-AFTER-FAIL"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{retry_acceptance}");
+        let retry_id = wait_for_fixture_id(&fixture_dir, "RETRY-AFTER-FAIL").await;
+        let retry_snapshot = wait_for_receipt(&host, &router, &retry_id, 2).await;
+        assert_eq!(retry_snapshot["last_submission"]["session_id"], retry_id);
+        let aliases = host.state.inner.durable.read(|data| {
+            data.aliases
+                .iter()
+                .filter(|(_, ledger_id)| *ledger_id == &failed_draft)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(aliases, vec![retry_id.clone()]);
+        let (status, draft_retry_snapshot) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/sessions/{failed_draft}/snapshot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{draft_retry_snapshot}");
+        assert_eq!(draft_retry_snapshot["session"]["id"], retry_id);
+
         let (status, held) = round_trip_json(&router, create_draft("held-A")).await;
         assert_eq!(status, StatusCode::CREATED, "{held}");
         let held_draft = held["id"].as_str().unwrap().to_string();
@@ -2984,6 +3258,19 @@ fn main() {
         .await;
         assert_eq!(status, StatusCode::OK, "{duplicate}");
         assert_eq!(duplicate["duplicate"], true);
+        let (status, draft_duplicate) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{held_draft}/submit"),
+                r#"{"request_id":1,"prompt":"HOLD-A"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{draft_duplicate}");
+        assert_eq!(draft_duplicate["duplicate"], true);
         let (status, conflict) = round_trip_json(
             &router,
             api_json_request(
@@ -2997,6 +3284,30 @@ fn main() {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(conflict["error"], "submission_id_conflict");
+
+        for alias in [&held_draft, &held_id] {
+            for (request_id, prompt, expected_error) in [
+                (0, "stale alias request", "submission_id_stale"),
+                (2, "busy alias request", "session_busy"),
+                (3, "unexpected alias request", "submission_id_unexpected"),
+                (1, "conflicting alias request", "submission_id_conflict"),
+            ] {
+                let body = json!({"request_id": request_id, "prompt": prompt}).to_string();
+                let (status, rejected) = round_trip_json(
+                    &router,
+                    api_json_request(
+                        &host,
+                        Method::POST,
+                        &format!("/api/sessions/{alias}/submit"),
+                        &body,
+                        true,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT, "{alias}: {rejected}");
+                assert_eq!(rejected["error"], expected_error, "{alias}: {rejected}");
+            }
+        }
 
         let (status, draft_c) = round_trip_json(&router, create_draft("independent-C")).await;
         assert_eq!(status, StatusCode::CREATED, "{draft_c}");
@@ -3048,6 +3359,10 @@ fn main() {
         .await;
         assert_eq!(status, StatusCode::OK, "{rebound_snapshot}");
         assert_eq!(rebound_snapshot["session"]["id"], held_id);
+        let mut alias_stop = api_request(&host, &format!("/api/sessions/{held_draft}/stop"));
+        *alias_stop.method_mut() = Method::POST;
+        let (status, stopped_alias) = round_trip_json(&router, alias_stop).await;
+        assert_eq!(status, StatusCode::OK, "{stopped_alias}");
         let rebound_events = router
             .clone()
             .oneshot(api_request(
@@ -3090,7 +3405,34 @@ fn main() {
         assert!(stopped_snapshot["active"].is_null());
         assert_eq!(
             stopped_snapshot["last_submission"]["session_id"],
-            stopped_id
+            stopped_draft
+        );
+
+        let (status, pending_stop_draft_value) =
+            round_trip_json(&router, create_draft("pending-stop")).await;
+        assert_eq!(status, StatusCode::CREATED, "{pending_stop_draft_value}");
+        let pending_stop_draft = pending_stop_draft_value["id"].as_str().unwrap();
+        let pending_stop_session = host.state.inner.catalog.allocate_new_session_id().unwrap();
+        let pending_stop = PendingStop::new();
+        pending_stop.stop().unwrap();
+        let mut pending_turn = host
+            .state
+            .start_turn(
+                pending_stop_draft,
+                "HOLD-PENDING-STOP",
+                Some(&pending_stop_session),
+            )
+            .unwrap();
+        let _ = wait_for_fixture_id(&fixture_dir, "HOLD-PENDING-STOP").await;
+        pending_stop.attach(pending_turn.stop_handle());
+        let pending_outcome = pending_turn.wait().unwrap();
+        assert!(
+            matches!(pending_outcome, TurnOutcome::Stopped { .. }),
+            "pending Stop completed with {pending_outcome:?}"
+        );
+        assert!(
+            !fixture_dir.join("HOLD-PENDING-STOP.finished").exists(),
+            "a run stopped before handle attachment executed its prompt"
         );
 
         host.state.shutdown();

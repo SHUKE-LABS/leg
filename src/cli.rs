@@ -252,7 +252,7 @@ fn help_text() -> String {
          `sess-` id. These flags are mutually exclusive, and\n\
          `--session-id-out <path>` writes the id and a\n\
          newline after\n\
-         the turn when either is used. The session store is\n\
+         the turn when one is used. The session store is\n\
          LEG_SESSION_DIR, else XDG_STATE_HOME/leg/sessions, else\n\
          ~/.local/state/leg/sessions. `baton serve --agent-cmd <path>\n\
          --agent-arg exchange` expects this protocol. `--stream-json` opts\n\
