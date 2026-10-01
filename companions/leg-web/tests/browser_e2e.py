@@ -1195,6 +1195,9 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     await route.fulfill(response=response)
 
                 await page.route(f"**/api/sessions/{cross_tab_id}/snapshot", hold_first_snapshot)
+                provider_requests_before_cross_tab = (
+                    await asyncio.to_thread(fixture_status, provider_authority)
+                )["requests"]
                 await page2.locator("#prompt").fill(cross_tab_prompt)
                 await page2.get_by_role("button", name="Send").click()
                 await snapshot_started.wait()
@@ -1247,6 +1250,11 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 )
                 await wait_status(page2, "Succeeded")
                 assert cross_tab_result["session"]["turns"][0]["prompt"] == cross_tab_prompt
+                cross_tab_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert cross_tab_provider_status["requests"] == provider_requests_before_cross_tab + 1, (
+                    provider_requests_before_cross_tab,
+                    cross_tab_provider_status,
+                )
                 assert cross_tab_draft not in await page.locator("#messages").inner_text()
                 assert await page.locator("#prompt").input_value() == cross_tab_draft
                 await page.unroute(f"**/api/sessions/{cross_tab_id}/snapshot", hold_first_snapshot)
@@ -1264,6 +1272,9 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     await route.continue_()
 
                 await page.route(f"**/api/sessions/{local_id}/submit", delay_submit_until_draft_edit)
+                provider_requests_before_local = (
+                    await asyncio.to_thread(fixture_status, provider_authority)
+                )["requests"]
                 await page.locator("#prompt").fill(local_prompt)
                 await page.get_by_role("button", name="Send").click()
                 await submit_intercepted.wait()
@@ -1289,6 +1300,10 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 assert local_draft not in await page.locator("#messages").inner_text()
 
                 final_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
+                assert final_provider_status["requests"] == provider_requests_before_local + 1, (
+                    provider_requests_before_local,
+                    final_provider_status,
+                )
                 assert final_provider_status["scenario_requests"].get("TRIAL-HISTORY-SEED") == 1
                 assert final_provider_status["scenario_requests"].get("TRIAL-HISTORY-STREAM") == 1
                 assert final_provider_status["scenario_requests"].get("TRIAL-CROSS-TAB") == 1
