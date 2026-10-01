@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import fcntl
 import json
 import os
@@ -19,8 +20,11 @@ import termios
 import time
 import unicodedata
 import urllib.request
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
+
+import pyte
 
 
 WARNING = (
@@ -33,29 +37,89 @@ PASTED_TEXT = "first line: 中文\r\nsecond: 👩‍👩‍👧‍👦 e\u0301\r
 PROMPT = "?typed line\nfirst line: 中文\nsecond: 👩‍👩‍👧‍👦 e\u0301\nthird line\nfourth line?"
 NEXT_DRAFT = "next draft"
 LIVE_TEXT = "The first live text is visible."
+STOP_LIVE_TEXT = "Request 2: The first live text is visible."
+NEGATIVE_LIVE_TEXT = "Request 3: The first live text is visible."
+RESUMED_TEXT = "The fixture resumes after its fixed pause."
+ROWS = 40
+COLUMNS = 160
+STOP_DELAY_SECONDS = 2.1
 
 
-def read_until_screen_text(
+class TerminalCapture:
+    """Keep raw PTY bytes and the VT parser's current screen separately."""
+
+    def __init__(self, rows: int = ROWS, columns: int = COLUMNS) -> None:
+        self.raw = bytearray()
+        self.screen = pyte.Screen(columns, rows)
+        self.stream = pyte.Stream(self.screen)
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def feed(self, chunk: bytes) -> None:
+        self.raw.extend(chunk)
+        self.stream.feed(self.decoder.decode(chunk))
+
+    def text(self) -> str:
+        return "\n".join(line.rstrip() for line in self.screen.display)
+
+    def contains(self, expected: str) -> bool:
+        screen_text = self.text()
+        for border in "│─┌┐└┘├┤┬┴┼":
+            screen_text = screen_text.replace(border, " ")
+        screen_text = " ".join(screen_text.split())
+        expected_text = " ".join(expected.split())
+        return expected_text in screen_text
+
+    def __bytes__(self) -> bytes:
+        return bytes(self.raw)
+
+
+def test_terminal_screen_redraw() -> None:
+    capture = TerminalCapture(rows=3, columns=24)
+    chunks = (
+        b"\x1b[1;1HStopping",
+        b"\x1b[1;6H",
+        b"e\x1b[1;",
+        b"7Hd\x1b[1;8H\x1b[K",
+    )
+    for chunk in chunks:
+        capture.feed(chunk)
+    assert b"Stopped" not in capture.raw, (
+        "redraw fixture unexpectedly printed contiguous Stopped bytes"
+    )
+    assert capture.contains("Stopped"), capture.text()
+    assert not capture.contains("Stopping"), capture.text()
+
+    erased = TerminalCapture(rows=3, columns=24)
+    erased.feed(b"\x1b[1;1HStopped")
+    assert erased.contains("Stopped"), erased.text()
+    erased.feed(b"\x1b[1;1H\x1b[K")
+    assert not erased.contains("Stopped"), "an erased historical status still matched"
+
+    wrapped = TerminalCapture(rows=2, columns=6)
+    wrapped.feed(b"\x1b[1;1Hfirst second")
+    assert wrapped.contains("first second"), wrapped.text()
+
+
+def read_until(
     master_fd: int,
     child: subprocess.Popen[bytes],
-    output: bytearray,
-    needle: str,
+    capture: TerminalCapture,
+    expected: str,
     timeout: float = 8.0,
-    rows: int = DEFAULT_ROWS,
-    columns: int = DEFAULT_COLUMNS,
 ) -> None:
     deadline = time.monotonic() + timeout
-    while needle not in terminal_screen_text(bytes(output), rows, columns):
+    while not capture.contains(expected):
+        capture_owned_processes(child)
         if child.poll() is not None:
             raise AssertionError(
-                f"TUI exited before screen text {needle!r}; exit={child.returncode}; "
-                f"screen text={terminal_text(bytes(output))[-1200:]!r}"
+                f"TUI exited before visible screen text {expected!r}; exit={child.returncode}; "
+                f"current screen={capture.text()[-1200:]!r}"
             )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise AssertionError(
-                f"timed out waiting for screen text {needle!r}; "
-                f"screen text={terminal_text(bytes(output))[-1200:]!r}"
+                f"timed out waiting for visible screen text {expected!r}; "
+                f"current screen={capture.text()[-1200:]!r}"
             )
         ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
         if not ready:
@@ -65,17 +129,124 @@ def read_until_screen_text(
         except OSError:
             continue
         if chunk:
-            output.extend(chunk)
+            capture.feed(chunk)
+
+
+def linux_process_table() -> dict[int, tuple[int, int, int, str]]:
+    processes: dict[int, tuple[int, int, int, str]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+            close = stat.rfind(")")
+            fields = stat[close + 1 :].split()
+            processes[int(entry.name)] = (
+                int(fields[1]),  # parent pid
+                int(fields[2]),  # process group id
+                int(fields[19]),  # start time, used to reject a reused pid
+                fields[0],  # state
+            )
+        except (OSError, ValueError, IndexError):
+            continue
+    return processes
+
+
+def capture_owned_processes(child: subprocess.Popen[bytes]) -> None:
+    if sys.platform != "linux":
+        return
+    table = linux_process_table()
+    owned = getattr(child, "_pty_owned_processes", {})
+    frontier = [child.pid, *owned]
+    visited = set(frontier)
+    while frontier:
+        parent = frontier.pop()
+        for pid, (ppid, pgid, start_time, state) in table.items():
+            if ppid == parent and pid not in visited and state != "Z":
+                visited.add(pid)
+                owned[pid] = (start_time, pgid)
+                frontier.append(pid)
+    child._pty_owned_processes = owned
+
+
+def process_matches(pid: int, start_time: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        close = stat.rfind(")")
+        fields = stat[close + 1 :].split()
+        return int(fields[19]) == start_time and fields[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def kill_owned_process_group(child: subprocess.Popen[bytes]) -> None:
+    if sys.platform != "linux":
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+        return
+    # The PTY UI has its own session. Its supervisor and leg children create
+    # separate groups, so snapshot descendants before closing the UI's pipes.
+    capture_owned_processes(child)
+    owned: dict[int, tuple[int, int]] = getattr(child, "_pty_owned_processes", {})
+
+    if child.poll() is None:
+        with suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+    if child.poll() is None:
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=2)
+
+    def pending_owned() -> dict[int, tuple[int, int]]:
+        return {
+            pid: identity
+            for pid, identity in owned.items()
+            if process_matches(pid, identity[0])
+        }
+
+    deadline = time.monotonic() + 4.0
+    pending = pending_owned()
+    while pending and time.monotonic() < deadline:
+        time.sleep(0.05)
+        pending = pending_owned()
+    if pending:
+        groups = {
+            pgid
+            for pid, (_, pgid) in pending.items()
+            if any(candidate == pgid for candidate in pending)
+        }
+        for pgid in groups:
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+        for pid, (start_time, pgid) in pending.items():
+            if pgid not in groups and process_matches(pid, start_time):
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 1.0
+        pending = pending_owned()
+        while pending and time.monotonic() < deadline:
+            time.sleep(0.05)
+            pending = pending_owned()
+    if pending:
+        raise AssertionError(f"owned UI child processes survived cleanup: {sorted(pending)}")
 
 
 def drain_until_exit(
-    master_fd: int, child: subprocess.Popen[bytes], output: bytearray, timeout: float = 8.0
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    output: TerminalCapture | bytearray,
+    timeout: float = 8.0,
 ) -> int:
     deadline = time.monotonic() + timeout
     while child.poll() is None:
+        if isinstance(output, TerminalCapture):
+            capture_owned_processes(child)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            child.kill()
+            kill_owned_process_group(child)
             raise AssertionError("TUI did not exit after Ctrl-C")
         ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
         if ready:
@@ -84,7 +255,7 @@ def drain_until_exit(
             except OSError:
                 chunk = b""
             if chunk:
-                output.extend(chunk)
+                feed_output(output, chunk)
     while True:
         ready, _, _ = select.select([master_fd], [], [], 0)
         if not ready:
@@ -95,14 +266,24 @@ def drain_until_exit(
             break
         if not chunk:
             break
-        output.extend(chunk)
+        feed_output(output, chunk)
     return child.wait(timeout=1)
 
 
-def drain_for(master_fd: int, output: bytearray, duration: float = 0.3) -> None:
+def drain_for(
+    master_fd: int,
+    output: TerminalCapture | bytearray,
+    duration: float = 0.3,
+    child: subprocess.Popen[bytes] | None = None,
+) -> None:
     deadline = time.monotonic() + duration
     while time.monotonic() < deadline:
-        ready, _, _ = select.select([master_fd], [], [], min(0.05, deadline - time.monotonic()))
+        if child is not None and isinstance(output, TerminalCapture):
+            capture_owned_processes(child)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([master_fd], [], [], min(0.05, remaining))
         if not ready:
             continue
         try:
@@ -110,7 +291,8 @@ def drain_for(master_fd: int, output: bytearray, duration: float = 0.3) -> None:
         except OSError:
             continue
         if chunk:
-            output.extend(chunk)
+            feed_output(output, chunk)
+
 
 
 def spawn_in_pty(
@@ -127,89 +309,865 @@ def spawn_in_pty(
         os.setsid()
         fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-    child = subprocess.Popen(
-        command,
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        close_fds=True,
-        preexec_fn=attach_controlling_terminal,
-    )
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+            preexec_fn=attach_controlling_terminal,
+        )
+    except BaseException:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
     return master_fd, slave_fd, child, initial_termios
 
 
-def resize_pty(slave_fd: int, rows: int, columns: int) -> None:
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+
+def output_screen_text(
+    output: TerminalCapture | bytearray,
+    rows: int = DEFAULT_ROWS,
+    columns: int = DEFAULT_COLUMNS,
+) -> str:
+    if isinstance(output, TerminalCapture):
+        return output.text()
+    return terminal_screen_text(bytes(output), rows, columns)
 
 
-def wait_for_file(
-    path: Path,
+def feed_output(output: TerminalCapture | bytearray, chunk: bytes) -> None:
+    if isinstance(output, TerminalCapture):
+        output.feed(chunk)
+    else:
+        output.extend(chunk)
+
+
+def read_until_screen_text(
     master_fd: int,
-    output: bytearray,
     child: subprocess.Popen[bytes],
+    output: TerminalCapture | bytearray,
+    needle: str,
     timeout: float = 8.0,
+    rows: int = DEFAULT_ROWS,
+    columns: int = DEFAULT_COLUMNS,
 ) -> None:
     deadline = time.monotonic() + timeout
-    while not path.is_file():
-        remaining = deadline - time.monotonic()
+    while needle not in output_screen_text(output, rows, columns):
         if child.poll() is not None:
-            drain_for(master_fd, output, 0.05)
             raise AssertionError(
-                f"TUI exited before creating {path}; exit={child.returncode}; "
-                f"output={terminal_text(bytes(output))[-1200:]!r}"
+                f"TUI exited before screen text {needle!r}; exit={child.returncode}; "
+                f"screen text={output_screen_text(output, rows, columns)[-1200:]!r}"
             )
-        if remaining <= 0:
-            raise AssertionError(
-                f"timed out waiting for file {path}; "
-                f"output={terminal_text(bytes(output))[-1200:]!r}"
-            )
-        drain_for(master_fd, output, min(0.05, remaining))
-
-
-def kill_pty_child(master_fd: int, child: subprocess.Popen[bytes], output: bytearray) -> None:
-    if child.poll() is not None:
-        return
-    child.kill()
-    deadline = time.monotonic() + 10.0
-    while child.poll() is None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            break
-        drain_for(master_fd, output, min(0.05, remaining))
-    if child.poll() is None:
+            raise AssertionError(
+                f"timed out waiting for screen text {needle!r}; "
+                f"screen text={output_screen_text(output, rows, columns)[-1200:]!r}"
+            )
+        ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+        if not ready:
+            continue
         try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            # Preserve the test failure that led to cleanup.
-            drain_for(master_fd, output, 0.05)
-            return
-    drain_for(master_fd, output, 0.05)
+            chunk = os.read(master_fd, 8192)
+        except OSError:
+            continue
+        if chunk:
+            feed_output(output, chunk)
 
 
-def wait_for_pid_exit(pid: int, timeout: float = 6.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        status = subprocess.run(
-            ["ps", "-o", "stat=", "-p", str(pid)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        ).stdout.strip()
-        if not status or status.startswith("Z"):
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"owned tool process {pid} is still running")
-
-
-def request_status(status_url: str) -> dict[str, Any]:
-    with urllib.request.urlopen(status_url, timeout=3) as response:
+def request_status(status_url: str, timeout: float = 3.0) -> dict[str, Any]:
+    with urllib.request.urlopen(status_url, timeout=timeout) as response:
         return json.loads(response.read())
+
+
+def release_gate(base_url: str, request: int, timeout: float = 2.0) -> None:
+    request_url = f"{base_url}/__trial/release?request={request}"
+    release = urllib.request.Request(request_url, data=b"", method="POST")
+    with urllib.request.urlopen(release, timeout=timeout) as response:
+        value = json.loads(response.read())
+    assert value == {"released": request}, value
+
+
+def wait_for_status(
+    status_url: str,
+    predicate: Any,
+    description: str,
+    timeout: float = 3.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = request_status(status_url, timeout=1.0)
+        if predicate(last):
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for fixture {description}; last status={last!r}")
+
+
+def wait_for_fixture_start(fixture: subprocess.Popen[str], timeout: float = 5.0) -> str:
+    assert fixture.stdout is not None
+    deadline = time.monotonic() + timeout
+    buffered = bytearray()
+    while time.monotonic() < deadline:
+        if fixture.poll() is not None:
+            raise AssertionError(f"fake provider exited during startup: {fixture.returncode}")
+        stdout_fd = fixture.stdout.fileno()
+        ready, _, _ = select.select([stdout_fd], [], [], min(0.1, deadline - time.monotonic()))
+        if not ready:
+            continue
+        try:
+            buffered.extend(os.read(stdout_fd, 8192))
+        except OSError:
+            continue
+        while b"\n" in buffered:
+            line, _, rest = buffered.partition(b"\n")
+            buffered = bytearray(rest)
+            decoded = line.decode("utf-8", errors="replace")
+            if decoded.startswith("Status: "):
+                return decoded.split(": ", 1)[1].strip()
+    raise AssertionError("fake provider did not print its status URL within five seconds")
+
+
+def assert_terminal_restored(
+    raw: bytes, termios_fd: int, initial_termios: list[Any], child: subprocess.Popen[bytes]
+) -> None:
+    # macOS may revoke the session leader's controlling slave after exit; its
+    # PTY master remains available for reading the shared terminal attributes.
+    actual = termios.tcgetattr(termios_fd)
+    assert actual == initial_termios, f"terminal attributes were not restored: {actual!r}"
+    assert b"\x1b[?1049l" in raw, "alternate screen was not left"
+    assert b"\x1b[?25h" in raw, "cursor was not shown"
+    assert b"\x1b[?2004h" in raw, f"bracketed paste was not enabled: {raw[:240]!r}"
+    assert b"\x1b[?2004l" in raw, f"bracketed paste was not disabled: {raw[-240:]!r}"
+    assert child.returncode is not None
+
+
+
+def contains_string(value: Any, expected: str) -> bool:
+    if isinstance(value, str):
+        return value == expected
+    if isinstance(value, dict):
+        return any(contains_string(item, expected) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_string(item, expected) for item in value)
+    return False
+
+
+def start_prompt(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    capture: TerminalCapture,
+    workspace: Path,
+    status_url: str,
+    expected_requests: int,
+    expected_live_text: str = LIVE_TEXT,
+    exercise_keyboard: bool = False,
+) -> None:
+    read_until(master_fd, child, capture, "Path:")
+    os.write(master_fd, str(workspace).encode() + b"\r")
+    read_until(master_fd, child, capture, WARNING)
+    if exercise_keyboard:
+        drain_for(master_fd, capture, 0.1, child)
+        first_run_help = capture.text()
+        for hint in (
+            "Enter newline",
+            "Ctrl-S send",
+            "Backspace/Delete edit",
+            "Ctrl-Z undo",
+            "Ctrl-Y redo",
+            "Ctrl-C stops",
+            "F1 help",
+            "F2 keyboard actions",
+            "? is prompt text",
+            "PageUp/PageDown scroll",
+            "Ctrl-End newest",
+        ):
+            assert hint in first_run_help, (
+                f"first-run help omitted {hint!r}: {first_run_help[-1800:]!r}"
+            )
+    before_ack = request_status(status_url)
+    assert before_ack["requests"] == expected_requests, before_ack
+
+    os.write(master_fd, b"\r")
+    read_until(master_fd, child, capture, "Ready")
+    os.write(master_fd, b"\x13")
+    drain_for(master_fd, capture, child=child)
+    blank_prompt = request_status(status_url)
+    assert blank_prompt["requests"] == expected_requests, (
+        "a blank prompt started a provider request", blank_prompt
+    )
+
+    if exercise_keyboard:
+        os.write(master_fd, b"\x1bOP")
+        read_until(master_fd, child, capture, "Keyboard help")
+        os.write(master_fd, b"ignored-help")
+        os.write(master_fd, b"\x1b")
+        drain_for(master_fd, capture, 0.15, child)
+        os.write(master_fd, b"\x1bOQ")
+        read_until(master_fd, child, capture, "Keyboard actions")
+        action_menu = capture.text()
+        for action in (
+            "Insert a newline",
+            "Send the complete nonblank prompt",
+            "Move by grapheme",
+            "Remove one grapheme",
+            "Ctrl-Z / Ctrl-Y",
+            "Stop the turn",
+            "Scroll transcript",
+            "F1 / F2",
+        ):
+            assert action in action_menu, f"keyboard action menu omitted {action!r}"
+        os.write(master_fd, b"ignored-menu")
+        os.write(master_fd, b"\x1b[200~ignored-paste\x1b[201~")
+        os.write(master_fd, b"\x1b")
+        drain_for(master_fd, capture, 0.15, child)
+        assert request_status(status_url)["requests"] == expected_requests, (
+            "opening help or the action menu started a provider request"
+        )
+
+        os.write(master_fd, b"?typed line\r")
+        drain_for(master_fd, capture, 0.1, child)
+        question_screen = capture.text()
+        assert "?typed line" in question_screen, (
+            "? or Enter did not insert literal text and a newline in the composer"
+        )
+        assert "Keyboard help" not in question_screen, "? opened help instead of entering the draft"
+        os.write(master_fd, b"\x1b[200~" + PASTED_TEXT.encode() + b"\x1b[201~")
+        drain_for(master_fd, capture, child=child)
+        assert child.poll() is None, "a control byte in bracketed paste exited the TUI"
+        assert request_status(status_url)["requests"] == expected_requests, (
+            "paste content invoked a provider or keyboard shortcut"
+        )
+
+    if exercise_keyboard:
+        os.write(master_fd, b"\x13")
+    else:
+        os.write(master_fd, PROMPT.encode() + b"\x13")
+    read_until(master_fd, child, capture, expected_live_text)
+    assert capture.contains(expected_live_text), (
+        f"streamed response was not visible: {capture.text()[-2000:]!r}"
+    )
+
+
+def run_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+
+    with tempfile.TemporaryDirectory(prefix="leg-tui-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        negative_workspace = root / "negative-workspace"
+        negative_workspace.mkdir()
+        state_dir = root / "state"
+        event_log = root / "leg-events.jsonl"
+
+        fixture = subprocess.Popen(
+            [
+                sys.executable,
+                str(fixture_path),
+                "--scenario",
+                "paused-live-text",
+                "--hold-after-first-chunk",
+                "--workspace",
+                str(workspace),
+                "--port",
+                "0",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        status_url: str | None = None
+        try:
+            status_url = wait_for_fixture_start(fixture)
+            base_url = status_url.removesuffix("/__trial/status")
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": base_url,
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_UI_STATE_DIR": str(state_dir),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                    "LEG_EVENT_LOG": str(event_log),
+                }
+            )
+
+            command = [
+                str(Path(args.tui_bin).resolve()),
+                "--leg-bin",
+                str(Path(args.leg_bin).resolve()),
+                "--supervisor-bin",
+                str(Path(args.supervisor_bin).resolve()),
+            ]
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(
+                command, env, rows=ROWS, columns=COLUMNS
+            )
+            capture = TerminalCapture()
+            try:
+                start_prompt(
+                    master_fd,
+                    child,
+                    capture,
+                    workspace,
+                    status_url,
+                    0,
+                    exercise_keyboard=True,
+                )
+                held = wait_for_status(
+                    status_url,
+                    lambda value: value["requests"] == 1
+                    and value["active_requests"] == [1]
+                    and value["pause_gates"].get("1") == "held",
+                    "the streamed request to be active and held",
+                )
+                assert held["requests"] == 1, held
+                assert held["active_requests"] == [1], held
+                assert held["pause_gates"] == {"1": "held"}, held
+
+                # Preserve a draft while resizing below the supported minimum,
+                # restore the terminal, then assert busy-submit remains inert.
+                os.write(master_fd, NEXT_DRAFT.encode())
+                drain_for(master_fd, capture, 0.1, child)
+                resize_pty(slave_fd, 23, 79)
+                read_until_screen_text(
+                    master_fd, child, capture, "Terminal too small", rows=23, columns=79
+                )
+                assert request_status(status_url)["requests"] == 1
+                resize_pty(slave_fd, 24, 80)
+                drain_for(master_fd, capture, 0.2, child)
+                active_screen = capture.text()
+                assert "status: Running" in active_screen and NEXT_DRAFT in active_screen, (
+                    f"active turn or draft changed during resize recovery: {active_screen!r}"
+                )
+                resize_pty(slave_fd, ROWS, COLUMNS)
+                drain_for(master_fd, capture, 0.2, child)
+
+                os.write(master_fd, b"\x13")
+                read_until(master_fd, child, capture, "Busy: wait for the active turn")
+                busy = request_status(status_url)
+                assert busy["requests"] == 1, busy
+                assert busy["active_requests"] == [1], busy
+                assert busy["pause_gates"] == {"1": "held"}, busy
+                release_gate(base_url, 1)
+                completed_first = wait_for_status(
+                    status_url,
+                    lambda value: value["request_outcomes"].get("1") == "completed",
+                    "the first held response to complete after release",
+                )
+                assert completed_first["pause_gates"].get("1") == "completed", completed_first
+                read_until(master_fd, child, capture, "Succeeded")
+                assert capture.contains(NEXT_DRAFT), (
+                    "the next draft typed during the first turn was lost on success"
+                )
+
+                # Submit the preserved draft. The second request is the one held
+                # for Stop, and its unique first chunk proves the current screen
+                # shows this turn rather than stale text from the first one.
+                os.write(master_fd, b"\x13")
+                held_stop = wait_for_status(
+                    status_url,
+                    lambda value: value["requests"] == 2
+                    and value["active_requests"] == [2]
+                    and value["pause_gates"].get("2") == "held",
+                    "the follow-up request to be active and held",
+                )
+                assert held_stop["request_outcomes"].get("2") == "active", held_stop
+                read_until(master_fd, child, capture, STOP_LIVE_TEXT)
+                assert capture.contains(STOP_LIVE_TEXT), capture.text()
+
+                # Exercise a delayed Stop while the provider response is still
+                # held, and keep draining the PTY so visible state is current.
+                drain_for(master_fd, capture, STOP_DELAY_SECONDS, child)
+                delayed = request_status(status_url)
+                assert delayed["requests"] == 2, delayed
+                assert delayed["active_requests"] == [2], delayed
+                assert delayed["request_outcomes"].get("2") == "active", delayed
+                assert delayed["pause_gates"].get("2") == "held", delayed
+                assert capture.contains(STOP_LIVE_TEXT), capture.text()
+
+                os.write(master_fd, b"\x03")
+                read_until(master_fd, child, capture, "Interrupted")
+                assert capture.contains("Interrupted"), capture.text()
+                os.write(master_fd, b"\x03")
+                status = drain_until_exit(master_fd, child, capture)
+                assert status == 0, f"TUI exit status was {status}: {bytes(capture.raw)!r}"
+                assert_terminal_restored(bytes(capture.raw), slave_fd, initial_termios, child)
+            finally:
+                kill_owned_process_group(child)
+                os.close(master_fd)
+                os.close(slave_fd)
+
+            stopped_fixture = wait_for_status(
+                status_url,
+                lambda value: value["active_requests"] == []
+                and value["request_outcomes"].get("2") == "interrupted",
+                "the stopped request to disconnect without completing",
+            )
+            assert stopped_fixture["requests"] == 2, stopped_fixture
+            assert stopped_fixture["scenario_requests"] == {"paused-live-text": 2}, stopped_fixture
+            assert stopped_fixture["request_outcomes"] == {
+                "1": "completed",
+                "2": "interrupted",
+            }, stopped_fixture
+            assert stopped_fixture["pause_gates"].get("2") == "client_disconnected", stopped_fixture
+
+            exchange_events = [
+                json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()
+            ]
+            requests = [event for event in exchange_events if event.get("event") == "request"]
+            assert len(requests) == 2, (
+                f"expected one completed and one stopped exchange, found {requests!r}"
+            )
+            assert requests[0]["prompt"] == PROMPT, (
+                f"exchange request carried the wrong prompt: {requests[0]!r}"
+            )
+            assert requests[1]["prompt"] == NEXT_DRAFT, (
+                f"the delayed Stop round carried the wrong prompt: {requests[1]!r}"
+            )
+
+            trails = list((state_dir / "sessions").glob("*.jsonl"))
+            assert len(trails) == 1, f"expected one session trail, found {trails!r}"
+            records = [
+                json.loads(line) for line in trails[0].read_text(encoding="utf-8").splitlines()
+            ]
+            assert any(contains_string(record, PROMPT) for record in records), (
+                "the pasted provider exchange did not carry the exact submitted prompt"
+            )
+            assert any(contains_string(record, NEXT_DRAFT) for record in records), (
+                "the stopped follow-up exchange was not recorded in the session trail"
+            )
+            interrupted = [
+                record
+                for record in records
+                if record.get("event") == "response_error" and record.get("kind") == "interrupted"
+            ]
+            assert len(interrupted) == 1, (
+                f"expected exactly one stopped exchange, found {interrupted!r}"
+            )
+            assert not any(
+                record.get("event") == "response_error" and record.get("kind") == "incomplete"
+                for record in records
+            ), f"Stop produced an incomplete driver outcome: {records!r}"
+            session_id = trails[0].stem
+            catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
+            assert catalog["sessions"][session_id]["drafts"]["tui"] == NEXT_DRAFT, (
+                "the stopped follow-up prompt was not restored as the composer draft"
+            )
+
+            # A catalog startup error occurs after raw/alternate mode begins.
+            blocker = root / "not-a-directory"
+            blocker.write_text("file", encoding="utf-8")
+            error_env = env.copy()
+            error_env["LEG_UI_STATE_DIR"] = str(blocker)
+            error_master, error_slave, error_child, error_initial = spawn_in_pty(
+                command, error_env, rows=ROWS, columns=COLUMNS
+            )
+            error_capture = TerminalCapture()
+            try:
+                error_status = drain_until_exit(error_master, error_child, error_capture)
+                assert error_status != 0, "invalid catalog path unexpectedly succeeded"
+                assert_terminal_restored(
+                    bytes(error_capture.raw), error_slave, error_initial, error_child
+                )
+            finally:
+                kill_owned_process_group(error_child)
+                os.close(error_master)
+                os.close(error_slave)
+
+            after_error = request_status(status_url)
+            assert after_error["requests"] == 2, after_error
+
+            # Negative control: release another held stream before Stop. It
+            # completes as a normal response and exits from the idle composer.
+            negative_env = env.copy()
+            negative_env["LEG_UI_STATE_DIR"] = str(root / "negative-state")
+            negative_env["LEG_EVENT_LOG"] = str(root / "negative-events.jsonl")
+            negative_master, negative_slave, negative_child, negative_initial = spawn_in_pty(
+                command, negative_env, rows=ROWS, columns=COLUMNS
+            )
+            negative_capture = TerminalCapture()
+            try:
+                start_prompt(
+                    negative_master,
+                    negative_child,
+                    negative_capture,
+                    negative_workspace,
+                    status_url,
+                    2,
+                    expected_live_text=NEGATIVE_LIVE_TEXT,
+                )
+                held_negative = wait_for_status(
+                    status_url,
+                    lambda value: value["requests"] == 3
+                    and value["active_requests"] == [3]
+                    and value["pause_gates"].get("3") == "held",
+                    "the negative-control response to be held",
+                )
+                assert held_negative["request_outcomes"].get("3") == "active", held_negative
+                release_gate(base_url, 3)
+                completed_negative = wait_for_status(
+                    status_url,
+                    lambda value: value["active_requests"] == []
+                    and value["request_outcomes"].get("3") == "completed",
+                    "the released negative-control response to complete",
+                )
+                assert completed_negative["pause_gates"].get("3") == "completed", completed_negative
+                read_until(negative_master, negative_child, negative_capture, "Succeeded")
+                assert negative_capture.contains(RESUMED_TEXT), negative_capture.text()
+                assert not negative_capture.contains("Interrupted"), negative_capture.text()
+
+                os.write(negative_master, b"\x03")
+                negative_status = drain_until_exit(
+                    negative_master, negative_child, negative_capture
+                )
+                assert negative_status == 0, (
+                    f"negative-control TUI exit status was {negative_status}"
+                )
+                assert_terminal_restored(
+                    bytes(negative_capture.raw),
+                    negative_slave,
+                    negative_initial,
+                    negative_child,
+                )
+            finally:
+                kill_owned_process_group(negative_child)
+                os.close(negative_master)
+                os.close(negative_slave)
+
+            final_fixture = request_status(status_url)
+            assert final_fixture["requests"] == 3, final_fixture
+            assert final_fixture["scenario_requests"] == {"paused-live-text": 3}, final_fixture
+            assert final_fixture["request_outcomes"] == {
+                "1": "completed",
+                "2": "interrupted",
+                "3": "completed",
+            }, final_fixture
+            assert final_fixture["active_requests"] == [], final_fixture
+            assert final_fixture["pause_gates"] == {
+                "1": "completed",
+                "2": "client_disconnected",
+                "3": "completed",
+            }, final_fixture
+            assert "paused_response_completed" in final_fixture["input_checks"], final_fixture
+        finally:
+            if status_url is not None:
+                with suppress(Exception):
+                    current = request_status(status_url, timeout=1.0)
+                    base_url = status_url.removesuffix("/__trial/status")
+                    for request, state in current.get("pause_gates", {}).items():
+                        if state in ("waiting", "held"):
+                            with suppress(Exception):
+                                release_gate(base_url, int(request), timeout=1.0)
+            if fixture.poll() is None:
+                with suppress(ProcessLookupError):
+                    fixture.send_signal(signal.SIGTERM)
+                try:
+                    fixture.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    fixture.kill()
+                    fixture.wait(timeout=2)
+
+
+def start_fixture(
+    fixture_path: Path, scenario: str, workspace: Path | None
+) -> tuple[subprocess.Popen[str], str]:
+    fixture = subprocess.Popen(
+        [
+            sys.executable,
+            str(fixture_path),
+            "--scenario",
+            scenario,
+            "--workspace",
+            str(workspace) if workspace is not None else "",
+            "--port",
+            "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        status_url = wait_for_fixture_start(fixture)
+    except BaseException:
+        if fixture.poll() is None:
+            fixture.kill()
+        try:
+            fixture.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            fixture.kill()
+            fixture.wait(timeout=2)
+        raise
+    return fixture, status_url
+
+
+def launch_conversation(
+    args: argparse.Namespace, env: dict[str, str], workspace: Path
+) -> tuple[int, int, subprocess.Popen[bytes], list[Any], TerminalCapture]:
+    command = [
+        str(Path(args.tui_bin).resolve()),
+        "--leg-bin",
+        str(Path(args.leg_bin).resolve()),
+        "--supervisor-bin",
+        str(Path(args.supervisor_bin).resolve()),
+    ]
+    master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+    capture = TerminalCapture(rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS)
+    try:
+        read_until(master_fd, child, capture, "Path:")
+        os.write(master_fd, str(workspace).encode() + b"\r")
+        read_until(master_fd, child, capture, WARNING)
+        os.write(master_fd, b"\r")
+        read_until(master_fd, child, capture, "Idle")
+        return master_fd, slave_fd, child, initial_termios, capture
+    except BaseException:
+        kill_owned_process_group(child)
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+
+
+def stop_fixture(fixture: subprocess.Popen[str]) -> None:
+    if fixture.poll() is None:
+        with suppress(ProcessLookupError):
+            fixture.send_signal(signal.SIGTERM)
+    try:
+        fixture.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        fixture.kill()
+        fixture.wait(timeout=2)
+
+
+def run_turn_contract_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+    with tempfile.TemporaryDirectory(prefix="leg-tui-contract-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_MAX_TOOL_ROUNDS": "2",
+                    "LEG_UI_STATE_DIR": str(root / "state"),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                    "LEG_EVENT_LOG": str(root / "leg-events.jsonl"),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+
+            os.write(master_fd, b"TRIAL-TOOL-TEXT\x13")
+            read_until(
+                master_fd, child, output, "The write result returned; this is the final text."
+            )
+            read_until(master_fd, child, output, "Succeeded")
+            screen = output.text()
+            assert screen.count("First the text, then a verified fixture write.") == 1, screen
+            assert screen.count("The write result returned; this is the final text.") == 1, screen
+            assert "Tool completed: write" in screen, screen
+            status = request_status(status_url)
+            assert status["requests"] == 2, status
+
+            os.write(master_fd, b"TRIAL-TUI-MULTI-TOOL\x13")
+            read_until(master_fd, child, output, "Final multi-round text.")
+            drain_for(master_fd, output, 0.25)
+            multi_round_screen = output.text()
+            for segment in (
+                "First multi-round text.",
+                "Second multi-round text.",
+                "Final multi-round text.",
+            ):
+                assert multi_round_screen.count(segment) == 1, multi_round_screen
+            assert request_status(status_url)["requests"] == 5
+
+            os.write(master_fd, b"TRIAL-TUI-MAX-TOKENS\x13")
+            read_until(master_fd, child, output, "Reply truncated at max tokens.")
+            assert request_status(status_url)["requests"] == 6
+
+            os.write(master_fd, b"TRIAL-CAP\x13")
+            read_until(master_fd, child, output, "Capped")
+            read_until(master_fd, child, output, "Tool-round limit reached.")
+            assert request_status(status_url)["requests"] == 9
+
+            os.write(master_fd, b"TRIAL-TUI-ANSI\x13")
+            read_until(master_fd, child, output, "Before red after Ω")
+            drain_for(master_fd, output, 0.25)
+            ansi_screen = output.text()
+            assert "secret title" not in ansi_screen, ansi_screen
+            assert "Before red after Ω" in ansi_screen, ansi_screen
+            assert request_status(status_url)["requests"] == 10
+
+            os.write(master_fd, b"TRIAL-LARGE-TOOL\x13")
+            read_until(master_fd, child, output, "The large tool result was returned.")
+            drain_for(master_fd, output, 0.25)
+            large_tool_screen = output.text()
+            assert "more characters" in large_tool_screen, large_tool_screen
+            assert request_status(status_url)["requests"] == 12
+
+            os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE\x13")
+            read_until(master_fd, child, output, "Long fixture line 090")
+            os.write(master_fd, b"\x1b[5~")
+            drain_for(master_fd, output, 0.15)
+            history_screen = output.text()
+            visible_rows = re.findall(r"Long fixture line \d{3}", history_screen)
+            assert visible_rows, f"PageUp did not reveal transcript history: {history_screen!r}"
+            anchor = visible_rows[len(visible_rows) // 2]
+            read_until(master_fd, child, output, "new content below")
+            preserved_screen = output.text()
+            assert anchor in preserved_screen, (
+                f"streaming moved the historical viewport away from {anchor!r}: {preserved_screen!r}"
+            )
+            os.write(master_fd, b"\x1b[1;5F")
+            read_until(master_fd, child, output, "END OF FIXTURE ANSWER")
+            newest_screen = output.text()
+            assert "new content below" not in newest_screen, newest_screen
+            assert request_status(status_url)["requests"] == 13
+
+            status = drain_until_exit_after_close(master_fd, child, output, slave_fd, initial_termios)
+            master_fd = slave_fd = None
+            assert status == 0
+            final_status = request_status(status_url)
+            assert final_status["scenario_requests"] == {
+                "TRIAL-TOOL-TEXT": 2,
+                "TRIAL-TUI-MULTI-TOOL": 3,
+                "TRIAL-TUI-MAX-TOKENS": 1,
+                "TRIAL-CAP": 3,
+                "TRIAL-TUI-ANSI": 1,
+                "TRIAL-LARGE-TOOL": 2,
+                "TRIAL-TUI-LONG-PAUSE": 1,
+            }, final_status
+            for check in (
+                "tool_result_returned",
+                "multi_tool_results_returned",
+                "large_tool_result_returned",
+            ):
+                assert final_status["input_checks"].get(check) is True, final_status
+            assert any(
+                check["path"] == "trial-rounds.txt" and check["ok"]
+                for check in final_status["workspace_checks"]
+            ), final_status
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
+
+
+def drain_until_exit_after_close(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    output: TerminalCapture,
+    slave_fd: int,
+    initial_termios: list[Any],
+) -> int:
+    os.write(master_fd, b"\x03")
+    status = drain_until_exit(master_fd, child, output)
+    termios_fd = master_fd if sys.platform == "darwin" else slave_fd
+    assert_terminal_restored(bytes(output.raw), termios_fd, initial_termios, child)
+    os.close(master_fd)
+    os.close(slave_fd)
+    return status
+
+
+def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+    with tempfile.TemporaryDirectory(prefix="leg-tui-retry-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_UI_STATE_DIR": str(root / "state"),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                    "LEG_EVENT_LOG": str(root / "leg-events.jsonl"),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+            retry_prompt = "TRIAL-REOPEN-FAILURE retry this failed prompt"
+            os.write(master_fd, retry_prompt.encode() + b"\x13")
+            read_until(master_fd, child, output, "Failed")
+            assert request_status(status_url)["requests"] == 1
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "reading a failure retried it"
+
+            os.write(master_fd, b"\r")
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "Enter retried a failed prompt"
+            os.write(master_fd, b"\x7f")
+            drain_for(master_fd, output, 0.1)
+
+            warning = "Retry sends this prompt again and may repeat tool side effects."
+            os.write(master_fd, b"\x13")
+            read_until(master_fd, child, output, warning)
+            assert request_status(status_url)["requests"] == 1
+            os.write(master_fd, b"\r")
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "Enter confirmed a retry"
+            assert warning in output.text()
+
+            os.write(master_fd, b"n")
+            drain_for(master_fd, output, 0.1)
+            assert request_status(status_url)["requests"] == 1
+            assert "Explicit retry confirmation" not in output.text()
+            os.write(master_fd, b"\x13")
+            read_until(master_fd, child, output, warning)
+            assert request_status(status_url)["requests"] == 1
+            os.write(master_fd, b"y")
+            read_until(master_fd, child, output, "The explicit retry succeeded.")
+            drain_for(master_fd, output, 0.25)
+            assert request_status(status_url)["requests"] == 2
+
+            status = drain_until_exit_after_close(master_fd, child, output, slave_fd, initial_termios)
+            master_fd = slave_fd = None
+            assert status == 0
+            final_status = request_status(status_url)
+            assert final_status["scenario_requests"] == {"TRIAL-REOPEN-FAILURE": 2}, final_status
+            assert final_status["input_checks"].get("retry_or_reopen_succeeded") is True, final_status
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
 
 
 def terminal_text(output: bytes) -> str:
@@ -218,7 +1176,6 @@ def terminal_text(output: bytes) -> str:
     separated = re.sub(rb"\x1b\[[0-9;]*H", b" ", output)
     plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", separated)
     return plain.decode("utf-8", errors="replace")
-
 
 def terminal_screen_text(
     output: bytes, rows: int = DEFAULT_ROWS, columns: int = DEFAULT_COLUMNS
@@ -291,603 +1248,83 @@ def terminal_screen_text(
         index += size
     return "\n".join("".join(line) for line in screen)
 
-
 def screen_contains(screen: str, expected: str) -> bool:
     for border in "│─┌┐└┘├┤┬┴┼":
         screen = screen.replace(border, " ")
     return " ".join(expected.split()) in " ".join(screen.split())
 
+def resize_pty(slave_fd: int, rows: int, columns: int) -> None:
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
 
-def contains_string(value: Any, expected: str) -> bool:
-    if isinstance(value, str):
-        return value == expected
-    if isinstance(value, dict):
-        return any(contains_string(item, expected) for item in value.values())
-    if isinstance(value, list):
-        return any(contains_string(item, expected) for item in value)
-    return False
-
-
-def assert_terminal_restored(
-    output: bytes, termios_fd: int, initial_termios: list[Any], child: subprocess.Popen[bytes]
-) -> None:
-    # BSD revokes a session leader's controlling slave after it exits. The
-    # master remains usable for reading the PTY's terminal attributes.
-    actual = termios.tcgetattr(termios_fd)
-    assert actual == initial_termios, f"terminal attributes were not restored: {actual!r}"
-    assert b"\x1b[?1049l" in output, "alternate screen was not left"
-    assert b"\x1b[?25h" in output, "cursor was not shown"
-    assert b"\x1b[?2004h" in output, f"bracketed paste was not enabled: {output[:240]!r}"
-    assert b"\x1b[?2004l" in output, f"bracketed paste was not disabled: {output[-240:]!r}"
-    assert child.returncode is not None
-
-
-def run_smoke(args: argparse.Namespace) -> None:
-    repository = Path(__file__).resolve().parents[2]
-    fixture_path = repository / "trials" / "fake_provider.py"
-
-    with tempfile.TemporaryDirectory(prefix="leg-tui-pty-") as temporary:
-        root = Path(temporary)
-        workspace = root / "workspace"
-        workspace.mkdir()
-        state_dir = root / "state"
-        event_log = root / "leg-events.jsonl"
-
-        fixture = subprocess.Popen(
-            [
-                sys.executable,
-                str(fixture_path),
-                "--scenario",
-                "paused-live-text",
-                "--workspace",
-                str(workspace),
-                "--port",
-                "0",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        assert fixture.stdout is not None
-        status_url = None
-        try:
-            for line in fixture.stdout:
-                if line.startswith("Status: "):
-                    status_url = line.split(": ", 1)[1].strip()
-                    break
-            assert status_url is not None, "fake provider did not print its status URL"
-            base_url = status_url.removesuffix("/__trial/status")
-
-            env = os.environ.copy()
-            env.update(
-                {
-                    "LEG_PROVIDER": "anthropic",
-                    "ANTHROPIC_BASE_URL": base_url,
-                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
-                    "LEG_MODEL": "trial-fixture",
-                    "LEG_MAX_RETRIES": "0",
-                    "LEG_UI_STATE_DIR": str(state_dir),
-                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
-                    "LEG_EVENT_LOG": str(event_log),
-                }
-            )
-
-            command = [
-                str(Path(args.tui_bin).resolve()),
-                "--leg-bin",
-                str(Path(args.leg_bin).resolve()),
-                "--supervisor-bin",
-                str(Path(args.supervisor_bin).resolve()),
-            ]
-            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
-            output = bytearray()
-            try:
-                read_until_screen_text(
-                    master_fd, child, output, "Path:", rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS
-                )
-                os.write(master_fd, str(workspace).encode() + b"\r")
-                read_until_screen_text(
-                    master_fd,
-                    child,
-                    output,
-                    "Leg can run shell commands",
-                    rows=DEFAULT_ROWS,
-                    columns=DEFAULT_COLUMNS,
-                )
-                drain_for(master_fd, output, 0.1)
-                first_run_help = terminal_screen_text(bytes(output))
-                for hint in (
-                    "Enter newline",
-                    "Ctrl-S send",
-                    "Backspace/Delete edit",
-                    "Ctrl-Z undo",
-                    "Ctrl-Y redo",
-                    "Ctrl-C stops",
-                    "F1 help",
-                    "F2 keyboard actions",
-                    "? is prompt text",
-                    "PageUp/PageDown scroll",
-                    "Ctrl-End newest",
-                ):
-                    assert hint in first_run_help, (
-                        f"first-run help omitted {hint!r}: {first_run_help[-1800:]!r}"
-                    )
-                before_ack = request_status(status_url)
-                assert before_ack["requests"] == 0, "a provider request ran before warning acknowledgement"
-
-                os.write(master_fd, b"\r")
-                read_until_screen_text(
-                    master_fd, child, output, "Ready", rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS
-                )
-                os.write(master_fd, b"\x13")
-                drain_for(master_fd, output)
-                assert request_status(status_url)["requests"] == 0, (
-                    "a blank prompt started a provider request"
-                )
-
-                # Help and the action menu are overlays: input cannot edit or submit there.
-                os.write(master_fd, b"\x1bOP")
-                read_until_screen_text(master_fd, child, output, "Keyboard help")
-                os.write(master_fd, b"ignored-help")
-                os.write(master_fd, b"\x1b")
-                drain_for(master_fd, output, 0.15)
-                os.write(master_fd, b"\x1bOQ")
-                read_until_screen_text(master_fd, child, output, "Keyboard actions")
-                action_menu = terminal_screen_text(bytes(output))
-                for action in (
-                    "Insert a newline",
-                    "Send the complete nonblank prompt",
-                    "Move by grapheme",
-                    "Remove one grapheme",
-                    "Ctrl-Z / Ctrl-Y",
-                    "Stop the turn",
-                    "Scroll transcript",
-                    "F1 / F2",
-                ):
-                    assert action in action_menu, f"keyboard action menu omitted {action!r}"
-                os.write(master_fd, b"ignored-menu")
-                os.write(master_fd, b"\x1b[200~ignored-paste\x1b[201~")
-                os.write(master_fd, b"\x1b")
-                drain_for(master_fd, output, 0.15)
-                assert request_status(status_url)["requests"] == 0, (
-                    "opening help or the action menu started a provider request"
-                )
-
-                # A question mark is literal prompt text. Control bytes in this one
-                # bracketed paste must never become send, stop, or help key events.
-                os.write(master_fd, b"?typed line\r")
-                drain_for(master_fd, output, 0.1)
-                question_screen = terminal_screen_text(bytes(output))
-                assert "?typed line" in question_screen, (
-                    "? or Enter did not insert literal text and a newline in the composer"
-                )
-                assert "Keyboard help" not in question_screen, "? opened help instead of entering the draft"
-                os.write(master_fd, b"\x1b[200~" + PASTED_TEXT.encode() + b"\x1b[201~")
-                drain_for(master_fd, output)
-                assert child.poll() is None, "a control byte in bracketed paste exited the TUI"
-                assert request_status(status_url)["requests"] == 0, (
-                    "paste content invoked a provider or keyboard shortcut"
-                )
-                os.write(master_fd, b"\x13")
-                read_until_screen_text(
-                    master_fd,
-                    child,
-                    output,
-                    LIVE_TEXT,
-                    rows=DEFAULT_ROWS,
-                    columns=DEFAULT_COLUMNS,
-                )
-                os.write(master_fd, NEXT_DRAFT.encode())
-                drain_for(master_fd, output, 0.1)
-                resize_pty(slave_fd, 23, 79)
-                read_until_screen_text(
-                    master_fd,
-                    child,
-                    output,
-                    "Terminal too small",
-                    rows=23,
-                    columns=79,
-                )
-                assert request_status(status_url)["requests"] == 1
-                resize_pty(slave_fd, 24, 80)
-                drain_for(master_fd, output, 0.2)
-                active_screen = terminal_screen_text(bytes(output), 24, 80)
-                assert "status: Running" in active_screen and NEXT_DRAFT in active_screen, (
-                    f"active turn or draft changed during resize recovery: {active_screen!r}"
-                )
-                resize_pty(slave_fd, DEFAULT_ROWS, DEFAULT_COLUMNS)
-                drain_for(master_fd, output, 0.2)
-                os.write(master_fd, b"\x13")
-                read_until_screen_text(
-                    master_fd, child, output, "Busy: wait for the active turn"
-                )
-                assert request_status(status_url)["requests"] == 1, (
-                    "busy Ctrl-S started a second provider request"
-                )
-
-                read_until_screen_text(master_fd, child, output, "Succeeded")
-                assert request_status(status_url)["requests"] == 1, (
-                    "the pasted prompt caused more than one exchange invocation"
-                )
-                assert NEXT_DRAFT in terminal_screen_text(bytes(output)), (
-                    "the next draft typed during the turn was lost on success"
-                )
-
-                # Submit the preserved next draft, then verify Ctrl-C stops a live turn.
-                os.write(master_fd, b"\x13")
-                deadline = time.monotonic() + 5.0
-                fixture_status = request_status(status_url)
-                while fixture_status["requests"] < 2 and time.monotonic() < deadline:
-                    drain_for(master_fd, output, 0.05)
-                    fixture_status = request_status(status_url)
-                assert fixture_status["requests"] == 2, fixture_status
-                os.write(master_fd, b"\x03")
-                read_until_screen_text(master_fd, child, output, "Interrupted")
-                os.write(master_fd, b"\x03")
-                status = drain_until_exit(master_fd, child, output)
-                assert status == 0, f"TUI exit status was {status}: {bytes(output)!r}"
-                assert_terminal_restored(bytes(output), master_fd, initial_termios, child)
-            finally:
-                if child.poll() is None:
-                    child.kill()
-                    child.wait(timeout=2)
-                os.close(master_fd)
-                os.close(slave_fd)
-
-            fixture_status = request_status(status_url)
-            assert fixture_status["requests"] == 2, fixture_status
-            assert fixture_status["scenario_requests"] == {"paused-live-text": 2}, fixture_status
-            assert fixture_status["input_checks"].get("paused_response_completed") is True, (
-                "the first paused turn did not complete while preserving the active draft"
-            )
-
-            exchange_events = [
-                json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()
-            ]
-            requests = [event for event in exchange_events if event.get("event") == "request"]
-            assert len(requests) == 2, f"expected two exchange request events, found {requests!r}"
-            assert requests[0]["prompt"] == PROMPT, (
-                f"exchange request carried the wrong prompt: {requests[0]!r}"
-            )
-            assert requests[1]["prompt"] == NEXT_DRAFT, (
-                f"follow-up exchange carried the wrong prompt: {requests[1]!r}"
-            )
-
-            trails = list((state_dir / "sessions").glob("*.jsonl"))
-            assert len(trails) == 1, f"expected one session trail, found {trails!r}"
-            records = [json.loads(line) for line in trails[0].read_text(encoding="utf-8").splitlines()]
-            assert any(contains_string(record, PROMPT) for record in records), (
-                "the pasted provider exchange did not carry the exact submitted prompt"
-            )
-            session_id = trails[0].stem
-            catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
-            assert catalog["sessions"][session_id]["drafts"]["tui"] == NEXT_DRAFT, (
-                "the stopped follow-up prompt was not restored as the composer draft"
-            )
-
-            # A catalog startup error occurs after raw/alternate mode begins.
-            blocker = root / "not-a-directory"
-            blocker.write_text("file", encoding="utf-8")
-            error_env = env.copy()
-            error_env["LEG_UI_STATE_DIR"] = str(blocker)
-            error_master, error_slave, error_child, error_initial = spawn_in_pty(command, error_env)
-            error_output = bytearray()
-            try:
-                error_status = drain_until_exit(error_master, error_child, error_output)
-                assert error_status != 0, "invalid catalog path unexpectedly succeeded"
-                assert_terminal_restored(
-                    bytes(error_output), error_master, error_initial, error_child
-                )
-            finally:
-                if error_child.poll() is None:
-                    error_child.kill()
-                    error_child.wait(timeout=2)
-                os.close(error_master)
-                os.close(error_slave)
-
-            after_error = request_status(status_url)
-            assert after_error["requests"] == 2, after_error
-        finally:
-            fixture.send_signal(signal.SIGTERM)
-            try:
-                fixture.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                fixture.kill()
-                fixture.wait(timeout=2)
-
-
-def start_fixture(
-    fixture_path: Path, scenario: str, workspace: Path | None
-) -> tuple[subprocess.Popen[str], str]:
-    fixture = subprocess.Popen(
-        [
-            sys.executable,
-            str(fixture_path),
-            "--scenario",
-            scenario,
-            "--workspace",
-            str(workspace) if workspace is not None else "",
-            "--port",
-            "0",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-    assert fixture.stdout is not None
-    status_url = None
-    for line in fixture.stdout:
-        if line.startswith("Status: "):
-            status_url = line.split(": ", 1)[1].strip()
-            break
-    assert status_url is not None, "fake provider did not print its status URL"
-    return fixture, status_url
-
-
-def launch_conversation(
-    args: argparse.Namespace, env: dict[str, str], workspace: Path
-) -> tuple[int, int, subprocess.Popen[bytes], list[Any], bytearray]:
-    command = [
-        str(Path(args.tui_bin).resolve()),
-        "--leg-bin",
-        str(Path(args.leg_bin).resolve()),
-        "--supervisor-bin",
-        str(Path(args.supervisor_bin).resolve()),
-    ]
-    master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
-    output = bytearray()
-    read_until_screen_text(
-        master_fd, child, output, "Path:", rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS
-    )
-    os.write(master_fd, str(workspace).encode() + b"\r")
-    read_until_screen_text(
-        master_fd,
-        child,
-        output,
-        "Leg can run shell commands",
-        rows=DEFAULT_ROWS,
-        columns=DEFAULT_COLUMNS,
-    )
-    os.write(master_fd, b"\r")
-    read_until_screen_text(master_fd, child, output, "Idle")
-    return master_fd, slave_fd, child, initial_termios, output
-
-
-def stop_fixture(fixture: subprocess.Popen[str]) -> None:
-    fixture.send_signal(signal.SIGTERM)
-    try:
-        fixture.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        fixture.kill()
-        fixture.wait(timeout=2)
-
-
-def run_turn_contract_smoke(args: argparse.Namespace) -> None:
-    repository = Path(__file__).resolve().parents[2]
-    fixture_path = repository / "trials" / "fake_provider.py"
-    with tempfile.TemporaryDirectory(prefix="leg-tui-contract-pty-") as temporary:
-        root = Path(temporary)
-        workspace = root / "workspace"
-        workspace.mkdir()
-        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
-        master_fd = slave_fd = None
-        child = None
-        output = bytearray()
-        try:
-            env = os.environ.copy()
-            env.update(
-                {
-                    "LEG_PROVIDER": "anthropic",
-                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
-                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
-                    "LEG_MODEL": "trial-fixture",
-                    "LEG_MAX_RETRIES": "0",
-                    "LEG_MAX_TOOL_ROUNDS": "2",
-                    "LEG_UI_STATE_DIR": str(root / "state"),
-                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
-                    "LEG_EVENT_LOG": str(root / "leg-events.jsonl"),
-                }
-            )
-            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
-                args, env, workspace
-            )
-
-            os.write(master_fd, b"TRIAL-TOOL-TEXT\x13")
-            read_until_screen_text(
-                master_fd, child, output, "The write result returned; this is the final text."
-            )
-            read_until_screen_text(master_fd, child, output, "Succeeded")
-            screen = terminal_screen_text(bytes(output))
-            assert screen.count("First the text, then a verified fixture write.") == 1, screen
-            assert screen.count("The write result returned; this is the final text.") == 1, screen
-            assert "Tool completed: write" in screen, screen
-            status = request_status(status_url)
-            assert status["requests"] == 2, status
-
-            os.write(master_fd, b"TRIAL-TUI-MULTI-TOOL\x13")
-            read_until_screen_text(master_fd, child, output, "Final multi-round text.")
-            drain_for(master_fd, output, 0.25)
-            multi_round_screen = terminal_screen_text(bytes(output))
-            for segment in (
-                "First multi-round text.",
-                "Second multi-round text.",
-                "Final multi-round text.",
-            ):
-                assert multi_round_screen.count(segment) == 1, multi_round_screen
-            assert request_status(status_url)["requests"] == 5
-
-            os.write(master_fd, b"TRIAL-TUI-MAX-TOKENS\x13")
-            read_until_screen_text(master_fd, child, output, "Reply truncated at max tokens.")
-            assert request_status(status_url)["requests"] == 6
-
-            os.write(master_fd, b"TRIAL-CAP\x13")
-            read_until_screen_text(master_fd, child, output, "Capped")
-            read_until_screen_text(master_fd, child, output, "Tool-round limit reached.")
-            assert request_status(status_url)["requests"] == 9
-
-            os.write(master_fd, b"TRIAL-TUI-ANSI\x13")
-            read_until_screen_text(master_fd, child, output, "Before red after Ω")
-            drain_for(master_fd, output, 0.25)
-            ansi_screen = terminal_screen_text(bytes(output))
-            assert "secret title" not in ansi_screen, ansi_screen
-            assert "Before red after Ω" in ansi_screen, ansi_screen
-            assert request_status(status_url)["requests"] == 10
-
-            os.write(master_fd, b"TRIAL-LARGE-TOOL\x13")
-            read_until_screen_text(master_fd, child, output, "The large tool result was returned.")
-            drain_for(master_fd, output, 0.25)
-            large_tool_screen = terminal_screen_text(bytes(output))
-            assert "more characters" in large_tool_screen, large_tool_screen
-            assert request_status(status_url)["requests"] == 12
-
-            os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE\x13")
-            read_until_screen_text(master_fd, child, output, "Long fixture line 090")
-            os.write(master_fd, b"\x1b[5~")
-            drain_for(master_fd, output, 0.15)
-            history_screen = terminal_screen_text(bytes(output))
-            visible_rows = re.findall(r"Long fixture line \d{3}", history_screen)
-            assert visible_rows, f"PageUp did not reveal transcript history: {history_screen!r}"
-            anchor = visible_rows[len(visible_rows) // 2]
-            read_until_screen_text(master_fd, child, output, "new content below")
-            preserved_screen = terminal_screen_text(bytes(output))
-            assert anchor in preserved_screen, (
-                f"streaming moved the historical viewport away from {anchor!r}: {preserved_screen!r}"
-            )
-            os.write(master_fd, b"\x1b[1;5F")
-            read_until_screen_text(master_fd, child, output, "END OF FIXTURE ANSWER")
-            newest_screen = terminal_screen_text(bytes(output))
-            assert "new content below" not in newest_screen, newest_screen
-            assert request_status(status_url)["requests"] == 13
-
-            status = drain_until_exit_after_close(master_fd, child, output, slave_fd, initial_termios)
-            master_fd = slave_fd = None
-            assert status == 0
-            final_status = request_status(status_url)
-            assert final_status["scenario_requests"] == {
-                "TRIAL-TOOL-TEXT": 2,
-                "TRIAL-TUI-MULTI-TOOL": 3,
-                "TRIAL-TUI-MAX-TOKENS": 1,
-                "TRIAL-CAP": 3,
-                "TRIAL-TUI-ANSI": 1,
-                "TRIAL-LARGE-TOOL": 2,
-                "TRIAL-TUI-LONG-PAUSE": 1,
-            }, final_status
-            for check in (
-                "tool_result_returned",
-                "multi_tool_results_returned",
-                "large_tool_result_returned",
-            ):
-                assert final_status["input_checks"].get(check) is True, final_status
-            assert any(
-                check["path"] == "trial-rounds.txt" and check["ok"]
-                for check in final_status["workspace_checks"]
-            ), final_status
-        finally:
-            if child is not None and child.poll() is None:
-                child.kill()
-                child.wait(timeout=2)
-            if master_fd is not None:
-                os.close(master_fd)
-            if slave_fd is not None:
-                os.close(slave_fd)
-            stop_fixture(fixture)
-
-
-def drain_until_exit_after_close(
+def wait_for_file(
+    path: Path,
     master_fd: int,
-    child: subprocess.Popen[bytes],
     output: bytearray,
-    slave_fd: int,
-    initial_termios: list[Any],
-) -> int:
-    os.write(master_fd, b"\x03")
-    status = drain_until_exit(master_fd, child, output)
-    assert_terminal_restored(bytes(output), master_fd, initial_termios, child)
-    os.close(master_fd)
-    os.close(slave_fd)
-    return status
+    child: subprocess.Popen[bytes],
+    timeout: float = 8.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        remaining = deadline - time.monotonic()
+        if child.poll() is not None:
+            drain_for(master_fd, output, 0.05)
+            raise AssertionError(
+                f"TUI exited before creating {path}; exit={child.returncode}; "
+                f"output={terminal_text(bytes(output))[-1200:]!r}"
+            )
+        if remaining <= 0:
+            raise AssertionError(
+                f"timed out waiting for file {path}; "
+                f"output={terminal_text(bytes(output))[-1200:]!r}"
+            )
+        drain_for(master_fd, output, min(0.05, remaining))
 
-
-def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
-    repository = Path(__file__).resolve().parents[2]
-    fixture_path = repository / "trials" / "fake_provider.py"
-    with tempfile.TemporaryDirectory(prefix="leg-tui-retry-pty-") as temporary:
-        root = Path(temporary)
-        workspace = root / "workspace"
-        workspace.mkdir()
-        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
-        master_fd = slave_fd = None
-        child = None
-        output = bytearray()
+def kill_pty_child(master_fd: int, child: subprocess.Popen[bytes], output: bytearray) -> None:
+    if child.poll() is not None:
+        return
+    child.kill()
+    deadline = time.monotonic() + 10.0
+    while child.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        drain_for(master_fd, output, min(0.05, remaining))
+    if child.poll() is None:
         try:
-            env = os.environ.copy()
-            env.update(
-                {
-                    "LEG_PROVIDER": "anthropic",
-                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
-                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
-                    "LEG_MODEL": "trial-fixture",
-                    "LEG_MAX_RETRIES": "0",
-                    "LEG_UI_STATE_DIR": str(root / "state"),
-                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
-                    "LEG_EVENT_LOG": str(root / "leg-events.jsonl"),
-                }
-            )
-            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
-                args, env, workspace
-            )
-            retry_prompt = "TRIAL-REOPEN-FAILURE retry this failed prompt"
-            os.write(master_fd, retry_prompt.encode() + b"\x13")
-            read_until_screen_text(master_fd, child, output, "Failed")
-            assert request_status(status_url)["requests"] == 1
-            drain_for(master_fd, output, 0.15)
-            assert request_status(status_url)["requests"] == 1, "reading a failure retried it"
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Preserve the test failure that led to cleanup.
+            drain_for(master_fd, output, 0.05)
+            return
+    drain_for(master_fd, output, 0.05)
 
-            os.write(master_fd, b"\r")
-            drain_for(master_fd, output, 0.15)
-            assert request_status(status_url)["requests"] == 1, "Enter retried a failed prompt"
-            os.write(master_fd, b"\x7f")
-            drain_for(master_fd, output, 0.1)
+def wait_for_pid_exit(pid: int, timeout: float = 6.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+        if not status or status.startswith("Z"):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"owned tool process {pid} is still running")
 
-            warning = "Retry sends this prompt again and may repeat tool side effects."
-            os.write(master_fd, b"\x13")
-            read_until_screen_text(master_fd, child, output, warning)
-            assert request_status(status_url)["requests"] == 1
-            os.write(master_fd, b"\r")
-            drain_for(master_fd, output, 0.15)
-            assert request_status(status_url)["requests"] == 1, "Enter confirmed a retry"
-            assert warning in terminal_screen_text(bytes(output))
-
-            os.write(master_fd, b"n")
-            drain_for(master_fd, output, 0.1)
-            assert request_status(status_url)["requests"] == 1
-            assert "Explicit retry confirmation" not in terminal_screen_text(bytes(output))
-            os.write(master_fd, b"\x13")
-            read_until_screen_text(master_fd, child, output, warning)
-            assert request_status(status_url)["requests"] == 1
-            os.write(master_fd, b"y")
-            read_until_screen_text(master_fd, child, output, "The explicit retry succeeded.")
-            drain_for(master_fd, output, 0.25)
-            assert request_status(status_url)["requests"] == 2
-
-            status = drain_until_exit_after_close(master_fd, child, output, slave_fd, initial_termios)
-            master_fd = slave_fd = None
-            assert status == 0
-            final_status = request_status(status_url)
-            assert final_status["scenario_requests"] == {"TRIAL-REOPEN-FAILURE": 2}, final_status
-            assert final_status["input_checks"].get("retry_or_reopen_succeeded") is True, final_status
-        finally:
-            if child is not None and child.poll() is None:
-                child.kill()
-                child.wait(timeout=2)
-            if master_fd is not None:
-                os.close(master_fd)
-            if slave_fd is not None:
-                os.close(slave_fd)
-            stop_fixture(fixture)
-
+def has_color_styling(output: bytes) -> bool:
+    color_codes = set(range(30, 38)) | set(range(40, 48)) | set(range(90, 98)) | set(range(100, 108))
+    color_codes.update((38, 48, 58))
+    for params in re.findall(rb"\x1b\[([0-9;]*)m", output):
+        codes = [int(value) for value in params.split(b";") if value]
+        if any(code in color_codes for code in codes):
+            return True
+    return False
 
 def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
     repository = Path(__file__).resolve().parents[2]
@@ -1091,7 +1528,6 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
                 os.close(slave_fd)
             stop_fixture(fixture)
 
-
 def run_signal_smoke(args: argparse.Namespace) -> None:
     repository = Path(__file__).resolve().parents[2]
     fixture_path = repository / "trials" / "fake_provider.py"
@@ -1189,17 +1625,6 @@ def run_signal_smoke(args: argparse.Namespace) -> None:
                         os.close(slave_fd)
                     stop_fixture(fixture)
 
-
-def has_color_styling(output: bytes) -> bool:
-    color_codes = set(range(30, 38)) | set(range(40, 48)) | set(range(90, 98)) | set(range(100, 108))
-    color_codes.update((38, 48, 58))
-    for params in re.findall(rb"\x1b\[([0-9;]*)m", output):
-        codes = [int(value) for value in params.split(b";") if value]
-        if any(code in color_codes for code in codes):
-            return True
-    return False
-
-
 def run_color_policy_smoke(args: argparse.Namespace) -> None:
     command = [
         str(Path(args.tui_bin).resolve()),
@@ -1275,13 +1700,16 @@ def main() -> None:
     parser.add_argument("--leg-bin", required=True)
     parser.add_argument("--supervisor-bin", required=True)
     args = parser.parse_args()
-    run_smoke(args)
+    test_terminal_screen_redraw()
+    if sys.platform == "linux":
+        run_smoke(args)
     run_turn_contract_smoke(args)
     run_retry_confirmation_smoke(args)
     run_resize_and_non_tty_smoke(args)
     run_signal_smoke(args)
     run_color_policy_smoke(args)
     print("leg-tui native Linux/macOS PTY smoke passed")
+
 
 
 if __name__ == "__main__":

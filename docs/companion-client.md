@@ -218,14 +218,18 @@ to retry or N/Esc to cancel. Enter remains a newline and never retries.
 
 The native Linux/macOS PTY smoke test uses the local fake provider and explicit
 binary paths. It covers both supported sizes, resize recovery, signal cleanup,
-non-TTY startup, color-disabled output, and the composer and active-turn
-workflows:
+non-TTY startup, color-disabled output, the composer and active-turn workflows,
+and the delayed Stop regression. It uses the pinned Python VT parser in
+`companions/leg-tui/tests/requirements.txt`; install that test-only dependency
+in a virtual environment before running it:
 
 ```sh
+python3 -m venv /tmp/leg-pty-test-venv
+/tmp/leg-pty-test-venv/bin/python -m pip install --requirement companions/leg-tui/tests/requirements.txt
 cargo build --locked --bin leg
 cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
 cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui
-python3 companions/leg-tui/tests/pty_smoke.py \
+/tmp/leg-pty-test-venv/bin/python companions/leg-tui/tests/pty_smoke.py \
   --tui-bin companions/target/debug/leg-tui \
   --leg-bin target/debug/leg \
   --supervisor-bin companions/target/debug/leg-ui-supervisor
