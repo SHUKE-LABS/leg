@@ -35,7 +35,7 @@ struct StartRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SessionMode {
-    New,
+    New { session_id: String },
     Existing { session_id: String },
 }
 
@@ -88,23 +88,32 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
             request.store_dir.display()
         )
     })?;
-    let creation_lock = open_lock_file(&store_dir.join(".leg-ui-client-create.lock"))?;
-    creation_lock
-        .lock_exclusive()
-        .map_err(|error| format!("could not acquire session creation guard: {error}"))?;
-    let mut creation_lock = Some(creation_lock);
-
-    let mut session_lock: Option<File> = match &request.session {
-        SessionMode::New => None,
+    let (mut creation_lock, mut session_lock): (Option<File>, Option<File>) = match &request.session
+    {
+        SessionMode::New { session_id } => {
+            if !safe_session_id(session_id) || !native_session_id(session_id) {
+                return Err("invalid preallocated session id".to_string());
+            }
+            let creation_lock = open_lock_file(&store_dir.join(".leg-ui-client-create.lock"))?;
+            creation_lock
+                .lock_exclusive()
+                .map_err(|error| format!("could not acquire session creation guard: {error}"))?;
+            let session_lock = match try_session_lock(&store_dir, session_id)? {
+                Some(lock) => lock,
+                None => {
+                    write_control(&json!({"_supervisor":"busy"}))
+                        .map_err(|error| error.to_string())?;
+                    return Ok(0);
+                }
+            };
+            (Some(creation_lock), Some(session_lock))
+        }
         SessionMode::Existing { session_id } => {
             if !safe_session_id(session_id) {
                 return Err("invalid session id".to_string());
             }
             match try_session_lock(&store_dir, session_id)? {
-                Some(lock) => {
-                    creation_lock.take();
-                    Some(lock)
-                }
+                Some(lock) => (None, Some(lock)),
                 None => {
                     write_control(&json!({"_supervisor":"busy"}))
                         .map_err(|error| error.to_string())?;
@@ -117,8 +126,8 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     let mut command = Command::new(&request.leg_path);
     command.args(["exchange", "--stream-json"]);
     match &request.session {
-        SessionMode::New => {
-            command.arg("--new-session");
+        SessionMode::New { session_id } => {
+            command.args(["--new-session-id", session_id]);
         }
         SessionMode::Existing { session_id } => {
             command.args(["--session", session_id]);
@@ -260,8 +269,12 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
                         );
                         continue;
                     };
-                    if !safe_session_id(&id) {
-                        eprintln!("leg stream returned an invalid session id");
+                    let expected_id = match &request.session {
+                        SessionMode::New { session_id } => session_id.as_str(),
+                        SessionMode::Existing { .. } => unreachable!("existing IDs start seen"),
+                    };
+                    if !safe_session_id(&id) || id != expected_id {
+                        eprintln!("leg stream returned an unexpected new session id");
                         begin_stop(
                             leg_pid,
                             &root_identity,
@@ -272,37 +285,20 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
                         );
                         continue;
                     }
-                    match try_session_lock(&store_dir, &id) {
-                        Ok(Some(lock)) => {
-                            session_lock = Some(lock);
-                            creation_lock.take();
-                            session_id_seen = true;
-                        }
-                        Ok(None) => {
-                            eprintln!("new session id is already owned by another controller");
-                            begin_stop(
-                                leg_pid,
-                                &root_identity,
-                                status.is_none(),
-                                &mut observed,
-                                &mut stop_started,
-                                &mut stop_deadline,
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            eprintln!("could not lock the new session: {error}");
-                            begin_stop(
-                                leg_pid,
-                                &root_identity,
-                                status.is_none(),
-                                &mut observed,
-                                &mut stop_started,
-                                &mut stop_deadline,
-                            );
-                            continue;
-                        }
+                    if session_lock.is_none() {
+                        eprintln!("new session lock was not reserved before native startup");
+                        begin_stop(
+                            leg_pid,
+                            &root_identity,
+                            status.is_none(),
+                            &mut observed,
+                            &mut stop_started,
+                            &mut stop_deadline,
+                        );
+                        continue;
                     }
+                    creation_lock.take();
+                    session_id_seen = true;
                 }
                 if let Err(error) = write_raw_record(&line) {
                     if error.kind() == io::ErrorKind::BrokenPipe {
@@ -430,6 +426,20 @@ fn safe_session_id(id: &str) -> bool {
         && id
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+fn native_session_id(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("sess-") else {
+        return false;
+    };
+    let components = suffix.split('-').collect::<Vec<_>>();
+    (components.len() == 2 || components.len() == 3)
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+        })
 }
 
 fn spawn_output_reader(stdout: ChildStdout, tx: mpsc::Sender<Message>) {
@@ -791,6 +801,12 @@ mod tests {
         assert!(!safe_session_id(""));
         assert!(!safe_session_id("../trail"));
         assert!(!safe_session_id("你好"));
+        assert!(native_session_id("sess-12-34"));
+        assert!(native_session_id("sess-12-34-5"));
+        assert!(!native_session_id("session-12-34"));
+        assert!(!native_session_id("sess-12"));
+        assert!(!native_session_id("sess-12-x"));
+        assert!(!native_session_id("sess-12-34/../trail"));
     }
 
     #[test]

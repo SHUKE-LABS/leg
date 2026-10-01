@@ -244,7 +244,7 @@ session trail can therefore be resumed without reusing the failed turn.
 ### Exchange
 
 ```
-leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>] [--stream-json]
+leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session|--new-session-id <id>] [--session-id-out <path>] [--stream-json]
 ```
 
 Answers one `baton.message/v1` request (from `--in`, or stdin) with exactly
@@ -254,9 +254,12 @@ is the headless entry point for adapters. If `LEG_EVENT_LOG` is non-blank,
 it appends request, tool, and outcome events to the trail for `leg log show`.
 
 By default, each exchange is cold and independent. Use `--new-session` to
-create a persistent session or `--session <id>` to continue one; the flags are
-mutually exclusive. `--session-id-out <path>` may accompany either and writes
-the session id plus a newline after the turn. Each session is stored as
+create a persistent session, `--session <id>` to continue one, or
+`--new-session-id <id>` to create one under a preallocated native `sess-...`
+ID. The session selection flags are mutually exclusive. The preallocated ID
+must not already have a trail; creation refuses an existing trail atomically.
+`--session-id-out <path>` may accompany any session selection and writes the
+session id plus a newline after the turn. Each session is stored as
 `<id>.jsonl` in `$LEG_SESSION_DIR`, or `$XDG_STATE_HOME/leg/sessions`, or
 `~/.local/state/leg/sessions` when neither variable is set. The store directory
 is created when a new session is started. A missing id fails before contacting
@@ -264,7 +267,8 @@ the provider with `leg: no session found: <id>`.
 
 Pass `--stream-json` to write a flushed NDJSON feed using the
 `leg.exchange.stream/v1` schema. This mode always writes to stdout and cannot
-be combined with `--out`. With `--session` or `--new-session`,
+be combined with `--out`. With `--session`, `--new-session`, or
+`--new-session-id`,
 `--session-id-out` remains available and writes that id after the turn. Each
 line has `schema`, `event`, and a zero-based increasing
 `seq`. Events are `turn_start`, `text_delta`, `tool_round`, `tool_call`,

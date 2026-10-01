@@ -296,10 +296,17 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)
                 page = await context.new_page()
                 browser_requests: list[tuple[str, str]] = []
+                browser_submit_responses: list[tuple[int, str]] = []
                 external_attempts: list[str] = []
                 page_errors: list[str] = []
                 allowed_authorities = {authority}
                 page.on("request", lambda request: browser_requests.append((request.method, request.url)))
+                page.on(
+                    "response",
+                    lambda response: browser_submit_responses.append((response.status, response.url))
+                    if response.request.method == "POST" and response.url.endswith("/submit")
+                    else None,
+                )
                 page.on("pageerror", lambda error: page_errors.append(str(error)))
 
                 async def local_only(route):
@@ -629,7 +636,21 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
 
                 await composer.fill("TRIAL-REOPEN-INTERRUPTION: expose an incomplete stream")
                 await page.get_by_role("button", name="Send").click()
-                failed_stream = wait_completed_submission(authority, token, session_id, 11)
+                try:
+                    failed_stream = wait_completed_submission(authority, token, session_id, 11)
+                except AssertionError as error:
+                    ui_state = await page.evaluate(
+                        """() => ({
+                          sessionId: sessionStorage.getItem('leg-web-current-session'),
+                          status: document.querySelector('#turn-status')?.textContent,
+                          error: document.querySelector('#send-error')?.textContent,
+                          sendDisabled: document.querySelector('#send')?.disabled,
+                          prompt: document.querySelector('#prompt')?.value,
+                        })"""
+                    )
+                    raise AssertionError(
+                        f"{error}; UI state={ui_state}; submit responses={browser_submit_responses}"
+                    ) from error
                 assert failed_stream["last_submission"]["status"] == "failed", failed_stream
                 await wait_status(page, "Failed")
 

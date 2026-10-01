@@ -344,6 +344,213 @@ def stop_process(process: subprocess.Popen[str], graceful: bool = True) -> None:
     process.wait(timeout=10)
 
 
+def run_binding_concurrency_smoke(
+    web_bin: Path,
+    supervisor_bin: Path,
+    root: Path,
+    workspace: Path,
+    provider_url: str,
+) -> None:
+    """Hold a native fixture before turn_start and exercise the shared supervisor."""
+    fixture_dir = workspace / "binding-fixture"
+    fixture_dir.mkdir()
+    source = fixture_dir / "fake_leg.rs"
+    fake_leg = fixture_dir / "fake-leg"
+    source.write_text(
+        r'''use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+const FIXTURE: &str = env!("LEG_BINDING_FIXTURE_DIR");
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {
+        println!("leg 0.14.0");
+        return;
+    }
+    if args == ["--help"] {
+        println!("usage: leg exchange --stream-json --new-session-id <id>");
+        return;
+    }
+    if args.first().map(String::as_str) != Some("exchange") {
+        std::process::exit(2);
+    }
+    let session_arg = args
+        .windows(2)
+        .find(|pair| pair[0] == "--new-session-id" || pair[0] == "--session")
+        .expect("session argument");
+    let new_session = session_arg[0] == "--new-session-id";
+    let session_id = session_arg[1].clone();
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    let fixture = PathBuf::from(FIXTURE);
+    let log_path = fixture.join("turns.log");
+    let prior_turns = fs::read_to_string(&log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with(&format!("{session_id}|")))
+        .count();
+    let mut log = OpenOptions::new().create(true).append(true).open(&log_path).unwrap();
+    writeln!(log, "{session_id}|{prompt}").unwrap();
+    let session_dir = PathBuf::from(env::var_os("LEG_SESSION_DIR").unwrap());
+    fs::create_dir_all(&session_dir).unwrap();
+    if new_session {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(session_dir.join(format!("{session_id}.jsonl")))
+            .unwrap();
+    }
+    fs::write(fixture.join(format!("{prompt}.id")), &session_id).unwrap();
+    if prompt == "HOLD-A" {
+        let release = fixture.join("HOLD-A.release");
+        while !release.exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let start = format!(
+        "{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_start\",\"seq\":0,\"provider\":\"fixture\",\"model\":\"fixture\",\"session_id\":\"{session_id}\",\"turn_index\":{prior_turns},\"request\":{{\"schema\":\"baton.message/v1\",\"message_id\":\"request-{prompt}\",\"conversation_id\":\"conversation-{session_id}\",\"kind\":\"request\",\"body\":\"{prompt}\"}}}}"
+    );
+    let end = format!(
+        "{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_end\",\"seq\":1,\"capped\":false,\"session_id\":\"{session_id}\",\"turn_index\":{prior_turns},\"response\":{{\"schema\":\"baton.message/v1\",\"message_id\":\"response-{prompt}\",\"conversation_id\":\"conversation-{session_id}\",\"in_reply_to\":\"request-{prompt}\",\"kind\":\"response\",\"body\":\"ok\"}}}}"
+    );
+    println!("{start}");
+    println!("{end}");
+}
+''',
+        encoding="utf-8",
+    )
+    compile_env = os.environ.copy()
+    compile_env["LEG_BINDING_FIXTURE_DIR"] = str(fixture_dir)
+    compiled = subprocess.run(
+        ["rustc", "--edition=2021", str(source), "-o", str(fake_leg)],
+        env=compile_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compiled.returncode == 0, f"native fixture build failed: {compiled.stderr}"
+
+    state_dir = root / "binding-state"
+    state_dir.mkdir()
+    host, authority, token = start_host(
+        web_bin, fake_leg, supervisor_bin, state_dir, workspace, provider_url
+    )
+    try:
+        def create_draft(name: str) -> str:
+            status, body = request(
+                authority,
+                token,
+                "POST",
+                "/api/sessions",
+                {"name": name, "cwd": str(workspace)},
+            )
+            assert status == 201 and isinstance(body, dict), body
+            return str(body["id"])
+
+        base_draft = create_draft("bound-base")
+        status, accepted = request(
+            authority,
+            token,
+            "POST",
+            f"/api/sessions/{base_draft}/submit",
+            {"request_id": 1, "prompt": "BASE"},
+        )
+        assert status == 202, accepted
+        base_id = wait_for(
+            lambda: (fixture_dir / "BASE.id").read_text(encoding="utf-8")
+            if (fixture_dir / "BASE.id").exists()
+            else None,
+            "base session binding fixture",
+        )
+        wait_for_receipt(authority, token, base_id, 1)
+
+        held_draft = create_draft("held-binding")
+        started = time.monotonic()
+        status, accepted = request(
+            authority,
+            token,
+            "POST",
+            f"/api/sessions/{held_draft}/submit",
+            {"request_id": 1, "prompt": "HOLD-A"},
+            timeout=2,
+        )
+        assert status == 202 and time.monotonic() - started < 1, accepted
+        held_id = wait_for(
+            lambda: (fixture_dir / "HOLD-A.id").read_text(encoding="utf-8")
+            if (fixture_dir / "HOLD-A.id").exists()
+            else None,
+            "held session ID before turn_start",
+        )
+        started = time.monotonic()
+        status, sessions = request(authority, token, "GET", "/api/sessions", timeout=2)
+        assert status == 200 and time.monotonic() - started < 1, sessions
+        started = time.monotonic()
+        pending = snapshot(authority, token, held_draft)
+        assert time.monotonic() - started < 1, pending
+        assert pending["last_submission"]["session_id"] == held_draft, pending
+
+        for alias in (held_draft, held_id):
+            status, duplicate = request(
+                authority,
+                token,
+                "POST",
+                f"/api/sessions/{alias}/submit",
+                {"request_id": 1, "prompt": "HOLD-A"},
+            )
+            assert status == 200 and duplicate["duplicate"] is True, duplicate
+        status, conflict = request(
+            authority,
+            token,
+            "POST",
+            f"/api/sessions/{held_id}/submit",
+            {"request_id": 1, "prompt": "different"},
+        )
+        assert status == 409 and conflict["error"] == "submission_id_conflict", conflict
+
+        started = time.monotonic()
+        status, existing = request(
+            authority,
+            token,
+            "POST",
+            f"/api/sessions/{base_id}/submit",
+            {"request_id": 2, "prompt": "BOUND-ONCE"},
+            timeout=2,
+        )
+        assert status == 202 and time.monotonic() - started < 1, existing
+        wait_for_receipt(authority, token, base_id, 2)
+        assert (fixture_dir / "turns.log").read_text(encoding="utf-8").count("|BOUND-ONCE\n") == 1
+
+        independent_draft = create_draft("independent-draft")
+        started = time.monotonic()
+        status, second = request(
+            authority,
+            token,
+            "POST",
+            f"/api/sessions/{independent_draft}/submit",
+            {"request_id": 1, "prompt": "QUICK-C"},
+            timeout=2,
+        )
+        assert status == 202 and time.monotonic() - started < 1, second
+        assert second["session_id"] == independent_draft, second
+
+        (fixture_dir / "HOLD-A.release").write_text("release", encoding="utf-8")
+        wait_for_receipt(authority, token, held_id, 1)
+        independent_id = wait_for(
+            lambda: (fixture_dir / "QUICK-C.id").read_text(encoding="utf-8")
+            if (fixture_dir / "QUICK-C.id").exists()
+            else None,
+            "independent draft startup after binding release",
+        )
+        wait_for_receipt(authority, token, independent_id, 1)
+    finally:
+        stop_process(host)
+
+
 def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="leg-web-smoke-") as root_string:
         root = Path(root_string)
@@ -581,6 +788,9 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
             assert final["high_water"] == 7 and final["next_request_id"] == 8, final
             assert final["last_submission"]["status"] in ("stopped", "incomplete"), final
             assert fixture_request_count(provider_url) == before_restart + 1
+            run_binding_concurrency_smoke(
+                web_bin, supervisor_bin, root, workspace, provider_url
+            )
         finally:
             if restarted is not None:
                 stop_process(restarted)

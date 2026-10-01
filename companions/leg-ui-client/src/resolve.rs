@@ -32,7 +32,7 @@ pub enum ResolveError {
     #[error("leg binary {path:?} did not identify itself as leg (version output: {detail})")]
     NotLeg { path: PathBuf, detail: String },
     #[error(
-        "leg binary {path:?} does not support --stream-json; install a version that provides leg.exchange.stream/v1"
+        "leg binary {path:?} lacks required exchange features (--stream-json, --new-session-id); install a version that provides leg.exchange.stream/v1"
     )]
     MissingStreamCapability { path: PathBuf },
     #[error("could not run leg binary {path:?}: {message}")]
@@ -83,7 +83,7 @@ pub(crate) fn resolve_leg(override_path: Option<&Path>) -> Result<ResolvedLeg, R
             message,
         })?;
     let help = String::from_utf8_lossy(&help.stdout);
-    if !help.contains("--stream-json") {
+    if !help.contains("--stream-json") || !help.contains("--new-session-id") {
         return Err(ResolveError::MissingStreamCapability { path });
     }
 

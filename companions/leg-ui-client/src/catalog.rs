@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use crate::client::{
     Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,
-    TurnRequest, TurnStopHandle,
+    TurnRequest, TurnStopHandle, new_native_session_id,
 };
 use crate::protocol::StreamEvent;
 use crate::supervisor;
@@ -429,13 +429,48 @@ impl SessionCatalog {
         _interface: SessionInterface,
         prompt: impl Into<String>,
     ) -> Result<CatalogTurn, CatalogError> {
+        let session_id = self.allocate_new_session_id()?;
+        self.start_new_with_id(draft_id, session_id, _interface, prompt)
+    }
+
+    /// Mints a native-format ID that is not already present in this catalog.
+    /// The supervisor reserves the per-session lock before the ID is published.
+    pub fn allocate_new_session_id(&self) -> Result<String, CatalogError> {
+        let _guard = self.lock_index()?;
+        let index = self.read_index_unlocked()?;
+        for _ in 0..128 {
+            let id = new_native_session_id();
+            if !index.sessions.contains_key(&id) && !self.trail_path(&id).exists() {
+                return Ok(id);
+            }
+        }
+        Err(CatalogError::Catalog(
+            "could not allocate a unique native session id".into(),
+        ))
+    }
+
+    /// Starts a draft under an ID reserved by the acceptance ledger.
+    pub fn start_new_with_id(
+        &self,
+        draft_id: &str,
+        session_id: String,
+        _interface: SessionInterface,
+        prompt: impl Into<String>,
+    ) -> Result<CatalogTurn, CatalogError> {
         validate_session_id(draft_id)?;
         if !is_draft_id(draft_id) {
             return Err(CatalogError::NotFound(draft_id.into()));
         }
+        validate_session_id(&session_id)?;
+        if is_draft_id(&session_id) || !session_id.starts_with("sess-") {
+            return Err(CatalogError::InvalidSessionId);
+        }
         let prompt = prompt.into();
         let _guard = self.lock_index()?;
         let mut index = self.read_index_unlocked()?;
+        if index.sessions.contains_key(&session_id) || self.trail_path(&session_id).exists() {
+            return Err(CatalogError::AlreadyExists(session_id));
+        }
         let record = index
             .sessions
             .get_mut(draft_id)
@@ -447,9 +482,10 @@ impl SessionCatalog {
         record.pending_new_turn = true;
         record.updated_at_ms = now_ms();
         self.write_index_unlocked(&index)?;
+        drop(_guard);
 
         let client = self.client();
-        let request = TurnRequest::new(prompt, cwd, LegSession::New);
+        let request = TurnRequest::new(prompt, cwd, LegSession::NewWithId(session_id));
         match client.start(request) {
             Ok(turn) => Ok(CatalogTurn {
                 turn,
@@ -460,11 +496,7 @@ impl SessionCatalog {
                 finished: None,
             }),
             Err(error) => {
-                if let Some(record) = index.sessions.get_mut(draft_id) {
-                    record.pending_new_turn = false;
-                    record.updated_at_ms = now_ms();
-                }
-                self.write_index_unlocked(&index)?;
+                self.clear_pending_draft(draft_id)?;
                 Err(map_start_error(error))
             }
         }
@@ -493,6 +525,7 @@ impl SessionCatalog {
         }
         ensure_idle(&session)?;
         let cwd = self.validated_cwd(id, record)?;
+        drop(_guard);
         let client = self.client();
         let turn = client
             .start(TurnRequest::new(
@@ -869,6 +902,15 @@ impl SessionCatalog {
             self.write_index_unlocked(&index)?;
         }
         Ok(())
+    }
+
+    /// Clears a draft's pending-start marker after the host has recovered an
+    /// unfinished durable receipt following restart.
+    pub fn recover_pending_new_session(&self, draft_id: &str) -> Result<(), CatalogError> {
+        if !is_draft_id(draft_id) {
+            return Err(CatalogError::InvalidSessionId);
+        }
+        self.clear_pending_draft(draft_id)
     }
 }
 

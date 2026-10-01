@@ -513,12 +513,13 @@ async function refreshSnapshot({ eventsArrived = false, sessionId = state.sessio
   const snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/snapshot`);
   if (state.sessionId !== sessionId || state.switchGeneration !== switchGeneration) return null;
   const savedId = state.sessionId;
-  if (snapshot.session?.id && snapshot.session.id !== savedId && !state.pending) {
-    bindSessionId(savedId, snapshot.session.id);
-  }
+  const boundSessionId = snapshot.session?.id !== savedId && !state.pending
+    ? snapshot.session?.id
+    : null;
   state.snapshot = snapshot;
   state.active = snapshot.active;
   state.cursor = Number(snapshot.cursor) || 0;
+  if (boundSessionId) adoptBoundSession(savedId, boundSessionId, switchGeneration);
   renderAll({ eventsArrived });
   return snapshot;
 }
@@ -535,6 +536,23 @@ function bindSessionId(oldId, actualId) {
   }
   state.sessionId = actualId;
   window.sessionStorage.setItem(sessionKey, actualId);
+}
+
+function adoptBoundSession(oldId, actualId, switchGeneration) {
+  if (
+    !oldId?.startsWith("draft-") ||
+    !actualId ||
+    actualId.startsWith("draft-") ||
+    !isCurrentSession(oldId, switchGeneration)
+  ) return false;
+  bindSessionId(oldId, actualId);
+  connectEvents(state.cursor, actualId, switchGeneration);
+  void api("/api/sessions/select", {
+    method: "POST",
+    body: { session_id: actualId, tab_id: tabId },
+  }).catch(() => {});
+  void refreshSessionList({ quiet: true });
+  return true;
 }
 
 function isCurrentSession(sessionId, switchGeneration) {
@@ -627,9 +645,11 @@ function handleSseFrame(frame, sessionId, switchGeneration) {
     return;
   }
   if (fields.event === "reset") {
+    const boundSessionId = data.session?.id;
     state.snapshot = data;
     state.active = data.active;
     state.cursor = Number(fields.id || data.cursor) || 0;
+    if (!state.pending) adoptBoundSession(sessionId, boundSessionId, switchGeneration);
     renderAll({ eventsArrived: true });
     if (state.pending) void reconcilePending();
     return;
@@ -647,6 +667,14 @@ function applyHostEvent(event, sessionId, switchGeneration) {
     return;
   }
   state.cursor = cursor;
+  const boundSessionId = event.kind === "stream" && event.data?.event === "turn_start"
+    ? event.session_id
+    : null;
+  if (sessionId.startsWith("draft-") && boundSessionId && !boundSessionId.startsWith("draft-")) {
+    adoptBoundSession(sessionId, boundSessionId, switchGeneration);
+    void refreshSnapshot({ eventsArrived: true, sessionId: boundSessionId, switchGeneration })
+      .catch(() => {});
+  }
   if (!state.active && event.kind === "accepted") {
     state.active = {
       turn_id: event.turn_id,
@@ -1244,7 +1272,7 @@ async function reconcilePending({ sessionId = state.sessionId, switchGeneration 
       }
       const actualId = receipt.session_id || snapshot.session.id;
       if (actualId && actualId !== state.sessionId) {
-        bindSessionId(state.sessionId, actualId);
+        adoptBoundSession(state.sessionId, actualId, switchGeneration);
       }
       const completedWithError = ["failed", "incomplete", "stopped"].includes(receipt.status);
       state.pending = null;

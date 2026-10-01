@@ -78,11 +78,24 @@ validation, and process ownership reuse `leg-ui-client`.
 
 The snapshot supplies the next per-session monotonically increasing request
 ID. The host persists its high-water mark and an accepted receipt before it
-starts leg. A retry with the same ID and prompt hash returns the existing
-receipt; using that ID with different content conflicts. New work while a run
-is active is busy. IDs older than the retained receipts remain stale because
-the high-water mark is durable. Receipts are bounded to 128 per session by
-default; prompts are not copied into host state.
+starts native leg work. For a draft, acceptance also reserves the native
+`sess-...` ID and records its alias before startup; the accepted receipt may
+still name the draft until `turn_start` confirms the binding. Snapshot and
+event requests using that draft ID continue to resolve to the bound session,
+so a reconnect can recover the native ID from the snapshot. Binding and
+catalog work run outside the Tokio request worker and outside other sessions'
+acceptance locks. A retry with the same ID and prompt hash returns the existing
+receipt; using that ID with different content conflicts. New work for the same
+logical session while a run is active is busy. IDs older than the retained
+receipts remain stale because the high-water mark is durable. Receipts are
+bounded to 128 per session by default; prompts are not copied into host state.
+
+An unrelated bound session can accept and start while a draft is waiting for
+its `turn_start`; a second draft can also receive its durable accepted receipt
+while native session creation is serialized. Stop reaches a run during startup
+or binding, and a late binding cannot restart a stopped run. A failed start or
+host restart leaves an incomplete receipt for snapshot and event recovery; the
+host never silently resubmits it.
 
 Each accepted run receives a host turn ID. Host event cursors increase
 monotonically per session and are persisted before an event is published. The

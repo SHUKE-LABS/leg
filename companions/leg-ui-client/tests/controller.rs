@@ -765,7 +765,7 @@ fn assert_resolution_failures(
     let fake_binary = scratch.join("old-leg");
     fs::write(
         &fake_source,
-        "fn main() { match std::env::args().nth(1).as_deref() { Some(\"--version\") => println!(\"leg 0.0.1\"), Some(\"--help\") => println!(\"usage: leg ask\"), _ => {} } }",
+        "fn main() { match std::env::args().nth(1).as_deref() { Some(\"--version\") => println!(\"leg 0.0.1\"), Some(\"--help\") => println!(\"usage: leg exchange --stream-json\"), _ => {} } }",
     )
     .expect("write old native fixture");
     let status = Command::new("rustc")
@@ -810,6 +810,163 @@ fn assert_success(outcome: TurnOutcome) {
         matches!(outcome, TurnOutcome::Succeeded { .. }),
         "expected a successful turn, got {outcome:?}"
     );
+}
+
+#[test]
+fn preallocated_new_session_locks_before_spawn_without_blocking_other_existing_sessions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let cwd = scratch.path().join("cwd");
+    let store = scratch.path().join("store");
+    fs::create_dir_all(&cwd).expect("create working directory");
+    fs::create_dir_all(&store).expect("create session store");
+    let leg_source = scratch.path().join("fixture-leg.rs");
+    let leg = scratch.path().join("fixture-leg");
+    fs::write(
+        &leg_source,
+        r##"
+use std::env;
+use std::fs;
+use std::io::{self, Read};
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+const HELD_ID: &str = "sess-100-200-1";
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {
+        println!("leg 0.14.0");
+        return;
+    }
+    if args == ["--help"] {
+        println!("leg exchange --stream-json --new-session-id");
+        return;
+    }
+    let session_id = args
+        .windows(2)
+        .find(|pair| pair[0] == "--new-session-id" || pair[0] == "--session")
+        .map(|pair| pair[1].clone())
+        .expect("session argument");
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    if session_id == HELD_ID {
+        fs::write("preallocated-started", "started").unwrap();
+        while !Path::new("release-preallocated").exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    println!(
+        r#"{{"schema":"leg.exchange.stream/v1","event":"turn_start","seq":0,"provider":"fixture","model":"fixture","session_id":"{}","turn_index":0,"request":{{"schema":"baton.message/v1","message_id":"request-1","conversation_id":"conversation-1","kind":"request","body":"fixture"}}}}"#,
+        session_id
+    );
+    println!(
+        r#"{{"schema":"leg.exchange.stream/v1","event":"turn_end","seq":1,"capped":false,"session_id":"{}","turn_index":0,"response":{{"schema":"baton.message/v1","message_id":"response-1","conversation_id":"conversation-1","in_reply_to":"request-1","kind":"response","body":"ok"}}}}"#,
+        session_id
+    );
+}
+"##,
+    )
+    .expect("write native fixture");
+    let compiled = Command::new("rustc")
+        .args(["--edition=2021"])
+        .arg(&leg_source)
+        .arg("-o")
+        .arg(&leg)
+        .output()
+        .expect("rustc is available to build the native fixture");
+    assert!(
+        compiled.status.success(),
+        "failed to compile native fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::set_permissions(&leg, fs::Permissions::from_mode(0o755)).expect("make fixture executable");
+    let supervisor = supervisor_binary();
+
+    let mut new_turn = client(Some(leg.clone()), &supervisor, &store)
+        .start(TurnRequest::new(
+            "hold new startup",
+            &cwd,
+            LegSession::NewWithId("sess-100-200-1".into()),
+        ))
+        .expect("start new session");
+    let started = cwd.join("preallocated-started");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "new leg did not reach its startup gate"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let (same_tx, same_rx) = std::sync::mpsc::sync_channel(1);
+    let same_leg = leg.clone();
+    let same_supervisor = supervisor.clone();
+    let same_store = store.clone();
+    let same_cwd = cwd.clone();
+    let same_thread = thread::spawn(move || {
+        let result = client(Some(same_leg), &same_supervisor, &same_store).start(TurnRequest::new(
+            "same session must be busy",
+            same_cwd,
+            LegSession::Existing("sess-100-200-1".into()),
+        ));
+        let _ = same_tx.send(result);
+    });
+    let same_result = same_rx.recv_timeout(Duration::from_secs(2));
+    if same_result.is_err() {
+        fs::write(cwd.join("release-preallocated"), "release").unwrap();
+        let _ = same_thread.join();
+        let _ = new_turn.wait();
+        panic!("same-ID Existing start waited behind the new-session lock");
+    }
+    match same_result.unwrap() {
+        Err(StartError::Busy) => {}
+        Err(error) => panic!("same-ID Existing start returned the wrong error: {error}"),
+        Ok(mut turn) => {
+            fs::write(cwd.join("release-preallocated"), "release").unwrap();
+            let _ = turn.wait();
+            let _ = new_turn.wait();
+            panic!("same-ID Existing start unexpectedly acquired the session lock");
+        }
+    }
+    same_thread.join().expect("same-ID start thread");
+
+    let (other_tx, other_rx) = std::sync::mpsc::sync_channel(1);
+    let other_leg = leg.clone();
+    let other_supervisor = supervisor.clone();
+    let other_store = store.clone();
+    let other_cwd = cwd.clone();
+    let other_thread = thread::spawn(move || {
+        let result =
+            client(Some(other_leg), &other_supervisor, &other_store).start(TurnRequest::new(
+                "unrelated existing session",
+                other_cwd,
+                LegSession::Existing("sess-unrelated-99".into()),
+            ));
+        let _ = other_tx.send(result);
+    });
+    let other_result = other_rx.recv_timeout(Duration::from_secs(2));
+    if other_result.is_err() {
+        fs::write(cwd.join("release-preallocated"), "release").unwrap();
+        let _ = other_thread.join();
+        let _ = new_turn.wait();
+        panic!("unrelated Existing start waited behind the new-session lock");
+    }
+    let mut other_turn = other_result
+        .unwrap()
+        .expect("unrelated Existing session proceeds");
+    other_thread.join().expect("unrelated start thread");
+    assert_success(
+        other_turn
+            .wait()
+            .expect("unrelated existing turn completes"),
+    );
+
+    fs::write(cwd.join("release-preallocated"), "release").unwrap();
+    assert_success(new_turn.wait().expect("new session completes"));
 }
 
 #[test]

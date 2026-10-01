@@ -27,7 +27,7 @@ use crate::transport::{StreamEvent, Transport, TransportCall};
 mod stream;
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
-const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session] [--session-id-out <path>] [--stream-json]";
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session|--new-session-id <id>] [--session-id-out <path>] [--stream-json]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
 /// to. An unset or blank value disables recording for `ask`, cold `exchange`,
@@ -94,6 +94,8 @@ enum ExchangeSession {
     Existing(String),
     /// Create a new session with a generated id.
     New,
+    /// Create a new session with a caller-reserved id.
+    NewWithId(String),
 }
 
 /// Selects the session trail to rehydrate for `leg session --resume`.
@@ -245,15 +247,18 @@ fn help_text() -> String {
          plain-text `exchange` leave stdout empty and report an error on\n\
          stderr; envelope `exchange` writes its `kind:\"error\"` response\n\
          before reporting the failure. `--session <id>` continues a named\n\
-         exchange session; `--new-session` creates one. These flags are\n\
-         mutually exclusive, and `--session-id-out <path>` writes the id and a\n\
+         exchange session; `--new-session` creates one. The\n\
+         `--new-session-id <id>` form creates under a pre-reserved native\n\
+         `sess-` id. These flags are mutually exclusive, and\n\
+         `--session-id-out <path>` writes the id and a\n\
          newline after\n\
-         the turn when either is used. The session store is\n\
+         the turn when one is used. The session store is\n\
          LEG_SESSION_DIR, else XDG_STATE_HOME/leg/sessions, else\n\
          ~/.local/state/leg/sessions. `baton serve --agent-cmd <path>\n\
          --agent-arg exchange` expects this protocol. `--stream-json` opts\n\
          into the `leg.exchange.stream/v1` NDJSON live-turn feed on stdout; it\n\
-         cannot be combined with `--out`. With `--session` or `--new-session`,\n\
+         cannot be combined with `--out`. With `--session`, `--new-session`,\n\
+         or `--new-session-id`,\n\
          `--session-id-out` remains available and writes that id after the turn.\n\
          Each record has a\n\
          zero-based increasing `seq`; text deltas are provisional, and EOF\n\
@@ -472,7 +477,7 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
             "--session" => {
                 if session.is_some() {
                     return Err(LegError::Usage(
-                        "exchange accepts only one of --session and --new-session".to_string(),
+                        "exchange accepts only one session selection flag".to_string(),
                     ));
                 }
                 let value = iter
@@ -484,6 +489,7 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
                         | "--out"
                         | "--session"
                         | "--new-session"
+                        | "--new-session-id"
                         | "--session-id-out"
                         | "--stream-json"
                 ) {
@@ -494,10 +500,26 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
             "--new-session" => {
                 if session.is_some() {
                     return Err(LegError::Usage(
-                        "exchange accepts only one of --session and --new-session".to_string(),
+                        "exchange accepts only one session selection flag".to_string(),
                     ));
                 }
                 session = Some(ExchangeSession::New);
+            }
+            "--new-session-id" => {
+                if session.is_some() {
+                    return Err(LegError::Usage(
+                        "exchange accepts only one session selection flag".to_string(),
+                    ));
+                }
+                let value = iter.next().ok_or_else(|| {
+                    LegError::Usage("--new-session-id requires a value".to_string())
+                })?;
+                if !valid_new_session_id(value) {
+                    return Err(LegError::Usage(
+                        "--new-session-id must use the native sess-<id> format".to_string(),
+                    ));
+                }
+                session = Some(ExchangeSession::NewWithId(value.clone()));
             }
             "--session-id-out" => {
                 let value = iter.next().ok_or_else(|| {
@@ -514,7 +536,7 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
 
     if session_id_out.is_some() && session.is_none() {
         return Err(LegError::Usage(
-            "--session-id-out requires --session or --new-session".to_string(),
+            "--session-id-out requires --session, --new-session, or --new-session-id".to_string(),
         ));
     }
 
@@ -628,6 +650,20 @@ fn execute_exchange_session(
             let session_id = new_session_id();
             let path = exchange_session_path(&store_dir, &session_id)
                 .ok_or_else(|| LegError::Config("generated an invalid session id".to_string()))?;
+            (
+                ResumedSession {
+                    session_id,
+                    conversation: Conversation::new(),
+                    prior_turns: 0,
+                    next_turn_index: 0,
+                },
+                path,
+                true,
+            )
+        }
+        ExchangeSession::NewWithId(session_id) => {
+            let path = exchange_session_path(&store_dir, &session_id)
+                .ok_or_else(|| LegError::Config("invalid preallocated session id".to_string()))?;
             (
                 ResumedSession {
                     session_id,
@@ -1718,6 +1754,17 @@ fn exchange_session_path(store_dir: &Path, session_id: &str) -> Option<PathBuf> 
         return None;
     }
     Some(store_dir.join(format!("{session_id}.jsonl")))
+}
+
+fn valid_new_session_id(session_id: &str) -> bool {
+    let Some(suffix) = session_id.strip_prefix("sess-") else {
+        return false;
+    };
+    let components = suffix.split('-').collect::<Vec<_>>();
+    (components.len() == 2 || components.len() == 3)
+        && components.iter().all(|component| {
+            !component.is_empty() && component.chars().all(|ch| ch.is_ascii_digit())
+        })
 }
 
 /// Loads and rehydrates one id-addressed session trail.
