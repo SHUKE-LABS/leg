@@ -1341,18 +1341,7 @@ fn timed_session_exchange(
     };
 
     if let Ok(outcome) = &result {
-        if outcome.reply.stop_reason == Some(StopReason::MaxTokens) {
-            let _ = writeln!(
-                warning,
-                "warning: reply truncated (stop_reason: {})",
-                StopReason::MaxTokens.as_str()
-            );
-        }
-        if outcome.capped {
-            let max_tool_rounds =
-                max_tool_rounds.expect("a capped turn has a configured round limit");
-            let _ = writeln!(warning, "{}", tool_round_limit_warning(max_tool_rounds));
-        }
+        write_turn_warnings(outcome, max_tool_rounds, warning);
     }
 
     let event = match &result {
@@ -1380,6 +1369,25 @@ fn timed_session_exchange(
     emit(sink, &event);
 
     TransportCall::completed(result, attempts)
+}
+
+/// Writes stderr warnings for a successful turn's truncation and tool-round cap.
+fn write_turn_warnings(
+    outcome: &TurnOutcome,
+    max_tool_rounds: Option<usize>,
+    warning: &mut dyn Write,
+) {
+    if outcome.reply.stop_reason == Some(StopReason::MaxTokens) {
+        let _ = writeln!(
+            warning,
+            "warning: reply truncated (stop_reason: {})",
+            StopReason::MaxTokens.as_str()
+        );
+    }
+    if outcome.capped {
+        let max_tool_rounds = max_tool_rounds.expect("a capped turn has a configured round limit");
+        let _ = writeln!(warning, "{}", tool_round_limit_warning(max_tool_rounds));
+    }
 }
 
 /// The history turn recorded for a session reply.

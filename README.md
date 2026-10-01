@@ -269,7 +269,8 @@ be combined with `--out`. With `--session` or `--new-session`,
 line has `schema`, `event`, and a zero-based increasing
 `seq`. Events are `turn_start`, `text_delta`, `tool_round`, `tool_call`,
 `tool_result`, and `turn_end`. Provider-round and content-block indices start
-at zero. Session records also carry `session_id` and `turn_index`.
+at zero. Session records also carry `session_id` and `turn_index`. Stdout is
+the NDJSON stream; human-readable warnings are written to stderr.
 
 Example output (each line is one JSON value):
 

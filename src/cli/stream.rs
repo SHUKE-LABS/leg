@@ -36,6 +36,8 @@ fn execute_cold_exchange(in_path: Option<&str>) -> Result<()> {
     let mut sink = open_event_sink();
     let stdout = std::io::stdout();
     let writer = Rc::new(RefCell::new(StreamJsonWriter::new(stdout.lock())));
+    let stderr = std::io::stderr();
+    let mut warning = stderr.lock();
 
     execute_cold_exchange_core(
         &transport,
@@ -43,6 +45,7 @@ fn execute_cold_exchange(in_path: Option<&str>) -> Result<()> {
         provider,
         &request,
         sink.as_mut(),
+        &mut warning,
         &writer,
     )
 }
@@ -129,6 +132,7 @@ fn execute_cold_exchange_core<T: Transport, W: Write>(
     provider: Provider,
     request: &MessageEnvelope,
     sink: &mut dyn EventSink,
+    warning: &mut dyn Write,
     writer: &Rc<RefCell<StreamJsonWriter<W>>>,
 ) -> Result<()> {
     write_turn_start(writer, request, meta, provider, None)?;
@@ -152,6 +156,9 @@ fn execute_cold_exchange_core<T: Transport, W: Write>(
         Some(error) => Err(error),
         None => call.result,
     };
+    if let Ok(turn) = &result {
+        write_turn_warnings(turn, transport.max_tool_rounds(), warning);
+    }
     let attempts = Some(call.attempts);
     let outcome_ts_ms = now_ms();
     let mut turn_error = None;
@@ -755,6 +762,7 @@ mod tests {
             Provider::Anthropic,
             &request,
             &mut sink,
+            &mut Vec::new(),
             &writer,
         )
         .expect("exchange succeeds");
@@ -806,6 +814,7 @@ mod tests {
             Provider::Anthropic,
             &request("hello"),
             &mut sink,
+            &mut Vec::new(),
             &writer,
         )
         .unwrap_err();
