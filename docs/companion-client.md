@@ -63,12 +63,22 @@ recovered, read-only session until a person selects an existing workspace; the
 catalog never derives a workspace from tool output. If a saved workspace
 disappears, submission stays blocked until a replacement is selected.
 
-Catalog updates use a cross-process lock and atomic file replacement. New UI
-sessions remain draft records until leg emits the session id at `turn_start`;
-that id is recorded before later turn success or failure. Reopening or importing
-a session only reads its trail. Starting another prompt and retrying a failed
-or incomplete prompt are explicit operations. Retry keeps the original prompt
-and returns the shared warning
+Catalog updates use a cross-process lock and atomic file replacement. Starting
+a new session writes a tokenized pending attempt with the controller's process
+birth identity and a candidate session ID, then releases the catalog lock
+before startup. The supervisor records its own process identity before it may
+launch leg. Once the managed trail exists, it writes a token-matched handoff
+for that exact session before the controller binds the draft at `turn_start`.
+Reopening or reading the catalog reconciles unfinished attempts from those
+records, process identities, the session lock, and the trail; it never starts
+leg or calls a provider. It binds a completed attempt only when the handoff and
+trail match and all owners and locks are gone. A live or ambiguous attempt
+stays pending with an actionable warning. Stale handoff, failure, and recovery
+updates cannot change a newer attempt.
+
+Reopening or importing a session only reads its trail. Starting another
+prompt and retrying a failed or incomplete prompt are explicit operations.
+Retry keeps the original prompt and returns the shared warning
 `Retry sends this prompt again and may repeat tool side effects.` The
 supervisor's session lock is held until owned leg and tool processes finish;
 catalog workspace changes and retries require that lock to be idle.
@@ -124,12 +134,53 @@ installed beside the UI binary or selected with `LEG_UI_SUPERVISOR_BIN`.
 The companion supervisor holds a kernel-released exclusive lock in the
 canonical session store until both leg and its tools have exited. Existing
 sessions acquire only their per-session lock, so they can start while an
-unrelated new session is still binding. New-session creation reserves its
-native `sess-...` ID and per-session lock before launching leg; a short store
-creation guard serializes new-session startup until `turn_start`. Leg creates
-the trail with exclusive file creation, so a preexisting trail is never
+unrelated new session is still binding. New-session creation reserves a
+native `sess-...` candidate ID. The supervisor acquires that ID's session lock
+before launching leg; a short store creation guard serializes startup until
+the token-matched trail handoff is durable. Leg creates the trail with
+exclusive file creation, so a preexisting trail is never
 overwritten. Different sessions can run concurrently. A competing start
 returns `StartError::Busy` without invoking a provider.
+
+Older pending drafts may have no attempt identity or session association. They
+remain `Unknown`; recovery preserves both the draft and any orphan trail and
+does not resend the prompt. Before copying one into a new conversation, stop
+the companion that owned it, wait for its supervisor and native `leg` process
+to finish cleanup, and confirm those processes have exited in the operating
+system's process viewer. If ownership cannot be confirmed, leave the draft
+pending and do not submit it again.
+
+To preserve a legacy draft, keep its Web tab open, copy the composer text and
+the `Workspace:` path, then choose **New conversation**, enter that same
+workspace, and paste the text into the new composer. The old draft and any
+orphan trail remain in the catalog. Web keeps unsent composer text in that
+tab's session storage. If the text was saved in catalog metadata by an
+interface such as the TUI, print pending drafts with no session handoff from
+`catalog.json` under the state root described above. Set `CATALOG` to that
+file's full path:
+
+```sh
+python3 - "$CATALOG" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as catalog_file:
+    sessions = json.load(catalog_file)["sessions"]
+for draft_id, record in sorted(sessions.items()):
+    attempt = record.get("pending_attempt") or {}
+    if not record.get("pending_new_turn") or attempt.get("native_session_id"):
+        continue
+    print(f"draft: {draft_id}; name: {record.get('name') or ''}")
+    print("workspace:", record.get("cwd") or "")
+    for interface, text in sorted(record.get("drafts", {}).items()):
+        print(f"\n[{interface} draft]\n{text}")
+PY
+```
+
+Use the printed workspace and desired interface draft when creating the new
+conversation. Keep the old catalog entry and trail so the original attempt's
+history is not lost. If the composer text is no longer in the Web tab or in
+catalog metadata, it cannot be recovered from the trail; the trail remains
+preserved for inspection.
 
 The supervisor is a separate process. Dropping a view does not drop the
 controller's turn handle; dropping the controller handle closes its control

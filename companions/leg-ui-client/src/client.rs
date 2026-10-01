@@ -115,6 +115,14 @@ struct StartRequestWire<'a> {
     store_dir: String,
     prompt: &'a str,
     session: SessionWire<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<StartAttemptWire<'a>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StartAttemptWire<'a> {
+    draft_id: &'a str,
+    token: &'a str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -140,6 +148,26 @@ impl Client {
     }
 
     pub fn start(&self, request: TurnRequest) -> Result<TurnHandle, StartError> {
+        self.start_with_attempt(request, None)
+    }
+
+    pub(crate) fn start_catalog_new(
+        &self,
+        request: TurnRequest,
+        draft_id: &str,
+        attempt_token: &str,
+    ) -> Result<TurnHandle, StartError> {
+        self.start_with_attempt(request, Some((draft_id, attempt_token)))
+    }
+
+    fn start_with_attempt(
+        &self,
+        request: TurnRequest,
+        attempt: Option<(&str, &str)>,
+    ) -> Result<TurnHandle, StartError> {
+        if attempt.is_some() && !matches!(&request.session, LegSession::NewWithId(_)) {
+            return Err(StartError::InvalidSessionId);
+        }
         let resolved = resolve_leg(self.config.leg_bin.as_deref())?;
         let store_dir = resolve_store_dir(self.config.session_store_dir.as_deref())?;
         let cwd = fs::canonicalize(&request.cwd)
@@ -198,6 +226,7 @@ impl Client {
             store_dir: store_dir.to_string_lossy().into_owned(),
             prompt: &request.prompt,
             session,
+            attempt: attempt.map(|(draft_id, token)| StartAttemptWire { draft_id, token }),
         };
         let mut child_stdin = child_stdin;
         serde_json::to_writer(&mut child_stdin, &wire)
