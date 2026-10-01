@@ -22,6 +22,7 @@ use crate::client::{
     Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,
     TurnRequest, TurnStopHandle, new_native_session_id,
 };
+use crate::process_owner::{OwnerState, ProcessOwner};
 use crate::protocol::StreamEvent;
 use crate::supervisor;
 
@@ -30,6 +31,7 @@ const LOCK_NAME: &str = ".catalog.lock";
 const INDEX_VERSION: u32 = 1;
 const EXCHANGE_SCHEMA: &str = "baton.exchange/v1";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionCatalogConfig {
@@ -232,8 +234,38 @@ struct SessionMetadata {
     display: BTreeMap<String, Value>,
     #[serde(default)]
     pending_new_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_attempt: Option<PendingAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_attempt_token: Option<String>,
     #[serde(default)]
     recovered: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingAttempt {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    controller: Option<ProcessOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervisor: Option<ProcessOwner>,
+    #[serde(default)]
+    candidate_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_session_id: Option<String>,
+    #[serde(default)]
+    controller_released: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RecoveryDecision {
+    Active,
+    Unknown,
+    Clear,
+    Bind(String),
 }
 
 impl SessionMetadata {
@@ -276,15 +308,18 @@ impl SessionCatalog {
                 supervisor_bin: config.supervisor_bin,
             }),
         };
-        let _guard = catalog.lock_index()?;
-        if !catalog.index_path().exists() {
-            catalog.write_index_unlocked(&CatalogIndex {
-                version: INDEX_VERSION,
-                sessions: BTreeMap::new(),
-            })?;
-        } else {
-            let _ = catalog.read_index_unlocked()?;
+        {
+            let _guard = catalog.lock_index()?;
+            if !catalog.index_path().exists() {
+                catalog.write_index_unlocked(&CatalogIndex {
+                    version: INDEX_VERSION,
+                    sessions: BTreeMap::new(),
+                })?;
+            } else {
+                let _ = catalog.read_index_unlocked()?;
+            }
         }
+        catalog.reconcile_pending_attempts(None)?;
         Ok(catalog)
     }
 
@@ -356,6 +391,9 @@ impl SessionCatalog {
     pub fn set_workspace(&self, id: &str, cwd: &Path) -> Result<(), CatalogError> {
         validate_session_id(id)?;
         let cwd = canonical_workspace(cwd)?;
+        if is_draft_id(id) {
+            self.reconcile_pending_attempts(Some(id))?;
+        }
         let _guard = self.lock_index()?;
         let mut index = self.read_index_unlocked()?;
         if !index.sessions.contains_key(id) {
@@ -390,6 +428,7 @@ impl SessionCatalog {
 
     pub fn get(&self, id: &str) -> Result<CatalogSession, CatalogError> {
         validate_session_id(id)?;
+        self.reconcile_pending_attempts(Some(id))?;
         let index = self.read_index()?;
         if let Some(record) = index.sessions.get(id) {
             return self.session_from_metadata(id, record, record.recovered);
@@ -401,6 +440,7 @@ impl SessionCatalog {
     }
 
     pub fn list(&self) -> Result<Vec<CatalogSession>, CatalogError> {
+        self.reconcile_pending_attempts(None)?;
         let index = self.read_index()?;
         let mut entries = Vec::new();
         for (id, record) in &index.sessions {
@@ -465,7 +505,10 @@ impl SessionCatalog {
         if is_draft_id(&session_id) || !session_id.starts_with("sess-") {
             return Err(CatalogError::InvalidSessionId);
         }
+        self.reconcile_pending_attempts(Some(draft_id))?;
         let prompt = prompt.into();
+        let controller = ProcessOwner::current().map_err(CatalogError::Driver)?;
+        let token = new_attempt_token(&controller);
         let _guard = self.lock_index()?;
         let mut index = self.read_index_unlocked()?;
         if index.sessions.contains_key(&session_id) || self.trail_path(&session_id).exists() {
@@ -480,23 +523,33 @@ impl SessionCatalog {
         }
         let cwd = self.validated_cwd(draft_id, record)?;
         record.pending_new_turn = true;
+        record.pending_attempt = Some(PendingAttempt {
+            token: token.clone(),
+            revision: 0,
+            controller: Some(controller),
+            supervisor: None,
+            candidate_session_id: session_id.clone(),
+            native_session_id: None,
+            controller_released: false,
+        });
         record.updated_at_ms = now_ms();
         self.write_index_unlocked(&index)?;
         drop(_guard);
 
         let client = self.client();
         let request = TurnRequest::new(prompt, cwd, LegSession::NewWithId(session_id));
-        match client.start(request) {
+        match client.start_catalog_new(request, draft_id, &token) {
             Ok(turn) => Ok(CatalogTurn {
                 turn,
                 catalog: self.clone(),
                 draft_id: Some(draft_id.to_string()),
+                attempt_token: Some(token),
                 session_id: None,
                 pending_event: VecDeque::new(),
                 finished: None,
             }),
             Err(error) => {
-                self.clear_pending_draft(draft_id)?;
+                self.release_controller_attempt(draft_id, &token)?;
                 Err(map_start_error(error))
             }
         }
@@ -538,6 +591,7 @@ impl SessionCatalog {
             turn,
             catalog: self.clone(),
             draft_id: None,
+            attempt_token: None,
             session_id: Some(id.to_string()),
             pending_event: VecDeque::new(),
             finished: None,
@@ -668,19 +722,9 @@ impl SessionCatalog {
         }
 
         let run_state = if is_draft_id(id) {
-            if record.pending_new_turn {
-                match supervisor::creation_lock_is_held(&self.inner.sessions_dir) {
-                    Ok(true) => CatalogRunState::Active,
-                    Ok(false) => CatalogRunState::Unknown,
-                    Err(error) => {
-                        warnings.push(error);
-                        read_only = true;
-                        CatalogRunState::Unknown
-                    }
-                }
-            } else {
-                CatalogRunState::Idle
-            }
+            let (state, pending_warnings) = self.pending_attempt_state(id, record);
+            warnings.extend(pending_warnings);
+            state
         } else {
             match supervisor::session_lock_is_held(&self.inner.sessions_dir, id) {
                 Ok(true) => CatalogRunState::Active,
@@ -712,6 +756,203 @@ impl SessionCatalog {
             pending_new_turn: record.pending_new_turn,
             ended,
         })
+    }
+
+    fn pending_attempt_state(
+        &self,
+        draft_id: &str,
+        record: &SessionMetadata,
+    ) -> (CatalogRunState, Vec<String>) {
+        if !record.pending_new_turn {
+            return (CatalogRunState::Idle, Vec::new());
+        }
+        let Some(attempt) = record.pending_attempt.as_ref() else {
+            return (
+                CatalogRunState::Unknown,
+                vec![format!(
+                    "legacy pending draft {draft_id} has no verified attempt record; after confirming its original companion and supervisor have stopped, create a new conversation and copy the saved prompt and workspace. The draft and any orphan trail are preserved"
+                )],
+            );
+        };
+
+        let mut warnings = Vec::new();
+        let mut active = false;
+        let mut unknown = false;
+        if attempt.token.is_empty()
+            || attempt.controller.is_none()
+            || !safe_session_id(&attempt.candidate_session_id)
+            || !attempt.candidate_session_id.starts_with("sess-")
+        {
+            warnings.push(
+                "pending attempt is missing valid ownership or session handoff evidence; its reservation is preserved".into(),
+            );
+            return (CatalogRunState::Unknown, warnings);
+        }
+        if !attempt.controller_released {
+            if let Some(controller) = attempt.controller.as_ref() {
+                record_owner_state(
+                    "controller",
+                    controller,
+                    &mut active,
+                    &mut unknown,
+                    &mut warnings,
+                );
+            } else {
+                unknown = true;
+                warnings.push(
+                    "pending attempt has no recorded controller identity; its reservation is preserved".into(),
+                );
+            }
+        }
+        if let Some(supervisor_owner) = attempt.supervisor.as_ref() {
+            record_owner_state(
+                "supervisor",
+                supervisor_owner,
+                &mut active,
+                &mut unknown,
+                &mut warnings,
+            );
+        }
+        match supervisor::session_lock_is_held(
+            &self.inner.sessions_dir,
+            &attempt.candidate_session_id,
+        ) {
+            Ok(true) => active = true,
+            Ok(false) => {}
+            Err(error) => {
+                unknown = true;
+                warnings.push(format!(
+                    "could not verify the pending session lock for {}: {error}",
+                    attempt.candidate_session_id
+                ));
+            }
+        }
+        if active {
+            return (CatalogRunState::Active, warnings);
+        }
+        if unknown {
+            warnings.push(
+                "pending creation remains reserved until process and session ownership can be verified".into(),
+            );
+            return (CatalogRunState::Unknown, warnings);
+        }
+        if let Some(session_id) = attempt.native_session_id.as_deref() {
+            if session_id != attempt.candidate_session_id {
+                warnings.push(format!(
+                    "pending attempt {} recorded a session id that does not match its reservation; it was not adopted",
+                    attempt.token
+                ));
+            } else if !self.managed_trail_exists(session_id) {
+                warnings.push(format!(
+                    "supervisor recorded session {session_id}, but its managed trail is missing; the pending draft is preserved and no prompt was replayed"
+                ));
+            } else {
+                warnings.push(
+                    "pending session ownership changed during inspection; refresh to finish recovery".into(),
+                );
+            }
+        } else if self.managed_trail_exists(&attempt.candidate_session_id) {
+            warnings.push(format!(
+                "trail {} exists without a token-matched supervisor handoff; it was not adopted and the prompt was not replayed",
+                attempt.candidate_session_id
+            ));
+        } else {
+            warnings.push(
+                "pending creation changed during inspection; refresh to finish recovery".into(),
+            );
+        }
+        (CatalogRunState::Unknown, warnings)
+    }
+
+    fn reconcile_pending_attempts(&self, only_id: Option<&str>) -> Result<(), CatalogError> {
+        let pending = self
+            .read_index()?
+            .sessions
+            .into_iter()
+            .filter(|(id, record)| {
+                record.pending_new_turn
+                    && only_id.is_none_or(|only_id| only_id == id)
+                    && record.pending_attempt.is_some()
+            })
+            .filter_map(|(id, record)| record.pending_attempt.map(|attempt| (id, attempt)))
+            .collect::<Vec<_>>();
+
+        for (draft_id, attempt) in pending {
+            let decision = self.recovery_decision(&attempt);
+            match decision {
+                RecoveryDecision::Active | RecoveryDecision::Unknown => {}
+                RecoveryDecision::Clear => {
+                    self.clear_pending_attempt_if_current(
+                        &draft_id,
+                        &attempt.token,
+                        attempt.revision,
+                    )?;
+                }
+                RecoveryDecision::Bind(session_id) => {
+                    self.bind_session_id(
+                        &draft_id,
+                        &session_id,
+                        &attempt.token,
+                        Some(attempt.revision),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recovery_decision(&self, attempt: &PendingAttempt) -> RecoveryDecision {
+        let mut active = false;
+        let mut unknown = false;
+        if attempt.token.is_empty()
+            || attempt.controller.is_none()
+            || !safe_session_id(&attempt.candidate_session_id)
+            || !attempt.candidate_session_id.starts_with("sess-")
+        {
+            return RecoveryDecision::Unknown;
+        }
+        if !attempt.controller_released {
+            match attempt.controller.as_ref() {
+                Some(controller) => match controller.inspect() {
+                    OwnerState::Alive => active = true,
+                    OwnerState::Dead | OwnerState::Reused => {}
+                    OwnerState::Unknown(_) => unknown = true,
+                },
+                None => unknown = true,
+            }
+        }
+        if let Some(supervisor_owner) = attempt.supervisor.as_ref() {
+            match supervisor_owner.inspect() {
+                OwnerState::Alive => active = true,
+                OwnerState::Dead | OwnerState::Reused => {}
+                OwnerState::Unknown(_) => unknown = true,
+            }
+        }
+        match supervisor::session_lock_is_held(
+            &self.inner.sessions_dir,
+            &attempt.candidate_session_id,
+        ) {
+            Ok(true) => active = true,
+            Ok(false) => {}
+            Err(_) => unknown = true,
+        }
+        if active {
+            return RecoveryDecision::Active;
+        }
+        if unknown {
+            return RecoveryDecision::Unknown;
+        }
+        if let Some(session_id) = attempt.native_session_id.as_deref() {
+            if session_id == attempt.candidate_session_id && self.managed_trail_exists(session_id) {
+                RecoveryDecision::Bind(session_id.to_string())
+            } else {
+                RecoveryDecision::Unknown
+            }
+        } else if self.managed_trail_exists(&attempt.candidate_session_id) {
+            RecoveryDecision::Unknown
+        } else {
+            RecoveryDecision::Clear
+        }
     }
 
     fn validated_cwd(&self, id: &str, record: &SessionMetadata) -> Result<PathBuf, CatalogError> {
@@ -785,6 +1026,22 @@ impl SessionCatalog {
         let file = private_open_rw_create(&self.inner.state_dir.join(LOCK_NAME))?;
         file.lock_exclusive()?;
         Ok(file)
+    }
+
+    fn from_sessions_dir(sessions_dir: &Path) -> Result<Self, CatalogError> {
+        let sessions_dir = fs::canonicalize(sessions_dir)?;
+        let state_dir = sessions_dir
+            .parent()
+            .ok_or_else(|| CatalogError::Catalog("session store has no state directory".into()))?
+            .to_path_buf();
+        Ok(Self {
+            inner: Arc::new(CatalogInner {
+                state_dir,
+                sessions_dir,
+                leg_bin: None,
+                supervisor_bin: None,
+            }),
+        })
     }
 
     fn read_index(&self) -> Result<CatalogIndex, CatalogError> {
@@ -873,51 +1130,300 @@ impl SessionCatalog {
         Ok(())
     }
 
-    fn bind_session_id(&self, draft_id: &str, session_id: &str) -> Result<(), CatalogError> {
+    fn bind_session_id(
+        &self,
+        draft_id: &str,
+        session_id: &str,
+        attempt_token: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<(), CatalogError> {
         validate_session_id(session_id)?;
         if is_draft_id(session_id) {
             return Err(CatalogError::InvalidSessionId);
         }
         let _guard = self.lock_index()?;
         let mut index = self.read_index_unlocked()?;
-        if index.sessions.contains_key(session_id) {
+        if let Some(existing) = index.sessions.get(session_id) {
+            if existing.bound_attempt_token.as_deref() == Some(attempt_token) {
+                return Ok(());
+            }
             return Err(CatalogError::AlreadyExists(session_id.into()));
+        }
+        let current_attempt = index
+            .sessions
+            .get(draft_id)
+            .and_then(|record| record.pending_attempt.as_ref())
+            .ok_or_else(|| CatalogError::NotFound(draft_id.into()))?;
+        if current_attempt.token != attempt_token
+            || current_attempt.native_session_id.as_deref() != Some(session_id)
+            || expected_revision.is_some_and(|revision| current_attempt.revision != revision)
+        {
+            return Err(CatalogError::Catalog(
+                "pending session attempt changed before binding".into(),
+            ));
         }
         let mut record = index
             .sessions
             .remove(draft_id)
             .ok_or_else(|| CatalogError::NotFound(draft_id.into()))?;
         record.pending_new_turn = false;
+        record.pending_attempt = None;
+        record.bound_attempt_token = Some(attempt_token.to_string());
         record.updated_at_ms = now_ms();
         index.sessions.insert(session_id.to_string(), record);
         self.write_index_unlocked(&index)
     }
 
-    fn clear_pending_draft(&self, draft_id: &str) -> Result<(), CatalogError> {
+    fn clear_pending_attempt_if_current(
+        &self,
+        draft_id: &str,
+        attempt_token: &str,
+        revision: u64,
+    ) -> Result<(), CatalogError> {
         let _guard = self.lock_index()?;
         let mut index = self.read_index_unlocked()?;
         if let Some(record) = index.sessions.get_mut(draft_id) {
-            record.pending_new_turn = false;
+            let matches = record.pending_new_turn
+                && record.pending_attempt.as_ref().is_some_and(|attempt| {
+                    attempt.token == attempt_token && attempt.revision == revision
+                });
+            if matches {
+                record.pending_new_turn = false;
+                record.pending_attempt = None;
+                record.updated_at_ms = now_ms();
+                self.write_index_unlocked(&index)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn release_controller_attempt(
+        &self,
+        draft_id: &str,
+        attempt_token: &str,
+    ) -> Result<(), CatalogError> {
+        {
+            let _guard = self.lock_index()?;
+            let mut index = self.read_index_unlocked()?;
+            if let Some(record) = index.sessions.get_mut(draft_id)
+                && let Some(attempt) = record.pending_attempt.as_mut()
+                && record.pending_new_turn
+                && attempt.token == attempt_token
+                && !attempt.controller_released
+            {
+                attempt.controller_released = true;
+                attempt.revision = attempt.revision.saturating_add(1);
+                record.updated_at_ms = now_ms();
+                self.write_index_unlocked(&index)?;
+            }
+        }
+        self.reconcile_pending_attempts(Some(draft_id))
+    }
+
+    fn record_supervisor_owner(
+        &self,
+        draft_id: &str,
+        attempt_token: &str,
+        candidate_session_id: &str,
+        owner: ProcessOwner,
+    ) -> Result<(), CatalogError> {
+        self.mutate_pending_attempt(draft_id, attempt_token, |attempt| {
+            if attempt.candidate_session_id != candidate_session_id {
+                return Err(CatalogError::Catalog(
+                    "supervisor session reservation does not match the pending attempt".into(),
+                ));
+            }
+            if attempt.controller_released {
+                return Err(CatalogError::Catalog(
+                    "controller already released this pending attempt".into(),
+                ));
+            }
+            match attempt.supervisor.as_ref() {
+                Some(existing) if existing == &owner => return Ok(false),
+                Some(_) => {
+                    return Err(CatalogError::Catalog(
+                        "pending attempt already has a different supervisor owner".into(),
+                    ));
+                }
+                None => {}
+            }
+            attempt.supervisor = Some(owner);
+            Ok(true)
+        })
+    }
+
+    fn record_native_session_handoff(
+        &self,
+        draft_id: &str,
+        attempt_token: &str,
+        candidate_session_id: &str,
+        session_id: &str,
+        supervisor_owner: &ProcessOwner,
+    ) -> Result<(), CatalogError> {
+        self.mutate_pending_attempt(draft_id, attempt_token, |attempt| {
+            if attempt.candidate_session_id != candidate_session_id
+                || candidate_session_id != session_id
+                || attempt.supervisor.as_ref() != Some(supervisor_owner)
+            {
+                return Err(CatalogError::Catalog(
+                    "native session handoff does not match the verified pending attempt".into(),
+                ));
+            }
+            match attempt.native_session_id.as_deref() {
+                Some(existing) if existing == session_id => return Ok(false),
+                Some(_) => {
+                    return Err(CatalogError::Catalog(
+                        "pending attempt already names a different native session".into(),
+                    ));
+                }
+                None => {}
+            }
+            attempt.native_session_id = Some(session_id.to_string());
+            Ok(true)
+        })
+    }
+
+    fn mutate_pending_attempt<F>(
+        &self,
+        draft_id: &str,
+        attempt_token: &str,
+        mutate: F,
+    ) -> Result<(), CatalogError>
+    where
+        F: FnOnce(&mut PendingAttempt) -> Result<bool, CatalogError>,
+    {
+        let _guard = self.lock_index()?;
+        let mut index = self.read_index_unlocked()?;
+        let record = index
+            .sessions
+            .get_mut(draft_id)
+            .ok_or_else(|| CatalogError::NotFound(draft_id.into()))?;
+        let attempt = record
+            .pending_attempt
+            .as_mut()
+            .filter(|attempt| record.pending_new_turn && attempt.token == attempt_token)
+            .ok_or_else(|| {
+                CatalogError::Catalog("pending session attempt is no longer current".into())
+            })?;
+        if mutate(attempt)? {
+            attempt.revision = attempt.revision.saturating_add(1);
             record.updated_at_ms = now_ms();
             self.write_index_unlocked(&index)?;
         }
         Ok(())
     }
 
-    /// Clears a draft's pending-start marker after the host has recovered an
-    /// unfinished durable receipt following restart.
+    /// Reconciles the catalog attempt associated with an unfinished durable
+    /// receipt. Live or ambiguous ownership remains reserved.
     pub fn recover_pending_new_session(&self, draft_id: &str) -> Result<(), CatalogError> {
         if !is_draft_id(draft_id) {
             return Err(CatalogError::InvalidSessionId);
         }
-        self.clear_pending_draft(draft_id)
+        self.reconcile_pending_attempts(Some(draft_id))
     }
+}
+
+pub(crate) fn publish_supervisor_owner(
+    sessions_dir: &Path,
+    draft_id: &str,
+    attempt_token: &str,
+    candidate_session_id: &str,
+    owner: ProcessOwner,
+) -> Result<(), String> {
+    SessionCatalog::from_sessions_dir(sessions_dir)
+        .and_then(|catalog| {
+            catalog.record_supervisor_owner(draft_id, attempt_token, candidate_session_id, owner)
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn publish_native_session_handoff(
+    sessions_dir: &Path,
+    draft_id: &str,
+    attempt_token: &str,
+    candidate_session_id: &str,
+    session_id: &str,
+    supervisor_owner: &ProcessOwner,
+) -> Result<(), String> {
+    pause_before_handoff_for_tests()?;
+    SessionCatalog::from_sessions_dir(sessions_dir)
+        .and_then(|catalog| {
+            if !catalog.managed_trail_exists(session_id) {
+                return Err(CatalogError::Catalog(format!(
+                    "managed trail for session {session_id} is not present yet"
+                )));
+            }
+            catalog.record_native_session_handoff(
+                draft_id,
+                attempt_token,
+                candidate_session_id,
+                session_id,
+                supervisor_owner,
+            )
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn pause_before_handoff_for_tests() -> Result<(), String> {
+    let (Some(ready), Some(release)) = (
+        std::env::var_os("LEG_UI_TEST_HANDOFF_PAUSE_READY"),
+        std::env::var_os("LEG_UI_TEST_HANDOFF_PAUSE_RELEASE"),
+    ) else {
+        return Ok(());
+    };
+    let ready = PathBuf::from(ready);
+    let release = PathBuf::from(release);
+    fs::write(ready, "ready").map_err(|error| error.to_string())?;
+    while !release.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn pause_before_handoff_for_tests() -> Result<(), String> {
+    Ok(())
+}
+
+fn record_owner_state(
+    label: &str,
+    owner: &ProcessOwner,
+    active: &mut bool,
+    unknown: &mut bool,
+    warnings: &mut Vec<String>,
+) {
+    match owner.inspect() {
+        OwnerState::Alive => *active = true,
+        OwnerState::Dead | OwnerState::Reused => {}
+        OwnerState::Unknown(error) => {
+            *unknown = true;
+            warnings.push(format!(
+                "could not verify the recorded {label} process {} birth identity: {error}",
+                owner.pid
+            ));
+        }
+    }
+}
+
+fn new_attempt_token(owner: &ProcessOwner) -> String {
+    let sequence = ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "attempt-{}-{}-{started}-{sequence}",
+        owner.pid,
+        owner.birth_token.replace(':', "-")
+    )
 }
 
 pub struct CatalogTurn {
     turn: TurnHandle,
     catalog: SessionCatalog,
     draft_id: Option<String>,
+    attempt_token: Option<String>,
     session_id: Option<String>,
     pending_event: VecDeque<StreamEvent>,
     finished: Option<TurnOutcome>,
@@ -946,7 +1452,14 @@ impl CatalogTurn {
             },
         ) = (&self.draft_id, &event)
         {
-            match self.catalog.bind_session_id(draft_id, session_id) {
+            let attempt_token = self
+                .attempt_token
+                .as_deref()
+                .expect("new catalog turns carry an attempt token");
+            match self
+                .catalog
+                .bind_session_id(draft_id, session_id, attempt_token, None)
+            {
                 Ok(()) => {
                     self.session_id = Some(session_id.clone());
                     self.draft_id = None;
@@ -977,12 +1490,26 @@ impl CatalogTurn {
         while self.observe()?.is_some() {}
         let outcome = self.turn.wait()?;
         self.finished = Some(outcome.clone());
-        if let Some(draft_id) = self.draft_id.take() {
+        if let (Some(draft_id), Some(attempt_token)) =
+            (self.draft_id.as_deref(), self.attempt_token.as_deref())
+        {
             self.catalog
-                .clear_pending_draft(&draft_id)
+                .release_controller_attempt(draft_id, attempt_token)
                 .map_err(|error| CatalogTurnError::Catalog(error.to_string()))?;
         }
         Ok(outcome)
+    }
+}
+
+impl Drop for CatalogTurn {
+    fn drop(&mut self) {
+        if let (Some(draft_id), Some(attempt_token)) =
+            (self.draft_id.as_deref(), self.attempt_token.as_deref())
+        {
+            let _ = self
+                .catalog
+                .release_controller_attempt(draft_id, attempt_token);
+        }
     }
 }
 
@@ -1505,5 +2032,445 @@ mod tests {
         assert_eq!(snapshot.turns[0].outcome, TrailOutcome::Incomplete);
         assert!(snapshot.read_only);
         assert_eq!(snapshot.warnings.len(), 2);
+    }
+
+    fn attempt(token: &str, candidate: &str, owner: ProcessOwner) -> PendingAttempt {
+        PendingAttempt {
+            token: token.to_string(),
+            revision: 0,
+            controller: Some(owner),
+            supervisor: None,
+            candidate_session_id: candidate.to_string(),
+            native_session_id: None,
+            controller_released: false,
+        }
+    }
+
+    #[test]
+    fn stale_recovery_revision_cannot_clear_a_new_supervisor_handoff() {
+        let scratch = tempdir().unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(scratch.path().join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let draft = catalog
+            .create_draft(SessionInterface::Tui, Some("held".into()), None)
+            .unwrap();
+        let candidate = "sess-91-109";
+        let owner = ProcessOwner::current().unwrap();
+        let mut stale_owner = owner.clone();
+        stale_owner.birth_token.push_str("-old-incarnation");
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt = Some(attempt("token-1", candidate, stale_owner));
+                Ok(())
+            })
+            .unwrap();
+        let observed_revision = catalog.read_index().unwrap().sessions[&draft.id]
+            .pending_attempt
+            .as_ref()
+            .unwrap()
+            .revision;
+
+        catalog
+            .record_supervisor_owner(&draft.id, "token-1", candidate, owner)
+            .unwrap();
+        catalog
+            .clear_pending_attempt_if_current(&draft.id, "token-1", observed_revision)
+            .unwrap();
+
+        let pending = catalog.get(&draft.id).unwrap();
+        assert!(pending.pending_new_turn);
+        let stored = catalog.read_index().unwrap();
+        let handoff = stored.sessions[&draft.id].pending_attempt.as_ref().unwrap();
+        assert_eq!(handoff.revision, 1);
+        assert!(handoff.supervisor.is_some());
+        assert!(!catalog.trail_path(candidate).exists());
+    }
+
+    #[test]
+    fn old_attempt_updates_cannot_change_a_newer_reservation() {
+        let scratch = tempdir().unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(scratch.path().join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let draft = catalog
+            .create_draft(SessionInterface::Web, Some("newer".into()), None)
+            .unwrap();
+        let owner = ProcessOwner::current().unwrap();
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt = Some(attempt("old-token", "sess-91-1", owner.clone()));
+                Ok(())
+            })
+            .unwrap();
+        catalog
+            .clear_pending_attempt_if_current(&draft.id, "old-token", 0)
+            .unwrap();
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt = Some(attempt("new-token", "sess-91-2", owner));
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            catalog
+                .record_supervisor_owner(
+                    &draft.id,
+                    "old-token",
+                    "sess-91-1",
+                    ProcessOwner::current().unwrap()
+                )
+                .is_err()
+        );
+        catalog
+            .release_controller_attempt(&draft.id, "old-token")
+            .unwrap();
+
+        let stored = catalog.read_index().unwrap();
+        let current = stored.sessions[&draft.id].pending_attempt.as_ref().unwrap();
+        assert_eq!(current.token, "new-token");
+        assert_eq!(current.candidate_session_id, "sess-91-2");
+        assert!(current.supervisor.is_none());
+        assert!(!catalog.trail_path("sess-91-1").exists());
+        assert!(!catalog.trail_path("sess-91-2").exists());
+    }
+
+    #[test]
+    fn candidate_trail_without_supervisor_handoff_is_never_adopted() {
+        let scratch = tempdir().unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(scratch.path().join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let draft = catalog
+            .create_draft(SessionInterface::Tui, Some("preserve me".into()), None)
+            .unwrap();
+        let candidate = "sess-91-4";
+        let mut reused = ProcessOwner::current().unwrap();
+        reused.birth_token.push_str("-reused");
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt = Some(attempt("token-4", candidate, reused));
+                Ok(())
+            })
+            .unwrap();
+        fs::write(
+            catalog.trail_path(candidate),
+            sample_trail(candidate, "session_end"),
+        )
+        .unwrap();
+
+        catalog.reconcile_pending_attempts(None).unwrap();
+        let pending = catalog.get(&draft.id).unwrap();
+        assert!(pending.pending_new_turn);
+        assert_eq!(pending.run_state, CatalogRunState::Unknown);
+        assert!(
+            pending
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("without a token-matched supervisor handoff") })
+        );
+        assert!(catalog.trail_path(candidate).exists());
+        assert!(
+            !catalog
+                .read_index()
+                .unwrap()
+                .sessions
+                .contains_key(candidate)
+        );
+    }
+
+    #[test]
+    fn concurrent_recovery_adopts_one_token_matched_trail_with_metadata() {
+        let scratch = tempdir().unwrap();
+        let state_dir = scratch.path().join("state");
+        let workspace = scratch.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state_dir),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let draft = catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("exact attempt".into()),
+                Some(&workspace),
+            )
+            .unwrap();
+        catalog
+            .save_draft(&draft.id, SessionInterface::Tui, "TUI draft".into())
+            .unwrap();
+        catalog
+            .save_draft(&draft.id, SessionInterface::Web, "Web draft".into())
+            .unwrap();
+        catalog
+            .save_display_metadata(&draft.id, "accent".into(), json!("amber"))
+            .unwrap();
+
+        let candidate = "sess-91-3";
+        let owner = ProcessOwner::current().unwrap();
+        let mut old_owner = owner;
+        old_owner.birth_token.push_str("-old-incarnation");
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt = Some(attempt("token-3", candidate, old_owner.clone()));
+                Ok(())
+            })
+            .unwrap();
+        fs::write(
+            catalog.trail_path(candidate),
+            sample_trail(candidate, "session_end"),
+        )
+        .unwrap();
+        catalog
+            .record_supervisor_owner(&draft.id, "token-3", candidate, old_owner.clone())
+            .unwrap();
+        catalog
+            .record_native_session_handoff(&draft.id, "token-3", candidate, candidate, &old_owner)
+            .unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut recoveries = Vec::new();
+        for _ in 0..2 {
+            let catalog = catalog.clone();
+            let barrier = Arc::clone(&barrier);
+            recoveries.push(std::thread::spawn(move || {
+                barrier.wait();
+                catalog.reconcile_pending_attempts(None)
+            }));
+        }
+        barrier.wait();
+        for recovery in recoveries {
+            recovery.join().unwrap().unwrap();
+        }
+
+        let entries = catalog.list().unwrap();
+        assert_eq!(
+            entries.iter().filter(|entry| entry.id == candidate).count(),
+            1
+        );
+        assert!(!entries.iter().any(|entry| entry.id == draft.id));
+        let adopted = catalog.get(candidate).unwrap();
+        assert_eq!(adopted.name.as_deref(), Some("exact attempt"));
+        assert_eq!(
+            adopted.cwd.as_deref(),
+            Some(fs::canonicalize(workspace).unwrap().as_path())
+        );
+        assert_eq!(adopted.drafts[&SessionInterface::Tui], "TUI draft");
+        assert_eq!(adopted.drafts[&SessionInterface::Web], "Web draft");
+        assert_eq!(adopted.display["accent"], json!("amber"));
+    }
+
+    #[test]
+    fn concurrent_pending_drafts_bind_only_their_token_matched_sessions() {
+        let scratch = tempdir().unwrap();
+        let workspace = scratch.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(scratch.path().join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let first = catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("first attempt".into()),
+                Some(&workspace),
+            )
+            .unwrap();
+        let second = catalog
+            .create_draft(
+                SessionInterface::Tui,
+                Some("second attempt".into()),
+                Some(&workspace),
+            )
+            .unwrap();
+        catalog
+            .save_draft(&first.id, SessionInterface::Web, "first prompt".into())
+            .unwrap();
+        catalog
+            .save_draft(&second.id, SessionInterface::Tui, "second prompt".into())
+            .unwrap();
+
+        let first_session = "sess-91-51";
+        let second_session = "sess-91-52";
+        let current_owner = ProcessOwner::current().unwrap();
+        let mut first_owner = current_owner.clone();
+        first_owner.birth_token.push_str("-first-old");
+        let mut second_owner = current_owner;
+        second_owner.birth_token.push_str("-second-old");
+        catalog
+            .update_index(|index| {
+                index.sessions.get_mut(&first.id).unwrap().pending_new_turn = true;
+                index.sessions.get_mut(&first.id).unwrap().pending_attempt =
+                    Some(attempt("first-token", first_session, first_owner.clone()));
+                index.sessions.get_mut(&second.id).unwrap().pending_new_turn = true;
+                index.sessions.get_mut(&second.id).unwrap().pending_attempt = Some(attempt(
+                    "second-token",
+                    second_session,
+                    second_owner.clone(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        for (draft_id, token, session_id, owner) in [
+            (&first.id, "first-token", first_session, &first_owner),
+            (&second.id, "second-token", second_session, &second_owner),
+        ] {
+            fs::write(
+                catalog.trail_path(session_id),
+                sample_trail(session_id, "session_end"),
+            )
+            .unwrap();
+            catalog
+                .record_supervisor_owner(draft_id, token, session_id, owner.clone())
+                .unwrap();
+            catalog
+                .record_native_session_handoff(draft_id, token, session_id, session_id, owner)
+                .unwrap();
+        }
+
+        catalog.reconcile_pending_attempts(None).unwrap();
+        assert!(matches!(
+            catalog.get(&first.id),
+            Err(CatalogError::NotFound(_))
+        ));
+        assert!(matches!(
+            catalog.get(&second.id),
+            Err(CatalogError::NotFound(_))
+        ));
+        let first_bound = catalog.get(first_session).unwrap();
+        let second_bound = catalog.get(second_session).unwrap();
+        assert_eq!(first_bound.name.as_deref(), Some("first attempt"));
+        assert_eq!(second_bound.name.as_deref(), Some("second attempt"));
+        assert_eq!(first_bound.drafts[&SessionInterface::Web], "first prompt");
+        assert_eq!(second_bound.drafts[&SessionInterface::Tui], "second prompt");
+        let index = catalog.read_index().unwrap();
+        assert_eq!(
+            index.sessions[first_session].bound_attempt_token.as_deref(),
+            Some("first-token")
+        );
+        assert_eq!(
+            index.sessions[second_session]
+                .bound_attempt_token
+                .as_deref(),
+            Some("second-token")
+        );
+    }
+
+    #[test]
+    fn delayed_old_handoff_and_failure_cannot_change_a_new_bound_attempt() {
+        let scratch = tempdir().unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(scratch.path().join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let draft = catalog
+            .create_draft(SessionInterface::Web, Some("latest work".into()), None)
+            .unwrap();
+        let old_session = "sess-91-61";
+        let new_session = "sess-91-62";
+        let current_owner = ProcessOwner::current().unwrap();
+        let mut dead_owner = current_owner;
+        dead_owner.birth_token.push_str("-old-incarnation");
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt =
+                    Some(attempt("old-token", old_session, dead_owner.clone()));
+                Ok(())
+            })
+            .unwrap();
+        catalog
+            .record_supervisor_owner(&draft.id, "old-token", old_session, dead_owner.clone())
+            .unwrap();
+
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let release_update = Arc::new(std::sync::Barrier::new(2));
+        let delayed_catalog = catalog.clone();
+        let delayed_draft = draft.id.clone();
+        let delayed_owner = dead_owner.clone();
+        let update_ready = Arc::clone(&ready);
+        let update_release = Arc::clone(&release_update);
+        let delayed_update = std::thread::spawn(move || {
+            update_ready.wait();
+            update_release.wait();
+            let handoff = delayed_catalog.record_native_session_handoff(
+                &delayed_draft,
+                "old-token",
+                old_session,
+                old_session,
+                &delayed_owner,
+            );
+            let failure = delayed_catalog.release_controller_attempt(&delayed_draft, "old-token");
+            (handoff, failure)
+        });
+
+        ready.wait();
+        catalog.reconcile_pending_attempts(Some(&draft.id)).unwrap();
+        assert!(!catalog.get(&draft.id).unwrap().pending_new_turn);
+        catalog
+            .update_index(|index| {
+                let record = index.sessions.get_mut(&draft.id).unwrap();
+                record.pending_new_turn = true;
+                record.pending_attempt =
+                    Some(attempt("new-token", new_session, dead_owner.clone()));
+                Ok(())
+            })
+            .unwrap();
+        fs::write(
+            catalog.trail_path(new_session),
+            sample_trail(new_session, "session_end"),
+        )
+        .unwrap();
+        catalog
+            .record_supervisor_owner(&draft.id, "new-token", new_session, dead_owner.clone())
+            .unwrap();
+        catalog
+            .record_native_session_handoff(
+                &draft.id,
+                "new-token",
+                new_session,
+                new_session,
+                &dead_owner,
+            )
+            .unwrap();
+        catalog.reconcile_pending_attempts(Some(&draft.id)).unwrap();
+
+        release_update.wait();
+        let (stale_handoff, stale_failure) = delayed_update.join().unwrap();
+        assert!(stale_handoff.is_err());
+        stale_failure.unwrap();
+        assert!(matches!(
+            catalog.get(&draft.id),
+            Err(CatalogError::NotFound(_))
+        ));
+        let bound = catalog.get(new_session).unwrap();
+        assert_eq!(bound.name.as_deref(), Some("latest work"));
+        let index = catalog.read_index().unwrap();
+        assert_eq!(
+            index.sessions[new_session].bound_attempt_token.as_deref(),
+            Some("new-token")
+        );
+        assert!(!catalog.trail_path(old_session).exists());
     }
 }

@@ -16,6 +16,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sysinfo::{ProcessStatus, ProcessesToUpdate, System};
 
+use crate::process_owner::{OwnerState, ProcessOwner};
+
 const MAX_START_REQUEST: usize = 16 * 1024 * 1024;
 const MAX_STREAM_RECORD: usize = 16 * 1024 * 1024;
 const MAX_CHILD_STDERR: usize = 1024 * 1024;
@@ -30,6 +32,14 @@ struct StartRequest {
     store_dir: PathBuf,
     prompt: String,
     session: SessionMode,
+    #[serde(default)]
+    attempt: Option<StartAttempt>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StartAttempt {
+    draft_id: String,
+    token: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -52,8 +62,7 @@ enum Control {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ProcessIdentity {
-    pid: u32,
-    start_token: u128,
+    owner: ProcessOwner,
     pgid: i32,
     executable: Option<PathBuf>,
 }
@@ -88,6 +97,24 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
             request.store_dir.display()
         )
     })?;
+    let attempt_owner = match (&request.attempt, &request.session) {
+        (Some(attempt), SessionMode::New { session_id }) => {
+            if !safe_session_id(session_id) || !native_session_id(session_id) {
+                return Err("invalid preallocated session id".to_string());
+            }
+            let owner = ProcessOwner::current()?;
+            crate::catalog::publish_supervisor_owner(
+                &store_dir,
+                &attempt.draft_id,
+                &attempt.token,
+                session_id,
+                owner.clone(),
+            )?;
+            Some(owner)
+        }
+        (Some(_), _) => return Err("catalog attempt metadata requires a new session".to_string()),
+        (None, _) => None,
+    };
     let (mut creation_lock, mut session_lock): (Option<File>, Option<File>) = match &request.session
     {
         SessionMode::New { session_id } => {
@@ -193,8 +220,42 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     let mut observed = HashSet::new();
     let mut active_tool_ids = HashSet::new();
     let mut session_id_seen = matches!(&request.session, SessionMode::Existing { .. });
+    let mut handoff_recorded = false;
 
     loop {
+        if !handoff_recorded
+            && let (Some(attempt), Some(owner), SessionMode::New { session_id }) = (
+                request.attempt.as_ref(),
+                attempt_owner.as_ref(),
+                &request.session,
+            )
+            && managed_session_trail_exists(&store_dir, session_id)
+        {
+            match crate::catalog::publish_native_session_handoff(
+                &store_dir,
+                &attempt.draft_id,
+                &attempt.token,
+                session_id,
+                session_id,
+                owner,
+            ) {
+                Ok(()) => {
+                    handoff_recorded = true;
+                    creation_lock.take();
+                }
+                Err(error) => {
+                    eprintln!("could not persist native session handoff: {error}");
+                    begin_stop(
+                        leg_pid,
+                        &root_identity,
+                        status.is_none(),
+                        &mut observed,
+                        &mut stop_started,
+                        &mut stop_deadline,
+                    );
+                }
+            }
+        }
         if status.is_none() && (stop_started.is_some() || !active_tool_ids.is_empty()) {
             observed.extend(snapshot_owned_processes(&root_identity));
             observed.insert(root_identity.clone());
@@ -293,6 +354,36 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
                             &mut stop_deadline,
                         );
                         continue;
+                    }
+                    if !handoff_recorded && let Some(attempt) = request.attempt.as_ref() {
+                        let SessionMode::New {
+                            session_id: candidate_session_id,
+                        } = &request.session
+                        else {
+                            unreachable!("catalog attempts only start new sessions")
+                        };
+                        if let Err(error) = crate::catalog::publish_native_session_handoff(
+                            &store_dir,
+                            &attempt.draft_id,
+                            &attempt.token,
+                            candidate_session_id,
+                            &id,
+                            attempt_owner
+                                .as_ref()
+                                .expect("catalog attempt has a verified supervisor identity"),
+                        ) {
+                            eprintln!("could not persist native session handoff: {error}");
+                            begin_stop(
+                                leg_pid,
+                                &root_identity,
+                                status.is_none(),
+                                &mut observed,
+                                &mut stop_started,
+                                &mut stop_deadline,
+                            );
+                            continue;
+                        }
+                        handoff_recorded = true;
                     }
                     creation_lock.take();
                     session_id_seen = true;
@@ -396,13 +487,6 @@ pub(crate) fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Opt
 pub(crate) fn session_lock_is_held(store_dir: &Path, session_id: &str) -> Result<bool, String> {
     let path = store_dir.join(format!(".leg-ui-session-{session_id}.lock"));
     lock_is_held_if_present(&path, session_id)
-}
-
-pub(crate) fn creation_lock_is_held(store_dir: &Path) -> Result<bool, String> {
-    lock_is_held_if_present(
-        &store_dir.join(".leg-ui-client-create.lock"),
-        "session creation",
-    )
 }
 
 fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
@@ -550,6 +634,21 @@ fn spawn_control_reader(input: BufReader<io::Stdin>, tx: mpsc::Sender<Message>) 
     });
 }
 
+fn managed_session_trail_exists(store_dir: &Path, session_id: &str) -> bool {
+    let path = store_dir.join(format!("{session_id}.jsonl"));
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    fs::canonicalize(path)
+        .ok()
+        .and_then(|canonical| canonical.parent().map(Path::to_path_buf))
+        .as_deref()
+        == Some(store_dir)
+}
+
 fn is_turn_start_for_new_session(line: &[u8]) -> bool {
     serde_json::from_slice::<Value>(line)
         .ok()
@@ -624,7 +723,7 @@ fn capture_process_identity(pid: u32) -> Option<ProcessIdentity> {
         .processes()
         .iter()
         .find(|(candidate, _)| candidate.as_u32() == pid)
-        .map(|(_, process)| process_identity(pid, process))
+        .and_then(|(_, process)| process_identity(pid, process))
 }
 
 fn snapshot_owned_processes(root: &ProcessIdentity) -> HashSet<ProcessIdentity> {
@@ -633,25 +732,27 @@ fn snapshot_owned_processes(root: &ProcessIdentity) -> HashSet<ProcessIdentity> 
     let Some((_, process)) = system
         .processes()
         .iter()
-        .find(|(pid, _)| pid.as_u32() == root.pid)
+        .find(|(pid, _)| pid.as_u32() == root.owner.pid)
     else {
         return HashSet::new();
     };
-    if process_identity(root.pid, process) != *root {
+    if process_identity(root.owner.pid, process).as_ref() != Some(root) {
         return HashSet::new();
     }
     let mut processes = HashMap::new();
     for (pid, process) in system.processes() {
         let raw_pid = pid.as_u32();
         let parent = process.parent().map(|parent| parent.as_u32());
-        processes.insert(raw_pid, (parent, process_identity(raw_pid, process)));
+        if let Some(identity) = process_identity(raw_pid, process) {
+            processes.insert(raw_pid, (parent, identity));
+        }
     }
     let mut descendants = HashSet::new();
-    let mut queue = VecDeque::from([root.pid]);
+    let mut queue = VecDeque::from([root.owner.pid]);
     while let Some(parent) = queue.pop_front() {
         for (pid, (candidate_parent, identity)) in &processes {
             if *candidate_parent == Some(parent)
-                && *pid != root.pid
+                && *pid != root.owner.pid
                 && descendants.insert(identity.clone())
             {
                 queue.push_back(*pid);
@@ -677,65 +778,27 @@ fn process_group(pid: u32) -> i32 {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn process_start_token(pid: u32, fallback: u64) -> u128 {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return u128::from(fallback) << 64;
-    };
-    let Some(close) = stat.rfind(')') else {
-        return u128::from(fallback) << 64;
-    };
-    stat[close + 1..]
-        .split_whitespace()
-        .nth(19)
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(u128::from)
-        .unwrap_or(u128::from(fallback) << 64)
-}
-
-#[cfg(target_os = "macos")]
-fn process_start_token(pid: u32, fallback: u64) -> u128 {
-    let Ok(pid) = libc::c_int::try_from(pid) else {
-        return u128::from(fallback) << 64;
-    };
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let result = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
-        )
-    };
-    if result != std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int {
-        return u128::from(fallback) << 64;
+fn process_identity(pid: u32, process: &sysinfo::Process) -> Option<ProcessIdentity> {
+    if process.status() == ProcessStatus::Zombie {
+        return None;
     }
-    let info = unsafe { info.assume_init() };
-    (u128::from(info.pbi_start_tvsec) << 64) | u128::from(info.pbi_start_tvusec)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_start_token(_pid: u32, fallback: u64) -> u128 {
-    u128::from(fallback) << 64
-}
-
-fn process_identity(pid: u32, process: &sysinfo::Process) -> ProcessIdentity {
-    ProcessIdentity {
-        pid,
-        start_token: process_start_token(pid, process.start_time()),
+    Some(ProcessIdentity {
+        owner: ProcessOwner::capture(pid).ok()?,
         pgid: process_group(pid),
         executable: process.exe().map(Path::to_path_buf),
-    }
+    })
 }
 
 fn current_identity(identity: &ProcessIdentity) -> bool {
+    if identity.owner.inspect() != OwnerState::Alive {
+        return false;
+    }
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     system.processes().iter().any(|(pid, process)| {
-        pid.as_u32() == identity.pid
+        pid.as_u32() == identity.owner.pid
             && process.status() != ProcessStatus::Zombie
-            && process_identity(identity.pid, process) == *identity
+            && process_identity(identity.owner.pid, process).as_ref() == Some(identity)
     })
 }
 
@@ -749,7 +812,7 @@ fn force_owned_tree(observed: &HashSet<ProcessIdentity>, child: &mut Child, chil
         for identity in observed {
             if current_identity(identity) {
                 unsafe {
-                    let _ = libc::kill(identity.pid as libc::pid_t, libc::SIGKILL);
+                    let _ = libc::kill(identity.owner.pid as libc::pid_t, libc::SIGKILL);
                 }
             }
         }
@@ -877,14 +940,30 @@ mod tests {
     }
 
     #[test]
-    fn linux_start_token_uses_kernel_start_time() {
+    fn process_birth_identity_is_verifiable() {
         #[cfg(target_os = "linux")]
         {
-            let current = std::process::id();
-            let token = process_start_token(current, 0);
-            assert_ne!(token, 0);
-            assert!(token < (1_u128 << 64));
+            let owner = ProcessOwner::current().expect("capture current process birth identity");
+            assert!(owner.birth_token.starts_with("linux:"));
+            assert_eq!(owner.inspect(), OwnerState::Alive);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_pid_identity_is_never_signaled() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("start process for identity check");
+        let mut identity =
+            capture_process_identity(child.id()).expect("capture child process birth identity");
+        identity.owner.birth_token.push_str("-reused-pid");
+
+        force_owned_tree(&HashSet::from([identity]), &mut child, false);
+        assert!(child.try_wait().expect("inspect child status").is_none());
+        child.kill().expect("clean up identity test child");
+        let _ = child.wait();
     }
 
     #[test]

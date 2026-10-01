@@ -2380,7 +2380,12 @@ mod tests {
         })
         .unwrap();
         let recovered_draft = recovered.state.inner.catalog.get(&draft.id).unwrap();
-        assert!(!recovered_draft.pending_new_turn);
+        assert!(recovered_draft.pending_new_turn);
+        assert_eq!(recovered_draft.run_state, CatalogRunState::Unknown);
+        assert!(recovered_draft.warnings.iter().any(|warning| {
+            warning.contains("legacy pending draft")
+                && warning.contains("copy the saved prompt and workspace")
+        }));
         assert_eq!(
             recovered.state.snapshot(&draft.id).unwrap().session.id,
             draft.id
@@ -2407,7 +2412,7 @@ mod tests {
         assert_eq!(receipt.session_id.as_deref(), Some(draft.id.as_str()));
         assert_eq!(
             receipt.recovery_evidence.as_deref(),
-            Some("driver_reports_idle_after_restart")
+            Some("driver_ownership_unknown")
         );
         let bound_receipt = recovered.state.latest_receipt(&bound_draft.id).unwrap();
         assert_eq!(bound_receipt.status, ReceiptStatus::Incomplete);

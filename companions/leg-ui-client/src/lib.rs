@@ -2,6 +2,7 @@
 
 mod catalog;
 mod client;
+mod process_owner;
 mod protocol;
 mod resolve;
 pub mod supervisor;

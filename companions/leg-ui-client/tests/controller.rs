@@ -430,9 +430,10 @@ fn write_fixture_leg(path: &Path, exchange_log: Option<&Path>, release_file: Opt
     let mut source = String::from(
         r##"
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -451,8 +452,36 @@ fn main() {
         .find(|pair| pair[0] == "--new-session-id" || pair[0] == "--session")
         .map(|pair| pair[1].clone())
         .expect("session argument");
+    let creates_session = args.windows(2).any(|pair| pair[0] == "--new-session-id");
     let mut prompt = String::new();
 io::stdin().read_to_string(&mut prompt).unwrap();
+    if let Some(path) = env::var_os("LEG_UI_FIXTURE_INVOCATION_LOG") {
+        let mut log = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        writeln!(log, "{session_id}").unwrap();
+    }
+    if creates_session {
+        let store = PathBuf::from(env::var_os("LEG_SESSION_DIR").expect("session store"));
+        fs::create_dir_all(&store).unwrap();
+        let path = store.join(format!("{session_id}.jsonl"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut trail) => writeln!(trail, r#"{{"schema":"baton.exchange/v1","event":"request","ts_ms":1,"model":"fixture","base_url":"fixture","prompt":"fixture","session_id":"{session_id}","turn_index":0}}"#).unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create fixture session trail: {error}"),
+        }
+    }
+    if let Some(path) = env::var_os("LEG_UI_FIXTURE_CHILD_PID_FILE") {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        fs::write(path, child.id().to_string()).unwrap();
+    }
+    if let Some(ready_file) = env::var_os("LEG_UI_FIXTURE_PRE_TURN_START_FILE") {
+        fs::write(&ready_file, "ready").unwrap();
+        let release_file = PathBuf::from(env::var_os("LEG_UI_FIXTURE_RELEASE_TURN_START").expect("turn_start release"));
+        while !release_file.exists() { thread::sleep(Duration::from_millis(5)); }
+    }
 "##,
     );
     if let Some(exchange_log) = exchange_log {
@@ -464,7 +493,11 @@ io::stdin().read_to_string(&mut prompt).unwrap();
     source.push_str(
         r##"
     let turn_start = r#"{"schema":"leg.exchange.stream/v1","event":"turn_start","seq":0,"provider":"fixture","model":"fixture","session_id":"__SESSION_ID__","turn_index":0,"request":{"schema":"baton.message/v1","message_id":"request-1","conversation_id":"conversation-1","kind":"request","body":"fixture"}}"#.replace("__SESSION_ID__", &session_id);
+    if let Some(path) = env::var_os("LEG_UI_FIXTURE_TURN_START_FILE") { fs::write(path, "ready").unwrap(); }
     println!("{turn_start}");
+    if let Some(path) = env::var_os("LEG_UI_FIXTURE_AFTER_TURN_START_RELEASE") {
+        while !Path::new(&path).exists() { thread::sleep(Duration::from_millis(5)); }
+    }
 "##,
     );
     if let Some(release_file) = release_file {
@@ -1399,6 +1432,488 @@ fn controller_child_entrypoint() {
         }
     }
     let _ = turn.wait();
+}
+
+#[test]
+fn catalog_crash_window_worker() {
+    if std::env::var("LEG_UI_CATALOG_CRASH_WORKER").ok().as_deref() != Some("1") {
+        return;
+    }
+    let state = PathBuf::from(std::env::var_os("LEG_UI_CRASH_STATE").expect("state"));
+    let leg = PathBuf::from(std::env::var_os("LEG_UI_CRASH_LEG").expect("leg fixture"));
+    let supervisor =
+        PathBuf::from(std::env::var_os("LEG_UI_CRASH_SUPERVISOR").expect("supervisor binary"));
+    let draft_id = std::env::var("LEG_UI_CRASH_DRAFT").expect("draft ID");
+    let session_id = std::env::var("LEG_UI_CRASH_SESSION").expect("session ID");
+    let ready = PathBuf::from(std::env::var_os("LEG_UI_CRASH_READY").expect("ready file"));
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state),
+        leg_bin: Some(leg),
+        supervisor_bin: Some(supervisor),
+    })
+    .expect("open crash worker catalog");
+    let mut turn = catalog
+        .start_new_with_id(
+            &draft_id,
+            session_id,
+            SessionInterface::Web,
+            "prompt must not replay",
+        )
+        .expect("start catalog turn in child controller");
+    fs::write(ready, "ready").expect("signal controller started");
+    while let Some(_event) = turn.observe().expect("observe catalog crash turn") {}
+    let _ = turn.wait();
+}
+
+fn spawn_catalog_crash_worker(
+    state: &Path,
+    cwd: &Path,
+    leg: &Path,
+    supervisor: &Path,
+    draft_id: &str,
+    session_id: &str,
+    ready: &Path,
+    pre_turn_start: Option<&Path>,
+    release_turn_start: Option<&Path>,
+    turn_start_file: Option<&Path>,
+    invocation_log: Option<&Path>,
+    child_pid_file: Option<&Path>,
+    handoff_pause_ready: Option<&Path>,
+    handoff_pause_release: Option<&Path>,
+    after_turn_start_release: Option<&Path>,
+) -> std::process::Child {
+    let mut command = Command::new(std::env::current_exe().expect("integration test executable"));
+    command
+        .args(["--exact", "catalog_crash_window_worker", "--nocapture"])
+        .env("LEG_UI_CATALOG_CRASH_WORKER", "1")
+        .env("LEG_UI_CRASH_STATE", state)
+        .env("LEG_UI_CRASH_CWD", cwd)
+        .env("LEG_UI_CRASH_LEG", leg)
+        .env("LEG_UI_CRASH_SUPERVISOR", supervisor)
+        .env("LEG_UI_CRASH_DRAFT", draft_id)
+        .env("LEG_UI_CRASH_SESSION", session_id)
+        .env("LEG_UI_CRASH_READY", ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if let Some(path) = pre_turn_start {
+        command.env("LEG_UI_FIXTURE_PRE_TURN_START_FILE", path);
+    }
+    if let Some(path) = release_turn_start {
+        command.env("LEG_UI_FIXTURE_RELEASE_TURN_START", path);
+    }
+    if let Some(path) = turn_start_file {
+        command.env("LEG_UI_FIXTURE_TURN_START_FILE", path);
+    }
+    if let Some(path) = invocation_log {
+        command.env("LEG_UI_FIXTURE_INVOCATION_LOG", path);
+    }
+    if let Some(path) = child_pid_file {
+        command.env("LEG_UI_FIXTURE_CHILD_PID_FILE", path);
+    }
+    if let Some(path) = handoff_pause_ready {
+        command.env("LEG_UI_TEST_HANDOFF_PAUSE_READY", path);
+    } else {
+        command.env_remove("LEG_UI_TEST_HANDOFF_PAUSE_READY");
+    }
+    if let Some(path) = handoff_pause_release {
+        command.env("LEG_UI_TEST_HANDOFF_PAUSE_RELEASE", path);
+    } else {
+        command.env_remove("LEG_UI_TEST_HANDOFF_PAUSE_RELEASE");
+    }
+    if let Some(path) = after_turn_start_release {
+        command.env("LEG_UI_FIXTURE_AFTER_TURN_START_RELEASE", path);
+    } else {
+        command.env_remove("LEG_UI_FIXTURE_AFTER_TURN_START_RELEASE");
+    }
+    command.spawn().expect("spawn catalog controller worker")
+}
+
+fn create_crash_draft(
+    state: &Path,
+    cwd: &Path,
+    leg: &Path,
+    supervisor: &Path,
+    name: &str,
+) -> (SessionCatalog, String) {
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state.to_path_buf()),
+        leg_bin: Some(leg.to_path_buf()),
+        supervisor_bin: Some(supervisor.to_path_buf()),
+    })
+    .expect("open crash test catalog");
+    let draft = catalog
+        .create_draft(SessionInterface::Web, Some(name.into()), Some(cwd))
+        .expect("create crash test draft");
+    catalog
+        .save_draft(&draft.id, SessionInterface::Web, "web text survives".into())
+        .unwrap();
+    catalog
+        .save_draft(&draft.id, SessionInterface::Tui, "tui text survives".into())
+        .unwrap();
+    catalog
+        .save_display_metadata(&draft.id, "color".into(), json!("blue"))
+        .unwrap();
+    (catalog, draft.id)
+}
+
+fn wait_for_session_handoff(state: &Path, draft_id: &str, session_id: &str) {
+    wait_until(Duration::from_secs(5), || {
+        fs::read(state.join("catalog.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|index| {
+                index["sessions"][draft_id]["pending_attempt"]["native_session_id"] == session_id
+            })
+    });
+}
+
+fn wait_for_session_lock_release(store: &Path, session_id: &str) {
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let path = store.join(format!(".leg-ui-session-{session_id}.lock"));
+    wait_until(Duration::from_secs(5), || {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+            return !path.exists();
+        };
+        if file.try_lock_exclusive().is_ok() {
+            let _ = FileExt::unlock(&file);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn write_blocking_version_leg(path: &Path, pid_file: &Path, release_file: &Path) {
+    let source_path = path.with_extension("rs");
+    let pid_literal = serde_json::to_string(&pid_file.to_string_lossy().to_string()).unwrap();
+    let release_literal =
+        serde_json::to_string(&release_file.to_string_lossy().to_string()).unwrap();
+    let source = format!(
+        r#"
+use std::fs;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+fn main() {{
+    match std::env::args().nth(1).as_deref() {{
+        Some("--version") => {{
+            fs::write({pid_literal}, std::process::id().to_string()).unwrap();
+            while !Path::new({release_literal}).exists() {{
+                thread::sleep(Duration::from_millis(5));
+            }}
+            println!("leg 0.14.0");
+        }}
+        Some("--help") => println!("--stream-json"),
+        _ => std::process::exit(1),
+    }}
+}}
+"#
+    );
+    fs::write(&source_path, source).expect("write blocking version fixture source");
+    let output = Command::new("rustc")
+        .args(["--edition=2021"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(path)
+        .output()
+        .expect("rustc is available to build the blocking version fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile blocking version fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+struct KillPidOnDrop(u32);
+
+impl Drop for KillPidOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+struct ReleaseFileOnDrop(PathBuf);
+
+impl Drop for ReleaseFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release");
+    }
+}
+
+#[test]
+fn pending_catalog_drafts_recover_at_each_controller_crash_window() {
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let cwd = scratch.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("create workspace");
+    let supervisor = supervisor_binary();
+    let fixture_leg = scratch.path().join("fixture-leg");
+    write_fixture_leg(&fixture_leg, None, None);
+
+    // Window (a): the draft reservation is durable, but the controller dies
+    // while resolving the leg executable and before it spawns a supervisor.
+    let state_a = scratch.path().join("before-spawn-state");
+    let blocking_leg = scratch.path().join("blocking-leg");
+    let version_pid = scratch.path().join("version.pid");
+    let version_release = scratch.path().join("version-release");
+    write_blocking_version_leg(&blocking_leg, &version_pid, &version_release);
+    let (_catalog_a, draft_a) =
+        create_crash_draft(&state_a, &cwd, &blocking_leg, &supervisor, "before spawn");
+    let ready_a = scratch.path().join("worker-a-ready");
+    let mut controller_a = spawn_catalog_crash_worker(
+        &state_a,
+        &cwd,
+        &blocking_leg,
+        &supervisor,
+        &draft_a,
+        "sess-109-101",
+        &ready_a,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    wait_for_file(&version_pid, Duration::from_secs(5));
+    let version_process = read_pid(&version_pid);
+    controller_a.kill().expect("kill pre-spawn controller");
+    let _ = controller_a.wait();
+    unsafe {
+        libc::kill(version_process as libc::pid_t, libc::SIGKILL);
+    }
+    wait_until(Duration::from_secs(3), || {
+        !process_is_running(version_process)
+    });
+
+    let recovered_a = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state_a.clone()),
+        ..SessionCatalogConfig::default()
+    })
+    .expect("reopen pre-spawn catalog");
+    let draft = recovered_a
+        .get(&draft_a)
+        .expect("dead pre-spawn draft remains");
+    assert!(!draft.pending_new_turn);
+    assert_eq!(draft.run_state, leg_ui_client::CatalogRunState::Idle);
+    assert_eq!(draft.name.as_deref(), Some("before spawn"));
+    assert_eq!(draft.drafts[&SessionInterface::Web], "web text survives");
+    assert_eq!(draft.drafts[&SessionInterface::Tui], "tui text survives");
+    assert_eq!(draft.display["color"], json!("blue"));
+    recovered_a
+        .save_draft(
+            &draft_a,
+            SessionInterface::Web,
+            "editable after recovery".into(),
+        )
+        .expect("recovered draft stays editable");
+    let submit_catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(state_a),
+        leg_bin: Some(fixture_leg.clone()),
+        supervisor_bin: Some(supervisor.clone()),
+    })
+    .unwrap();
+    let mut submitted = submit_catalog
+        .start_new(&draft_a, SessionInterface::Web, "submit after recovery")
+        .expect("recovered draft stays submittable");
+    while submitted.observe().unwrap().is_some() {}
+    assert_success(submitted.wait().unwrap());
+
+    // Windows (b) and (c): the native process has created its trail. The
+    // supervisor commits the token-matched session association before the
+    // fixture emits turn_start.
+    for (window, bind_before_kill) in [("after-spawn", false), ("before-bind", true)] {
+        let state = scratch.path().join(format!("{window}-state"));
+        let (catalog, draft_id) =
+            create_crash_draft(&state, &cwd, &fixture_leg, &supervisor, window);
+        let session_id = if bind_before_kill {
+            "sess-109-303"
+        } else {
+            "sess-109-202"
+        };
+        let native_ready = scratch.path().join(format!("{window}-native-ready"));
+        let turn_start_file = scratch.path().join(format!("{window}-turn-start"));
+        let turn_start_release = scratch.path().join(format!("{window}-turn-release"));
+        let invocation_log = scratch.path().join(format!("{window}-invocations"));
+        let child_pid_file = scratch.path().join(format!("{window}-child.pid"));
+        let worker_ready = scratch.path().join(format!("{window}-worker-ready"));
+        let handoff_pause_ready = scratch.path().join(format!("{window}-handoff-ready"));
+        let handoff_pause_release = scratch.path().join(format!("{window}-handoff-release"));
+        let after_turn_start_release = scratch.path().join(format!("{window}-turn-end-release"));
+        let _handoff_pause =
+            (!bind_before_kill).then(|| ReleaseFileOnDrop(handoff_pause_release.clone()));
+        let _turn_end_release =
+            bind_before_kill.then(|| ReleaseFileOnDrop(after_turn_start_release.clone()));
+        let mut controller = spawn_catalog_crash_worker(
+            &state,
+            &cwd,
+            &fixture_leg,
+            &supervisor,
+            &draft_id,
+            session_id,
+            &worker_ready,
+            Some(&native_ready),
+            Some(&turn_start_release),
+            Some(&turn_start_file),
+            Some(&invocation_log),
+            Some(&child_pid_file),
+            (!bind_before_kill).then_some(handoff_pause_ready.as_path()),
+            (!bind_before_kill).then_some(handoff_pause_release.as_path()),
+            bind_before_kill.then_some(after_turn_start_release.as_path()),
+        );
+        wait_for_file(&native_ready, Duration::from_secs(5));
+        if !bind_before_kill {
+            // The supervisor has created the native trail and is paused just
+            // before committing its token-matched handoff. A fresh catalog
+            // reader must complete while startup is held at this barrier.
+            wait_for_file(&handoff_pause_ready, Duration::from_secs(5));
+            let read_state = state.clone();
+            let read_draft = draft_id.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let started = Instant::now();
+            thread::spawn(move || {
+                let result = SessionCatalog::open(SessionCatalogConfig {
+                    state_dir: Some(read_state),
+                    ..SessionCatalogConfig::default()
+                })
+                .and_then(|catalog| catalog.get(&read_draft))
+                .map(|session| session.run_state)
+                .map_err(|error| error.to_string());
+                let _ = done_tx.send(result);
+            });
+            let read_state = done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("independent catalog read must finish within one second")
+                .expect("read pending catalog while handoff is paused");
+            assert_eq!(read_state, leg_ui_client::CatalogRunState::Active);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            fs::write(&handoff_pause_release, "release").expect("release handoff barrier");
+        }
+        wait_for_session_handoff(&state, &draft_id, session_id);
+        let child_pid = read_pid(&child_pid_file);
+        let _kill_child_on_drop = KillPidOnDrop(child_pid);
+        assert_eq!(
+            fs::read_to_string(&invocation_log).unwrap().lines().count(),
+            1
+        );
+
+        if bind_before_kill {
+            let catalog_lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(state.join(".catalog.lock"))
+                .expect("open catalog lock");
+            catalog_lock.lock_exclusive().expect("hold catalog lock");
+            fs::write(&turn_start_release, "release").expect("release turn_start");
+            wait_for_file(&turn_start_file, Duration::from_secs(5));
+            let index: Value = serde_json::from_slice(
+                &fs::read(state.join("catalog.json")).expect("read pending catalog under lock"),
+            )
+            .unwrap();
+            assert_eq!(index["sessions"][&draft_id]["pending_new_turn"], true);
+            assert!(index["sessions"][session_id].is_null());
+            controller
+                .kill()
+                .expect("kill controller before catalog bind");
+            let _ = controller.wait();
+            FileExt::unlock(&catalog_lock).expect("release catalog lock");
+        } else {
+            let active = SessionCatalog::open(SessionCatalogConfig {
+                state_dir: Some(state.clone()),
+                ..SessionCatalogConfig::default()
+            })
+            .unwrap();
+            let pending = active.get(&draft_id).unwrap();
+            assert!(pending.pending_new_turn);
+            assert_eq!(pending.run_state, leg_ui_client::CatalogRunState::Active);
+            assert!(matches!(
+                active.start_new_with_id(
+                    &draft_id,
+                    "sess-109-222".into(),
+                    SessionInterface::Web,
+                    "second prompt must not start",
+                ),
+                Err(CatalogError::Busy)
+            ));
+            controller
+                .kill()
+                .expect("kill controller before turn_start");
+            let _ = controller.wait();
+        }
+
+        let after_controller_death = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .unwrap();
+        let still_owned = after_controller_death.get(&draft_id).unwrap();
+        assert!(still_owned.pending_new_turn);
+        assert_eq!(
+            still_owned.run_state,
+            leg_ui_client::CatalogRunState::Active
+        );
+        assert!(process_is_running(child_pid));
+        assert!(matches!(
+            after_controller_death.start_new_with_id(
+                &draft_id,
+                "sess-109-404".into(),
+                SessionInterface::Web,
+                "second prompt must not start",
+            ),
+            Err(CatalogError::Busy)
+        ));
+
+        wait_for_session_lock_release(&state.join("sessions"), session_id);
+        assert!(
+            !process_is_running(child_pid),
+            "supervisor must clean its child"
+        );
+        let index: Value = serde_json::from_slice(
+            &fs::read(state.join("catalog.json")).expect("read supervisor owner record"),
+        )
+        .unwrap();
+        let supervisor_pid = index["sessions"][&draft_id]["pending_attempt"]["supervisor"]["pid"]
+            .as_u64()
+            .expect("recorded supervisor PID") as u32;
+        wait_until(Duration::from_secs(5), || {
+            !process_is_running(supervisor_pid)
+        });
+        let recovered = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("reopen after controller death");
+        assert!(matches!(
+            recovered.get(&draft_id),
+            Err(CatalogError::NotFound(_))
+        ));
+        let adopted = recovered
+            .get(session_id)
+            .expect("adopt exact native session");
+        assert_eq!(adopted.name.as_deref(), Some(window));
+        assert_eq!(
+            adopted.cwd.as_deref(),
+            Some(fs::canonicalize(&cwd).unwrap().as_path())
+        );
+        assert_eq!(adopted.drafts[&SessionInterface::Web], "web text survives");
+        assert_eq!(adopted.drafts[&SessionInterface::Tui], "tui text survives");
+        assert_eq!(adopted.display["color"], json!("blue"));
+        assert_eq!(
+            fs::read_to_string(&invocation_log).unwrap().lines().count(),
+            1,
+            "catalog recovery must not launch another exchange"
+        );
+        drop(catalog);
+    }
 }
 
 #[test]
