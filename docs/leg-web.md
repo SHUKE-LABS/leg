@@ -138,6 +138,12 @@ its saved request ID and prompt hash. If the host proves it did not accept the
 send, **Retry same send** reuses that ID and exact text; it never creates a new
 turn automatically.
 
+Earlier replies keep their document nodes while a later turn streams, so you
+can keep a link focused and select or copy history as new text arrives. Each
+tab keeps its own composer draft. The transcript shows the submitted prompt
+from that tab's pending send or the host snapshot, while the draft stays in the
+composer.
+
 Press Enter for a newline. Press Ctrl+Enter or Cmd+Enter, or select **Send**,
 to submit. Send is disabled while leg is running; a draft can still be edited
 and failed prompts remain available. Markdown formatting uses local DOM
