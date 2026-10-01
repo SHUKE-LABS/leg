@@ -143,12 +143,48 @@ def resize_pty(slave_fd: int, rows: int, columns: int) -> None:
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
 
 
-def wait_for_file(path: Path, timeout: float = 8.0) -> None:
+def wait_for_file(
+    path: Path,
+    master_fd: int,
+    output: bytearray,
+    child: subprocess.Popen[bytes],
+    timeout: float = 8.0,
+) -> None:
     deadline = time.monotonic() + timeout
     while not path.is_file():
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"timed out waiting for file {path}")
-        time.sleep(0.025)
+        remaining = deadline - time.monotonic()
+        if child.poll() is not None:
+            drain_for(master_fd, output, 0.05)
+            raise AssertionError(
+                f"TUI exited before creating {path}; exit={child.returncode}; "
+                f"output={terminal_text(bytes(output))[-1200:]!r}"
+            )
+        if remaining <= 0:
+            raise AssertionError(
+                f"timed out waiting for file {path}; "
+                f"output={terminal_text(bytes(output))[-1200:]!r}"
+            )
+        drain_for(master_fd, output, min(0.05, remaining))
+
+
+def kill_pty_child(master_fd: int, child: subprocess.Popen[bytes], output: bytearray) -> None:
+    if child.poll() is not None:
+        return
+    child.kill()
+    deadline = time.monotonic() + 10.0
+    while child.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        drain_for(master_fd, output, min(0.05, remaining))
+    if child.poll() is None:
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Preserve the test failure that led to cleanup.
+            drain_for(master_fd, output, 0.05)
+            return
+    drain_for(master_fd, output, 0.05)
 
 
 def wait_for_pid_exit(pid: int, timeout: float = 6.0) -> None:
@@ -1106,7 +1142,7 @@ def run_signal_smoke(args: argparse.Namespace) -> None:
                     if active:
                         os.write(master_fd, b"TRIAL-STOP\x13")
                         pid_file = workspace / "trial-stalled-child.pid"
-                        wait_for_file(pid_file)
+                        wait_for_file(pid_file, master_fd, output, child)
                         next_draft = f"draft survives {signal_name}"
                         os.write(master_fd, next_draft.encode())
                         drain_for(master_fd, output, 0.2)
@@ -1146,8 +1182,7 @@ def run_signal_smoke(args: argparse.Namespace) -> None:
                     assert request_status(status_url)["requests"] == expected_requests
                 finally:
                     if child is not None and child.poll() is None:
-                        child.kill()
-                        child.wait(timeout=2)
+                        kill_pty_child(master_fd, child, output)
                     if master_fd is not None:
                         os.close(master_fd)
                     if slave_fd is not None:
