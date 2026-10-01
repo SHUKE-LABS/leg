@@ -273,9 +273,11 @@ def contains_string(value: Any, expected: str) -> bool:
 
 
 def assert_terminal_restored(
-    output: bytes, slave_fd: int, initial_termios: list[Any], child: subprocess.Popen[bytes]
+    output: bytes, termios_fd: int, initial_termios: list[Any], child: subprocess.Popen[bytes]
 ) -> None:
-    actual = termios.tcgetattr(slave_fd)
+    # BSD revokes a session leader's controlling slave after it exits. The
+    # master remains usable for reading the PTY's terminal attributes.
+    actual = termios.tcgetattr(termios_fd)
     assert actual == initial_termios, f"terminal attributes were not restored: {actual!r}"
     assert b"\x1b[?1049l" in output, "alternate screen was not left"
     assert b"\x1b[?25h" in output, "cursor was not shown"
@@ -489,7 +491,7 @@ def run_smoke(args: argparse.Namespace) -> None:
                 os.write(master_fd, b"\x03")
                 status = drain_until_exit(master_fd, child, output)
                 assert status == 0, f"TUI exit status was {status}: {bytes(output)!r}"
-                assert_terminal_restored(bytes(output), slave_fd, initial_termios, child)
+                assert_terminal_restored(bytes(output), master_fd, initial_termios, child)
             finally:
                 if child.poll() is None:
                     child.kill()
@@ -539,7 +541,7 @@ def run_smoke(args: argparse.Namespace) -> None:
                 error_status = drain_until_exit(error_master, error_child, error_output)
                 assert error_status != 0, "invalid catalog path unexpectedly succeeded"
                 assert_terminal_restored(
-                    bytes(error_output), error_slave, error_initial, error_child
+                    bytes(error_output), error_master, error_initial, error_child
                 )
             finally:
                 if error_child.poll() is None:
@@ -766,7 +768,7 @@ def drain_until_exit_after_close(
 ) -> int:
     os.write(master_fd, b"\x03")
     status = drain_until_exit(master_fd, child, output)
-    assert_terminal_restored(bytes(output), slave_fd, initial_termios, child)
+    assert_terminal_restored(bytes(output), master_fd, initial_termios, child)
     os.close(master_fd)
     os.close(slave_fd)
     return status
@@ -985,7 +987,7 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x03")
             status = drain_until_exit(master_fd, child, output)
             assert status == 0, f"TUI exit status was {status}"
-            assert_terminal_restored(bytes(output), slave_fd, initial_termios, child)
+            assert_terminal_restored(bytes(output), master_fd, initial_termios, child)
             master_fd = slave_fd = None
             child = None
 
@@ -1123,7 +1125,7 @@ def run_signal_smoke(args: argparse.Namespace) -> None:
                         f"{terminal_text(bytes(output))[-1200:]!r}"
                     )
                     assert_terminal_restored(
-                        bytes(output), slave_fd, initial_termios, child
+                        bytes(output), master_fd, initial_termios, child
                     )
 
                     if active:
@@ -1221,7 +1223,7 @@ def run_color_policy_smoke(args: argparse.Namespace) -> None:
                 os.write(master_fd, b"\x03")
                 status = drain_until_exit(master_fd, child, output)
                 assert status == 0
-                assert_terminal_restored(bytes(output), slave_fd, initial_termios, child)
+                assert_terminal_restored(bytes(output), master_fd, initial_termios, child)
             finally:
                 if child.poll() is None:
                     child.kill()
