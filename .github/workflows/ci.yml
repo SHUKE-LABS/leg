@@ -106,11 +106,12 @@ jobs:
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin' }}
         shell: bash
         run: |
-          python3 -m pip install --requirement companions/leg-tui/tests/requirements.txt
+          python3 -m venv /tmp/leg-pty-test-venv
+          /tmp/leg-pty-test-venv/bin/python -m pip install --requirement companions/leg-tui/tests/requirements.txt
           cargo build --locked --bin leg
           cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
           cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui
-          python3 companions/leg-tui/tests/pty_smoke.py \
+          /tmp/leg-pty-test-venv/bin/python companions/leg-tui/tests/pty_smoke.py \
             --tui-bin companions/target/debug/leg-tui \
             --leg-bin target/debug/leg \
             --supervisor-bin companions/target/debug/leg-ui-supervisor
