@@ -1633,6 +1633,11 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     session["turns"][-1]["private_turn_sentinel"] = "TRIAL-EXPORT-TURN-SECRET"
                     session["turns"][0]["tools"][0]["authorization_key"] = "TRIAL-EXPORT-AUTH-KEY"
                     session["turns"][0]["tools"][0]["input"]["nested"] = {
+                        "token": "TRIAL-EXPORT-NESTED-TOKEN",
+                        "oauth_token": "TRIAL-EXPORT-NESTED-OAUTH-TOKEN",
+                        "githubToken": "TRIAL-EXPORT-NESTED-GITHUB-TOKEN",
+                        "oauth-token": "TRIAL-EXPORT-NESTED-OAUTH-KEBAB-TOKEN",
+                        "token_value": "TRIAL-EXPORT-NESTED-TOKEN-VALUE",
                         "api_key": "TRIAL-EXPORT-NESTED-API-KEY",
                         "auth_token": "TRIAL-EXPORT-NESTED-AUTH-TOKEN",
                         "deeper": [{
@@ -1678,6 +1683,11 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     "TRIAL-EXPORT-AUTH-HEADER",
                     "TRIAL-EXPORT-TURN-SECRET",
                     "TRIAL-EXPORT-AUTH-KEY",
+                    "TRIAL-EXPORT-NESTED-TOKEN",
+                    "TRIAL-EXPORT-NESTED-OAUTH-TOKEN",
+                    "TRIAL-EXPORT-NESTED-GITHUB-TOKEN",
+                    "TRIAL-EXPORT-NESTED-OAUTH-KEBAB-TOKEN",
+                    "TRIAL-EXPORT-NESTED-TOKEN-VALUE",
                     "TRIAL-EXPORT-NESTED-API-KEY",
                     "TRIAL-EXPORT-NESTED-ACCESS-TOKEN",
                     "TRIAL-EXPORT-NESTED-AUTH-TOKEN",

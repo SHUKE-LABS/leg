@@ -1454,9 +1454,15 @@ function transcriptExportValue(value) {
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([key]) => !TRANSCRIPT_CREDENTIAL_KEY.test(key))
+      .filter(([key]) => !isTranscriptCredentialKey(key))
       .map(([key, nested]) => [key, transcriptExportValue(nested)]),
   );
+}
+
+function isTranscriptCredentialKey(key) {
+  const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+  const hasTokenField = /(?:^|[^a-z0-9])tokens?(?:$|[^a-z0-9])/.test(normalizedKey);
+  return hasTokenField || TRANSCRIPT_CREDENTIAL_KEY.test(normalizedKey);
 }
 
 function allowedTranscriptExport(snapshot) {
