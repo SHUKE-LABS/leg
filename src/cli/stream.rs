@@ -78,6 +78,20 @@ fn execute_session_exchange(
                 true,
             )
         }
+        ExchangeSession::NewWithId(session_id) => {
+            let path = exchange_session_path(&store_dir, &session_id)
+                .ok_or_else(|| LegError::Config("invalid preallocated session id".to_string()))?;
+            (
+                ResumedSession {
+                    session_id,
+                    conversation: Conversation::new(),
+                    prior_turns: 0,
+                    next_turn_index: 0,
+                },
+                path,
+                true,
+            )
+        }
     };
 
     let config = LegConfig::from_env()?;

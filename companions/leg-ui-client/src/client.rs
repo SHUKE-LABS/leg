@@ -7,7 +7,7 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -20,6 +20,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONTROL_LINE: usize = 64 * 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+static SESSION_ID_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default)]
 pub struct ClientConfig {
@@ -34,6 +35,7 @@ pub struct ClientConfig {
 #[derive(Clone, Debug)]
 pub enum LegSession {
     New,
+    NewWithId(String),
     Existing(String),
 }
 
@@ -118,7 +120,7 @@ struct StartRequestWire<'a> {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SessionWire<'a> {
-    New,
+    New { session_id: &'a str },
     Existing { session_id: &'a str },
 }
 
@@ -145,8 +147,20 @@ impl Client {
         if !cwd.is_dir() {
             return Err(StartError::InvalidCwd(cwd));
         }
+        let generated_session_id;
         let session = match &request.session {
-            LegSession::New => SessionWire::New,
+            LegSession::New => {
+                generated_session_id = new_native_session_id();
+                SessionWire::New {
+                    session_id: &generated_session_id,
+                }
+            }
+            LegSession::NewWithId(id) => {
+                if !safe_session_id(id) || !native_session_id(id) {
+                    return Err(StartError::InvalidSessionId);
+                }
+                SessionWire::New { session_id: id }
+            }
             LegSession::Existing(id) => {
                 if !safe_session_id(id) {
                     return Err(StartError::InvalidSessionId);
@@ -489,6 +503,26 @@ fn safe_session_id(id: &str) -> bool {
         && id
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+fn native_session_id(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("sess-") else {
+        return false;
+    };
+    let components = suffix.split('-').collect::<Vec<_>>();
+    (components.len() == 2 || components.len() == 3)
+        && components.iter().all(|component| {
+            !component.is_empty() && component.chars().all(|ch| ch.is_ascii_digit())
+        })
+}
+
+pub(crate) fn new_native_session_id() -> String {
+    let sequence = SESSION_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("sess-{}-{timestamp}-{sequence}", std::process::id())
 }
 
 fn read_bounded_line<R: BufRead>(

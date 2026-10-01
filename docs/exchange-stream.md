@@ -2,10 +2,12 @@
 
 `leg exchange --stream-json` opts into an NDJSON stream on stdout. It accepts
 the same plain-text or `baton.message/v1` input as `leg exchange`; `--in`,
-`--session`, and `--new-session` keep their existing meanings. The stream is
+`--session`, and `--new-session` keep their existing meanings. The
+`--new-session-id <id>` option creates a session using a caller-reserved native
+`sess-...` ID and refuses to overwrite an existing trail. The stream is
 the complete stdout protocol for that invocation, so `--out` cannot be used.
-`--session-id-out` remains valid with a session and still writes the id plus a
-newline after the turn.
+`--session-id-out` remains valid with any session selection and still writes
+the id plus a newline after the turn.
 
 Without `--stream-json`, `leg exchange` keeps its existing one-response stdout
 contract. Streaming uses the same provider, tool loop, session history, and

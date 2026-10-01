@@ -115,10 +115,12 @@ installed beside the UI binary or selected with `LEG_UI_SUPERVISOR_BIN`.
 
 The companion supervisor holds a kernel-released exclusive lock in the
 canonical session store until both leg and its tools have exited. Existing
-sessions use one lock per session ID. New-session creation briefly uses a store
-guard and transfers ownership to the ID emitted by `turn_start` before exposing
-that event, so another process cannot start the newly created session during
-the handoff. Different sessions can run concurrently. A competing start
+sessions acquire only their per-session lock, so they can start while an
+unrelated new session is still binding. New-session creation reserves its
+native `sess-...` ID and per-session lock before launching leg; a short store
+creation guard serializes new-session startup until `turn_start`. Leg creates
+the trail with exclusive file creation, so a preexisting trail is never
+overwritten. Different sessions can run concurrently. A competing start
 returns `StartError::Busy` without invoking a provider.
 
 The supervisor is a separate process. Dropping a view does not drop the

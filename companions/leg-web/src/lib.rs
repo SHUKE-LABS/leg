@@ -9,7 +9,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path as RoutePath, Query, Request, State};
@@ -131,7 +131,7 @@ impl Host {
                 authority: Arc::new(Mutex::new(None)),
                 durable,
                 runtime: Mutex::new(runtime),
-                submit_gate: AsyncMutex::new(()),
+                acceptance_gates: Mutex::new(HashMap::new()),
                 workers: Mutex::new(Vec::new()),
                 shutdown_tx,
                 shutting_down: AtomicBool::new(false),
@@ -208,7 +208,7 @@ struct HostInner {
     authority: Arc<Mutex<Option<String>>>,
     durable: DurableStore,
     runtime: Mutex<Runtime>,
-    submit_gate: AsyncMutex<()>,
+    acceptance_gates: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     shutdown_tx: broadcast::Sender<()>,
     shutting_down: AtomicBool,
@@ -234,8 +234,44 @@ struct SessionRuntime {
 
 struct ActiveRun {
     turn_id: String,
-    stop: TurnStopHandle,
+    stop: PendingStop,
     stop_requested: bool,
+}
+
+#[derive(Clone)]
+struct PendingStop {
+    inner: Arc<PendingStopInner>,
+}
+
+struct PendingStopInner {
+    requested: AtomicBool,
+    handle: Mutex<Option<TurnStopHandle>>,
+}
+
+impl PendingStop {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(PendingStopInner {
+                requested: AtomicBool::new(false),
+                handle: Mutex::new(None),
+            }),
+        }
+    }
+
+    fn stop(&self) -> Result<(), ()> {
+        self.inner.requested.store(true, Ordering::Release);
+        if let Some(handle) = lock(&self.inner.handle).as_ref() {
+            handle.stop().map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    fn attach(&self, handle: TurnStopHandle) {
+        *lock(&self.inner.handle) = Some(handle.clone());
+        if self.inner.requested.load(Ordering::Acquire) {
+            let _ = handle.stop();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,6 +347,21 @@ enum SubmissionReject {
     Conflict,
     Unexpected,
     Exhausted,
+}
+
+#[derive(Clone)]
+struct NewSubmission {
+    requested_id: String,
+    ledger_id: String,
+    bound_session_id: Option<String>,
+    request_id: u64,
+    turn_id: String,
+    prompt: String,
+    stop: PendingStop,
+}
+
+struct SubmissionAcceptance {
+    receipt: SubmissionReceipt,
 }
 
 fn submission_decision(
@@ -714,18 +765,32 @@ async fn set_workspace(
     RoutePath(id): RoutePath<String>,
     Json(body): Json<SetWorkspace>,
 ) -> Result<StatusCode, ApiError> {
-    state.catalog_session(&id)?;
+    if !valid_session_id(&id) {
+        return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
+    }
     if !body.cwd.is_absolute() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "workspace_must_be_absolute",
         ));
     }
-    state
-        .inner
-        .catalog
-        .set_workspace(&id, &body.cwd)
-        .map_err(map_catalog_error)?;
+    let ledger_id = state.ledger_id(&id);
+    let gate = state.acceptance_gate(&ledger_id);
+    let _gate = gate.lock().await;
+    if state.runtime_is_busy(&ledger_id) {
+        return Err(api_error(StatusCode::CONFLICT, "session_busy"));
+    }
+    let blocking_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        blocking_state.catalog_session(&id)?;
+        blocking_state
+            .inner
+            .catalog
+            .set_workspace(&id, &body.cwd)
+            .map_err(map_catalog_error)
+    })
+    .await
+    .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace_worker_failed"))??;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -744,14 +809,35 @@ async fn submit_turn(
     if body.prompt.trim().is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "prompt_is_blank"));
     }
-    let _gate = state.inner.submit_gate.lock().await;
+    if !valid_session_id(&id) {
+        return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
+    }
     if state.inner.shutting_down.load(Ordering::Acquire) {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "host_shutting_down",
         ));
     }
-    let response = state.accept_submission(&id, body)?;
+    let ledger_id = state.ledger_id(&id);
+    let gate = state.acceptance_gate(&ledger_id);
+    let _gate = gate.lock().await;
+    if state.inner.shutting_down.load(Ordering::Acquire) {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_shutting_down",
+        ));
+    }
+    let blocking_state = state.clone();
+    let acceptance =
+        tokio::task::spawn_blocking(move || blocking_state.accept_submission(&id, body))
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "submission_worker_failed",
+                )
+            })??;
+    let response = acceptance.receipt;
     let status = if response.duplicate {
         StatusCode::OK
     } else {
@@ -764,46 +850,52 @@ async fn stop_turn(
     State(state): State<HostState>,
     RoutePath(id): RoutePath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let session = state.catalog_session(&id)?;
+    if !valid_session_id(&id) {
+        return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
+    }
     let ledger_id = state.ledger_id(&id);
-    let mut runtime = lock(&state.inner.runtime);
-    let runtime_id = runtime_id(&runtime, &ledger_id);
-    let Some(active) = runtime
-        .sessions
-        .get_mut(&runtime_id)
-        .and_then(|entry| entry.active.as_mut())
-    else {
-        let latest = state.latest_receipt(&ledger_id);
-        return Ok(Json(json!({
-            "session_id": id,
-            "status": latest.map(|r| format!("{:?}", r.status).to_ascii_lowercase()).unwrap_or_else(|| "idle".into()),
-            "run_state": session.run_state,
-        })));
+    let gate = state.acceptance_gate(&ledger_id);
+    let _gate = gate.lock().await;
+    let stop = {
+        let mut runtime = lock(&state.inner.runtime);
+        let runtime_key = runtime_id(&runtime, &ledger_id);
+        if let Some(entry) = runtime.sessions.get_mut(&runtime_key)
+            && let Some(active) = entry.active.as_mut()
+        {
+            if active.stop_requested {
+                return Ok(Json(json!({
+                    "session_id": id,
+                    "turn_id": active.turn_id,
+                    "status": "stop_requested",
+                })));
+            }
+            active.stop_requested = true;
+            let turn_id = active.turn_id.clone();
+            let stop = active.stop.clone();
+            if let Some(live) = entry.live.as_mut() {
+                live.status = "stopping".into();
+            }
+            Some((turn_id, stop))
+        } else {
+            None
+        }
     };
-    if active.stop_requested {
+    if let Some((turn_id, stop)) = stop {
+        stop.stop()
+            .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "stop_unavailable"))?;
         return Ok(Json(json!({
             "session_id": id,
-            "turn_id": active.turn_id,
+            "turn_id": turn_id,
             "status": "stop_requested",
         })));
     }
-    let turn_id = active.turn_id.clone();
-    active.stop_requested = true;
-    active
-        .stop
-        .stop()
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "stop_unavailable"))?;
-    if let Some(live) = runtime
-        .sessions
-        .get_mut(&runtime_id)
-        .and_then(|entry| entry.live.as_mut())
-    {
-        live.status = "stopping".into();
-    }
+
+    let session = state.catalog_session(&id)?;
+    let latest = state.latest_receipt(&ledger_id);
     Ok(Json(json!({
         "session_id": id,
-        "turn_id": turn_id,
-        "status": "stop_requested",
+        "status": latest.map(|r| format!("{:?}", r.status).to_ascii_lowercase()).unwrap_or_else(|| "idle".into()),
+        "run_state": session.run_state,
     })))
 }
 
@@ -813,7 +905,7 @@ async fn events(
     Query(query): Query<EventQuery>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
 {
-    state.catalog_session(&id)?;
+    state.catalog_session_or_bound_alias(&id)?;
     let ledger_id = state.ledger_id(&id);
     let (initial, reset_snapshot, mut receiver, mut last_cursor) =
         state.subscribe(&id, &ledger_id, query.after)?;
@@ -858,11 +950,43 @@ async fn events(
 }
 
 impl HostState {
+    fn acceptance_gate(&self, ledger_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut gates = lock(&self.inner.acceptance_gates);
+        Arc::clone(
+            gates
+                .entry(ledger_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
     fn catalog_session(&self, id: &str) -> Result<CatalogSession, ApiError> {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
         self.inner.catalog.get(id).map_err(map_catalog_error)
+    }
+
+    fn catalog_session_or_bound_alias(&self, id: &str) -> Result<CatalogSession, ApiError> {
+        if !valid_session_id(id) {
+            return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
+        }
+        match self.inner.catalog.get(id) {
+            Ok(session) => Ok(session),
+            Err(CatalogError::NotFound(_)) => {
+                let bound_id = self.inner.durable.read(|data| {
+                    data.aliases.iter().find_map(|(actual, ledger_id)| {
+                        (ledger_id == id && actual != id).then(|| actual.clone())
+                    })
+                });
+                match bound_id {
+                    Some(bound_id) => {
+                        self.inner.catalog.get(&bound_id).map_err(map_catalog_error)
+                    }
+                    None => Err(api_error(StatusCode::NOT_FOUND, "session_not_found")),
+                }
+            }
+            Err(error) => Err(map_catalog_error(error)),
+        }
     }
 
     fn ledger_id(&self, id: &str) -> String {
@@ -884,7 +1008,7 @@ impl HostState {
     }
 
     fn snapshot(&self, id: &str) -> Result<Snapshot, ApiError> {
-        let session = self.catalog_session(id)?;
+        let session = self.catalog_session_or_bound_alias(id)?;
         let ledger_id = self.ledger_id(id);
         let (high_water, cursor, last_submission, runtime_key_hint) =
             self.inner.durable.read(|data| {
@@ -938,7 +1062,11 @@ impl HostState {
         })
     }
 
-    fn accept_submission(&self, id: &str, body: SubmitTurn) -> Result<SubmissionReceipt, ApiError> {
+    fn accept_submission(
+        &self,
+        id: &str,
+        body: SubmitTurn,
+    ) -> Result<SubmissionAcceptance, ApiError> {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
@@ -949,12 +1077,14 @@ impl HostState {
         });
         match decision {
             Ok(SubmissionDecision::Replay(previous)) => {
-                return Ok(SubmissionReceipt {
-                    request_id: previous.request_id,
-                    turn_id: previous.turn_id,
-                    session_id: previous.session_id.unwrap_or_else(|| id.to_string()),
-                    status: previous.status,
-                    duplicate: true,
+                return Ok(SubmissionAcceptance {
+                    receipt: SubmissionReceipt {
+                        request_id: previous.request_id,
+                        turn_id: previous.turn_id,
+                        session_id: previous.session_id.unwrap_or_else(|| id.to_string()),
+                        status: previous.status,
+                        duplicate: true,
+                    },
                 });
             }
             Ok(SubmissionDecision::New) => {}
@@ -971,15 +1101,41 @@ impl HostState {
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_exhausted"));
             }
         }
+        if self.runtime_is_busy(&ledger_id) {
+            return Err(api_error(StatusCode::CONFLICT, "session_busy"));
+        }
         let current = self.catalog_session(id)?;
         if current.run_state != CatalogRunState::Idle {
             return Err(api_error(StatusCode::CONFLICT, "session_busy"));
         }
+        let bound_session_id = if id.starts_with("draft-") {
+            let mut available = None;
+            for _ in 0..128 {
+                let candidate = self
+                    .inner
+                    .catalog
+                    .allocate_new_session_id()
+                    .map_err(map_catalog_error)?;
+                let reserved = self.inner.durable.read(|data| {
+                    data.aliases.contains_key(&candidate) || data.sessions.contains_key(&candidate)
+                });
+                if !reserved {
+                    available = Some(candidate);
+                    break;
+                }
+            }
+            Some(available.ok_or(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_id_unavailable",
+            ))?)
+        } else {
+            None
+        };
         let turn_id = random_hex(16)
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "random_unavailable"))?;
         let accepted = Receipt {
             request_id: body.request_id,
-            prompt_sha256: prompt_hash,
+            prompt_sha256: prompt_hash.clone(),
             turn_id: turn_id.clone(),
             status: ReceiptStatus::Accepted,
             session_id: Some(id.to_string()),
@@ -989,6 +1145,26 @@ impl HostState {
         self.inner
             .durable
             .transact(|data| {
+                if !matches!(
+                    submission_decision(
+                        data.sessions.get(&ledger_id),
+                        body.request_id,
+                        &prompt_hash
+                    ),
+                    Ok(SubmissionDecision::New)
+                ) {
+                    return Err(HostError::State(
+                        "submission changed before durable acceptance".into(),
+                    ));
+                }
+                if let Some(bound_id) = &bound_session_id {
+                    if data.aliases.contains_key(bound_id) || data.sessions.contains_key(bound_id) {
+                        return Err(HostError::State(
+                            "preallocated session id was already reserved".into(),
+                        ));
+                    }
+                    data.aliases.insert(bound_id.clone(), ledger_id.clone());
+                }
                 let ledger = data.sessions.entry(ledger_id.clone()).or_default();
                 ledger.high_water = body.request_id;
                 ledger.receipts.push_back(accepted.clone());
@@ -998,41 +1174,12 @@ impl HostState {
                 Ok(())
             })
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"))?;
-
-        let turn = self.start_turn(id, &body.prompt);
-        let mut turn = match turn {
-            Ok(turn) => turn,
-            Err(error) => {
-                if matches!(error, CatalogError::Busy) {
-                    self.rollback_accepted_submission(&ledger_id, body.request_id, &turn_id)?;
-                    return Err(map_catalog_error(error));
-                }
-                let error_value = json!({"status": "incomplete"});
-                self.finish_receipt(
-                    &ledger_id,
-                    body.request_id,
-                    ReceiptStatus::Incomplete,
-                    None,
-                    error_value.clone(),
-                )?;
-                self.append_event(&ledger_id, id, &turn_id, "outcome", error_value)?;
-                return Ok(SubmissionReceipt {
-                    request_id: body.request_id,
-                    turn_id,
-                    session_id: id.to_string(),
-                    status: ReceiptStatus::Incomplete,
-                    duplicate: false,
-                });
-            }
-        };
-        let accepted_event = self.append_event(
-            &ledger_id,
-            id,
-            &turn_id,
-            "accepted",
-            json!({"request_id": body.request_id}),
-        );
-        let stop = turn.stop_handle();
+        let pending_stop = PendingStop::new();
+        if let Some(bound_id) = &bound_session_id {
+            lock(&self.inner.runtime)
+                .aliases
+                .insert(bound_id.clone(), ledger_id.clone());
+        }
         self.ensure_runtime(&ledger_id);
         {
             let mut runtime = lock(&self.inner.runtime);
@@ -1043,7 +1190,7 @@ impl HostState {
                 .or_insert_with(SessionRuntime::new);
             entry.active = Some(ActiveRun {
                 turn_id: turn_id.clone(),
-                stop,
+                stop: pending_stop.clone(),
                 stop_requested: false,
             });
             entry.live = Some(LiveSnapshot {
@@ -1058,175 +1205,222 @@ impl HostState {
                 tools: Vec::new(),
             });
         }
-        let running_receipt = self.finish_receipt(
+        let _ = self.append_event(
+            &ledger_id,
+            id,
+            &turn_id,
+            "accepted",
+            json!({"request_id": body.request_id}),
+        );
+        let _ = self.finish_receipt(
             &ledger_id,
             body.request_id,
             ReceiptStatus::Running,
             Some(id.to_string()),
             json!({"status": "running"}),
         );
-        let state = self.clone();
-        let turn_id_worker = turn_id.clone();
-        let requested_id = id.to_string();
-        let ledger_id_worker = ledger_id.clone();
-        let request_id = body.request_id;
-        let (bound_id_tx, bound_id_rx) = if id.starts_with("draft-") {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
+        let submission = NewSubmission {
+            requested_id: id.to_string(),
+            ledger_id: ledger_id.clone(),
+            bound_session_id,
+            request_id: body.request_id,
+            turn_id: turn_id.clone(),
+            prompt: body.prompt,
+            stop: pending_stop,
         };
+        let owner_submission = submission.clone();
+        let state = self.clone();
         let worker = thread::Builder::new()
             .name("leg-web-turn-owner".into())
-            .spawn(move || {
-                let mut bound_id = requested_id.clone();
-                let mut bound_id_sent = false;
-                loop {
-                    match turn.observe() {
-                        Ok(Some(event)) => {
-                            if let StreamEvent::TurnStart {
-                                session_id: Some(session_id),
-                                ..
-                            } = &event
-                            {
-                                bound_id = session_id.clone();
-                                if requested_id.starts_with("draft-")
-                                    && requested_id != session_id.as_str()
-                                {
-                                    let _ = state.bind_alias(&requested_id, session_id);
-                                }
-                                if let Some(sender) = bound_id_tx.as_ref() {
-                                    let _ = sender.send(bound_id.clone());
-                                    bound_id_sent = true;
-                                }
-                            }
-                            let _ = state.record_stream_event(
-                                &ledger_id_worker,
-                                &bound_id,
-                                &turn_id_worker,
-                                event,
-                            );
-                        }
-                        Ok(None) => break,
-                        Err(_) => break,
-                    }
-                }
-                // Stream EOF is not a successful outcome; wait() supplies the
-                // driver's correlated response and process status.
-                let (status, outcome) = match turn.wait() {
-                    Ok(outcome) => outcome_summary(&outcome),
-                    Err(_) => (ReceiptStatus::Incomplete, json!({"status": "incomplete"})),
-                };
-                if !bound_id_sent && let Some(sender) = bound_id_tx.as_ref() {
-                    let _ = sender.send(bound_id.clone());
-                }
-                let _ = state.finish_receipt(
-                    &ledger_id_worker,
-                    request_id,
-                    status,
-                    Some(bound_id.clone()),
-                    outcome.clone(),
-                );
-                let mut runtime = lock(&state.inner.runtime);
-                let key = runtime_id(&runtime, &ledger_id_worker);
-                if let Some(entry) = runtime.sessions.get_mut(&key) {
-                    entry.active = None;
-                    entry.live = None;
-                }
-                drop(runtime);
-                let _ = state.append_event(
-                    &ledger_id_worker,
-                    &bound_id,
-                    &turn_id_worker,
-                    "outcome",
-                    outcome,
-                );
-            });
+            .spawn(move || state.run_submission_owner(owner_submission));
         let worker = match worker {
             Ok(worker) => worker,
             Err(_) => {
                 let incomplete = json!({"status": "incomplete"});
-                let receipt_result = self.finish_receipt(
-                    &ledger_id,
-                    body.request_id,
+                self.finish_submission(
+                    &submission,
+                    id,
                     ReceiptStatus::Incomplete,
-                    Some(id.to_string()),
                     incomplete.clone(),
                 );
-                let mut runtime = lock(&self.inner.runtime);
-                let key = runtime_id(&runtime, &ledger_id);
-                if let Some(entry) = runtime.sessions.get_mut(&key) {
-                    entry.active = None;
-                    entry.live = None;
-                }
-                drop(runtime);
+                self.clear_active_run(&submission);
                 let _ = self.append_event(&ledger_id, id, &turn_id, "outcome", incomplete);
-                receipt_result?;
-                return Ok(SubmissionReceipt {
-                    request_id: body.request_id,
-                    turn_id,
-                    session_id: id.to_string(),
-                    status: ReceiptStatus::Incomplete,
-                    duplicate: false,
+                return Ok(SubmissionAcceptance {
+                    receipt: SubmissionReceipt {
+                        request_id: body.request_id,
+                        turn_id,
+                        session_id: id.to_string(),
+                        status: ReceiptStatus::Incomplete,
+                        duplicate: false,
+                    },
                 });
             }
         };
         self.reap_finished_workers();
         lock(&self.inner.workers).push(worker);
-        let receipt_session_id = bound_id_rx
-            .and_then(|receiver| receiver.recv_timeout(Duration::from_secs(10)).ok())
-            .unwrap_or_else(|| id.to_string());
-        running_receipt?;
-        accepted_event?;
-        Ok(SubmissionReceipt {
-            request_id: body.request_id,
-            turn_id,
-            session_id: receipt_session_id,
-            status: ReceiptStatus::Running,
-            duplicate: false,
+        Ok(SubmissionAcceptance {
+            receipt: SubmissionReceipt {
+                request_id: body.request_id,
+                turn_id,
+                session_id: id.to_string(),
+                status: ReceiptStatus::Running,
+                duplicate: false,
+            },
         })
     }
 
-    fn rollback_accepted_submission(
-        &self,
-        ledger_id: &str,
-        request_id: u64,
-        turn_id: &str,
-    ) -> Result<(), ApiError> {
-        self.inner
-            .durable
-            .transact(|data| {
-                let ledger = data
-                    .sessions
-                    .get_mut(ledger_id)
-                    .ok_or_else(|| HostError::State("accepted submission disappeared".into()))?;
-                let expected_previous = request_id
-                    .checked_sub(1)
-                    .ok_or_else(|| HostError::State("invalid accepted request id".into()))?;
-                if ledger.high_water != request_id
-                    || !ledger.receipts.back().is_some_and(|receipt| {
-                        receipt.request_id == request_id
-                            && receipt.turn_id == turn_id
-                            && receipt.status == ReceiptStatus::Accepted
-                    })
-                {
-                    return Err(HostError::State(
-                        "accepted submission changed before rollback".into(),
-                    ));
-                }
-                ledger.receipts.pop_back();
-                ledger.high_water = expected_previous;
-                Ok(())
-            })
-            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"))
+    fn runtime_is_busy(&self, ledger_id: &str) -> bool {
+        let runtime = lock(&self.inner.runtime);
+        let key = runtime_id(&runtime, ledger_id);
+        runtime
+            .sessions
+            .get(&key)
+            .is_some_and(|entry| entry.active.is_some())
     }
 
-    fn start_turn(&self, id: &str, prompt: &str) -> Result<CatalogTurn, CatalogError> {
+    fn run_submission_owner(&self, submission: NewSubmission) {
+        let mut bound_id = submission
+            .bound_session_id
+            .clone()
+            .unwrap_or_else(|| submission.requested_id.clone());
+        let mut turn = match self.start_turn(
+            &submission.requested_id,
+            &submission.prompt,
+            submission.bound_session_id.as_deref(),
+        ) {
+            Ok(turn) => turn,
+            Err(_) => {
+                let outcome = json!({"status": "incomplete", "reason": "startup_failed"});
+                self.finish_submission(
+                    &submission,
+                    &submission.requested_id,
+                    ReceiptStatus::Incomplete,
+                    outcome.clone(),
+                );
+                self.clear_active_run(&submission);
+                let _ = self.append_event(
+                    &submission.ledger_id,
+                    &bound_id,
+                    &submission.turn_id,
+                    "outcome",
+                    outcome,
+                );
+                return;
+            }
+        };
+        submission.stop.attach(turn.stop_handle());
+        let mut binding_failed = false;
+        loop {
+            match turn.observe() {
+                Ok(Some(event)) => {
+                    if let StreamEvent::TurnStart {
+                        session_id: Some(session_id),
+                        ..
+                    } = &event
+                    {
+                        if submission
+                            .bound_session_id
+                            .as_deref()
+                            .is_some_and(|expected| expected != session_id)
+                        {
+                            binding_failed = true;
+                            let _ = submission.stop.stop();
+                        } else {
+                            bound_id = session_id.clone();
+                            if submission.requested_id.starts_with("draft-")
+                                && self
+                                    .bind_alias(
+                                        &submission.requested_id,
+                                        &bound_id,
+                                        submission.request_id,
+                                    )
+                                    .is_err()
+                            {
+                                binding_failed = true;
+                                let _ = submission.stop.stop();
+                            }
+                        }
+                    }
+                    let _ = self.record_stream_event(
+                        &submission.ledger_id,
+                        &bound_id,
+                        &submission.turn_id,
+                        event,
+                    );
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        // EOF is not success; wait() supplies the driver's terminal result.
+        let (status, outcome) = match turn.wait() {
+            Ok(outcome) => outcome_summary(&outcome),
+            Err(_) => (ReceiptStatus::Incomplete, json!({"status": "incomplete"})),
+        };
+        let (status, outcome) = if binding_failed {
+            (
+                ReceiptStatus::Incomplete,
+                json!({"status": "incomplete", "reason": "session_binding_failed"}),
+            )
+        } else {
+            (status, outcome)
+        };
+        self.finish_submission(&submission, &bound_id, status, outcome.clone());
+        self.clear_active_run(&submission);
+        let _ = self.append_event(
+            &submission.ledger_id,
+            &bound_id,
+            &submission.turn_id,
+            "outcome",
+            outcome,
+        );
+    }
+
+    fn finish_submission(
+        &self,
+        submission: &NewSubmission,
+        session_id: &str,
+        status: ReceiptStatus,
+        outcome: Value,
+    ) {
+        let _ = self.finish_receipt(
+            &submission.ledger_id,
+            submission.request_id,
+            status,
+            Some(session_id.to_string()),
+            outcome,
+        );
+    }
+
+    fn clear_active_run(&self, submission: &NewSubmission) {
+        let mut runtime = lock(&self.inner.runtime);
+        let key = runtime_id(&runtime, &submission.ledger_id);
+        if let Some(entry) = runtime.sessions.get_mut(&key)
+            && entry
+                .active
+                .as_ref()
+                .is_some_and(|active| active.turn_id == submission.turn_id)
+        {
+            entry.active = None;
+            entry.live = None;
+        }
+    }
+
+    fn start_turn(
+        &self,
+        id: &str,
+        prompt: &str,
+        bound_session_id: Option<&str>,
+    ) -> Result<CatalogTurn, CatalogError> {
         if id.starts_with("draft-") {
-            return self
-                .inner
-                .catalog
-                .start_new(id, SessionInterface::Web, prompt.to_string());
+            let bound_session_id = bound_session_id.ok_or_else(|| {
+                CatalogError::Catalog("draft submission has no reserved native id".into())
+            })?;
+            return self.inner.catalog.start_new_with_id(
+                id,
+                bound_session_id.to_string(),
+                SessionInterface::Web,
+                prompt.to_string(),
+            );
         }
         if let Ok(intent) = self.inner.catalog.prepare_retry(id)
             && intent.prompt() == prompt
@@ -1268,15 +1462,32 @@ impl HostState {
             .or_insert_with(SessionRuntime::new);
     }
 
-    fn bind_alias(&self, draft_id: &str, session_id: &str) -> Result<(), ApiError> {
+    fn bind_alias(
+        &self,
+        draft_id: &str,
+        session_id: &str,
+        request_id: u64,
+    ) -> Result<(), ApiError> {
         self.inner
             .durable
             .transact(|data| {
+                if data
+                    .aliases
+                    .get(session_id)
+                    .is_some_and(|existing| existing != draft_id)
+                {
+                    return Err(HostError::State(
+                        "native session id was reserved by another ledger".into(),
+                    ));
+                }
                 data.aliases
                     .insert(session_id.to_string(), draft_id.to_string());
-                if let Some(ledger) = data.sessions.get_mut(draft_id)
-                    && let Some(receipt) = ledger.receipts.back_mut()
-                {
+                if let Some(receipt) = data.sessions.get_mut(draft_id).and_then(|ledger| {
+                    ledger
+                        .receipts
+                        .iter_mut()
+                        .find(|receipt| receipt.request_id == request_id)
+                }) {
                     receipt.session_id = Some(session_id.to_string());
                 }
                 Ok(())
@@ -1535,6 +1746,9 @@ impl HostState {
                     .find_map(|(actual, draft)| (draft == &id).then(|| actual.clone()))
                     .unwrap_or_else(|| id.clone())
             });
+            if id.starts_with("draft-") {
+                self.inner.catalog.recover_pending_new_session(&id)?;
+            }
             let evidence = self
                 .inner
                 .catalog
@@ -1876,6 +2090,28 @@ mod tests {
         .unwrap();
         *lock(&host.state.inner.authority) = Some("127.0.0.1:43127".into());
         (host, temp)
+    }
+
+    #[cfg(unix)]
+    fn test_host_with_driver(temp: &TempDir, leg: &Path, supervisor: &Path) -> Host {
+        let host = Host::open(HostConfig {
+            catalog: SessionCatalogConfig {
+                state_dir: Some(temp.path().to_path_buf()),
+                leg_bin: Some(leg.to_path_buf()),
+                supervisor_bin: Some(supervisor.to_path_buf()),
+            },
+            ..HostConfig::default()
+        })
+        .unwrap();
+        *lock(&host.state.inner.authority) = Some("127.0.0.1:43127".into());
+        host
+    }
+
+    async fn round_trip_json(router: &Router, request: HttpRequest<Body>) -> (StatusCode, Value) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
     }
 
     fn api_request(host: &Host, path: &str) -> HttpRequest<Body> {
@@ -2391,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_start_rollback_restores_the_unspent_request_id() {
+    fn failed_start_keeps_the_durable_request_id_spent() {
         let (host, _temp) = test_host();
         let receipt = |request_id, status| Receipt {
             request_id,
@@ -2413,20 +2649,27 @@ mod tests {
                     .push_back(receipt(1, ReceiptStatus::Succeeded));
                 ledger
                     .receipts
-                    .push_back(receipt(2, ReceiptStatus::Accepted));
+                    .push_back(receipt(2, ReceiptStatus::Running));
                 Ok(())
             })
             .unwrap();
 
         host.state
-            .rollback_accepted_submission("session-a", 2, "turn-2")
+            .finish_receipt(
+                "session-a",
+                2,
+                ReceiptStatus::Incomplete,
+                Some("session-a".into()),
+                json!({"status": "incomplete"}),
+            )
             .unwrap();
 
         host.state.inner.durable.read(|data| {
             let ledger = data.sessions.get("session-a").unwrap();
-            assert_eq!(ledger.high_water, 1);
-            assert_eq!(ledger.receipts.len(), 1);
-            assert_eq!(ledger.receipts[0].request_id, 1);
+            assert_eq!(ledger.high_water, 2);
+            assert_eq!(ledger.receipts.len(), 2);
+            assert_eq!(ledger.receipts[1].request_id, 2);
+            assert_eq!(ledger.receipts[1].status, ReceiptStatus::Incomplete);
         });
     }
 
@@ -2507,6 +2750,400 @@ mod tests {
             );
             assert_eq!(ledger.receipts.len(), 2);
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn held_draft_binding_does_not_block_other_sessions_on_one_worker() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let fixture_dir = workspace.join("fixture");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        let log_path = fixture_dir.join("turns.log");
+        let leg = fixture_dir.join("fake-leg");
+        let source = fixture_dir.join("fake_leg.rs");
+        fs::write(
+            &source,
+            r#"
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {
+        println!("leg 0.14.0");
+        return;
+    }
+    if args == ["--help"] {
+        println!("usage: leg exchange --stream-json --new-session-id <id>");
+        return;
+    }
+    if args.first().map(String::as_str) != Some("exchange") {
+        std::process::exit(2);
+    }
+    let session_id = args
+        .windows(2)
+        .find(|pair| pair[0] == "--new-session-id" || pair[0] == "--session")
+        .map(|pair| pair[1].clone())
+        .expect("session argument");
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    let fixture = env::current_dir().unwrap().join("fixture");
+    let log = OpenOptions::new().create(true).append(true).open(fixture.join("turns.log")).unwrap();
+    writeln!(&log, "{session_id}|{prompt}").unwrap();
+    let session_dir = PathBuf::from(env::var_os("LEG_SESSION_DIR").unwrap());
+    fs::create_dir_all(&session_dir).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(session_dir.join(format!("{session_id}.jsonl")))
+        .unwrap();
+    fs::write(fixture.join(format!("{prompt}.id")), &session_id).unwrap();
+    if prompt == "FAIL-START" {
+        std::process::exit(1);
+    }
+    if prompt.starts_with("HOLD") {
+        let release = fixture.join(format!("{prompt}.release"));
+        while !release.exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let start = format!(
+        "{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_start\",\"seq\":0,\"provider\":\"fixture\",\"model\":\"fixture\",\"session_id\":\"{session_id}\",\"turn_index\":0,\"request\":{{\"schema\":\"baton.message/v1\",\"message_id\":\"request-{prompt}\",\"conversation_id\":\"conversation-{prompt}\",\"kind\":\"request\",\"body\":\"{prompt}\"}}}}"
+    );
+    let end = format!(
+        "{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_end\",\"seq\":1,\"capped\":false,\"session_id\":\"{session_id}\",\"turn_index\":0,\"response\":{{\"schema\":\"baton.message/v1\",\"message_id\":\"response-{prompt}\",\"conversation_id\":\"conversation-{prompt}\",\"in_reply_to\":\"request-{prompt}\",\"kind\":\"response\",\"body\":\"ok\"}}}}"
+    );
+    println!("{start}");
+    println!("{end}");
+}
+"#,
+        )
+        .unwrap();
+        let compiled = Command::new("rustc")
+            .args(["--edition=2021"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&leg)
+            .output()
+            .expect("rustc is available to build the native fixture");
+        assert!(
+            compiled.status.success(),
+            "failed to compile native leg fixture: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let supervisor = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("leg-ui-supervisor");
+        assert!(supervisor.is_file(), "missing supervisor at {supervisor:?}");
+        let host = test_host_with_driver(&temp, &leg, &supervisor);
+        let router = build_router(host.state.clone());
+
+        let release_files =
+            ["HOLD-A", "HOLD-D"].map(|prompt| fixture_dir.join(format!("{prompt}.release")));
+        let (watchdog_tx, watchdog_rx) = std::sync::mpsc::channel();
+        let watchdog_releases = release_files.clone();
+        let watchdog = thread::spawn(move || {
+            if watchdog_rx.recv_timeout(Duration::from_secs(8)).is_err() {
+                for release in watchdog_releases {
+                    let _ = fs::write(release, "release");
+                }
+            }
+        });
+
+        let create_draft = |name: &str| {
+            let body = json!({"name": name, "cwd": workspace.to_string_lossy()}).to_string();
+            api_json_request(&host, Method::POST, "/api/sessions", &body, true)
+        };
+        let (status, base) = round_trip_json(&router, create_draft("base")).await;
+        assert_eq!(status, StatusCode::CREATED, "{base}");
+        let base_draft = base["id"].as_str().unwrap().to_string();
+        let start = Instant::now();
+        let (status, receipt) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{base_draft}/submit"),
+                r#"{"request_id":1,"prompt":"BASE"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{receipt}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let base_id = wait_for_fixture_id(&fixture_dir, "BASE").await;
+        wait_for_receipt(&host, &router, &base_id, 1).await;
+
+        let (status, failed) = round_trip_json(&router, create_draft("failed-start")).await;
+        assert_eq!(status, StatusCode::CREATED, "{failed}");
+        let failed_draft = failed["id"].as_str().unwrap().to_string();
+        let (status, failed_acceptance) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{failed_draft}/submit"),
+                r#"{"request_id":1,"prompt":"FAIL-START"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{failed_acceptance}");
+        let failed_snapshot = wait_for_receipt(&host, &router, &failed_draft, 1).await;
+        assert_eq!(failed_snapshot["last_submission"]["status"], "incomplete");
+        assert_eq!(failed_snapshot["high_water"], 1);
+        let (status, failed_replay) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{failed_draft}/submit"),
+                r#"{"request_id":1,"prompt":"FAIL-START"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{failed_replay}");
+        assert_eq!(failed_replay["duplicate"], true);
+        assert_eq!(
+            fs::read_to_string(&log_path)
+                .unwrap()
+                .lines()
+                .filter(|line| line.ends_with("|FAIL-START"))
+                .count(),
+            1
+        );
+
+        let (status, held) = round_trip_json(&router, create_draft("held-A")).await;
+        assert_eq!(status, StatusCode::CREATED, "{held}");
+        let held_draft = held["id"].as_str().unwrap().to_string();
+        let start = Instant::now();
+        let (status, accepted_a) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{held_draft}/submit"),
+                r#"{"request_id":1,"prompt":"HOLD-A"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted_a}");
+        assert_eq!(accepted_a["session_id"], held_draft);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let held_id = wait_for_fixture_id(&fixture_dir, "HOLD-A").await;
+
+        let (status, workspace_busy) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::PUT,
+                &format!("/api/sessions/{held_draft}/workspace"),
+                &json!({"cwd": workspace.to_string_lossy()}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{workspace_busy}");
+        assert_eq!(workspace_busy["error"], "session_busy");
+
+        let start = Instant::now();
+        let (status, list) = round_trip_json(&router, api_request(&host, "/api/sessions")).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let start = Instant::now();
+        let (status, held_snapshot) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/sessions/{held_draft}/snapshot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{held_snapshot}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        let (status, duplicate) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{held_id}/submit"),
+                r#"{"request_id":1,"prompt":"HOLD-A"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{duplicate}");
+        assert_eq!(duplicate["duplicate"], true);
+        let (status, conflict) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{held_id}/submit"),
+                r#"{"request_id":1,"prompt":"different prompt"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(conflict["error"], "submission_id_conflict");
+
+        let (status, draft_c) = round_trip_json(&router, create_draft("independent-C")).await;
+        assert_eq!(status, StatusCode::CREATED, "{draft_c}");
+        let independent_draft = draft_c["id"].as_str().unwrap().to_string();
+        let start = Instant::now();
+        let (status, accepted_c) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{independent_draft}/submit"),
+                r#"{"request_id":1,"prompt":"QUICK-C"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted_c}");
+        assert_eq!(accepted_c["session_id"], independent_draft);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        let start = Instant::now();
+        let (status, accepted_b) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{base_id}/submit"),
+                r#"{"request_id":2,"prompt":"B-ONCE"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted_b}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        wait_for_receipt(&host, &router, &base_id, 2).await;
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            log.lines().filter(|line| line.ends_with("|B-ONCE")).count(),
+            1,
+            "bound session B must execute one exchange: {log}"
+        );
+
+        fs::write(&release_files[0], "release").unwrap();
+        wait_for_receipt(&host, &router, &held_id, 1).await;
+        let (status, rebound_snapshot) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/sessions/{held_draft}/snapshot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rebound_snapshot}");
+        assert_eq!(rebound_snapshot["session"]["id"], held_id);
+        let rebound_events = router
+            .clone()
+            .oneshot(api_request(
+                &host,
+                &format!("/api/sessions/{held_draft}/events?after=0"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rebound_events.status(), StatusCode::OK);
+        drop(rebound_events);
+        let independent_id = wait_for_fixture_id(&fixture_dir, "QUICK-C").await;
+        wait_for_receipt(&host, &router, &independent_id, 1).await;
+
+        let (status, held_d) = round_trip_json(&router, create_draft("held-D-stop")).await;
+        assert_eq!(status, StatusCode::CREATED, "{held_d}");
+        let stopped_draft = held_d["id"].as_str().unwrap().to_string();
+        let (status, accepted_d) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{stopped_draft}/submit"),
+                r#"{"request_id":1,"prompt":"HOLD-D"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted_d}");
+        let stopped_id = wait_for_fixture_id(&fixture_dir, "HOLD-D").await;
+        let mut stop_request = api_request(&host, &format!("/api/sessions/{stopped_id}/stop"));
+        *stop_request.method_mut() = Method::POST;
+        let (status, stop) = round_trip_json(&router, stop_request).await;
+        assert_eq!(status, StatusCode::OK, "{stop}");
+        assert_eq!(stop["status"], "stop_requested");
+        let stopped_snapshot = wait_for_receipt(&host, &router, &stopped_draft, 1).await;
+        assert!(matches!(
+            stopped_snapshot["last_submission"]["status"].as_str(),
+            Some("stopped" | "incomplete")
+        ));
+        assert!(stopped_snapshot["active"].is_null());
+        assert_eq!(
+            stopped_snapshot["last_submission"]["session_id"],
+            stopped_id
+        );
+
+        host.state.shutdown();
+        let _ = watchdog_tx.send(());
+        watchdog.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_fixture_id(fixture_dir: &Path, prompt: &str) -> String {
+        let path = fixture_dir.join(format!("{prompt}.id"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(id) = fs::read_to_string(&path) {
+                return id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture did not start {prompt}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_receipt(
+        host: &Host,
+        router: &Router,
+        session_id: &str,
+        request_id: u64,
+    ) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (status, snapshot) = round_trip_json(
+                router,
+                api_request(host, &format!("/api/sessions/{session_id}/snapshot")),
+            )
+            .await;
+            if status == StatusCode::OK
+                && snapshot["last_submission"]["request_id"].as_u64() == Some(request_id)
+                && matches!(
+                    snapshot["last_submission"]["status"].as_str(),
+                    Some("succeeded" | "failed" | "stopped" | "incomplete")
+                )
+            {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receipt did not finish: status={status} snapshot={snapshot}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     impl Host {

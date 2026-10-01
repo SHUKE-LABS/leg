@@ -332,6 +332,7 @@ fn help_text_documents_usage_env_and_failure_contract() {
     assert!(text.contains("kind:\"error\""));
     assert!(text.contains("--session <id>"));
     assert!(text.contains("--new-session"));
+    assert!(text.contains("--new-session-id <id>"));
     assert!(text.contains("--session-id-out"));
     assert!(text.contains("XDG_STATE_HOME/leg/sessions"));
 }
@@ -2111,6 +2112,58 @@ fn parse_args_exchange_accepts_session_flags_in_either_order() {
 }
 
 #[test]
+fn parse_args_exchange_accepts_a_preallocated_native_session_id() {
+    assert_eq!(
+        parse_args(&argv(&[
+            "exchange",
+            "--session-id-out",
+            "/tmp/id",
+            "--new-session-id",
+            "sess-12-34-5",
+            "--stream-json",
+        ]))
+        .unwrap(),
+        Some(Command::Exchange {
+            in_path: None,
+            out_path: None,
+            session: Some(ExchangeSession::NewWithId("sess-12-34-5".to_string())),
+            session_id_out: Some("/tmp/id".to_string()),
+            stream_json: true,
+        })
+    );
+}
+
+#[test]
+fn parse_args_exchange_rejects_invalid_or_conflicting_preallocated_ids() {
+    for id in ["other-12-34", "sess-12", "sess-a-34", "sess-12-34/../x"] {
+        assert!(
+            parse_args(&argv(&["exchange", "--new-session-id", id])).is_err(),
+            "accepted invalid preallocated id {id:?}"
+        );
+    }
+    assert!(parse_args(&argv(&["exchange", "--new-session-id"])).is_err());
+    assert!(
+        parse_args(&argv(&[
+            "exchange",
+            "--new-session-id",
+            "sess-12-34",
+            "--new-session"
+        ]))
+        .is_err()
+    );
+    assert!(
+        parse_args(&argv(&[
+            "exchange",
+            "--session",
+            "sess-12-34",
+            "--new-session-id",
+            "sess-12-35"
+        ]))
+        .is_err()
+    );
+}
+
+#[test]
 fn parse_args_exchange_rejects_conflicting_or_incomplete_session_flags() {
     assert!(
         parse_args(&argv(
@@ -2170,6 +2223,25 @@ fn parse_args_exchange_rejects_stream_json_with_out() {
         ])),
         Err(LegError::Usage(message)) if message.contains("--stream-json")
     ));
+}
+
+#[test]
+fn preallocated_session_trail_refuses_an_existing_file_without_overwriting_it() {
+    let directory = std::env::temp_dir().join(format!(
+        "leg-preallocated-session-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("sess-12-34.jsonl");
+    std::fs::write(&path, "existing trail\n").unwrap();
+
+    assert!(open_session_event_sink(&path, true).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing trail\n");
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
