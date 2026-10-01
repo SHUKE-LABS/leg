@@ -979,9 +979,7 @@ impl HostState {
                     })
                 });
                 match bound_id {
-                    Some(bound_id) => {
-                        self.inner.catalog.get(&bound_id).map_err(map_catalog_error)
-                    }
+                    Some(bound_id) => self.inner.catalog.get(&bound_id).map_err(map_catalog_error),
                     None => Err(api_error(StatusCode::NOT_FOUND, "session_not_found")),
                 }
             }
