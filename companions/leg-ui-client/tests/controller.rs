@@ -600,7 +600,10 @@ fn shared_catalog_controller_contract(
         .prepare_retry(&session_id)
         .expect("prepare explicit retry");
     assert_eq!(retry.prompt(), failed_prompt);
-    assert!(retry.warning().contains("tools again"));
+    assert_eq!(
+        retry.warning(),
+        "Retry sends this prompt again and may repeat tool side effects."
+    );
     let mut retried = second_controller
         .confirm_retry(&retry, SessionInterface::Web)
         .expect("confirm explicit retry");
