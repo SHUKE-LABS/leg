@@ -189,6 +189,69 @@ fn active_driver_lock_blocks_workspace_change() {
 }
 
 #[test]
+fn display_lock_probes_do_not_create_primary_locks_or_change_trails() {
+    use std::fs::OpenOptions;
+
+    let scratch = tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let catalog = SessionCatalog::open(config(&state)).unwrap();
+    let id = "sess-707-808";
+    let trail_path = catalog.sessions_dir().join(format!("{id}.jsonl"));
+    let trail = request_event(id, 0, "display probe");
+    fs::write(&trail_path, &trail).unwrap();
+    let primary = catalog
+        .sessions_dir()
+        .join(format!(".leg-ui-session-{id}.lock"));
+    let coordination = primary.with_file_name(format!(".leg-ui-session-{id}.lock.coord"));
+
+    assert_eq!(catalog.get(id).unwrap().run_state, CatalogRunState::Idle);
+    assert!(!primary.exists(), "display must not create a primary lock");
+    assert!(
+        !coordination.exists(),
+        "a missing primary lock needs no coordination sidecar"
+    );
+    assert_eq!(
+        catalog
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .run_state,
+        CatalogRunState::Idle
+    );
+    assert!(!primary.exists());
+    assert!(!coordination.exists());
+
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&primary)
+        .unwrap();
+    assert_eq!(catalog.get(id).unwrap().run_state, CatalogRunState::Idle);
+    assert!(
+        coordination.exists(),
+        "existing primary locks are coordinated"
+    );
+    assert_eq!(fs::read_to_string(&trail_path).unwrap(), trail);
+
+    fs::remove_file(&coordination).unwrap();
+    fs::create_dir(&coordination).unwrap();
+    let unknown = catalog.get(id).unwrap();
+    assert_eq!(unknown.run_state, CatalogRunState::Unknown);
+    assert!(unknown.read_only);
+    assert!(
+        unknown
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("coordination guard"))
+    );
+    assert_eq!(fs::read_to_string(&trail_path).unwrap(), trail);
+}
+
+#[test]
 fn missing_workspace_blocks_submission_until_explicit_replacement() {
     let scratch = tempdir().unwrap();
     let state = scratch.path().join("state");

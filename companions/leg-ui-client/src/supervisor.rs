@@ -94,10 +94,7 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
             if !safe_session_id(session_id) || !native_session_id(session_id) {
                 return Err("invalid preallocated session id".to_string());
             }
-            let creation_lock = open_lock_file(&store_dir.join(".leg-ui-client-create.lock"))?;
-            creation_lock
-                .lock_exclusive()
-                .map_err(|error| format!("could not acquire session creation guard: {error}"))?;
+            let creation_lock = acquire_creation_lock(&store_dir)?;
             let session_lock = match try_session_lock(&store_dir, session_id)? {
                 Some(lock) => lock,
                 None => {
@@ -383,7 +380,9 @@ fn open_lock_file(path: &Path) -> Result<File, String> {
 }
 
 pub(crate) fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Option<File>, String> {
-    let lock = open_lock_file(&store_dir.join(format!(".leg-ui-session-{session_id}.lock")))?;
+    let path = store_dir.join(format!(".leg-ui-session-{session_id}.lock"));
+    let _coordination = lock_coordination(&path, session_id)?;
+    let lock = open_lock_file(&path)?;
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock)),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -391,9 +390,9 @@ pub(crate) fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Opt
     }
 }
 
-/// Reads whether a driver lock is held without creating a lock file. This is
-/// for catalog display only; state-changing operations use the guard methods
-/// above and hold the guard through their metadata update.
+/// Reads whether a driver lock is held without creating the primary lock. The
+/// short coordination sidecar keeps this display probe from reserving the
+/// primary lock while a supervisor is claiming ownership.
 pub(crate) fn session_lock_is_held(store_dir: &Path, session_id: &str) -> Result<bool, String> {
     let path = store_dir.join(format!(".leg-ui-session-{session_id}.lock"));
     lock_is_held_if_present(&path, session_id)
@@ -407,6 +406,15 @@ pub(crate) fn creation_lock_is_held(store_dir: &Path) -> Result<bool, String> {
 }
 
 fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
+    lock_is_held_if_present_after_coordination_release(path, label, || {})
+}
+
+/// The callback marks a deterministic test boundary after both locks are released.
+fn lock_is_held_if_present_after_coordination_release(
+    path: &Path,
+    label: &str,
+    after_coordination_release: impl FnOnce(),
+) -> Result<bool, String> {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     let lock = match options.open(path) {
@@ -414,11 +422,53 @@ fn lock_is_held_if_present(path: &Path, label: &str) -> Result<bool, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("could not open {label} lock: {error}")),
     };
+    let coordination = lock_coordination(path, label)?;
     match lock.try_lock_exclusive() {
-        Ok(()) => Ok(false),
+        Ok(()) => {
+            FileExt::unlock(&lock)
+                .map_err(|error| format!("could not release {label} lock probe: {error}"))?;
+            drop(coordination);
+            after_coordination_release();
+            Ok(false)
+        }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
         Err(error) => Err(format!("could not inspect {label} lock: {error}")),
     }
+}
+
+fn acquire_creation_lock(store_dir: &Path) -> Result<File, String> {
+    let path = store_dir.join(".leg-ui-client-create.lock");
+    let lock = open_lock_file(&path)?;
+    let coordination = lock_coordination(&path, "session creation")?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => {
+            drop(coordination);
+            Ok(lock)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            drop(coordination);
+            // Wait without the sidecar; the exclusive primary lock marks ownership to probes.
+            lock.lock_exclusive()
+                .map_err(|error| format!("could not acquire session creation guard: {error}"))?;
+            Ok(lock)
+        }
+        Err(error) => Err(format!("could not acquire session creation guard: {error}")),
+    }
+}
+
+fn lock_coordination(path: &Path, label: &str) -> Result<File, String> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid {label} lock path"))?
+        .to_os_string();
+    name.push(".coord");
+    let guard_path = path.with_file_name(name);
+    let guard = open_lock_file(&guard_path)
+        .map_err(|error| format!("could not open {label} lock coordination guard: {error}"))?;
+    guard
+        .lock_exclusive()
+        .map_err(|error| format!("could not acquire {label} lock coordination guard: {error}"))?;
+    Ok(guard)
 }
 
 fn safe_session_id(id: &str) -> bool {
@@ -794,6 +844,8 @@ fn exit_code(status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn session_ids_match_core_filename_contract() {
@@ -833,5 +885,36 @@ mod tests {
             assert_ne!(token, 0);
             assert!(token < (1_u128 << 64));
         }
+    }
+
+    #[test]
+    fn display_probe_releases_primary_before_coordination_guard() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let store = scratch.path();
+        let session_id = "sess-123-456";
+        let lock_path = store.join(format!(".leg-ui-session-{session_id}.lock"));
+        File::create(&lock_path).expect("create primary lock");
+
+        let (released_tx, released_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let probe_path = lock_path.clone();
+        let probe = std::thread::spawn(move || {
+            lock_is_held_if_present_after_coordination_release(&probe_path, session_id, || {
+                released_tx.send(()).expect("signal guard release");
+                resume_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("resume probe");
+            })
+        });
+
+        released_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe released its coordination guard");
+        let lock = try_session_lock(store, session_id)
+            .expect("acquire session lock after probe")
+            .expect("probe must release the primary lock before its guard");
+        FileExt::unlock(&lock).expect("release session lock");
+        resume_tx.send(()).expect("resume probe");
+        assert!(!probe.join().expect("join probe").expect("probe succeeds"));
     }
 }
