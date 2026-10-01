@@ -102,8 +102,8 @@ jobs:
             target/debug/leg \
             companions/target/debug/leg-ui-supervisor
 
-      - name: TUI Linux PTY smoke (locked)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      - name: TUI native PTY smoke (locked)
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin' }}
         shell: bash
         run: |
           python3 -m pip install --requirement companions/leg-tui/tests/requirements.txt

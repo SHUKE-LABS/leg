@@ -164,26 +164,38 @@ and execution inspection remain #85.
 ## Experimental terminal UI
 
 `leg-tui` is a separate companion package. Build the native `leg` binary and
-the companion supervisor, then launch the UI with the native binary path:
+the companion supervisor, then launch the UI with their native binary paths:
 
 ```sh
 cargo build --locked --bin leg
 cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
-cargo run --locked --manifest-path companions/Cargo.toml -p leg-tui -- --leg-bin "$PWD/target/debug/leg"
+cargo run --locked --manifest-path companions/Cargo.toml -p leg-tui -- \
+  --leg-bin "$PWD/target/debug/leg" \
+  --supervisor-bin "$PWD/companions/target/debug/leg-ui-supervisor"
 ```
 
-The UI inherits provider configuration from its launching environment. Choose
-an existing workspace directory, review the first-run warning and its keyboard
-guide, then compose a prompt. Enter inserts a newline; Ctrl-S sends a nonblank
-prompt. Left/Right move by grapheme, Home/End move within the current line, and
-Backspace/Delete remove a grapheme. Ctrl-Z undoes and Ctrl-Y redoes; a bracketed
-paste is one edit, preserves Unicode and line breaks, normalizes CRLF/CR to LF,
-and discards other control characters. A literal `?` is prompt text. F1 opens
-help, F2 opens the keyboard action menu, and Esc closes either overlay. Ctrl-C
-stops a running turn; when idle it exits and keeps the draft. Editing stays
-available during a turn, but another Ctrl-S is rejected while busy. The first-run
-warning explains that the workspace is the tool working directory, not a
-sandbox.
+The UI inherits provider configuration from its launching environment. It
+requires terminals on both stdin and stdout; `leg-tui --help` also works with
+redirected streams. Choose an existing workspace directory, review the warning
+and keyboard guide, then compose a prompt. The first-run warning reads exactly:
+
+> Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.
+
+The minimum terminal size is 80 columns by 24 rows. Below that size the UI asks
+you to resize; it keeps the draft and active turn, and rejects sends until the
+terminal is large enough again. `NO_COLOR` and `TERM=dumb` disable color while
+text labels continue to identify every status.
+
+Enter inserts a newline; Ctrl-S sends a nonblank prompt. Left/Right move by
+grapheme, Home/End move within the current line, and Backspace/Delete remove a
+grapheme. Ctrl-Z undoes and Ctrl-Y redoes; a bracketed paste is one edit,
+preserves Unicode and line breaks, normalizes CRLF/CR to LF, and discards other
+control characters. A literal `?` is prompt text. F1 opens help, F2 opens the
+keyboard action menu, and Esc closes either overlay. Ctrl-C stops a running
+turn; when idle it exits and keeps the draft. External SIGINT and SIGTERM use
+the shared turn controller to stop an active turn, wait for process cleanup,
+save the draft, and restore the terminal. Editing stays available during a
+turn, but another Ctrl-S is rejected while busy.
 
 The conversation header shows Idle, Starting, Running, Stopping, Succeeded,
 Failed, Interrupted, Incomplete, Capped, or `Succeeded (truncated)`,
@@ -204,8 +216,10 @@ kept. Ctrl-S on the unchanged failed prompt opens an explicit retry confirmation
 with `Retry sends this prompt again and may repeat tool side effects.` Press Y
 to retry or N/Esc to cancel. Enter remains a newline and never retries.
 
-The Linux PTY smoke test uses the local fake provider and explicit native
-binary paths. It uses the pinned Python VT parser in
+The native Linux/macOS PTY smoke test uses the local fake provider and explicit
+binary paths. It covers both supported sizes, resize recovery, signal cleanup,
+non-TTY startup, color-disabled output, the composer and active-turn workflows,
+and the delayed Stop regression. It uses the pinned Python VT parser in
 `companions/leg-tui/tests/requirements.txt`; install that test-only dependency
 in a virtual environment before running it:
 

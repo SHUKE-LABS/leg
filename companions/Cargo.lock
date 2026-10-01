@@ -530,6 +530,7 @@ dependencies = [
  "leg-ui-client",
  "ratatui",
  "serde_json",
+ "signal-hook",
  "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
