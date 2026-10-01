@@ -7,13 +7,16 @@ import argparse
 import http.server
 import json
 import os
+import select
 import shlex
+import socket
 import socketserver
 import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 
 SCENARIOS = (
@@ -60,12 +63,22 @@ def sse(name: str, data: dict[str, Any]) -> bytes:
 
 
 class Fixture:
-    def __init__(self, scenario: str, workspace: Path | None):
+    def __init__(
+        self,
+        scenario: str,
+        workspace: Path | None,
+        hold_after_first_chunk: bool = False,
+    ):
         self.scenario = scenario
         self.workspace = workspace
+        self.hold_after_first_chunk = hold_after_first_chunk
         self.lock = threading.Lock()
         self.counts: dict[str, int] = {}
         self.request_count = 0
+        self.active_requests: set[int] = set()
+        self.request_outcomes: dict[int, str] = {}
+        self.pause_gates: dict[int, threading.Event] = {}
+        self.pause_gate_states: dict[int, str] = {}
         self.provider_waits: list[dict[str, Any]] = []
         self.input_checks: dict[str, bool] = {}
         self.expected_files: dict[str, tuple[str, str | None]] = {}
@@ -143,8 +156,61 @@ class Fixture:
     def advance(self, marker: str) -> tuple[int, int]:
         with self.lock:
             self.request_count += 1
+            request = self.request_count
             self.counts[marker] = self.counts.get(marker, 0) + 1
-            return self.request_count, self.counts[marker]
+            self.active_requests.add(request)
+            self.request_outcomes[request] = "active"
+            if self.hold_after_first_chunk and marker == "paused-live-text":
+                self.pause_gates[request] = threading.Event()
+                self.pause_gate_states[request] = "waiting"
+            return request, self.counts[marker]
+
+    def finish_request(self, request: int, outcome: str) -> None:
+        with self.lock:
+            self.active_requests.discard(request)
+            if self.request_outcomes.get(request) == "active":
+                self.request_outcomes[request] = outcome
+
+    def set_pause_gate_state(self, request: int, state: str) -> None:
+        with self.lock:
+            if request in self.pause_gates:
+                self.pause_gate_states[request] = state
+
+    def release_pause_gate(self, request: int) -> bool:
+        with self.lock:
+            gate = self.pause_gates.get(request)
+            if gate is None:
+                return False
+            gate.set()
+            self.pause_gate_states[request] = "released"
+            return True
+
+    def wait_for_pause_gate(
+        self,
+        handler: http.server.BaseHTTPRequestHandler,
+        request: int,
+        timeout: float = 30.0,
+    ) -> bool:
+        with self.lock:
+            gate = self.pause_gates[request]
+            self.pause_gate_states[request] = "held"
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.set_pause_gate_state(request, "timed_out")
+                return False
+            if gate.wait(min(0.05, remaining)):
+                return True
+            try:
+                readable, _, _ = select.select([handler.connection], [], [], 0)
+                if readable and handler.connection.recv(1, socket.MSG_PEEK) == b"":
+                    self.set_pause_gate_state(request, "client_disconnected")
+                    return False
+            except OSError:
+                self.set_pause_gate_state(request, "client_disconnected")
+                return False
 
     def send_error(self, handler: http.server.BaseHTTPRequestHandler, status: int, kind: str, message: str) -> None:
         body = json.dumps(
@@ -169,7 +235,15 @@ class Fixture:
         handler.wfile.write(body)
         handler.close_connection = True
 
-    def send_stream(self, handler: http.server.BaseHTTPRequestHandler, blocks: list[dict[str, Any]], stop_reason: str = "end_turn", pause_ms: int = 0, marker: str = "") -> None:
+    def send_stream(
+        self,
+        handler: http.server.BaseHTTPRequestHandler,
+        blocks: list[dict[str, Any]],
+        stop_reason: str = "end_turn",
+        pause_ms: int = 0,
+        marker: str = "",
+        gate_after_first_chunk: bool = False,
+    ) -> bool:
         request_number = getattr(handler, "fixture_request_number", self.request_count)
         if not getattr(handler, "fixture_streaming", False):
             if pause_ms:
@@ -201,7 +275,7 @@ class Fixture:
                     "usage": {"input_tokens": 1, "output_tokens": 1},
                 },
             )
-            return
+            return True
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
         handler.send_header("Cache-Control", "no-cache")
@@ -253,6 +327,11 @@ class Fixture:
                     if pause_ms and chunk_index == 0:
                         self.record_wait(request_number, marker, pause_ms)
                         time.sleep(pause_ms / 1000)
+                    if gate_after_first_chunk and chunk_index == 0:
+                        if not self.wait_for_pause_gate(handler, request_number):
+                            handler.fixture_response_interrupted = True
+                            return False
+                        self.set_pause_gate_state(request_number, "released")
                 write(sse("content_block_stop", {"type": "content_block_stop", "index": index}))
             elif block_type == "tool_use":
                 write(
@@ -285,6 +364,7 @@ class Fixture:
             )
         )
         write(sse("message_stop", {"type": "message_stop"}))
+        return True
 
     def send_partial_then_close(self, handler: http.server.BaseHTTPRequestHandler) -> None:
         if not getattr(handler, "fixture_streaming", False):
@@ -358,8 +438,24 @@ class Fixture:
             return
         if marker == "paused-live-text" or marker == "TRIAL-PAUSE":
             pause_ms = BROWSER_PAUSE_MS if self.scenario == "browser" else PAUSE_MS
-            self.send_stream(handler, [{"type": "text", "text": "The first live text is visible. The fixture resumes after its fixed pause."}], pause_ms=pause_ms, marker=marker)
-            self.check("paused_response_completed")
+            text = "The first live text is visible. The fixture resumes after its fixed pause."
+            if self.hold_after_first_chunk and request > 1:
+                # Identify later gated turns in the PTY screen so a previous
+                # completed response cannot satisfy the visible-first-chunk check.
+                text = f"Request {request}: {text}"
+            completed = self.send_stream(
+                handler,
+                [{"type": "text", "text": text}],
+                pause_ms=0 if self.hold_after_first_chunk else pause_ms,
+                marker=marker,
+                gate_after_first_chunk=self.hold_after_first_chunk,
+            )
+            if completed:
+                self.check("paused_response_completed")
+                handler.fixture_request_outcome = "completed"
+                self.set_pause_gate_state(request, "completed")
+            else:
+                handler.fixture_request_outcome = "interrupted"
             return
         if marker == "TRIAL-SEED-SESSION":
             self.send_stream(handler, [{"type": "text", "text": "Fixture seed: blue lantern."}])
@@ -539,6 +635,9 @@ class Fixture:
             counts = dict(self.counts)
             input_checks = dict(self.input_checks)
             requests = self.request_count
+            active_requests = sorted(self.active_requests)
+            request_outcomes = dict(self.request_outcomes)
+            pause_gate_states = dict(self.pause_gate_states)
         checks: list[dict[str, Any]] = []
         for relative, (kind, expected) in sorted(expected_files.items()):
             if self.workspace is None:
@@ -578,6 +677,13 @@ class Fixture:
             "scenario": self.scenario,
             "requests": requests,
             "scenario_requests": counts,
+            "active_requests": active_requests,
+            "request_outcomes": {
+                str(request): outcome for request, outcome in request_outcomes.items()
+            },
+            "pause_gates": {
+                str(request): state for request, state in pause_gate_states.items()
+            },
             "simulated_provider_waits": waits,
             "input_checks": input_checks,
             "workspace_checks": checks,
@@ -599,6 +705,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.fixture.send_json(self, 404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if self.path.startswith("/__trial/release"):
+            if not self.fixture.hold_after_first_chunk:
+                self.fixture.send_json(self, 404, {"error": "test gate is disabled"})
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                request = int(query.get("request", [""])[0])
+            except ValueError:
+                self.fixture.send_json(self, 400, {"error": "request number is required"})
+                return
+            if not self.fixture.release_pause_gate(request):
+                self.fixture.send_json(self, 404, {"error": "no held response for request"})
+                return
+            self.fixture.send_json(self, 200, {"released": request})
+            return
         if self.path != "/v1/messages":
             self.fixture.send_json(self, 404, {"error": "not found"})
             return
@@ -613,12 +734,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.fixture_streaming = payload.get("stream") is True
         # The incomplete-stream fixture closes its first response immediately;
         # repeating the same prompt gets the scripted successful response.
+        request = None
+        outcome = "completed"
         try:
             self.fixture.handle_messages(self, payload)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             # A UI may stop a paused stream. That disconnect is a fixture
             # outcome, not a provider-server traceback.
-            return
+            outcome = "disconnected"
+        finally:
+            request = getattr(self, "fixture_request_number", None)
+            if request is not None:
+                outcome = getattr(self, "fixture_request_outcome", outcome)
+                self.fixture.finish_request(request, outcome)
 
 
 class LoopbackThreadingHTTPServer(http.server.ThreadingHTTPServer):
@@ -656,7 +784,14 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback only)")
     parser.add_argument("--port", type=int, default=0, help="listen port (default: choose a free port)")
     parser.add_argument("--workspace", type=Path, help="trial workspace root for deterministic effect checks")
+    parser.add_argument(
+        "--hold-after-first-chunk",
+        action="store_true",
+        help="test-only: hold paused-live-text after its first chunk until released",
+    )
     args = parser.parse_args()
+    if args.hold_after_first_chunk and args.scenario != "paused-live-text":
+        parser.error("--hold-after-first-chunk requires --scenario paused-live-text")
     if args.workspace is not None:
         workspace = args.workspace.expanduser().resolve()
         if not workspace.is_dir():
@@ -664,7 +799,7 @@ def main() -> int:
     else:
         workspace = None
 
-    fixture = Fixture(args.scenario, workspace)
+    fixture = Fixture(args.scenario, workspace, args.hold_after_first_chunk)
     fixture.prepare_hook()
     handler_type = type("FixtureHandler", (Handler,), {"fixture": fixture})
     try:

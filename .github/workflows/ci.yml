@@ -45,7 +45,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: companions/leg-web/tests/browser-requirements.txt
+          cache-dependency-path: |
+            companions/leg-web/tests/browser-requirements.txt
+            companions/leg-tui/tests/requirements.txt
 
       - name: Cache Playwright Chromium
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
@@ -104,6 +106,7 @@ jobs:
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
         shell: bash
         run: |
+          python3 -m pip install --requirement companions/leg-tui/tests/requirements.txt
           cargo build --locked --bin leg
           cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
           cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui

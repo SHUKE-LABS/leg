@@ -67,6 +67,13 @@ python3 companions/trials/fake_provider.py --scenario text-tool-text --workspace
 | `reopen-after-failure` | First request returns 401; the next succeeds. | Reopening and explicitly retrying returns an answer. |
 | `reopen-after-interruption` | First response closes after partial live text; the next succeeds. | Reopening and repeating the prompt returns an answer. |
 
+The Linux PTY smoke test opts into a fixture gate that holds
+`paused-live-text` after its first chunk until the test releases it. The
+fixture reports the active held request and exposes a release endpoint for
+bounded cleanup. This is test synchronization, not a human measurement
+scenario; without the opt-in `--hold-after-first-chunk` flag, the documented
+1,200 ms pause and Web/trial timing remain unchanged.
+
 For `trial`, task prompts also cover Chinese/multiline input, a four-second
 visible bash run, denial, Stop, reopen, explicit retry, and a 180-line answer.
 Run the denied-hook and bash scenarios on a Unix-like host with Python and bash
