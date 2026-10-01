@@ -8,6 +8,22 @@ const readingPrefix = "leg-web-reading:";
 const inspectionPrefix = "leg-web-inspection:";
 const INITIAL_TURN_HEIGHT = 280;
 const TURN_OVERSCAN = 2;
+const TRANSCRIPT_CREDENTIAL_KEY = new RegExp(
+  `(?:^|[_-])(?:${[
+    "authorization(?:[_-]?(?:header|headers|key|keys|token|tokens))?",
+    "auth(?:[_-]?(?:header|headers|key|keys|token|tokens))?",
+    "api[_-]?(?:key|secret|token)",
+    "access[_-]?(?:key|token)",
+    "(?:bearer|id|launch|refresh|session)[_-]?token",
+    "client[_-]?secret",
+    "secret(?:[_-]?(?:access[_-]?)?key)?",
+    "private[_-]?key",
+    "signing[_-]?key",
+    "credentials?(?:[_-]?key)?",
+    "passwords?",
+  ].join("|")})$`,
+  "i",
+);
 
 const bootstrap = window.location.hash.slice(1);
 if (/^[0-9a-f]{64}$/i.test(bootstrap)) {
@@ -1436,10 +1452,9 @@ function moveTranscriptSearch(direction) {
 function transcriptExportValue(value) {
   if (Array.isArray(value)) return value.map(transcriptExportValue);
   if (!value || typeof value !== "object") return value;
-  const credentialKey = /(?:^|[_-])(?:authorization(?:[_-]?(?:header|headers|key|keys))?|auth(?:[_-]?(?:header|headers|key|keys))?|api[_-]?key|access[_-]?token|launch[_-]?token|client[_-]?secret|secret|credential|credentials|password)$/i;
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([key]) => !credentialKey.test(key))
+      .filter(([key]) => !TRANSCRIPT_CREDENTIAL_KEY.test(key))
       .map(([key, nested]) => [key, transcriptExportValue(nested)]),
   );
 }

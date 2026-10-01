@@ -166,8 +166,10 @@ does not copy it.
 `result`, and optional `error`. The file omits session/catalog identifiers and
 names, workspace paths, display metadata, launch tokens, and authorization
 headers or keys. Credential-like fields are also removed recursively from
-structured tool inputs, including API or access tokens, secrets, credentials,
-and passwords. Transcript text and free-form tool output are kept as recorded.
+structured tool inputs: authorization or auth headers, keys, or tokens; API,
+access, refresh, session, bearer, ID, or launch tokens; client secrets and
+secret, private, or signing keys; credentials; and passwords. Transcript text
+and free-form tool output are kept as recorded.
 Searching, copying, viewing, and downloading do not call a provider or execute
 tools.
 

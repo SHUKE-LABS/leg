@@ -1634,7 +1634,12 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     session["turns"][0]["tools"][0]["authorization_key"] = "TRIAL-EXPORT-AUTH-KEY"
                     session["turns"][0]["tools"][0]["input"]["nested"] = {
                         "api_key": "TRIAL-EXPORT-NESTED-API-KEY",
-                        "deeper": [{"accessToken": "TRIAL-EXPORT-NESTED-ACCESS-TOKEN"}],
+                        "auth_token": "TRIAL-EXPORT-NESTED-AUTH-TOKEN",
+                        "deeper": [{
+                            "accessToken": "TRIAL-EXPORT-NESTED-ACCESS-TOKEN",
+                            "refresh_token": "TRIAL-EXPORT-NESTED-REFRESH-TOKEN",
+                            "secret_key": "TRIAL-EXPORT-NESTED-SECRET-KEY",
+                        }],
                     }
                     await route.fulfill(
                         status=response.status,
@@ -1675,6 +1680,9 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     "TRIAL-EXPORT-AUTH-KEY",
                     "TRIAL-EXPORT-NESTED-API-KEY",
                     "TRIAL-EXPORT-NESTED-ACCESS-TOKEN",
+                    "TRIAL-EXPORT-NESTED-AUTH-TOKEN",
+                    "TRIAL-EXPORT-NESTED-REFRESH-TOKEN",
+                    "TRIAL-EXPORT-NESTED-SECRET-KEY",
                     restart_token,
                     "trial-only-not-a-secret",
                 ):
