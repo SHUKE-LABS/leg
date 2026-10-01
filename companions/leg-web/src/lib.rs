@@ -132,6 +132,8 @@ impl Host {
                 durable,
                 runtime: Mutex::new(runtime),
                 acceptance_gates: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                test_hooks: TestHooks::default(),
                 workers: Mutex::new(Vec::new()),
                 shutdown_tx,
                 shutting_down: AtomicBool::new(false),
@@ -209,6 +211,8 @@ struct HostInner {
     durable: DurableStore,
     runtime: Mutex<Runtime>,
     acceptance_gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    #[cfg(test)]
+    test_hooks: TestHooks,
     workers: Mutex<Vec<JoinHandle<()>>>,
     shutdown_tx: broadcast::Sender<()>,
     shutting_down: AtomicBool,
@@ -216,6 +220,19 @@ struct HostInner {
     _host_lock: File,
     event_buffer: usize,
     receipt_limit: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    pause_after_durable_receipt: Mutex<Option<AcceptancePause>>,
+    gate_attempts: Mutex<Option<tokio::sync::mpsc::UnboundedSender<&'static str>>>,
+}
+
+#[cfg(test)]
+struct AcceptancePause {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Default)]
@@ -776,6 +793,8 @@ async fn set_workspace(
         ));
     }
     let ledger_id = state.ledger_id(&id);
+    #[cfg(test)]
+    state.note_gate_attempt("workspace");
     let gate = state.acceptance_gate(&ledger_id);
     let _gate = gate.lock().await;
     if state.runtime_is_busy(&ledger_id) {
@@ -820,8 +839,10 @@ async fn submit_turn(
         ));
     }
     let ledger_id = state.ledger_id(&id);
+    #[cfg(test)]
+    state.note_gate_attempt("submit");
     let gate = state.acceptance_gate(&ledger_id);
-    let _gate = gate.lock().await;
+    let gate_guard = gate.lock_owned().await;
     if state.inner.shutting_down.load(Ordering::Acquire) {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -829,15 +850,18 @@ async fn submit_turn(
         ));
     }
     let blocking_state = state.clone();
-    let acceptance =
-        tokio::task::spawn_blocking(move || blocking_state.accept_submission(&id, body))
-            .await
-            .map_err(|_| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "submission_worker_failed",
-                )
-            })??;
+    let acceptance = tokio::task::spawn_blocking(move || {
+        // The blocking task can outlive this HTTP future, so it owns the gate.
+        let _gate_guard = gate_guard;
+        blocking_state.accept_submission(&id, body)
+    })
+    .await
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "submission_worker_failed",
+        )
+    })??;
     let response = acceptance.receipt;
     let status = if response.duplicate {
         StatusCode::OK
@@ -855,6 +879,8 @@ async fn stop_turn(
         return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
     }
     let ledger_id = state.ledger_id(&id);
+    #[cfg(test)]
+    state.note_gate_attempt("stop");
     let gate = state.acceptance_gate(&ledger_id);
     let _gate = gate.lock().await;
     let stop = {
@@ -951,6 +977,21 @@ async fn events(
 }
 
 impl HostState {
+    #[cfg(test)]
+    fn note_gate_attempt(&self, operation: &'static str) {
+        if let Some(sender) = lock(&self.inner.test_hooks.gate_attempts).as_ref() {
+            let _ = sender.send(operation);
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_durable_receipt(&self) {
+        if let Some(pause) = lock(&self.inner.test_hooks.pause_after_durable_receipt).take() {
+            let _ = pause.entered.send(());
+            let _ = lock(&pause.release).recv();
+        }
+    }
+
     fn acceptance_gate(&self, ledger_id: &str) -> Arc<AsyncMutex<()>> {
         let mut gates = lock(&self.inner.acceptance_gates);
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -1175,6 +1216,8 @@ impl HostState {
                 Ok(())
             })
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"))?;
+        #[cfg(test)]
+        self.pause_after_durable_receipt();
         let pending_stop = PendingStop::new();
         if let Some(bound_id) = &bound_session_id {
             lock(&self.inner.runtime)
@@ -3186,6 +3229,8 @@ extern "C" fn exit_on_interrupt(signal: i32) {
     unsafe { _exit(128 + signal) }
 }
 
+extern "C" fn ignore_interrupt(_: i32) {}
+
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args == ["--version"] {
@@ -3208,6 +3253,8 @@ fn main() {
     io::stdin().read_to_string(&mut prompt).unwrap();
     if prompt == "HOLD-PENDING-STOP" {
         unsafe { signal(2, exit_on_interrupt); }
+    } else if prompt == "HOLD-CANCELLED" {
+        unsafe { signal(2, ignore_interrupt); }
     }
     let fixture = env::current_dir().unwrap().join("fixture");
     let log = OpenOptions::new().create(true).append(true).open(fixture.join("turns.log")).unwrap();
@@ -3267,8 +3314,8 @@ fn main() {
         let host = test_host_with_driver(&temp, &leg, &supervisor);
         let router = build_router(host.state.clone());
 
-        let release_files =
-            ["HOLD-A", "HOLD-D"].map(|prompt| fixture_dir.join(format!("{prompt}.release")));
+        let release_files = ["HOLD-A", "HOLD-D", "HOLD-CANCELLED"]
+            .map(|prompt| fixture_dir.join(format!("{prompt}.release")));
         let (watchdog_tx, watchdog_rx) = std::sync::mpsc::channel();
         let watchdog_releases = release_files.clone();
         let watchdog = thread::spawn(move || {
@@ -3643,6 +3690,150 @@ fn main() {
         assert!(
             !fixture_dir.join("HOLD-PENDING-STOP.finished").exists(),
             "a run stopped before handle attachment executed its prompt"
+        );
+
+        let (status, cancelled_draft_value) =
+            round_trip_json(&router, create_draft("cancelled-acceptance")).await;
+        assert_eq!(status, StatusCode::CREATED, "{cancelled_draft_value}");
+        let cancelled_draft = cancelled_draft_value["id"].as_str().unwrap().to_string();
+        let (pause_entered_tx, pause_entered_rx) = std::sync::mpsc::channel();
+        let (pause_release_tx, pause_release_rx) = std::sync::mpsc::channel();
+        *lock(&host.state.inner.test_hooks.pause_after_durable_receipt) = Some(AcceptancePause {
+            entered: pause_entered_tx,
+            release: Mutex::new(pause_release_rx),
+        });
+        let first_request = api_json_request(
+            &host,
+            Method::POST,
+            &format!("/api/sessions/{cancelled_draft}/submit"),
+            r#"{"request_id":1,"prompt":"HOLD-CANCELLED"}"#,
+            true,
+        );
+        let first_router = router.clone();
+        let cancelled_submit =
+            tokio::spawn(async move { round_trip_json(&first_router, first_request).await });
+        tokio::task::spawn_blocking(move || {
+            pause_entered_rx
+                .recv()
+                .expect("acceptance paused after durable receipt creation");
+        })
+        .await
+        .unwrap();
+        cancelled_submit.abort();
+        assert!(cancelled_submit.await.unwrap_err().is_cancelled());
+
+        let acceptance_gate = host.state.acceptance_gate(&cancelled_draft);
+        assert!(
+            acceptance_gate.try_lock().is_err(),
+            "cancelled HTTP future released the acceptance gate"
+        );
+        let (status, paused_snapshot) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/sessions/{cancelled_draft}/snapshot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{paused_snapshot}");
+        assert_eq!(paused_snapshot["high_water"], 1);
+        assert_eq!(paused_snapshot["last_submission"]["request_id"], 1);
+        assert_eq!(paused_snapshot["last_submission"]["status"], "accepted");
+        assert!(paused_snapshot["active"].is_null());
+
+        let (gate_attempt_tx, mut gate_attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        *lock(&host.state.inner.test_hooks.gate_attempts) = Some(gate_attempt_tx);
+        let second_request = api_json_request(
+            &host,
+            Method::POST,
+            &format!("/api/sessions/{cancelled_draft}/submit"),
+            r#"{"request_id":2,"prompt":"SECOND"}"#,
+            true,
+        );
+        let second_router = router.clone();
+        let second_submit =
+            tokio::spawn(async move { round_trip_json(&second_router, second_request).await });
+        assert_eq!(gate_attempt_rx.recv().await, Some("submit"));
+
+        let workspace_body = json!({"cwd": workspace.to_string_lossy()}).to_string();
+        let workspace_request = api_json_request(
+            &host,
+            Method::PUT,
+            &format!("/api/sessions/{cancelled_draft}/workspace"),
+            &workspace_body,
+            true,
+        );
+        let workspace_router = router.clone();
+        let workspace_change =
+            tokio::spawn(
+                async move { round_trip_json(&workspace_router, workspace_request).await },
+            );
+        assert_eq!(gate_attempt_rx.recv().await, Some("workspace"));
+
+        let mut stop_request = api_request(&host, &format!("/api/sessions/{cancelled_draft}/stop"));
+        *stop_request.method_mut() = Method::POST;
+        let stop_router = router.clone();
+        let stop = tokio::spawn(async move { round_trip_json(&stop_router, stop_request).await });
+        assert_eq!(gate_attempt_rx.recv().await, Some("stop"));
+
+        assert!(!second_submit.is_finished());
+        assert!(!workspace_change.is_finished());
+        assert!(!stop.is_finished());
+        let durable_receipts = host.state.inner.durable.read(|data| {
+            let ledger = data.sessions.get(&cancelled_draft).unwrap();
+            (ledger.high_water, ledger.receipts.len())
+        });
+        assert_eq!(durable_receipts, (1, 1));
+        let first_turn_id = paused_snapshot["last_submission"]["turn_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        pause_release_tx.send(()).unwrap();
+        let (status, busy) = second_submit.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{busy}");
+        assert_eq!(busy["error"], "session_busy");
+        let (status, workspace_busy) = workspace_change.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{workspace_busy}");
+        assert_eq!(workspace_busy["error"], "session_busy");
+        let (status, stopped) = stop.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{stopped}");
+        assert_eq!(stopped["status"], "stop_requested");
+        assert_eq!(stopped["turn_id"], first_turn_id);
+
+        let (status, after_acceptance) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/sessions/{cancelled_draft}/snapshot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{after_acceptance}");
+        assert_eq!(after_acceptance["high_water"], 1);
+        assert_eq!(after_acceptance["last_submission"]["request_id"], 1);
+        assert_eq!(
+            after_acceptance["last_submission"]["turn_id"],
+            first_turn_id
+        );
+        let (status, replay) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{cancelled_draft}/submit"),
+                r#"{"request_id":1,"prompt":"HOLD-CANCELLED"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(replay["turn_id"], first_turn_id);
+
+        fs::write(&release_files[2], "release").unwrap();
+        wait_for_receipt(&host, &router, &cancelled_draft, 1).await;
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.ends_with("|HOLD-CANCELLED"))
+                .count(),
+            1,
+            "same-ID replay started another execution: {log}"
         );
 
         host.state.shutdown();
