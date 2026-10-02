@@ -19,6 +19,8 @@ import tempfile
 import termios
 import time
 import unicodedata
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
 import urllib.request
 from contextlib import suppress
 from pathlib import Path
@@ -36,6 +38,7 @@ DEFAULT_COLUMNS = 120
 PASTED_TEXT = "first line: 中文\r\nsecond: 👩‍👩‍👧‍👦 e\u0301\rthird line\x13\x03\x1b\x7f\nfourth line?"
 PROMPT = "?typed line\nfirst line: 中文\nsecond: 👩‍👩‍👧‍👦 e\u0301\nthird line\nfourth line?"
 NEXT_DRAFT = "next draft"
+EXCHANGE_SCHEMA = "baton.exchange/v1"
 LIVE_TEXT = "The first live text is visible."
 STOP_LIVE_TEXT = "Request 2: The first live text is visible."
 NEGATIVE_LIVE_TEXT = "Request 3: The first live text is visible."
@@ -130,6 +133,39 @@ def read_until(
             continue
         if chunk:
             capture.feed(chunk)
+
+
+def read_until_fast(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    capture: TerminalCapture,
+    expected: str,
+    timeout: float = 0.2,
+) -> float:
+    started = time.perf_counter()
+    deadline = started + timeout
+    while not capture.contains(expected):
+        if child.poll() is not None:
+            raise AssertionError(
+                f"TUI exited before screen text {expected!r}; exit={child.returncode}; "
+                f"screen={capture.text()[-1200:]!r}"
+            )
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise AssertionError(
+                f"TUI did not show {expected!r} within {timeout * 1000:.0f} ms; "
+                f"screen={capture.text()[-1200:]!r}"
+            )
+        ready, _, _ = select.select([master_fd], [], [], min(0.005, remaining))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, 8192)
+        except OSError:
+            continue
+        if chunk:
+            capture.feed(chunk)
+    return time.perf_counter() - started
 
 
 def linux_process_table() -> dict[int, tuple[int, int, int, str]]:
@@ -472,17 +508,15 @@ def start_prompt(
         drain_for(master_fd, capture, 0.1, child)
         first_run_help = capture.text()
         for hint in (
-            "Enter newline",
             "Ctrl-S send",
-            "Backspace/Delete edit",
-            "Ctrl-Z undo",
-            "Ctrl-Y redo",
-            "Ctrl-C stops",
             "F1 help",
-            "F2 keyboard actions",
-            "? is prompt text",
-            "PageUp/PageDown scroll",
-            "Ctrl-End newest",
+            "F2 actions",
+            "F3 sessions",
+            "Ctrl-F search",
+            "F4 inspect",
+            "F5 copy",
+            "F6 export",
+            "PageUp/PageDown scroll history",
         ):
             assert hint in first_run_help, (
                 f"first-run help omitted {hint!r}: {first_run_help[-1800:]!r}"
@@ -502,6 +536,21 @@ def start_prompt(
     if exercise_keyboard:
         os.write(master_fd, b"\x1bOP")
         read_until(master_fd, child, capture, "Keyboard help")
+        keyboard_help = capture.text()
+        for hint in (
+            "Ctrl-Z/Y undo/redo",
+            "Backspace/Delete remove",
+            "Ctrl-End newest",
+            "F3 sessions",
+            "F4 inspects",
+            "Ctrl-F searches",
+            "F5 copies",
+            "F7 saves",
+            "F6 exports transcript data only",
+            "Retry sends this prompt again and may repeat tool side effects.",
+            "Enter never confirms a retry",
+        ):
+            assert hint in keyboard_help, f"keyboard help omitted {hint!r}: {keyboard_help[-2200:]!r}"
         os.write(master_fd, b"ignored-help")
         os.write(master_fd, b"\x1b")
         drain_for(master_fd, capture, 0.15, child)
@@ -509,14 +558,14 @@ def start_prompt(
         read_until(master_fd, child, capture, "Keyboard actions")
         action_menu = capture.text()
         for action in (
-            "Insert a newline",
-            "Send the complete nonblank prompt",
-            "Move by grapheme",
-            "Remove one grapheme",
-            "Ctrl-Z / Ctrl-Y",
-            "Stop the turn",
-            "Scroll transcript",
-            "F1 / F2",
+            "F3  Browse/create/rename/reopen sessions",
+            "Ctrl-F  Search titles and displayed prompt/reply/tool text.",
+            "F4  Expand the selected turn's tool inspector.",
+            "F5  Send selected field with terminal OSC 52 clipboard.",
+            "F7  Save the copied field to a file",
+            "F6  Export transcript only",
+            "Ctrl-R in inspector  Retry latest failed turn",
+            "Esc closes this menu.",
         ):
             assert action in action_menu, f"keyboard action menu omitted {action!r}"
         os.write(master_fd, b"ignored-menu")
@@ -531,7 +580,8 @@ def start_prompt(
         drain_for(master_fd, capture, 0.1, child)
         question_screen = capture.text()
         assert "?typed line" in question_screen, (
-            "? or Enter did not insert literal text and a newline in the composer"
+            "? or Enter did not insert literal text and a newline in the composer: "
+            f"{question_screen[-1800:]!r}"
         )
         assert "Keyboard help" not in question_screen, "? opened help instead of entering the draft"
         os.write(master_fd, b"\x1b[200~" + PASTED_TEXT.encode() + b"\x1b[201~")
@@ -877,19 +927,25 @@ def run_smoke(args: argparse.Namespace) -> None:
 
 
 def start_fixture(
-    fixture_path: Path, scenario: str, workspace: Path | None
+    fixture_path: Path,
+    scenario: str,
+    workspace: Path | None,
+    hold_after_first_chunk: bool = False,
 ) -> tuple[subprocess.Popen[str], str]:
+    command = [
+        sys.executable,
+        str(fixture_path),
+        "--scenario",
+        scenario,
+        "--workspace",
+        str(workspace) if workspace is not None else "",
+        "--port",
+        "0",
+    ]
+    if hold_after_first_chunk:
+        command.append("--hold-after-first-chunk")
     fixture = subprocess.Popen(
-        [
-            sys.executable,
-            str(fixture_path),
-            "--scenario",
-            scenario,
-            "--workspace",
-            str(workspace) if workspace is not None else "",
-            "--port",
-            "0",
-        ],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -933,6 +989,222 @@ def launch_conversation(
         os.close(master_fd)
         os.close(slave_fd)
         raise
+
+
+def seed_windowed_catalog(state_dir: Path, workspace: Path, turn_count: int = 1000) -> str:
+    session_id = "session-windowed-1000"
+    now_ms = int(time.time() * 1000)
+    sessions_dir = state_dir / "sessions"
+    sessions_dir.mkdir(parents=True)
+    events: list[dict[str, Any]] = [
+        {
+            "schema": EXCHANGE_SCHEMA,
+            "event": "session_start",
+            "ts_ms": now_ms,
+            "session_id": session_id,
+        }
+    ]
+    tool_statuses = {
+        turn_count - 5: "failed",
+        turn_count - 4: "denied",
+        turn_count - 3: "pending",
+        turn_count - 2: "interrupted",
+        turn_count - 1: "completed",
+    }
+    for index in range(turn_count):
+        prompt = f"history fixture prompt {index:04d}"
+        event_ms = now_ms + index * 4
+        events.append(
+            {
+                "schema": EXCHANGE_SCHEMA,
+                "event": "request",
+                "ts_ms": event_ms,
+                "model": "fixture",
+                "base_url": "local",
+                "prompt": prompt,
+                "session_id": session_id,
+                "turn_index": index,
+            }
+        )
+        status = tool_statuses.get(index)
+        if status:
+            tool_id = "reused-tool-id"
+            tool_input = {"command": f"echo output from turn {index:04d}"}
+            events.append(
+                {
+                    "schema": EXCHANGE_SCHEMA,
+                    "event": "tool_round",
+                    "ts_ms": event_ms + 1,
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "bash",
+                            "input": tool_input,
+                        }
+                    ],
+                    "session_id": session_id,
+                    "turn_index": index,
+                }
+            )
+            events.append(
+                {
+                    "schema": EXCHANGE_SCHEMA,
+                    "event": "tool_call",
+                    "ts_ms": event_ms + 2,
+                    "tool_use_id": tool_id,
+                    "tool_name": "bash",
+                    "input": tool_input,
+                    "session_id": session_id,
+                    "turn_index": index,
+                }
+            )
+            if status not in ("pending", "interrupted"):
+                result: dict[str, Any] = {
+                    "schema": EXCHANGE_SCHEMA,
+                    "event": "tool_result",
+                    "ts_ms": event_ms + 3,
+                    "tool_use_id": tool_id,
+                    "tool_name": "bash",
+                    "status": status,
+                    "session_id": session_id,
+                    "turn_index": index,
+                }
+                if status == "completed":
+                    result["result"] = f"literal Ω output from turn {index:04d}"
+                else:
+                    result["error"] = f"fixture tool {status} from turn {index:04d}"
+                events.append(result)
+            if status == "interrupted":
+                events.append(
+                    {
+                        "schema": EXCHANGE_SCHEMA,
+                        "event": "response_error",
+                        "ts_ms": event_ms + 3,
+                        "kind": "interrupted",
+                        "message": "fixture turn interrupted",
+                        "session_id": session_id,
+                        "turn_index": index,
+                    }
+                )
+                continue
+            if status == "pending":
+                continue
+        events.append(
+            {
+                "schema": EXCHANGE_SCHEMA,
+                "event": "response_ok",
+                "ts_ms": event_ms + 4,
+                "reply": f"history fixture reply {index:04d}",
+                "stop_reason": "end_turn",
+                "session_id": session_id,
+                "turn_index": index,
+            }
+        )
+
+    trail_path = sessions_dir / f"{session_id}.jsonl"
+    trail_path.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    trail_path.chmod(0o600)
+    metadata = {
+        session_id: {
+            "name": "History fixture",
+            "cwd": str(workspace.resolve()),
+            "created_at_ms": now_ms,
+            "updated_at_ms": now_ms,
+            "drafts": {"tui": "Alpha draft survives session changes"},
+            "display": {"private_catalog_marker": "DO_NOT_EXPORT_CATALOG_DATA"},
+        },
+        "draft-windowed-beta": {
+            "name": "Beta fixture",
+            "cwd": str(workspace.resolve()),
+            "created_at_ms": now_ms - 1,
+            "updated_at_ms": now_ms - 1,
+            "drafts": {"tui": "Beta draft stays in its own session"},
+        },
+    }
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "catalog.json").write_text(
+        json.dumps({"version": 1, "sessions": metadata}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return session_id
+
+
+def launch_web_host(
+    args: argparse.Namespace, env: dict[str, str], state_dir: Path
+) -> tuple[subprocess.Popen[bytes], str, str]:
+    command = [
+        str(Path(args.web_bin).resolve()),
+        "--no-open",
+        "--bind",
+        "127.0.0.1:0",
+        "--state-dir",
+        str(state_dir),
+        "--leg-bin",
+        str(Path(args.leg_bin).resolve()),
+        "--supervisor-bin",
+        str(Path(args.supervisor_bin).resolve()),
+    ]
+    host = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    assert host.stdout is not None
+    buffered = bytearray()
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if host.poll() is not None:
+            raise AssertionError(f"leg-web exited during startup: {host.returncode}")
+        ready, _, _ = select.select([host.stdout.fileno()], [], [], 0.1)
+        if not ready:
+            continue
+        buffered.extend(os.read(host.stdout.fileno(), 8192))
+        while b"\n" in buffered:
+            line, _, rest = buffered.partition(b"\n")
+            buffered = bytearray(rest)
+            decoded = line.decode("utf-8", errors="replace")
+            if decoded.startswith("Open this one-time launch URL: "):
+                launch_url = decoded.split(": ", 1)[1]
+                return host, urlsplit(launch_url).netloc, urlsplit(launch_url).fragment
+    host.kill()
+    host.wait(timeout=2)
+    raise AssertionError("leg-web did not print its launch URL within eight seconds")
+
+
+def web_json_request(
+    authority: str,
+    token: str,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    body = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(
+        f"http://{authority}{path}",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Origin": f"http://{authority}",
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read())
+    except HTTPError as error:
+        return error.code, json.loads(error.read())
+
+
+def select_picker_session(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    capture: TerminalCapture,
+    title: str,
+) -> None:
+    os.write(master_fd, b"\x1bOR")
+    read_until(master_fd, child, capture, "Sessions · title · workspace · recent · status")
+    os.write(master_fd, b"/" + title.encode() + b"\r\r")
 
 
 def stop_fixture(fixture: subprocess.Popen[str]) -> None:
@@ -1021,25 +1293,41 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "The large tool result was returned.")
             drain_for(master_fd, output, 0.25)
             large_tool_screen = output.text()
-            assert "more characters" in large_tool_screen, large_tool_screen
+            assert "more ch" in large_tool_screen and "aracters]" in large_tool_screen, large_tool_screen
             assert request_status(status_url)["requests"] == 12
 
             os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE\x13")
-            read_until(master_fd, child, output, "Long fixture line 090")
+            read_until(master_fd, child, output, "Long fixture line 020")
+            os.write(master_fd, b"\x1bOS\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Inspector")
             os.write(master_fd, b"\x1b[5~")
             drain_for(master_fd, output, 0.15)
             history_screen = output.text()
-            visible_rows = re.findall(r"Long fixture line \d{3}", history_screen)
-            assert visible_rows, f"PageUp did not reveal transcript history: {history_screen!r}"
-            anchor = visible_rows[len(visible_rows) // 2]
+            assert "TRIAL-LARGE-TOOL" in history_screen, (
+                f"PageUp did not reveal the prior transcript turn: {history_screen!r}"
+            )
+            os.write(master_fd, NEXT_DRAFT.encode())
+            read_until(master_fd, child, output, NEXT_DRAFT)
+            assert NEXT_DRAFT in output.text(), (
+                f"composer stopped accepting text while inspecting: {output.text()!r}"
+            )
+            os.write(master_fd, b"\x7f" * len(NEXT_DRAFT))
+            drain_for(master_fd, output, 0.3, child)
+            assert NEXT_DRAFT not in output.text(), output.text()
+            read_until(master_fd, child, output, "Succeeded")
+            os.write(master_fd, b"\x1b[B")
+            read_until(master_fd, child, output, "Assistant reply")
+            os.write(master_fd, b"\x1b[6;2~\x1b[6;2~")
+            read_until(master_fd, child, output, "Long fixture line 020")
             read_until(master_fd, child, output, "new content below")
             preserved_screen = output.text()
-            assert anchor in preserved_screen, (
-                f"streaming moved the historical viewport away from {anchor!r}: {preserved_screen!r}"
-            )
-            os.write(master_fd, b"\x1b[1;5F")
+            assert "TRIAL-LARGE-TOOL" in preserved_screen, preserved_screen
+            os.write(master_fd, b"\x1b[6;2~" * 22)
             read_until(master_fd, child, output, "END OF FIXTURE ANSWER")
+            os.write(master_fd, b"\x1b[1;5F")
+            drain_for(master_fd, output, 0.1, child)
             newest_screen = output.text()
+            assert "END OF FIXTURE ANSWER" in newest_screen, newest_screen
             assert "new content below" not in newest_screen, newest_screen
             assert request_status(status_url)["requests"] == 13
 
@@ -1168,6 +1456,452 @@ def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
             if slave_fd is not None:
                 os.close(slave_fd)
             stop_fixture(fixture)
+
+
+def run_session_navigation_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+    with tempfile.TemporaryDirectory(prefix="leg-tui-navigation-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        state_dir = root / "state"
+        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "TERM": "xterm-256color",
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_UI_STATE_DIR": str(state_dir),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+
+            os.write(master_fd, b"\x1bOR")
+            read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
+            picker = output.text()
+            assert str(workspace.resolve()) in picker and "Ready" in picker, picker
+            os.write(master_fd, b"r")
+            read_until(master_fd, child, output, "Rename session")
+            os.write(master_fd, b"Alpha\r")
+            read_until(master_fd, child, output, "Alpha")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Alpha  |  model:")
+
+            seed_prompt = "TRIAL-NAV-SEED: create successful tool history"
+            os.write(master_fd, seed_prompt.encode() + b"\x13")
+            read_until(master_fd, child, output, "The navigation seed is complete.")
+            read_until(master_fd, child, output, "Succeeded")
+            seed_status = request_status(status_url)
+            assert seed_status["scenario_requests"] == {"TRIAL-NAV-SEED": 2}, seed_status
+            assert seed_status["input_checks"].get("navigation_seed_tool_result_returned") is True
+
+            alpha_draft = "Alpha draft before restart"
+            os.write(master_fd, alpha_draft.encode())
+            read_until(master_fd, child, output, alpha_draft)
+            os.write(master_fd, b"\x1bORn")
+            read_until(master_fd, child, output, "New session draft")
+            os.write(master_fd, b"\x1bORr")
+            read_until(master_fd, child, output, "Rename session")
+            os.write(master_fd, b"Beta\r")
+            read_until(master_fd, child, output, "Beta")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Beta  |  model:")
+
+            loser_prompt = "TRIAL-NAV-LOSER: belongs only to Beta"
+            os.write(master_fd, loser_prompt.encode() + b"\x13")
+            read_until(master_fd, child, output, "Deterministic fixture response for TRIAL-NAV-LOSER.")
+            read_until(master_fd, child, output, "Succeeded")
+            beta_draft = "Beta draft before restart"
+            os.write(master_fd, beta_draft.encode())
+            read_until(master_fd, child, output, beta_draft)
+            status = drain_until_exit_after_close(
+                master_fd, child, output, slave_fd, initial_termios
+            )
+            master_fd = slave_fd = None
+            child = None
+            assert status == 0
+            assert request_status(status_url)["requests"] == 3
+
+            catalog_path = state_dir / "catalog.json"
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            alpha_id = next(
+                session_id
+                for session_id, record in catalog["sessions"].items()
+                if record.get("name") == "Alpha" and not session_id.startswith("draft-")
+            )
+            assert any(
+                record.get("name") == "Beta" and not session_id.startswith("draft-")
+                for session_id, record in catalog["sessions"].items()
+            ), catalog
+            alpha_record = catalog["sessions"][alpha_id]
+            assert alpha_record.get("drafts", {}).get("tui") == alpha_draft, alpha_record
+            alpha_record.setdefault("display", {})["private_catalog_marker"] = (
+                "DO_NOT_EXPORT_CATALOG_DATA"
+            )
+            alpha_record["display"]["inherited_key_marker"] = "DO_NOT_EXPORT_INHERITED_KEY"
+            catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+            export_path = workspace / "leg-transcript.json"
+            export_path.write_text("keep this until overwrite is confirmed", encoding="utf-8")
+
+            command = [
+                str(Path(args.tui_bin).resolve()),
+                "--leg-bin",
+                str(Path(args.leg_bin).resolve()),
+                "--supervisor-bin",
+                str(Path(args.supervisor_bin).resolve()),
+            ]
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+            output = TerminalCapture()
+            read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
+            startup_picker = output.text()
+            for item in ("Alpha", "Beta", str(workspace.resolve()), "Ready", "just now"):
+                assert item in startup_picker, f"startup picker omitted {item!r}: {startup_picker!r}"
+            os.write(master_fd, b"/Alpha\r\r")
+            read_until(master_fd, child, output, "Alpha  |  model:")
+            read_until(master_fd, child, output, alpha_draft)
+            assert request_status(status_url)["requests"] == 3, "opening history called the provider"
+
+            os.write(master_fd, b"\x06")
+            read_until(master_fd, child, output, "Search history")
+            os.write(master_fd, b"TRIAL-NAV")
+            read_until(master_fd, child, output, "Match 1 of 2")
+            os.write(master_fd, b"\x1b[B")
+            read_until(master_fd, child, output, "Match 2 of 2")
+            os.write(master_fd, b"\x1b[A")
+            read_until(master_fd, child, output, "Match 1 of 2")
+            os.write(master_fd, b"\x15")
+            read_until(master_fd, child, output, "Search session titles and displayed transcript text.")
+            os.write(master_fd, b"TRIAL-NAV-SEED")
+            read_until(master_fd, child, output, "Match 1 of 1")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Inspector · Up/Down field")
+            assert "TRIAL-NAV-SEED" in output.text(), output.text()
+            assert "Tool completed" in output.text(), output.text()
+            os.write(master_fd, b"\x1b[B" * 6)
+            read_until(master_fd, child, output, "Tool bash · result")
+            read_until(master_fd, child, output, "tool-history")
+            before_copy = bytes(output.raw)
+            os.write(master_fd, b"\x1b[15~")
+            drain_for(master_fd, output, 0.1, child)
+            assert b"\x1b]52;c;" in bytes(output.raw[len(before_copy) :]), (
+                "F5 did not send the selected tool output through OSC 52"
+            )
+            assert "F7 to save" in output.text(), output.text()
+            os.write(master_fd, b"\x1b[18~")
+            read_until(master_fd, child, output, "Save selected text")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Saved")
+            copy_path = workspace / "leg-copy.txt"
+            assert "session-rail-tool-history" in copy_path.read_text(encoding="utf-8")
+            assert request_status(status_url)["requests"] == 3, "copy invoked the provider"
+
+            os.write(master_fd, b"\x1b[17~\r")
+            read_until(master_fd, child, output, "This file already exists.")
+            os.write(master_fd, b"n")
+            read_until(master_fd, child, output, "Export cancelled")
+            assert export_path.read_text(encoding="utf-8") == "keep this until overwrite is confirmed"
+            os.write(master_fd, b"\x1b[17~\r")
+            read_until(master_fd, child, output, "This file already exists.")
+            os.write(master_fd, b"y")
+            read_until(master_fd, child, output, "Saved")
+            exported = json.loads(export_path.read_text(encoding="utf-8"))
+            assert len(exported["turns"]) == 1, exported.keys()
+            assert "TRIAL-NAV-SEED" in json.dumps(exported)
+            assert "DO_NOT_EXPORT_CATALOG_DATA" not in json.dumps(exported)
+            assert "DO_NOT_EXPORT_INHERITED_KEY" not in json.dumps(exported)
+            assert "catalog_private_marker" not in json.dumps(exported)
+
+            select_picker_session(master_fd, child, output, "Beta")
+            read_until(master_fd, child, output, beta_draft)
+            select_picker_session(master_fd, child, output, "Alpha")
+            read_until(master_fd, child, output, alpha_draft)
+            os.write(master_fd, b"\x7f" * len(alpha_draft))
+            drain_for(master_fd, output, 0.1, child)
+            continuation = "TRIAL-NAV-CONTINUE: inspect the reopened tool history and cwd"
+            os.write(master_fd, continuation.encode() + b"\x13")
+            read_until(
+                master_fd,
+                child,
+                output,
+                "The reopened session kept its prior tool history and workspace.",
+            )
+            final_status = request_status(status_url)
+            assert final_status["requests"] == 4, final_status
+            for check in (
+                "navigation_prior_text_and_tool_history_returned",
+                "navigation_recorded_workspace_returned",
+                "navigation_other_session_history_excluded",
+            ):
+                assert final_status["input_checks"].get(check) is True, final_status
+
+            status = drain_until_exit_after_close(
+                master_fd, child, output, slave_fd, initial_termios
+            )
+            master_fd = slave_fd = None
+            child = None
+            assert status == 0
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
+
+
+def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+    with tempfile.TemporaryDirectory(prefix="leg-tui-background-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        state_dir = root / "state"
+        fixture, status_url = start_fixture(
+            fixture_path,
+            "paused-live-text",
+            workspace,
+            hold_after_first_chunk=True,
+        )
+        master_fd = slave_fd = None
+        child = None
+        web_host = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "TERM": "xterm-256color",
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_UI_STATE_DIR": str(state_dir),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+            os.write(master_fd, b"\x1bORr")
+            read_until(master_fd, child, output, "Rename session")
+            os.write(master_fd, b"Alpha\r\r")
+            read_until(master_fd, child, output, "Alpha  |  model:")
+            os.write(master_fd, b"Hold this turn while another session is open\x13")
+            read_until(master_fd, child, output, "The first live text is visible.")
+            held = wait_for_status(
+                status_url,
+                lambda value: value["requests"] == 1
+                and value["active_requests"] == [1]
+                and value["pause_gates"].get("1") == "held",
+                "the TUI-owned request to be held",
+            )
+            assert held["requests"] == 1, held
+            alpha_draft = "Alpha draft while its turn runs"
+            os.write(master_fd, alpha_draft.encode())
+            read_until(master_fd, child, output, alpha_draft)
+
+            catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
+            alpha_id = next(
+                session_id
+                for session_id in catalog["sessions"]
+                if not session_id.startswith("draft-")
+            )
+            web_host, authority, token = launch_web_host(args, env, state_dir)
+            snapshot_status, snapshot = web_json_request(
+                authority, token, "GET", f"/api/sessions/{alpha_id}/snapshot"
+            )
+            assert snapshot_status == 200, snapshot
+            submit_status, busy = web_json_request(
+                authority,
+                token,
+                "POST",
+                f"/api/sessions/{alpha_id}/submit",
+                {
+                    "request_id": snapshot["next_request_id"],
+                    "prompt": "TRIAL-NAV-LOSER: cross-interface busy probe",
+                },
+            )
+            assert (submit_status, busy) == (409, {"error": "session_busy"}), (submit_status, busy)
+            assert request_status(status_url)["requests"] == 1, "busy submission called the provider"
+
+            os.write(master_fd, b"\x1bOR")
+            read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
+            assert "Alpha  [Busy]" in output.text(), output.text()
+            os.write(master_fd, b"n")
+            read_until(master_fd, child, output, "New session draft")
+            os.write(master_fd, b"\x1bORr")
+            read_until(master_fd, child, output, "Rename session")
+            os.write(master_fd, b"Beta\r")
+            read_until(master_fd, child, output, "Beta")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Beta  |  model:")
+            beta_draft = "Beta draft while Alpha runs"
+            os.write(master_fd, beta_draft.encode())
+            read_until(master_fd, child, output, beta_draft)
+
+            select_picker_session(master_fd, child, output, "Alpha")
+            read_until(master_fd, child, output, alpha_draft)
+            assert "status: Running" in output.text(), output.text()
+            select_picker_session(master_fd, child, output, "Beta")
+            read_until(master_fd, child, output, beta_draft)
+            assert "1 turn(s) active in other session(s)" in output.text(), output.text()
+
+            release_gate(status_url.removesuffix("/__trial/status"), 1)
+            wait_for_status(
+                status_url,
+                lambda value: value["request_outcomes"].get("1") == "completed",
+                "the background TUI turn to finish while Beta is open",
+            )
+            select_picker_session(master_fd, child, output, "Alpha")
+            read_until(master_fd, child, output, "Succeeded")
+            assert "The first live text is visible." in output.text(), output.text()
+            read_until(master_fd, child, output, alpha_draft)
+            assert request_status(status_url)["requests"] == 1
+            select_picker_session(master_fd, child, output, "Beta")
+            read_until(master_fd, child, output, beta_draft)
+
+            status = drain_until_exit_after_close(
+                master_fd, child, output, slave_fd, initial_termios
+            )
+            master_fd = slave_fd = None
+            child = None
+            assert status == 0
+        finally:
+            if web_host is not None and web_host.poll() is None:
+                web_host.send_signal(signal.SIGINT)
+                try:
+                    web_host.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    web_host.kill()
+                    web_host.wait(timeout=2)
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
+
+
+def run_windowed_history_smoke(args: argparse.Namespace) -> None:
+    with tempfile.TemporaryDirectory(prefix="leg-tui-windowed-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        state_dir = root / "state"
+        session_id = seed_windowed_catalog(state_dir, workspace)
+        env = os.environ.copy()
+        env.update(
+            {
+                "TERM": "xterm-256color",
+                "LEG_UI_STATE_DIR": str(state_dir),
+                "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+            }
+        )
+        command = [
+            str(Path(args.tui_bin).resolve()),
+            "--leg-bin",
+            str(Path(args.leg_bin).resolve()),
+            "--supervisor-bin",
+            str(Path(args.supervisor_bin).resolve()),
+        ]
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+            read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
+            picker = output.text()
+            for item in ("History fixture", "Beta fixture", str(workspace.resolve()), "Ready"):
+                assert item in picker, f"picker omitted {item!r}: {picker!r}"
+
+            open_started = time.perf_counter()
+            os.write(master_fd, b"/History fixture\r\r")
+            read_until_fast(master_fd, child, output, "of 1000", timeout=0.2)
+            open_elapsed = time.perf_counter() - open_started
+            assert open_elapsed <= 0.2, f"opening known 1,000-turn session took {open_elapsed * 1000:.1f} ms"
+            conversation = output.text()
+            for status in ("Tool denied", "Tool pending", "Tool interrupted", "Tool completed"):
+                assert status in conversation, f"transcript omitted {status!r}: {conversation!r}"
+            assert "history fixture prompt 0999" in conversation
+            assert "literal Ω output from turn 0999" in conversation
+            os.write(master_fd, b"\x1b[5~")
+            read_until(master_fd, child, output, "Tool failed")
+            os.write(master_fd, b"\x1b[1;5F")
+            read_until(master_fd, child, output, "Turns 997-1000 of 1000")
+
+            inspector_started = time.perf_counter()
+            os.write(master_fd, b"\x1bOS")
+            inspector_ms = read_until_fast(
+                master_fd, child, output, "Inspector · Up/Down field", timeout=0.2
+            )
+            assert inspector_ms <= 0.2, f"opening inspector took {inspector_ms * 1000:.1f} ms"
+            assert time.perf_counter() - inspector_started <= 0.2, "inspector feedback exceeded 200 ms"
+
+            os.write(master_fd, b"\x1b[B" * 6)
+            read_until(master_fd, child, output, "literal Ω output from turn 0999")
+            os.write(master_fd, b"\x1b[5~")
+            read_until(master_fd, child, output, "Turns 995-998 of 1000")
+            before_switch = re.search(r"Turns (\d+-\d+ of 1000)", output.text())
+            assert before_switch, output.text()
+            scroll_position = before_switch.group(1)
+            assert "Alpha draft survives session changes" in output.text()
+
+            select_picker_session(master_fd, child, output, "Beta fixture")
+            read_until(master_fd, child, output, "Beta draft stays in its own session")
+            select_picker_session(master_fd, child, output, "History fixture")
+            read_until(master_fd, child, output, "Alpha draft survives session changes")
+            after_switch = re.search(r"Turns (\d+-\d+ of 1000)", output.text())
+            assert after_switch and after_switch.group(1) == scroll_position, (
+                scroll_position,
+                output.text(),
+            )
+            assert "Alpha draft survives session changes" in output.text()
+
+            os.write(master_fd, b"\x06history fixture reply 099")
+            read_until(master_fd, child, output, "Match 1 of 8")
+            os.write(master_fd, b"\x1b[B")
+            read_until(master_fd, child, output, "Match 2 of 8")
+            os.write(master_fd, b"\x15")
+            read_until(master_fd, child, output, "Search session titles and displayed transcript text.")
+            os.write(master_fd, "literal Ω output from turn 0999".encode())
+            read_until(master_fd, child, output, "Match 1 of 1")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Inspector · Up/Down field")
+            assert session_id in json.loads((state_dir / "catalog.json").read_text())["sessions"]
+
+            status = drain_until_exit_after_close(
+                master_fd, child, output, slave_fd, initial_termios
+            )
+            master_fd = slave_fd = None
+            child = None
+            assert status == 0
+            print(
+                f"1,000-turn TUI open/inspector latency: {open_elapsed * 1000:.1f}/"
+                f"{inspector_ms * 1000:.1f} ms on {sys.platform} {os.uname().machine}"
+            )
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
 
 
 def terminal_text(output: bytes) -> str:
@@ -1456,7 +2190,7 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             resize_pty(slave_fd, 40, 120)
             drain_for(master_fd, output, 0.2)
             final_screen = terminal_screen_text(bytes(output), 40, 120)
-            assert "Succeeded" in final_screen and "Conversation" in final_screen, final_screen
+            assert "Succeeded" in final_screen and "Turns 1-1 of 1" in final_screen, final_screen
             os.write(master_fd, b"\x03")
             status = drain_until_exit(master_fd, child, output)
             assert status == 0, f"TUI exit status was {status}"
@@ -1703,12 +2437,16 @@ def main() -> None:
     parser.add_argument("--tui-bin", required=True)
     parser.add_argument("--leg-bin", required=True)
     parser.add_argument("--supervisor-bin", required=True)
+    parser.add_argument("--web-bin", required=True)
     args = parser.parse_args()
     test_terminal_screen_redraw()
     if sys.platform == "linux":
         run_smoke(args)
     run_turn_contract_smoke(args)
     run_retry_confirmation_smoke(args)
+    run_session_navigation_smoke(args)
+    run_background_session_busy_smoke(args)
+    run_windowed_history_smoke(args)
     run_resize_and_non_tty_smoke(args)
     run_signal_smoke(args)
     run_color_policy_smoke(args)

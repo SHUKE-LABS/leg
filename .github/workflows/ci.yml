@@ -231,7 +231,8 @@ jobs:
           /tmp/leg-pty-test-venv/bin/python companions/leg-tui/tests/pty_smoke.py \
             --tui-bin companions/target/debug/leg-tui \
             --leg-bin target/debug/leg \
-            --supervisor-bin companions/target/debug/leg-ui-supervisor
+            --supervisor-bin companions/target/debug/leg-ui-supervisor \
+            --web-bin companions/target/debug/leg-web
 
       - name: Build (locked)
         shell: bash

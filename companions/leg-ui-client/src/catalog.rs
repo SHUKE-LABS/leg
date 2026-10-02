@@ -71,6 +71,8 @@ pub enum TrailOutcome {
 pub struct TrailToolResult {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -82,6 +84,8 @@ pub struct TrailTool {
     pub tool_name: String,
     pub input: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<TrailToolResult>,
 }
 
@@ -89,9 +93,15 @@ pub struct TrailTool {
 pub struct TrailTurn {
     pub turn_index: u64,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
     #[serde(skip)]
     retry_prompt: Option<String>,
     pub outcome: TrailOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1818,8 +1828,11 @@ fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
                 turns.push(TrailTurn {
                     turn_index,
                     prompt: prompt.to_string(),
+                    timestamp_ms: record.get("ts_ms").and_then(Value::as_u64),
                     retry_prompt: original_prompt,
                     outcome: TrailOutcome::Incomplete,
+                    outcome_timestamp_ms: None,
+                    stop_reason: None,
                     reply: None,
                     failure_kind: None,
                     failure_message: None,
@@ -1865,6 +1878,7 @@ fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
                         .unwrap_or_default()
                         .to_string(),
                     input: record.get("input").cloned().unwrap_or(Value::Null),
+                    timestamp_ms: record.get("ts_ms").and_then(Value::as_u64),
                     result: None,
                 });
             }
@@ -1898,6 +1912,7 @@ fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
                 if let Some(tool) = paired {
                     tool.result = Some(TrailToolResult {
                         status: status.to_string(),
+                        timestamp_ms: record.get("ts_ms").and_then(Value::as_u64),
                         result: record
                             .get("result")
                             .and_then(Value::as_str)
@@ -1928,6 +1943,11 @@ fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
                     continue;
                 };
                 turn.outcome = TrailOutcome::Succeeded;
+                turn.outcome_timestamp_ms = record.get("ts_ms").and_then(Value::as_u64);
+                turn.stop_reason = record
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 turn.reply = Some(reply.to_string());
             }
             "response_error" => {
@@ -1954,6 +1974,7 @@ fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
                 } else {
                     TrailOutcome::Failed
                 };
+                turn.outcome_timestamp_ms = record.get("ts_ms").and_then(Value::as_u64);
                 turn.failure_kind = Some(kind);
                 turn.failure_message = Some(message.to_string());
             }
@@ -2039,7 +2060,7 @@ mod tests {
             json!({"schema":EXCHANGE_SCHEMA,"event":"tool_round","ts_ms":3,"content":[{"type":"text","text":"thinking"},{"type":"tool_use","id":"call-1","name":"bash","input":{"command":"pwd"}}],"session_id":id,"turn_index":0}),
             json!({"schema":EXCHANGE_SCHEMA,"event":"tool_call","ts_ms":4,"tool_use_id":"call-1","tool_name":"bash","input":{"command":"pwd"},"session_id":id,"turn_index":0}),
             json!({"schema":EXCHANGE_SCHEMA,"event":"tool_result","ts_ms":5,"tool_use_id":"call-1","tool_name":"bash","status":"completed","result":"here","session_id":id,"turn_index":0}),
-            json!({"schema":EXCHANGE_SCHEMA,"event":"response_ok","ts_ms":6,"reply":"done","session_id":id,"turn_index":0}),
+            json!({"schema":EXCHANGE_SCHEMA,"event":"response_ok","ts_ms":6,"reply":"done","stop_reason":"end_turn","session_id":id,"turn_index":0}),
             json!({"schema":EXCHANGE_SCHEMA,"event":"future_event","ts_ms":7,"new_field":true}),
             json!({"schema":EXCHANGE_SCHEMA,"event":event_suffix,"ts_ms":8,"session_id":id,"turn_index":1,"prompt":"second"}),
         ];
@@ -2058,6 +2079,10 @@ mod tests {
         let snapshot = read_trail(&path, id).unwrap();
         assert_eq!(snapshot.turns.len(), 2);
         assert_eq!(snapshot.turns[0].outcome, TrailOutcome::Succeeded);
+        assert_eq!(snapshot.turns[0].timestamp_ms, Some(2));
+        assert_eq!(snapshot.turns[0].outcome_timestamp_ms, Some(6));
+        assert_eq!(snapshot.turns[0].stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(snapshot.turns[0].tools[0].timestamp_ms, Some(4));
         assert_eq!(
             snapshot.turns[0].tools[0]
                 .result
@@ -2066,6 +2091,14 @@ mod tests {
                 .result
                 .as_deref(),
             Some("here")
+        );
+        assert_eq!(
+            snapshot.turns[0].tools[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .timestamp_ms,
+            Some(5)
         );
         assert_eq!(snapshot.turns[1].outcome, TrailOutcome::Incomplete);
         assert!(snapshot.warnings.is_empty());

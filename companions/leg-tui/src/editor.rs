@@ -50,7 +50,7 @@ impl ComposerEditor {
     }
 
     pub(super) fn backspace(&mut self) -> bool {
-        let Some((start, _)) = self.text[..self.cursor].grapheme_indices(true).last() else {
+        let Some((start, _)) = self.text[..self.cursor].grapheme_indices(true).next_back() else {
             return false;
         };
         self.replace(start..self.cursor, "");
@@ -67,7 +67,7 @@ impl ComposerEditor {
     }
 
     pub(super) fn move_left(&mut self) {
-        if let Some((start, _)) = self.text[..self.cursor].grapheme_indices(true).last() {
+        if let Some((start, _)) = self.text[..self.cursor].grapheme_indices(true).next_back() {
             self.cursor = start;
         }
     }
