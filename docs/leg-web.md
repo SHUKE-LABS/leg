@@ -5,6 +5,18 @@ bootstrap page and JavaScript in the binary; running it needs no Node runtime,
 CDN, or external service. The experimental interface in #84 can use the API
 below without adding HTTP dependencies to core `leg`.
 
+## Experimental trial bundle
+
+Build a self-contained Linux or macOS bundle from the repository root with
+`bash scripts/build-web-trial.sh --output /tmp/leg-web-trial-build`. The build
+uses the root and companion lockfiles separately, and includes the compatible
+native binaries, dependency notices, the quickstart, the fixture, and the
+shared task/report materials. CI uploads `leg-web-experimental-<platform>-<revision>`
+artifacts after its Linux/macOS and Chromium/Firefox checks pass. The artifact
+is experimental and does not enter the regular release or npm packages. See
+the [bundle quickstart](../companions/leg-web/trial/QUICKSTART.md) for
+prerequisites, fixture setup, start/stop, and removal.
+
 ## Start and trust boundary
 
 Build `leg`, `leg-ui-supervisor`, and the Web host, then start it:
@@ -225,8 +237,12 @@ python3 companions/leg-web/tests/lifecycle_smoke.py \
   target/debug/leg \
   companions/target/debug/leg-ui-supervisor
 python3 -m pip install --requirement companions/leg-web/tests/browser-requirements.txt
-python3 -m playwright install chromium
-python3 companions/leg-web/tests/browser_e2e.py \
+python3 -m playwright install chromium firefox
+python3 companions/leg-web/tests/browser_e2e.py --browser chromium \
+  companions/target/debug/leg-web \
+  target/debug/leg \
+  companions/target/debug/leg-ui-supervisor
+python3 companions/leg-web/tests/browser_e2e.py --browser firefox \
   companions/target/debug/leg-web \
   target/debug/leg \
   companions/target/debug/leg-ui-supervisor
@@ -243,5 +259,7 @@ the Web package tests and builds the host binary. The Chromium browser E2E
 covers exact multiline input and one-submission counts across IME, Enter,
 repeated clicks, network and provider retries, and refresh; live tool activity
 and Stop; safe Markdown output; large tool summaries; history scroll anchoring;
-and the required viewport sizes. CI caches the pinned Playwright Chromium
-build and runs browser E2E on Linux.
+and the required viewport sizes. Browser E2E runs with the Playwright-pinned
+Chromium and Firefox builds on Linux; CI also runs the native host checks on
+Linux and macOS. Its unauthenticated and hostile-origin POST attempts must be
+rejected without changing the session request ID or reaching the fixture.
