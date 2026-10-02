@@ -603,6 +603,7 @@ async def run(
 
                 retry_ids: list[int] = []
                 dropped = False
+                retry_second_seen = asyncio.Event()
 
                 async def abort_before_accept(route):
                     nonlocal dropped
@@ -612,6 +613,7 @@ async def run(
                         await route.abort()
                     else:
                         await route.continue_()
+                        retry_second_seen.set()
 
                 await page.route("**/submit", abort_before_accept)
                 await composer.fill("TRIAL-CONTINUE: retry the same request ID after a lost connection")
@@ -621,6 +623,7 @@ async def run(
                 assert snapshot_before_retry["high_water"] == 1
                 assert snapshot_before_retry["next_request_id"] == 2
                 await page.get_by_role("button", name="Retry same send").click()
+                await asyncio.wait_for(retry_second_seen.wait(), timeout=5)
                 await page.unroute("**/submit", abort_before_accept)
                 assert len(retry_ids) == 2 and retry_ids[0] == retry_ids[1] == 2, retry_ids
                 await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 2)
@@ -833,41 +836,28 @@ async def run(
                 )
                 assert anchor_after is not None and abs(anchor_after - anchor_before["offset"]) <= 5, (anchor_before, anchor_after)
                 await page.get_by_role("button", name="New content · Jump to latest").click()
-                assert await page.locator("#new-content").is_hidden()
-                try:
-                    await page.wait_for_function(
-                        """() => {
-                          const element = document.querySelector('#transcript');
-                          return element && element.scrollHeight - element.clientHeight - element.scrollTop <= 5;
-                        }""",
-                        timeout=5000,
-                    )
-                except PlaywrightTimeoutError as error:
-                    scroll_state = await page.locator("#transcript").evaluate(
+
+                async def assert_latest_remains_pinned():
+                    scroll_state = await transcript.evaluate(
                         """async element => {
-                          const snapshot = () => ({
-                            scrollTop: element.scrollTop,
-                            scrollHeight: element.scrollHeight,
-                            clientHeight: element.clientHeight,
-                            gap: element.scrollHeight - element.clientHeight - element.scrollTop,
-                          });
-                          const before = snapshot();
-                          const overflowAnchor = getComputedStyle(element).overflowAnchor;
-                          element.scrollTop = element.scrollHeight;
-                          const immediate = snapshot();
                           await new Promise(requestAnimationFrame);
-                          return {overflowAnchor, before, immediate, nextFrame: snapshot()};
+                          await new Promise(requestAnimationFrame);
+                          return {
+                            bottomGap: element.scrollHeight - element.clientHeight - element.scrollTop,
+                            badgeHidden: document.querySelector('#new-content').hidden,
+                          };
                         }"""
                     )
-                    raise AssertionError(
-                        f"jump to latest did not reach the transcript end: {scroll_state}"
-                    ) from error
-                scroll_metrics = await transcript.evaluate("element => element.scrollHeight - element.clientHeight - element.scrollTop")
-                assert scroll_metrics <= 5, scroll_metrics
+                    assert scroll_state["badgeHidden"] and scroll_state["bottomGap"] <= 5, scroll_state
+
+                await assert_latest_remains_pinned()
+                await page.get_by_text("The fixture resumes after its fixed pause.", exact=False).wait_for()
+                await assert_latest_remains_pinned()
                 final = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 8)
                 await wait_status(page, "Succeeded")
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 11)
                 assert final["last_submission"]["status"] == "succeeded", final
+                await assert_latest_remains_pinned()
 
                 await composer.fill("TRIAL-AUTH: retain this failed prompt")
                 await page.get_by_role("button", name="Send").click()

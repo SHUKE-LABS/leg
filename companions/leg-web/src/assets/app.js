@@ -1164,18 +1164,21 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
     state.transcriptSessionId = state.sessionId;
   }
 
+  let windowScrollTop = previousTop;
   if (restore?.atBottom) {
-    scroller.scrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
+    windowScrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
   } else if (restore?.key) {
     const restoreIndex = items.findIndex((item) => item.key === restore.key);
     if (restoreIndex >= 0) {
-      scroller.scrollTop = Math.max(0, estimatedHeightBefore(items, restoreIndex) - restore.offset);
+      windowScrollTop = Math.max(0, estimatedHeightBefore(items, restoreIndex) - restore.offset);
+      scroller.scrollTop = windowScrollTop;
+      windowScrollTop = scroller.scrollTop;
     }
   } else if (wasAtBottom) {
-    scroller.scrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
+    windowScrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
   }
 
-  let { start, end } = transcriptWindow(items, scroller.scrollTop, scroller.clientHeight);
+  let { start, end } = transcriptWindow(items, windowScrollTop, scroller.clientHeight);
   const focusedTurn = document.activeElement?.closest?.(".transcript-turn");
   if (focusedTurn) {
     const focusedIndex = items.findIndex((item) => item.key === focusedTurn.dataset.key);
