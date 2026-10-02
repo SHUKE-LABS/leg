@@ -1581,21 +1581,18 @@ def run_signal_smoke(args: argparse.Namespace) -> None:
                         wait_for_file(pid_file, master_fd, output, child)
                         next_draft = f"draft survives {signal_name}"
                         os.write(master_fd, next_draft.encode())
-                        drain_for(master_fd, output, 0.2)
-                        assert next_draft in terminal_screen_text(
-                            bytes(output), DEFAULT_ROWS, DEFAULT_COLUMNS
-                        )
                     else:
                         next_draft = f"idle draft survives {signal_name}"
                         os.write(master_fd, next_draft.encode())
-                        read_until_screen_text(
-                            master_fd,
-                            child,
-                            output,
-                            next_draft,
-                            rows=DEFAULT_ROWS,
-                            columns=DEFAULT_COLUMNS,
-                        )
+
+                    read_until_screen_text(
+                        master_fd,
+                        child,
+                        output,
+                        next_draft,
+                        rows=DEFAULT_ROWS,
+                        columns=DEFAULT_COLUMNS,
+                    )
 
                     child.send_signal(signal_number)
                     status = drain_until_exit(master_fd, child, output)
