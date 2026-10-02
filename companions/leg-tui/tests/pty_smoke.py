@@ -12,6 +12,7 @@ import pty
 import re
 import select
 import signal
+import shutil
 import struct
 import subprocess
 import sys
@@ -1055,13 +1056,17 @@ def start_fixture(
 def launch_conversation(
     args: argparse.Namespace, env: dict[str, str], workspace: Path
 ) -> tuple[int, int, subprocess.Popen[bytes], list[Any], TerminalCapture]:
-    command = [
-        str(Path(args.tui_bin).resolve()),
-        "--leg-bin",
-        str(Path(args.leg_bin).resolve()),
-        "--supervisor-bin",
-        str(Path(args.supervisor_bin).resolve()),
-    ]
+    launcher = getattr(args, "launcher", None)
+    if launcher:
+        command = [str(Path(launcher).resolve())]
+    else:
+        command = [
+            str(Path(args.tui_bin).resolve()),
+            "--leg-bin",
+            str(Path(args.leg_bin).resolve()),
+            "--supervisor-bin",
+            str(Path(args.supervisor_bin).resolve()),
+        ]
     master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
     capture = TerminalCapture(rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS)
     try:
@@ -1521,6 +1526,151 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
                 check["path"] == "trial-rounds.txt" and check["ok"]
                 for check in final_status["workspace_checks"]
             ), final_status
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
+
+
+def run_issue82_trial_coverage_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = Path(args.fixture) if getattr(args, "fixture", None) else (
+        repository / "trials" / "fake_provider.py"
+    )
+    with tempfile.TemporaryDirectory(prefix="leg-tui-trial-coverage-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        state_dir = root / "state"
+        secret = "tui-trial-fixture-key-must-not-be-displayed"
+        hook = root / "deny-hook.py"
+        hook.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            "event = json.load(sys.stdin)\n"
+            "command = event.get('tool_input', {}).get('command', '')\n"
+            "if 'TRIAL-DENY' in command:\n"
+            "    print(json.dumps({'decision':'deny','reason':'trial denial'}))\n"
+            "else:\n"
+            "    print(json.dumps({'decision':'allow'}))\n",
+            encoding="utf-8",
+        )
+        hook.chmod(0o700)
+        fixture, status_url = start_fixture(fixture_path, "trial", workspace)
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "TERM": "xterm-256color",
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": secret,
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_MAX_TOOL_ROUNDS": "2",
+                    "LEG_BASH_TIMEOUT_SECS": "600",
+                    "LEG_PRETOOL_HOOK": str(hook),
+                    "LEG_UI_STATE_DIR": str(state_dir),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                    "LEG_EVENT_LOG": str(root / "events.jsonl"),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+
+            # The first live-provider turn is a bracketed CJK/multiline paste.
+            chinese_prompt = (
+                "TRIAL-CHINESE\n"
+                "Line one: keep this first.\n"
+                "第二行：保留中文。\n"
+                "Line three: keep this third."
+            )
+            os.write(master_fd, b"\x1b[200~" + chinese_prompt.encode() + b"\x1b[201~")
+            os.write(master_fd, b"\x13")
+            read_until(master_fd, child, output, "Three lines received, including the Chinese second line.")
+            chinese_status = request_status(status_url)
+            assert chinese_status["input_checks"].get("chinese_multiline_prompt") is True, chinese_status
+
+            os.write(master_fd, b"TRIAL-TOOL-TEXT: inspect this write\x13")
+            read_until(master_fd, child, output, "The write result returned; this is the final text.")
+            read_until(master_fd, child, output, "Tool completed: write")
+            read_until(master_fd, child, output, "Succeeded")
+            assert (workspace / "fixture-write.txt").read_text(encoding="utf-8") == "fixture-write-ok\n"
+            os.write(master_fd, b"\x1bOS")
+            read_until(master_fd, child, output, "Inspector · Up/Down field")
+            os.write(master_fd, b"\x1b[B" * 6)
+            read_until(master_fd, child, output, "Tool write · result")
+            read_until(master_fd, child, output, "Successfully wrote to")
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
+
+            os.write(master_fd, b"TRIAL-CONTINUE: continue after inspecting the tool\x13")
+            read_until(
+                master_fd,
+                child,
+                output,
+                "Continuation response: the earlier fixture answer is still in this session.",
+            )
+
+            os.write(master_fd, b"TRIAL-AUTH: verify the fixture auth failure\x13")
+            read_until(master_fd, child, output, "Failed")
+            auth_status = request_status(status_url)
+            assert auth_status["input_checks"].get("auth_error_sent") is True, auth_status
+
+            os.write(master_fd, b"TRIAL-DENIED: exercise the pretool hook\x13")
+            read_until(master_fd, child, output, "The tool was denied and its error result was returned.")
+            denied_status = request_status(status_url)
+            assert denied_status["input_checks"].get("denied_tool_error_returned") is True, denied_status
+            assert not (workspace / "denied-marker.txt").exists()
+
+            os.write(master_fd, b"TRIAL-FAILED: exercise an invalid tool call\x13")
+            read_until(master_fd, child, output, "The tool failed and its error result was returned.")
+            final_status = request_status(status_url)
+            assert final_status["input_checks"].get("failed_tool_error_returned") is True, final_status
+            assert not (workspace / "failed-marker.txt").exists()
+            os.write(master_fd, b"TRIAL-STOP: stop the active tool process tree\x13")
+            pid_file = workspace / "trial-stalled-child.pid"
+            wait_for_file(pid_file, master_fd, output, child)
+            stopped_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            os.write(master_fd, b"\x03")
+            read_until(master_fd, child, output, "Interrupted")
+            wait_for_pid_exit(stopped_pid)
+            assert not (workspace / "trial-stall-finished.txt").exists()
+
+            final_status = request_status(status_url)
+            assert final_status["requests"] == 10, final_status
+            assert final_status["scenario_requests"] == {
+                "TRIAL-CHINESE": 1,
+                "TRIAL-TOOL-TEXT": 2,
+                "TRIAL-CONTINUE": 1,
+                "TRIAL-AUTH": 1,
+                "TRIAL-DENIED": 2,
+                "TRIAL-FAILED": 2,
+                "TRIAL-STOP": 1,
+            }, final_status
+            workspace_checks = {
+                check["path"]: check["ok"] for check in final_status["workspace_checks"]
+            }
+            assert workspace_checks.get("trial-stalled-child.pid") is True, final_status
+            assert workspace_checks.get("trial-stall-finished.txt") is True, final_status
+
+            status = drain_until_exit_after_close(
+                master_fd, child, output, slave_fd, initial_termios
+            )
+            master_fd = slave_fd = None
+            child = None
+            assert status == 0
+            assert secret.encode() not in bytes(output.raw), "fixture credential appeared in terminal output"
+            events = (root / "events.jsonl").read_text(encoding="utf-8")
+            assert secret not in events, "fixture credential appeared in the event log"
         finally:
             if child is not None:
                 kill_owned_process_group(child)
@@ -2879,12 +3029,30 @@ def main() -> None:
     parser.add_argument("--tui-bin", required=True)
     parser.add_argument("--leg-bin", required=True)
     parser.add_argument("--supervisor-bin", required=True)
-    parser.add_argument("--web-bin", required=True)
+    parser.add_argument("--web-bin")
+    parser.add_argument("--fixture")
+    parser.add_argument("--launcher")
+    parser.add_argument(
+        "--trial-coverage-only",
+        action="store_true",
+        help="run the bundle-safe issue #82 workflow against the selected fixture",
+    )
     args = parser.parse_args()
+    if args.trial_coverage_only:
+        runtime_path = os.environ.get("PATH", "")
+        for command in ("cargo", "node"):
+            if shutil.which(command, path=runtime_path) is not None:
+                raise SystemExit(f"bundle smoke runtime PATH unexpectedly includes {command}")
+        run_issue82_trial_coverage_smoke(args)
+        print("unpacked TUI bundle smoke passed: fixture prompt, tool flow, and error handling")
+        return
+    if not args.web_bin:
+        parser.error("--web-bin is required for the full native PTY suite")
     test_terminal_screen_redraw()
     if sys.platform == "linux":
         run_smoke(args)
     run_turn_contract_smoke(args)
+    run_issue82_trial_coverage_smoke(args)
     run_retry_confirmation_smoke(args)
     run_session_navigation_smoke(args)
     run_workspace_flow_smoke(args)

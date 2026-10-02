@@ -110,6 +110,101 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  tui-trial-artifacts:
+    needs: [native, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x86_64
+          - runner: macos-15-intel
+            platform: macos-x86_64
+          - runner: macos-latest
+            platform: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PTY smoke dependency
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/leg-tui-trial-venv"
+          "${RUNNER_TEMP}/leg-tui-trial-venv/bin/python" -m pip install \
+            --requirement companions/leg-tui/tests/requirements.txt
+          echo "TUI_TRIAL_PYTHON=${RUNNER_TEMP}/leg-tui-trial-venv/bin/python" >>"${GITHUB_ENV}"
+
+      - name: Build experimental TUI trial bundle
+        run: bash scripts/build-tui-trial.sh --output "${RUNNER_TEMP}/tui-trial"
+
+      - name: Unpack and smoke the experimental TUI trial bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find "${RUNNER_TEMP}/tui-trial" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          [[ -n "${archive}" ]]
+          unpack_dir="${RUNNER_TEMP}/tui-trial-unpacked"
+          mkdir -p "${unpack_dir}"
+          tar -xzf "${archive}" -C "${unpack_dir}"
+          bundle_dir="$(find "${unpack_dir}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          [[ -n "${bundle_dir}" ]]
+          runtime_path="/usr/bin:/bin:/usr/sbin:/sbin"
+          PATH="${runtime_path}" "${TUI_TRIAL_PYTHON}" \
+            companions/leg-tui/tests/trial_bundle_smoke.py --bundle-dir "${bundle_dir}"
+          PATH="${runtime_path}" "${TUI_TRIAL_PYTHON}" \
+            companions/leg-tui/tests/pty_smoke.py \
+              --trial-coverage-only \
+              --fixture "${bundle_dir}/companions/trials/fake_provider.py" \
+              --launcher "${bundle_dir}/start-tui.sh" \
+              --tui-bin "${bundle_dir}/bin/leg-tui" \
+              --leg-bin "${bundle_dir}/bin/leg" \
+              --supervisor-bin "${bundle_dir}/bin/leg-ui-supervisor"
+          echo "TUI_TRIAL_BUNDLE_DIR=${bundle_dir}" >>"${GITHUB_ENV}"
+          echo "TUI_TRIAL_ARCHIVE=${archive}" >>"${GITHUB_ENV}"
+
+      - name: Measure delivered TUI trial resources
+        if: ${{ matrix.platform == 'linux-x86_64' }}
+        run: |
+          "${TUI_TRIAL_PYTHON}" companions/trials/measure_trial_resources.py \
+            --tui-only \
+            --tui-archive "${TUI_TRIAL_ARCHIVE}" \
+            --tui-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg-tui" \
+            --leg-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg" \
+            --supervisor-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg-ui-supervisor" \
+            --output "${RUNNER_TEMP}/tui-trial/resource-measurements.json"
+
+      - name: Write TUI trial report
+        if: ${{ matrix.platform == 'linux-x86_64' }}
+        run: |
+          python3 companions/trials/write_tui_trial_report.py \
+            --template companions/trials/results-template.json \
+            --measurements "${RUNNER_TEMP}/tui-trial/resource-measurements.json" \
+            --bundle-info "${TUI_TRIAL_BUNDLE_DIR}/bundle-info.json" \
+            --archive "${TUI_TRIAL_ARCHIVE}" \
+            --output-dir "${RUNNER_TEMP}/tui-trial" \
+            --ci-run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Upload experimental TUI trial bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: leg-tui-experimental-${{ matrix.platform }}-${{ github.sha }}
+          path: ${{ runner.temp }}/tui-trial/*
+          if-no-files-found: error
+          retention-days: 14
+
   native:
     strategy:
       fail-fast: false
@@ -166,7 +261,7 @@ jobs:
 
       - name: Test deterministic trial helpers
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        run: python3 -m unittest companions/trials/test_fake_provider.py companions/trials/test_trial_archive.py companions/trials/test_web_trial_report.py
+        run: python3 -m unittest companions/trials/test_fake_provider.py companions/trials/test_trial_archive.py companions/trials/test_web_trial_report.py companions/trials/test_tui_trial_report.py
 
       - name: Test Web host package on Windows (locked)
         if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
@@ -254,15 +349,15 @@ jobs:
           set -euo pipefail
           cargo tree --locked -p leg --edges normal,build --prefix none --format '{p}' \
             >"${RUNNER_TEMP}/leg-core-dependencies.txt"
-          if rg -n '^(axum|leg-web|leg-ui-client|tokio|tower) v' "${RUNNER_TEMP}/leg-core-dependencies.txt"; then
-            echo '::error::default leg dependencies include companion/server packages'
+          if rg -n '^(axum|crossterm|leg-tui|leg-web|leg-ui-client|ratatui|signal-hook|tokio|tower|unicode-segmentation|unicode-width) v' "${RUNNER_TEMP}/leg-core-dependencies.txt"; then
+            echo '::error::default leg dependencies include companion UI/server packages'
             exit 1
           fi
           cargo package --locked --list --allow-dirty \
             >"${RUNNER_TEMP}/leg-core-package-files.txt"
           if rg -n '^(companions/|src/bin/leg-web(\.rs)?$|src/bin/leg-ui-supervisor(\.rs)?$)' \
             "${RUNNER_TEMP}/leg-core-package-files.txt"; then
-            echo '::error::core Cargo package includes Web companion contents'
+            echo '::error::core Cargo package includes companion UI contents'
             exit 1
           fi
 
