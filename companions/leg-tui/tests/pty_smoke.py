@@ -77,6 +77,26 @@ class TerminalCapture:
         return bytes(self.raw)
 
 
+def workspace_path_text(capture: TerminalCapture) -> str | None:
+    lines = capture.text().splitlines()
+    path_index = next(
+        (index for index, line in enumerate(lines) if "Path: " in line),
+        None,
+    )
+    if path_index is None:
+        return None
+    first = lines[path_index].partition("Path: ")[2].partition("│")[0].strip()
+    parts = [first]
+    for line in lines[path_index + 1 :]:
+        if "│" not in line:
+            break
+        continuation = line.split("│", 1)[1].rsplit("│", 1)[0].strip()
+        if not continuation:
+            break
+        parts.append(continuation)
+    return "".join(parts)
+
+
 def test_terminal_screen_redraw() -> None:
     capture = TerminalCapture(rows=3, columns=24)
     chunks = (
@@ -156,6 +176,39 @@ def read_until_not_contains(
             raise AssertionError(
                 f"timed out waiting for screen text {unexpected!r} to disappear; "
                 f"current screen={capture.text()[-1200:]!r}"
+            )
+        ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, 8192)
+        except OSError:
+            continue
+        if chunk:
+            capture.feed(chunk)
+
+
+def read_until_workspace_path(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    capture: TerminalCapture,
+    expected: str,
+    timeout: float = 8.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while workspace_path_text(capture) != expected:
+        capture_owned_processes(child)
+        if child.poll() is not None:
+            raise AssertionError(
+                f"TUI exited before workspace path {expected!r}; exit={child.returncode}; "
+                f"current screen={capture.text()[-1200:]!r}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"timed out waiting for workspace path {expected!r}; "
+                f"current workspace path={workspace_path_text(capture)!r}; "
+                f"screen={capture.text()[-1200:]!r}"
             )
         ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
         if not ready:
@@ -610,7 +663,7 @@ def start_prompt(
         )
 
         os.write(master_fd, b"?typed line\r")
-        drain_for(master_fd, capture, 0.1, child)
+        read_until(master_fd, child, capture, "?typed line")
         question_screen = capture.text()
         assert "?typed line" in question_screen, (
             "? or Enter did not insert literal text and a newline in the composer: "
@@ -1837,7 +1890,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Alpha  |  model:")
             read_until(master_fd, child, output, "Alpha transcript marker")
             read_until(master_fd, child, output, alpha_original_draft)
-            os.write(master_fd, b"\x7f" * len(alpha_original_draft))
+            os.write(master_fd, b"\x7f" * (len(alpha_original_draft) + 2))
             os.write(master_fd, alpha_draft.encode())
             read_until(master_fd, child, output, alpha_draft)
 
@@ -1853,14 +1906,30 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"w")
             read_until(master_fd, child, output, "Choose an existing replacement workspace")
             assert output.contains("removed-beta-works"), output.text()
-            os.write(master_fd, b"\x7f" * len(str(missing_workspace)))
+            os.write(master_fd, b"\x7f" * (len(str(missing_workspace)) + 2))
             os.write(master_fd, str(replacement_workspace).encode() + b"\r")
             read_until(master_fd, child, output, WARNING)
             assert "Press Enter to acknowledge" in output.text(), output.text()
             os.write(master_fd, b"\x1b")
-            read_until(master_fd, child, output, "Choose an existing directory")
-            os.write(master_fd, b"\x7f" * len(str(replacement_workspace)))
-            os.write(master_fd, str(second_replacement_workspace).encode() + b"\r")
+            read_until_not_contains(master_fd, child, output, WARNING)
+            read_until(master_fd, child, output, "Choose a workspace")
+            read_until_workspace_path(
+                master_fd,
+                child,
+                output,
+                str(replacement_workspace),
+            )
+            assert workspace_path_text(output) == str(replacement_workspace), output.text()
+            os.write(master_fd, b"\x7f" * (len(str(replacement_workspace)) + 2))
+            os.write(master_fd, str(second_replacement_workspace).encode())
+            read_until_workspace_path(
+                master_fd,
+                child,
+                output,
+                str(second_replacement_workspace),
+            )
+            assert workspace_path_text(output) == str(second_replacement_workspace), output.text()
+            os.write(master_fd, b"\r")
             read_until(master_fd, child, output, WARNING)
             assert "Press Enter to acknowledge" in output.text(), output.text()
             os.write(master_fd, b"\r")
@@ -1876,7 +1945,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             replacement_screen = output.text()
             assert "Beta transcript marker" in replacement_screen, replacement_screen
             assert "Alpha transcript marker" not in replacement_screen, replacement_screen
-            os.write(master_fd, b"\x7f" * len(beta_original_draft))
+            os.write(master_fd, b"\x7f" * (len(beta_original_draft) + 2))
             os.write(master_fd, beta_draft.encode())
             read_until(master_fd, child, output, beta_draft)
 
