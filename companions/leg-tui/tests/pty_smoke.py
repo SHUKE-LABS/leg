@@ -1785,8 +1785,10 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
         state_dir = root / "state"
         alpha_workspace = root / "alpha-workspace"
         replacement_workspace = root / "replacement-workspace"
+        second_replacement_workspace = root / "second-replacement-workspace"
         alpha_workspace.mkdir()
         replacement_workspace.mkdir()
+        second_replacement_workspace.mkdir()
         missing_workspace = root / "removed-beta-workspace"
         alpha_original_draft = "Alpha original draft before replacement"
         beta_original_draft = "Beta original draft before replacement"
@@ -1855,6 +1857,12 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, str(replacement_workspace).encode() + b"\r")
             read_until(master_fd, child, output, WARNING)
             assert "Press Enter to acknowledge" in output.text(), output.text()
+            os.write(master_fd, b"\x1b")
+            read_until(master_fd, child, output, "Choose an existing directory")
+            os.write(master_fd, b"\x7f" * len(str(replacement_workspace)))
+            os.write(master_fd, str(second_replacement_workspace).encode() + b"\r")
+            read_until(master_fd, child, output, WARNING)
+            assert "Press Enter to acknowledge" in output.text(), output.text()
             os.write(master_fd, b"\r")
             read_until_not_contains(master_fd, child, output, WARNING)
             read_until(master_fd, child, output, "Beta  |  model:")
@@ -1897,8 +1905,12 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
             alpha_record = catalog["sessions"]["session-workspace-alpha"]
             beta_record = catalog["sessions"]["session-workspace-beta"]
+            assert set(catalog["sessions"]) == {
+                "session-workspace-alpha",
+                "session-workspace-beta",
+            }, catalog
             assert alpha_record["cwd"] == str(alpha_workspace), alpha_record
-            assert beta_record["cwd"] == str(replacement_workspace), beta_record
+            assert beta_record["cwd"] == str(second_replacement_workspace.resolve()), beta_record
             assert alpha_record["drafts"]["tui"] == alpha_draft, alpha_record
             assert beta_record["drafts"]["tui"] == beta_draft, beta_record
 

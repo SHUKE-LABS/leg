@@ -1254,7 +1254,11 @@ impl App {
                     self.recovered = session.recovered;
                     self.view_aliases
                         .insert(session.id.clone(), self.state_key.clone());
-                    self.workspace_flow = WorkspaceFlow::Initial;
+                    self.workspace_flow = if self.warning_acknowledged {
+                        WorkspaceFlow::Initial
+                    } else {
+                        WorkspaceFlow::ReplaceSession(expected_id)
+                    };
                     self.screen = if self.warning_acknowledged {
                         Screen::Conversation
                     } else {
@@ -1285,6 +1289,7 @@ impl App {
 
     fn acknowledge_warning(&mut self) {
         self.warning_acknowledged = true;
+        self.workspace_flow = WorkspaceFlow::Initial;
         self.screen = Screen::Conversation;
         self.status = "Ready".to_string();
         let record_id = self
