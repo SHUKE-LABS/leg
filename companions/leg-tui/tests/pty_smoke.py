@@ -135,6 +135,38 @@ def read_until(
             capture.feed(chunk)
 
 
+def read_until_not_contains(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    capture: TerminalCapture,
+    unexpected: str,
+    timeout: float = 8.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while capture.contains(unexpected):
+        capture_owned_processes(child)
+        if child.poll() is not None:
+            raise AssertionError(
+                f"TUI exited before screen text {unexpected!r} disappeared; "
+                f"exit={child.returncode}; screen={capture.text()[-1200:]!r}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"timed out waiting for screen text {unexpected!r} to disappear; "
+                f"current screen={capture.text()[-1200:]!r}"
+            )
+        ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, 8192)
+        except OSError:
+            continue
+        if chunk:
+            capture.feed(chunk)
+
+
 def read_until_fast(
     master_fd: int,
     child: subprocess.Popen[bytes],
@@ -1205,6 +1237,75 @@ def select_picker_session(
     os.write(master_fd, b"\x1bOR")
     read_until(master_fd, child, capture, "Sessions · title · workspace · recent · status")
     os.write(master_fd, b"/" + title.encode() + b"\r\r")
+    read_until_not_contains(
+        master_fd,
+        child,
+        capture,
+        "Sessions · title · workspace · recent · status",
+    )
+
+
+def seed_catalog_session(
+    state_dir: Path,
+    session_id: str,
+    title: str,
+    workspace: Path | None,
+    draft: str,
+    prompt: str,
+    reply: str,
+    updated_at_ms: int,
+    recovered: bool = False,
+) -> None:
+    sessions_dir = state_dir / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "schema": EXCHANGE_SCHEMA,
+            "event": "session_start",
+            "ts_ms": updated_at_ms,
+            "session_id": session_id,
+        },
+        {
+            "schema": EXCHANGE_SCHEMA,
+            "event": "request",
+            "ts_ms": updated_at_ms + 1,
+            "model": "fixture",
+            "base_url": "local",
+            "prompt": prompt,
+            "session_id": session_id,
+            "turn_index": 0,
+        },
+        {
+            "schema": EXCHANGE_SCHEMA,
+            "event": "response_ok",
+            "ts_ms": updated_at_ms + 2,
+            "reply": reply,
+            "stop_reason": "end_turn",
+            "session_id": session_id,
+            "turn_index": 0,
+        },
+    ]
+    (sessions_dir / f"{session_id}.jsonl").write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    catalog_path = state_dir / "catalog.json"
+    if catalog_path.exists():
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    else:
+        catalog = {"version": 1, "sessions": {}}
+    record: dict[str, Any] = {
+        "name": title,
+        "created_at_ms": updated_at_ms,
+        "updated_at_ms": updated_at_ms,
+        "drafts": {"tui": draft},
+    }
+    if workspace is not None:
+        record["cwd"] = str(workspace)
+    if recovered:
+        record["recovered"] = True
+    catalog["sessions"][session_id] = record
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def stop_fixture(fixture: subprocess.Popen[str]) -> None:
@@ -1660,6 +1761,233 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             if slave_fd is not None:
                 os.close(slave_fd)
             stop_fixture(fixture)
+
+
+def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
+    command = [
+        str(Path(args.tui_bin).resolve()),
+        "--leg-bin",
+        str(Path(args.leg_bin).resolve()),
+        "--supervisor-bin",
+        str(Path(args.supervisor_bin).resolve()),
+    ]
+    now_ms = int(time.time() * 1000)
+
+    with tempfile.TemporaryDirectory(prefix="leg-tui-replacement-pty-") as temporary:
+        root = Path(temporary)
+        state_dir = root / "state"
+        alpha_workspace = root / "alpha-workspace"
+        replacement_workspace = root / "replacement-workspace"
+        alpha_workspace.mkdir()
+        replacement_workspace.mkdir()
+        missing_workspace = root / "removed-beta-workspace"
+        alpha_original_draft = "Alpha original draft before replacement"
+        beta_original_draft = "Beta original draft before replacement"
+        alpha_draft = "Alpha edited draft stays with Alpha"
+        beta_draft = "Beta edited draft stays with Beta"
+        seed_catalog_session(
+            state_dir,
+            "session-workspace-alpha",
+            "Alpha",
+            alpha_workspace,
+            alpha_original_draft,
+            "Alpha transcript marker",
+            "Alpha history reply",
+            now_ms,
+        )
+        seed_catalog_session(
+            state_dir,
+            "session-workspace-beta",
+            "Beta",
+            missing_workspace,
+            beta_original_draft,
+            "Beta transcript marker",
+            "Beta history reply",
+            now_ms - 1,
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "TERM": "xterm-256color",
+                "LEG_UI_STATE_DIR": str(state_dir),
+                "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+            }
+        )
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+            read_until(
+                master_fd,
+                child,
+                output,
+                "Sessions · title · workspace · recent · status",
+            )
+            os.write(master_fd, b"/Alpha\r\r")
+            read_until(master_fd, child, output, "Alpha  |  model:")
+            read_until(master_fd, child, output, "Alpha transcript marker")
+            read_until(master_fd, child, output, alpha_original_draft)
+            os.write(master_fd, b"\x7f" * len(alpha_original_draft))
+            os.write(master_fd, alpha_draft.encode())
+            read_until(master_fd, child, output, alpha_draft)
+
+            os.write(master_fd, b"\x1bOR")
+            read_until(
+                master_fd,
+                child,
+                output,
+                "Sessions · title · workspace · recent · status",
+            )
+            os.write(master_fd, b"/Beta\r")
+            read_until(master_fd, child, output, "Filter: Beta")
+            os.write(master_fd, b"w")
+            read_until(master_fd, child, output, "Choose an existing replacement workspace")
+            assert output.contains("removed-beta-works"), output.text()
+            os.write(master_fd, b"\x7f" * len(str(missing_workspace)))
+            os.write(master_fd, str(replacement_workspace).encode() + b"\r")
+            read_until(master_fd, child, output, "workspace: " + str(replacement_workspace))
+            read_until(master_fd, child, output, "Beta  |  model:")
+            read_until_not_contains(
+                master_fd,
+                child,
+                output,
+                "Select an existing workspace directory before starting a turn.",
+            )
+            read_until(master_fd, child, output, beta_original_draft)
+            replacement_screen = output.text()
+            assert "Beta transcript marker" in replacement_screen, replacement_screen
+            assert "Alpha transcript marker" not in replacement_screen, replacement_screen
+            os.write(master_fd, b"\x7f" * len(beta_original_draft))
+            os.write(master_fd, beta_draft.encode())
+            read_until(master_fd, child, output, beta_draft)
+
+            select_picker_session(master_fd, child, output, "Alpha")
+            read_until(master_fd, child, output, "Alpha  |  model:")
+            read_until(master_fd, child, output, alpha_draft)
+            saved_alpha = json.loads(
+                (state_dir / "catalog.json").read_text(encoding="utf-8")
+            )["sessions"]["session-workspace-alpha"]["drafts"]["tui"]
+            assert saved_alpha == alpha_draft, saved_alpha
+            alpha_screen = output.text()
+            assert "Alpha transcript marker" in alpha_screen, alpha_screen
+            assert "Alpha history reply" in alpha_screen, alpha_screen
+            assert alpha_draft in alpha_screen, alpha_screen
+            assert "Beta transcript marker" not in alpha_screen, alpha_screen
+
+            select_picker_session(master_fd, child, output, "Beta")
+            read_until(master_fd, child, output, beta_draft)
+            beta_screen = output.text()
+            assert "Beta  |  model:" in beta_screen, beta_screen
+            assert "Beta transcript marker" in beta_screen, beta_screen
+            assert "Beta history reply" in beta_screen, beta_screen
+            assert beta_draft in beta_screen, beta_screen
+            assert "Alpha transcript marker" not in beta_screen, beta_screen
+
+            catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
+            alpha_record = catalog["sessions"]["session-workspace-alpha"]
+            beta_record = catalog["sessions"]["session-workspace-beta"]
+            assert alpha_record["cwd"] == str(alpha_workspace), alpha_record
+            assert beta_record["cwd"] == str(replacement_workspace), beta_record
+            assert alpha_record["drafts"]["tui"] == alpha_draft, alpha_record
+            assert beta_record["drafts"]["tui"] == beta_draft, beta_record
+
+            status = drain_until_exit_after_close(
+                master_fd, child, output, slave_fd, initial_termios
+            )
+            master_fd = slave_fd = None
+            child = None
+            assert status == 0
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+
+    with tempfile.TemporaryDirectory(prefix="leg-tui-new-recovered-pty-") as temporary:
+        root = Path(temporary)
+        state_dir = root / "state"
+        workspace = root / "new-session-workspace"
+        workspace.mkdir()
+        recovered_draft = "Recovered draft stays untouched"
+        seed_catalog_session(
+            state_dir,
+            "session-recovered-no-workspace",
+            "Recovered",
+            None,
+            recovered_draft,
+            "Recovered transcript marker",
+            "Recovered history reply",
+            now_ms,
+            recovered=True,
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "TERM": "xterm-256color",
+                "LEG_UI_STATE_DIR": str(state_dir),
+                "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+            }
+        )
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+            read_until(
+                master_fd,
+                child,
+                output,
+                "Sessions · title · workspace · recent · status",
+            )
+            os.write(master_fd, b"/Recovered\r\r")
+            read_until(master_fd, child, output, "Recovered  |  model:")
+            read_until(master_fd, child, output, "Recovered transcript marker")
+
+            os.write(master_fd, b"\x1bOR")
+            read_until(
+                master_fd,
+                child,
+                output,
+                "Sessions · title · workspace · recent · status",
+            )
+            os.write(master_fd, b"n")
+            read_until(master_fd, child, output, "Choose a workspace for the new session")
+            os.write(master_fd, str(workspace).encode() + b"\r")
+            read_until(master_fd, child, output, "New session draft")
+            new_draft = "This belongs to the new session"
+            os.write(master_fd, new_draft.encode())
+            read_until(master_fd, child, output, new_draft)
+
+            status = drain_until_exit_after_close(
+                master_fd, child, output, slave_fd, initial_termios
+            )
+            master_fd = slave_fd = None
+            child = None
+            assert status == 0
+            catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
+            recovered_record = catalog["sessions"]["session-recovered-no-workspace"]
+            assert recovered_record.get("cwd") is None, recovered_record
+            assert recovered_record.get("recovered") is True, recovered_record
+            assert recovered_record["drafts"]["tui"] == recovered_draft, recovered_record
+            new_sessions = {
+                session_id: record
+                for session_id, record in catalog["sessions"].items()
+                if session_id != "session-recovered-no-workspace"
+            }
+            assert len(new_sessions) == 1, catalog
+            new_session = next(iter(new_sessions.values()))
+            assert new_session["cwd"] == str(workspace), new_session
+            assert new_session["drafts"]["tui"] == new_draft, new_session
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
 
 
 def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
@@ -2445,6 +2773,7 @@ def main() -> None:
     run_turn_contract_smoke(args)
     run_retry_confirmation_smoke(args)
     run_session_navigation_smoke(args)
+    run_workspace_flow_smoke(args)
     run_background_session_busy_smoke(args)
     run_windowed_history_smoke(args)
     run_resize_and_non_tty_smoke(args)

@@ -269,6 +269,13 @@ enum Screen {
     CopyFallback,
 }
 
+#[derive(Clone)]
+enum WorkspaceFlow {
+    Initial,
+    NewSession,
+    ReplaceSession(String),
+}
+
 enum TurnMessage {
     Event {
         owner: String,
@@ -283,6 +290,7 @@ enum TurnMessage {
 struct App {
     catalog: SessionCatalog,
     screen: Screen,
+    workspace_flow: WorkspaceFlow,
     workspace_input: String,
     view: ConversationState,
     views: HashMap<String, ConversationState>,
@@ -504,6 +512,7 @@ impl App {
         Self {
             catalog,
             screen: Screen::Workspace,
+            workspace_flow: WorkspaceFlow::Initial,
             workspace_input: String::new(),
             view: ConversationState::empty(),
             views: HashMap::new(),
@@ -606,7 +615,7 @@ impl App {
             .min(self.search_hits.len().saturating_sub(1));
     }
 
-    fn open_session(&mut self, session_id: &str, turn_index: Option<usize>) {
+    fn open_session(&mut self, session_id: &str, turn_index: Option<usize>) -> bool {
         let Some(session) = self
             .sessions
             .iter()
@@ -617,7 +626,7 @@ impl App {
                 Ok(session) => self.sessions.push(session),
                 Err(error) => {
                     self.status = format!("Could not reopen session: {error}");
-                    return;
+                    return false;
                 }
             }
             self.rebuild_search_entries();
@@ -639,12 +648,12 @@ impl App {
                 self.inspector_scroll_step = 1;
             }
             self.screen = Screen::Conversation;
-            return;
+            return true;
         }
         if let Err(error) = self.persist_draft() {
             self.status = format!("Could not save the current draft: {error}");
             self.screen = Screen::Conversation;
-            return;
+            return false;
         }
         let incoming = if let Some(saved) = self.views.remove(&target_key) {
             saved
@@ -673,12 +682,15 @@ impl App {
         } else {
             session_action_status(&session)
         };
+        true
     }
 
     fn create_session(&mut self) {
         let Some(workspace) = self.workspace.clone() else {
-            self.status = "Choose a workspace before creating a session".to_string();
+            self.workspace_input.clear();
+            self.workspace_flow = WorkspaceFlow::NewSession;
             self.screen = Screen::Workspace;
+            self.status = "Choose a workspace for the new session".to_string();
             return;
         };
         if let Err(error) = self.persist_draft() {
@@ -690,19 +702,25 @@ impl App {
             .catalog
             .create_draft(SessionInterface::Tui, None, Some(&workspace))
         {
-            Ok(session) => {
-                let mut incoming = ConversationState::from_catalog(&session);
-                incoming.state_key = session.id.clone();
-                let outgoing = std::mem::replace(&mut self.view, incoming);
-                self.views.insert(outgoing.state_key.clone(), outgoing);
-                self.screen = Screen::Conversation;
-                self.inspector_open = false;
-                self.refresh_sessions();
-                self.status =
-                    "New session draft. Rename it with F3, then type a prompt.".to_string();
-            }
+            Ok(session) => self.activate_new_session(session),
             Err(error) => self.status = format!("Could not create a session: {error}"),
         }
+    }
+
+    fn activate_new_session(&mut self, session: CatalogSession) {
+        let mut incoming = ConversationState::from_catalog(&session);
+        incoming.state_key = session.id.clone();
+        let outgoing = std::mem::replace(&mut self.view, incoming);
+        if let Some(session_id) = outgoing.session_id.as_ref() {
+            self.view_aliases
+                .insert(session_id.clone(), outgoing.state_key.clone());
+        }
+        self.views.insert(outgoing.state_key.clone(), outgoing);
+        self.workspace_flow = WorkspaceFlow::Initial;
+        self.screen = Screen::Conversation;
+        self.inspector_open = false;
+        self.refresh_sessions();
+        self.status = "New session draft. Rename it with F3, then type a prompt.".to_string();
     }
 
     fn visible_session_indices(&self) -> Vec<usize> {
@@ -744,6 +762,9 @@ impl App {
     }
 
     fn begin_workspace_replacement(&mut self, session_id: &str) {
+        if !self.open_session(session_id, None) {
+            return;
+        }
         if let Some(session) = self
             .sessions
             .iter()
@@ -758,8 +779,7 @@ impl App {
         } else {
             self.workspace_input.clear();
         }
-        self.draft_id = Some(session_id.to_string());
-        self.session_id = Some(session_id.to_string());
+        self.workspace_flow = WorkspaceFlow::ReplaceSession(session_id.to_string());
         self.screen = Screen::Workspace;
         self.status = "Choose an existing replacement workspace, then press Enter".to_string();
     }
@@ -1176,32 +1196,52 @@ impl App {
                 return;
             }
         };
-        let result = match self.draft_id.as_deref() {
-            Some(draft_id) => self
+        let flow = self.workspace_flow.clone();
+        if matches!(&flow, WorkspaceFlow::NewSession)
+            && let Err(error) = self.persist_draft()
+        {
+            self.status = format!("Could not save the current draft: {error}");
+            return;
+        }
+        let result = match &flow {
+            WorkspaceFlow::ReplaceSession(session_id) => self
                 .catalog
-                .set_workspace(draft_id, canonical.as_path())
-                .and_then(|()| self.catalog.get(draft_id)),
-            None => {
+                .set_workspace(session_id, canonical.as_path())
+                .and_then(|()| self.catalog.get(session_id)),
+            WorkspaceFlow::Initial | WorkspaceFlow::NewSession => {
                 self.catalog
                     .create_draft(SessionInterface::Tui, None, Some(canonical.as_path()))
             }
         };
         match result {
-            Ok(session) => {
-                self.workspace = session.cwd.clone();
-                self.draft_id = Some(session.id.clone());
-                if self.session_id.is_some() {
-                    self.read_only = session.read_only;
-                    self.recovered = session.recovered;
-                    self.screen = Screen::Conversation;
-                    self.status = "Replacement workspace selected".to_string();
-                } else {
+            Ok(session) => match flow {
+                WorkspaceFlow::Initial => {
+                    self.workspace = session.cwd.clone();
+                    self.draft_id = Some(session.id.clone());
+                    self.session_id = None;
                     self.state_key = session.id;
+                    self.workspace_flow = WorkspaceFlow::Initial;
                     self.screen = Screen::Warning;
                     self.status = "Review and acknowledge the first-run warning".to_string();
+                    self.refresh_sessions();
                 }
-                self.refresh_sessions();
-            }
+                WorkspaceFlow::NewSession => self.activate_new_session(session),
+                WorkspaceFlow::ReplaceSession(expected_id) => {
+                    debug_assert_eq!(session.id, expected_id);
+                    self.workspace = session.cwd.clone();
+                    self.draft_id = Some(session.id.clone());
+                    self.session_id =
+                        (!session.id.starts_with("draft-")).then(|| session.id.clone());
+                    self.read_only = session.read_only;
+                    self.recovered = session.recovered;
+                    self.view_aliases
+                        .insert(session.id.clone(), self.state_key.clone());
+                    self.workspace_flow = WorkspaceFlow::Initial;
+                    self.screen = Screen::Conversation;
+                    self.status = "Replacement workspace selected".to_string();
+                    self.refresh_sessions();
+                }
+            },
             Err(error) => self.status = format!("Could not create a session draft: {error}"),
         }
     }
