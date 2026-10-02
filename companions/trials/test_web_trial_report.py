@@ -73,12 +73,16 @@ class WriteWebTrialReportTests(unittest.TestCase):
             self.assertIn(value, report)
         self.assertIn("Browser-only `about:blank` baseline: 101 bytes.", report)
         self.assertIn("10 seconds idle, then 10 one-second samples", report)
+        self.assertIn("| Unpacked trial bundle | Pass |", report)
         for workflow in BROWSER_E2E_WORKFLOWS:
             self.assertIn(workflow["name"], report)
             self.assertIn(workflow["coverage"], report)
         recorded = results["deterministic_ci_results"]["browser_e2e_workflows"]
         self.assertEqual(len(recorded), len(BROWSER_E2E_WORKFLOWS))
         self.assertTrue(all(item["result"] == "passed" for item in recorded))
+        self.assertEqual(
+            results["deterministic_ci_results"]["unpacked_trial_bundle_smoke"], "passed"
+        )
         self.assertEqual(
             results["resource_measurements"]["Web"]["host_plus_browser_total_rss_bytes"],
             606,

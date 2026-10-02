@@ -19,7 +19,9 @@ from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURE = ROOT / "trials" / "fake_provider.py"
+FIXTURE = Path(
+    os.environ.get("LEG_WEB_FIXTURE_PATH", str(ROOT / "trials" / "fake_provider.py"))
+)
 
 
 def read_until(process: subprocess.Popen[str], prefix: str, timeout: float = 15) -> str:
@@ -427,7 +429,13 @@ fn main() {
     compile_env = os.environ.copy()
     compile_env["LEG_BINDING_FIXTURE_DIR"] = str(fixture_dir)
     compiled = subprocess.run(
-        ["rustc", "--edition=2021", str(source), "-o", str(fake_leg)],
+        [
+            os.environ.get("LEG_TEST_RUSTC_BIN", "rustc"),
+            "--edition=2021",
+            str(source),
+            "-o",
+            str(fake_leg),
+        ],
         env=compile_env,
         capture_output=True,
         text=True,

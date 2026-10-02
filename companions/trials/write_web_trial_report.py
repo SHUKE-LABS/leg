@@ -124,7 +124,10 @@ def write_report(
             "bundle_size_method": measurements["method"]["bundle_size_method"],
         }
     )
+    # These depend on the preceding bundle smoke and this job's `needs: [native, lint]`.
+    # Keep both workflow gates aligned with the results recorded here.
     results["deterministic_ci_results"] = {
+        "unpacked_trial_bundle_smoke": "passed",
         "native_linux_macos": "passed",
         "browser_chromium": "passed",
         "browser_firefox": "passed",
@@ -166,6 +169,7 @@ def write_report(
                 "| Core Rust lint and tests | Pass | `lint` and `native` CI jobs |",
                 "| Release packaging | Pass | `bash tests/release_test.sh` in the Linux native job |",
                 "| Native Web host checks | Pass | Linux and macOS lifecycle smoke and package tests |",
+                "| Unpacked trial bundle | Pass | Launcher/page smoke and lifecycle smoke using packaged binaries and fixture on Linux and macOS, with Cargo and Node absent from runtime PATH |",
                 "| Chromium browser E2E | Pass | `browser_e2e.py --browser chromium` |",
                 "| Firefox browser E2E | Pass | `browser_e2e.py --browser firefox` |",
                 "",

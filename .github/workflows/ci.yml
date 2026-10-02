@@ -8,6 +8,8 @@ on:
 
 jobs:
   web-trial-artifacts:
+    # The report generator records the native/lint gates and prior bundle smoke as passed.
+    # Keep this dependency and the smoke step in sync with that report.
     needs: [native, lint]
     strategy:
       fail-fast: false
@@ -34,16 +36,37 @@ jobs:
           node-version: 22
 
       - uses: actions/setup-python@v5
-        if: ${{ matrix.platform == 'linux-x86_64' }}
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            companions/leg-web/tests/browser-requirements.txt
-            companions/leg-tui/tests/requirements.txt
 
       - name: Build experimental Web trial bundle
         run: bash scripts/build-web-trial.sh --output "${RUNNER_TEMP}/web-trial"
+
+      - name: Unpack and smoke the experimental Web trial bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find "${RUNNER_TEMP}/web-trial" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          [[ -n "${archive}" ]]
+          unpack_dir="${RUNNER_TEMP}/web-trial-unpacked"
+          mkdir -p "${unpack_dir}"
+          tar -xzf "${archive}" -C "${unpack_dir}"
+          bundle_dir="$(find "${unpack_dir}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          [[ -n "${bundle_dir}" ]]
+          python_bin="$(command -v python3)"
+          rustc_bin="$(command -v rustc)"
+          runtime_path="/usr/bin:/bin:/usr/sbin:/sbin"
+          PATH="${runtime_path}" "${python_bin}" \
+            companions/leg-web/tests/trial_bundle_smoke.py --bundle-dir "${bundle_dir}"
+          PATH="${runtime_path}" \
+            LEG_TEST_RUSTC_BIN="${rustc_bin}" \
+            LEG_WEB_FIXTURE_PATH="${bundle_dir}/companions/trials/fake_provider.py" \
+            "${python_bin}" \
+            companions/leg-web/tests/lifecycle_smoke.py \
+              "${bundle_dir}/bin/leg-web" \
+              "${bundle_dir}/bin/leg" \
+              "${bundle_dir}/bin/leg-ui-supervisor"
+          echo "WEB_TRIAL_BUNDLE_DIR=${bundle_dir}" >>"${GITHUB_ENV}"
 
       - name: Install resource measurement dependencies
         if: ${{ matrix.platform == 'linux-x86_64' }}
@@ -60,9 +83,9 @@ jobs:
           archive="$(find "${RUNNER_TEMP}/web-trial" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
           python3 companions/trials/measure_trial_resources.py \
             --web-archive "${archive}" \
-            --web-bin companions/target/release/leg-web \
-            --leg-bin target/release/leg \
-            --supervisor-bin companions/target/release/leg-ui-supervisor \
+            --web-bin "${WEB_TRIAL_BUNDLE_DIR}/bin/leg-web" \
+            --leg-bin "${WEB_TRIAL_BUNDLE_DIR}/bin/leg" \
+            --supervisor-bin "${WEB_TRIAL_BUNDLE_DIR}/bin/leg-ui-supervisor" \
             --tui-bin companions/target/release/leg-tui \
             --browser chromium \
             --output "${RUNNER_TEMP}/web-trial/resource-measurements.json"
@@ -71,13 +94,10 @@ jobs:
         if: ${{ matrix.platform == 'linux-x86_64' }}
         run: |
           archive="$(find "${RUNNER_TEMP}/web-trial" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          mkdir -p "${RUNNER_TEMP}/web-trial-unpacked"
-          tar -xzf "${archive}" -C "${RUNNER_TEMP}/web-trial-unpacked"
-          bundle_dir="$(find "${RUNNER_TEMP}/web-trial-unpacked" -mindepth 1 -maxdepth 1 -type d -print -quit)"
           python3 companions/trials/write_web_trial_report.py \
             --template companions/trials/results-template.json \
             --measurements "${RUNNER_TEMP}/web-trial/resource-measurements.json" \
-            --bundle-info "${bundle_dir}/bundle-info.json" \
+            --bundle-info "${WEB_TRIAL_BUNDLE_DIR}/bundle-info.json" \
             --archive "${archive}" \
             --output-dir "${RUNNER_TEMP}/web-trial" \
             --ci-run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
