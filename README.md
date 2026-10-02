@@ -43,6 +43,16 @@ other subject bumps patch. The first release uses the current Cargo version
 Every published npm package includes `THIRD_PARTY_NOTICES.txt` with the
 licenses of the bundled third-party Rust crates and vendored material.
 
+## Experimental TUI trial
+
+The separate terminal interface is experimental and is not part of the regular
+`leg` installation or npm package. Download a `leg-tui-experimental-*` bundle
+from a Linux or macOS CI run, or build one with the command in the
+[TUI trial quickstart](companions/leg-tui/trial/QUICKSTART.md). Run it with a
+disposable workspace and the local fixture; stop the TUI and remove the
+unpacked bundle directory when finished. This trial does not change how the
+regular `leg` binary is installed.
+
 ## Experimental Web trial
 
 The separate Web companion is experimental and is not part of the regular

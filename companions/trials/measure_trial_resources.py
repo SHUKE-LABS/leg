@@ -25,7 +25,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pyte
-from playwright.async_api import async_playwright
 
 from make_trial_archive import create_archive
 from sample_process_rss import process_table, process_tree_rss
@@ -178,6 +177,54 @@ def start_tui(
     raise RuntimeError(f"leg-tui did not show its workspace chooser: {screen.display!r}")
 
 
+def measure_tui_only(args: argparse.Namespace) -> dict[str, object]:
+    tui_archive = args.tui_archive.resolve()
+    tui_bin = args.tui_bin.resolve()
+    leg_bin = args.leg_bin.resolve()
+    supervisor_bin = args.supervisor_bin.resolve()
+    bundle_info_path = tui_bin.parent.parent / "bundle-info.json"
+    bundle_info = json.loads(bundle_info_path.read_text(encoding="utf-8"))
+
+    with tempfile.TemporaryDirectory(prefix="leg-tui-trial-measure-") as directory:
+        temporary = Path(directory)
+        workspace = temporary / "workspace"
+        state_dir = temporary / "state"
+        workspace.mkdir()
+        state_dir.mkdir()
+        process, master, startup_ms = start_tui(
+            tui_bin, leg_bin, supervisor_bin, workspace, state_dir
+        )
+        try:
+            idle = sample_process_set([process.pid])
+        finally:
+            stop_process(process)
+            os.close(master)
+
+    return {
+        "schema": "leg-ui-trial.resource-measurements/v1",
+        "source_revision": bundle_info["core_revision"],
+        "rust_target": bundle_info["rust_target"],
+        "environment": environment_info(None, None),
+        "method": {
+            "startup_ready_event": "first workspace-selection control visible",
+            "rss_tool": "companions/trials/sample_process_rss.py via ps process trees",
+            "settle_seconds": 10,
+            "sample_count": 10,
+            "sample_interval_seconds": 1,
+            "tui_process_set": "leg-tui process tree at workspace chooser",
+            "bundle_size_method": "normalized .tar.gz archive bytes",
+        },
+        "TUI": {
+            "startup_time_ms": startup_ms,
+            "idle_rss_bytes": idle["median_rss_bytes"],
+            "rss_samples": idle,
+            "bundle_size_bytes": tui_archive.stat().st_size,
+            "bundle_size_kind": "delivered TUI trial archive",
+            "bundle_archive": tui_archive.name,
+        },
+    }
+
+
 def make_tui_reference_bundle(
     stage_root: Path,
     archive_path: Path,
@@ -249,7 +296,9 @@ def make_tui_reference_bundle(
     return archive_path.stat().st_size
 
 
-def environment_info(browser_name: str, browser_version: str) -> dict[str, object]:
+def environment_info(
+    browser_name: str | None, browser_version: str | None
+) -> dict[str, object]:
     memory_bytes = None
     cpu_model = ""
     if sys.platform.startswith("linux"):
@@ -269,18 +318,23 @@ def environment_info(browser_name: str, browser_version: str) -> dict[str, objec
             ).strip()
         except subprocess.CalledProcessError:
             pass
-    return {
+    result: dict[str, object] = {
         "os": platform.platform(),
         "cpu_model": cpu_model or platform.processor() or platform.machine(),
         "architecture": platform.machine(),
         "logical_cpu_count": os.cpu_count(),
         "physical_memory_bytes": memory_bytes,
-        "browser": browser_name,
-        "browser_version": browser_version,
     }
+    if browser_name is not None:
+        result["browser"] = browser_name
+    if browser_version is not None:
+        result["browser_version"] = browser_version
+    return result
 
 
 async def measure(args: argparse.Namespace) -> dict[str, object]:
+    from playwright.async_api import async_playwright
+
     web_archive = args.web_archive.resolve()
     web_bin = args.web_bin.resolve()
     leg_bin = args.leg_bin.resolve()
@@ -392,19 +446,31 @@ async def measure(args: argparse.Namespace) -> dict[str, object]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--web-archive", type=Path, required=True)
-    parser.add_argument("--web-bin", type=Path, required=True)
-    parser.add_argument("--leg-bin", type=Path, required=True)
-    parser.add_argument("--supervisor-bin", type=Path, required=True)
-    parser.add_argument("--tui-bin", type=Path, required=True)
+    parser.add_argument("--tui-only", action="store_true", help="measure a delivered TUI bundle without Web or Playwright")
+    parser.add_argument("--tui-archive", type=Path)
+    parser.add_argument("--web-archive", type=Path)
+    parser.add_argument("--web-bin", type=Path)
+    parser.add_argument("--leg-bin", type=Path)
+    parser.add_argument("--supervisor-bin", type=Path)
+    parser.add_argument("--tui-bin", type=Path)
     parser.add_argument("--browser", choices=("chromium", "firefox"), default="chromium")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    report = asyncio.run(measure(args))
+    if args.tui_only:
+        if not all((args.tui_archive, args.tui_bin, args.leg_bin, args.supervisor_bin)):
+            parser.error("--tui-only requires --tui-archive, --tui-bin, --leg-bin, and --supervisor-bin")
+        report = measure_tui_only(args)
+    else:
+        if not all((args.web_archive, args.web_bin, args.leg_bin, args.supervisor_bin, args.tui_bin)):
+            parser.error("Web measurement requires --web-archive, --web-bin, --leg-bin, --supervisor-bin, and --tui-bin")
+        report = asyncio.run(measure(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"resource_report={args.output}")
-    print(json.dumps({"TUI": report["TUI"], "Web": report["Web"]}, indent=2))
+    summary = {"TUI": report["TUI"]}
+    if "Web" in report:
+        summary["Web"] = report["Web"]
+    print(json.dumps(summary, indent=2))
     return 0
 
 
