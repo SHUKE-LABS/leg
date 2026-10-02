@@ -43,6 +43,17 @@ other subject bumps patch. The first release uses the current Cargo version
 Every published npm package includes `THIRD_PARTY_NOTICES.txt` with the
 licenses of the bundled third-party Rust crates and vendored material.
 
+## Experimental Web trial
+
+The separate Web companion is experimental and is not part of the regular
+`leg` installation. Get the Linux or macOS bundle from the CI run's
+`leg-web-experimental-*` artifact, or build one with the command in the
+[Web trial quickstart](companions/leg-web/trial/QUICKSTART.md). The bundle
+embeds its page assets and runs locally; its tools use your OS account, with
+the selected workspace as their working directory. The workspace is not a
+sandbox. Stop the host with Ctrl-C and remove the unpacked bundle directory
+when finished.
+
 ## Usage
 
 ```

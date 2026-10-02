@@ -49,8 +49,21 @@
     "Web": {
       "startup_time_ms": null,
       "idle_rss_bytes": null,
+      "host_plus_browser_total_rss_bytes": null,
+      "browser_baseline_rss_bytes": null,
       "bundle_size_bytes": null
     }
+  },
+  "resource_measurement_method": {
+    "reference_environment": null,
+    "rss_tool": "companions/trials/sample_process_rss.py using ps",
+    "settle_seconds": 10,
+    "sample_count": 10,
+    "sample_interval_seconds": 1,
+    "tui_process_set": "leg-tui process tree",
+    "web_process_set": "leg-web host and browser process trees",
+    "browser_baseline_process_set": "same browser with about:blank, no Web host",
+    "bundle_size_method": "compressed trial archive byte length"
   },
   "limitations": []
 }

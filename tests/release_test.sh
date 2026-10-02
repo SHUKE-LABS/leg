@@ -488,7 +488,8 @@ platform not supported (linux/ppc64)" "${resolved}" \
 
 test_npm_pack_checksums() (
     set -euo pipefail
-    local repo version package_dir
+    local repo version package_dir tarball package_key target npm_os npm_cpu archive binary
+    local expected actual
     repo="$(mktemp -d)"
     trap 'rm -rf "${repo}"' EXIT
     version="0.4.25"
@@ -504,6 +505,24 @@ test_npm_pack_checksums() (
     (cd "${repo}/npm-tarballs" && release_sha256_check ../npm-SHA256SUMS)
     assert_eq "7" "$(find "${repo}/npm-tarballs" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" \
         "one npm tarball per package"
+
+    tarball="${repo}/npm-tarballs/shukelabs-leg-${version}.tgz"
+    expected="$(printf '%s\n' \
+        'package/THIRD_PARTY_NOTICES.txt' \
+        'package/bin/leg.js' \
+        'package/package.json' | sort)"
+    actual="$(tar -tzf "${tarball}" | sort)"
+    assert_eq "${expected}" "${actual}" "root npm tarball contains only its shim and notice"
+    while IFS='|' read -r package_key target npm_os npm_cpu archive binary; do
+        tarball="${repo}/npm-tarballs/shukelabs-leg-${package_key}-${version}.tgz"
+        expected="$(printf '%s\n' \
+            'package/THIRD_PARTY_NOTICES.txt' \
+            "package/bin/${binary}" \
+            'package/package.json' | sort)"
+        actual="$(tar -tzf "${tarball}" | sort)"
+        assert_eq "${expected}" "${actual}" \
+            "${package_key} npm tarball contains only its native binary and notice"
+    done < <(release_npm_platform_rows)
 
     release_npm_verify_tarballs "${repo}/npm-tarballs"
     for tarball in "${repo}"/npm-tarballs/*.tgz; do
@@ -701,6 +720,36 @@ NODE
     assert_rc_nonzero "${status}" || fail "stale notice is rejected"
 )
 
+test_web_trial_notices_cover_companion_graph() (
+    set -euo pipefail
+    local dir target manifest
+    dir="$(mktemp -d)"
+    trap 'rm -rf "${dir}"' EXIT
+    target="$(rustc -vV | sed -n 's/^host: //p')"
+
+    release_web_trial_notices_generate "${target}" >"${dir}/first.txt"
+    release_web_trial_notices_generate "${target}" >"${dir}/second.txt"
+    cmp -s "${dir}/first.txt" "${dir}/second.txt" || fail "Web notice generation is reproducible"
+    grep -q '^THIRD-PARTY NOTICES FOR leg Web trial bundle$' "${dir}/first.txt" || \
+        fail "Web notice identifies its bundle"
+    grep -q '^Crate: axum ' "${dir}/first.txt" || fail "Web notice includes the HTTP host dependency"
+
+    for manifest in Cargo.toml companions/leg-ui-client/Cargo.toml companions/leg-web/Cargo.toml; do
+        cargo tree --locked --manifest-path "${ROOT}/${manifest}" -e normal,build \
+            --target "${target}" --prefix none --format '{p}'
+    done | awk '$1 !~ /^(leg|leg-web|leg-ui-client)$/ { sub(/^v/, "", $2); print $1, $2 }' \
+        | sort -u >"${dir}/expected"
+    grep '^Crate: ' "${dir}/first.txt" | sed 's/^Crate: //' | sort -u >"${dir}/actual"
+    assert_eq "" "$(comm -23 "${dir}/expected" "${dir}/actual")" \
+        "Web notice covers core, host, and supervisor dependency graphs"
+
+    release_tui_trial_notices_generate "${target}" >"${dir}/tui.txt"
+    grep -q '^THIRD-PARTY NOTICES FOR leg TUI trial bundle$' "${dir}/tui.txt" || \
+        fail "TUI reference notice identifies its bundle"
+    grep -q '^Crate: crossterm ' "${dir}/tui.txt" || \
+        fail "TUI reference notice includes terminal dependencies"
+)
+
 tests=(
     test_manifest_and_lockfile_version_reads
     test_verify_tag_matches_manifest
@@ -717,6 +766,7 @@ tests=(
     test_npm_pack_checksums
     test_third_party_notices_fixture_rendering
     test_third_party_notices_cover_release_graph
+    test_web_trial_notices_cover_companion_graph
 )
 
 for test_name in "${tests[@]}"; do

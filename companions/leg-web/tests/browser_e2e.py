@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise the embedded Leg Web workbench in Chromium with local fixtures."""
+"""Exercise the embedded Leg Web workbench in a selected browser engine."""
 
 from __future__ import annotations
 
+import argparse
 import http.client
 import asyncio
 import json
@@ -116,6 +117,26 @@ def host_snapshot(authority: str, token: str, session_id: str) -> dict[str, obje
     return json.loads(raw)
 
 
+def api_status(
+    authority: str,
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    value: object | None = None,
+) -> int:
+    connection = http.client.HTTPConnection(authority, timeout=5)
+    body = None if value is None else json.dumps(value).encode()
+    request_headers = dict(headers)
+    if body is not None:
+        request_headers["Content-Type"] = "application/json"
+    connection.request(method, path, body=body, headers=request_headers)
+    response = connection.getresponse()
+    response.read()
+    status = response.status
+    connection.close()
+    return status
+
+
 def create_workspace_less_session(authority: str, token: str) -> dict[str, object]:
     connection = http.client.HTTPConnection(authority, timeout=5)
     connection.request(
@@ -136,6 +157,30 @@ def create_workspace_less_session(authority: str, token: str) -> dict[str, objec
     if status != 201:
         raise AssertionError(f"workspace-less session creation returned {status}: {raw!r}")
     return json.loads(raw)
+
+
+async def launch_test_browser_context(playwright, browser_name: str, profile_dir: Path):
+    viewport = {"width": 1280, "height": 800}
+    if browser_name == "firefox":
+        context = await playwright.firefox.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=True,
+            viewport=viewport,
+            firefox_user_prefs={
+                "dom.events.testing.asyncClipboard": True,
+                "dom.events.testing.enabled": True,
+            },
+        )
+        return context.browser, context, True
+
+    browser = await getattr(playwright, browser_name).launch(headless=True)
+    context = await browser.new_context(viewport=viewport)
+    return browser, context, False
+
+
+async def grant_clipboard_permissions(context, browser_name: str, origin: str) -> None:
+    if browser_name == "chromium":
+        await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)
 
 
 def recovered_request_event(session_id: str, prompt: str) -> str:
@@ -315,7 +360,9 @@ async def assert_control_visible_in_viewport(page, selector: str) -> None:
     assert bounds["y"] + bounds["height"] <= viewport["height"], (selector, bounds, viewport)
 
 
-async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
+async def run(
+    web_bin: Path, leg_bin: Path, supervisor_bin: Path, browser_name: str
+) -> None:
     with tempfile.TemporaryDirectory(prefix="leg-web-browser-e2e-") as root_string:
         root = Path(root_string)
         workspace = root / "workspace"
@@ -374,9 +421,10 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
             origin = f"http://{authority}"
 
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(headless=True)
-                context = await browser.new_context(viewport={"width": 1280, "height": 800})
-                await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)
+                browser, context, persistent_context = await launch_test_browser_context(
+                    playwright, browser_name, root / "browser-profile"
+                )
+                await grant_clipboard_permissions(context, browser_name, origin)
                 page = await context.new_page()
                 browser_requests: list[tuple[str, str]] = []
                 browser_submit_responses: list[tuple[int, str]] = []
@@ -430,6 +478,26 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 session_id = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
                 token = await page.evaluate("sessionStorage.getItem('leg-web-launch-token')")
                 assert session_id and token
+                unauthenticated = api_status(
+                    authority,
+                    "POST",
+                    f"/api/sessions/{session_id}/submit",
+                    {"Host": authority, "Origin": origin},
+                    {"request_id": 1, "prompt": "TRIAL-UNAUTHENTICATED"},
+                )
+                assert unauthenticated == 401, unauthenticated
+                hostile_origin = api_status(
+                    authority,
+                    "POST",
+                    f"/api/sessions/{session_id}/submit",
+                    {
+                        "Host": authority,
+                        "Origin": "https://attacker.invalid",
+                        "Authorization": f"Bearer {token}",
+                    },
+                    {"request_id": 1, "prompt": "TRIAL-HOSTILE-ORIGIN"},
+                )
+                assert hostile_origin == 403, hostile_origin
                 assert await page.locator("#turn-status").inner_text() == "Idle"
                 assert await page.locator("#workspace-warning").is_visible()
                 assert await page.get_by_role("button", name="Send").is_disabled()
@@ -627,16 +695,7 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 )
                 await page.unroute("**/stop", delay_stop)
                 stopped = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 3)
-                try:
-                    await wait_status(page, "Interrupted")
-                except Exception:
-                    print(
-                        "stopped turn UI state:",
-                        await page.locator("#turn-status").inner_text(),
-                        await page.locator("#connection-state").inner_text(),
-                        stopped["last_submission"]["status"],
-                    )
-                    raise
+                await wait_status(page, "Interrupted")
                 assert stopped["last_submission"]["status"] == "stopped", stopped
                 assert await composer.input_value() == active_draft
 
@@ -775,6 +834,34 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert anchor_after is not None and abs(anchor_after - anchor_before["offset"]) <= 5, (anchor_before, anchor_after)
                 await page.get_by_role("button", name="New content · Jump to latest").click()
                 assert await page.locator("#new-content").is_hidden()
+                try:
+                    await page.wait_for_function(
+                        """() => {
+                          const element = document.querySelector('#transcript');
+                          return element && element.scrollHeight - element.clientHeight - element.scrollTop <= 5;
+                        }""",
+                        timeout=5000,
+                    )
+                except PlaywrightTimeoutError as error:
+                    scroll_state = await page.locator("#transcript").evaluate(
+                        """async element => {
+                          const snapshot = () => ({
+                            scrollTop: element.scrollTop,
+                            scrollHeight: element.scrollHeight,
+                            clientHeight: element.clientHeight,
+                            gap: element.scrollHeight - element.clientHeight - element.scrollTop,
+                          });
+                          const before = snapshot();
+                          const overflowAnchor = getComputedStyle(element).overflowAnchor;
+                          element.scrollTop = element.scrollHeight;
+                          const immediate = snapshot();
+                          await new Promise(requestAnimationFrame);
+                          return {overflowAnchor, before, immediate, nextFrame: snapshot()};
+                        }"""
+                    )
+                    raise AssertionError(
+                        f"jump to latest did not reach the transcript end: {scroll_state}"
+                    ) from error
                 scroll_metrics = await transcript.evaluate("element => element.scrollHeight - element.clientHeight - element.scrollTop")
                 assert scroll_metrics <= 5, scroll_metrics
                 final = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 8)
@@ -991,13 +1078,16 @@ async def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
                 assert submits_after_provider_retry - submits_before_provider_retry == 1
 
                 await context.close()
-                await browser.close()
+                if not persistent_context:
+                    await browser.close()
         finally:
             stop_process(host, graceful=True)
             stop_process(provider, graceful=False)
 
 
-async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
+async def run_session_navigation(
+    web_bin: Path, leg_bin: Path, supervisor_bin: Path, browser_name: str
+) -> None:
     with tempfile.TemporaryDirectory(prefix="leg-web-session-rail-e2e-") as root_string:
         root = Path(root_string)
         workspace_a = root / "workspace-a"
@@ -1065,9 +1155,12 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
             missing_id = str(missing["id"])
 
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(headless=True)
-                context = await browser.new_context(viewport={"width": 1280, "height": 800})
-                await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=f"http://{authority}")
+                browser, context, persistent_context = await launch_test_browser_context(
+                    playwright, browser_name, root / "browser-profile"
+                )
+                await grant_clipboard_permissions(
+                    context, browser_name, f"http://{authority}"
+                )
                 page = await context.new_page()
                 await page.add_init_script(
                     """(() => {
@@ -1432,7 +1525,9 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                 token = restart_token
                 launch_url = restart_url
                 await page.goto(restart_url, wait_until="load")
-                await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=f"http://{restart_authority}")
+                await grant_clipboard_permissions(
+                    context, browser_name, f"http://{restart_authority}"
+                )
                 await open_session(page, alpha_id, "Alpha")
                 reopened = host_snapshot(restart_authority, restart_token, alpha_id)
                 assert reopened["session"]["cwd"] == str(workspace_a.resolve()), reopened
@@ -2299,25 +2394,30 @@ async def run_session_navigation(web_bin: Path, leg_bin: Path, supervisor_bin: P
                     "1,000-turn interaction: "
                     f"selection={selection_ms:.1f}ms, inspector={inspector_ms:.1f}ms; "
                     f"mounted turns={mounted_turns}, detail fields={mounted_detail_fields}; "
-                    f"Chromium={browser.version}, platform={platform.platform()}, viewport=1280x800; "
+                    f"{browser_name.capitalize()}={browser.version}, platform={platform.platform()}, viewport=1280x800; "
                     "timing=click event to first requestAnimationFrame showing selection/expanded panel"
                 )
                 assert not page_errors, page_errors
 
                 await context.close()
-                await browser.close()
+                if not persistent_context:
+                    await browser.close()
         finally:
             stop_process(host, graceful=True)
             stop_process(provider, graceful=False)
 
 
 async def main() -> int:
-    if len(sys.argv) != 4:
-        print("usage: browser_e2e.py LEG_WEB_BIN LEG_BIN SUPERVISOR_BIN", file=sys.stderr)
-        return 2
-    await run(*(Path(value).resolve() for value in sys.argv[1:]))
-    await run_session_navigation(*(Path(value).resolve() for value in sys.argv[1:]))
-    print("leg-web browser E2E passed")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--browser", choices=("chromium", "firefox"), default="chromium")
+    parser.add_argument("web_bin", type=Path)
+    parser.add_argument("leg_bin", type=Path)
+    parser.add_argument("supervisor_bin", type=Path)
+    args = parser.parse_args()
+    binaries = tuple(path.resolve() for path in (args.web_bin, args.leg_bin, args.supervisor_bin))
+    await run(*binaries, args.browser)
+    await run_session_navigation(*binaries, args.browser)
+    print(f"leg-web {args.browser} browser E2E passed")
     return 0
 
 
