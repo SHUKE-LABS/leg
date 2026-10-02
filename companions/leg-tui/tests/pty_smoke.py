@@ -1588,7 +1588,14 @@ def run_signal_smoke(args: argparse.Namespace) -> None:
                     else:
                         next_draft = f"idle draft survives {signal_name}"
                         os.write(master_fd, next_draft.encode())
-                        drain_for(master_fd, output, 0.15)
+                        read_until_screen_text(
+                            master_fd,
+                            child,
+                            output,
+                            next_draft,
+                            rows=DEFAULT_ROWS,
+                            columns=DEFAULT_COLUMNS,
+                        )
 
                     child.send_signal(signal_number)
                     status = drain_until_exit(master_fd, child, output)
