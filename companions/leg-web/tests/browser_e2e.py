@@ -603,6 +603,7 @@ async def run(
 
                 retry_ids: list[int] = []
                 dropped = False
+                retry_second_seen = asyncio.Event()
 
                 async def abort_before_accept(route):
                     nonlocal dropped
@@ -612,6 +613,7 @@ async def run(
                         await route.abort()
                     else:
                         await route.continue_()
+                        retry_second_seen.set()
 
                 await page.route("**/submit", abort_before_accept)
                 await composer.fill("TRIAL-CONTINUE: retry the same request ID after a lost connection")
@@ -621,6 +623,7 @@ async def run(
                 assert snapshot_before_retry["high_water"] == 1
                 assert snapshot_before_retry["next_request_id"] == 2
                 await page.get_by_role("button", name="Retry same send").click()
+                await asyncio.wait_for(retry_second_seen.wait(), timeout=5)
                 await page.unroute("**/submit", abort_before_accept)
                 assert len(retry_ids) == 2 and retry_ids[0] == retry_ids[1] == 2, retry_ids
                 await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 2)

@@ -1171,6 +1171,8 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
     const restoreIndex = items.findIndex((item) => item.key === restore.key);
     if (restoreIndex >= 0) {
       windowScrollTop = Math.max(0, estimatedHeightBefore(items, restoreIndex) - restore.offset);
+      scroller.scrollTop = windowScrollTop;
+      windowScrollTop = scroller.scrollTop;
     }
   } else if (wasAtBottom) {
     windowScrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
