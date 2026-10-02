@@ -21,7 +21,7 @@ impl PreToolHook {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
