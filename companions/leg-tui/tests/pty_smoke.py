@@ -2080,7 +2080,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             }
             assert len(new_sessions) == 1, catalog
             new_session = next(iter(new_sessions.values()))
-            assert new_session["cwd"] == str(workspace), new_session
+            assert new_session["cwd"] == str(workspace.resolve()), new_session
             assert new_session["drafts"]["tui"] == new_draft, new_session
             assert new_session["display"][WARNING_ACK_KEY] is True, new_session
         finally:
