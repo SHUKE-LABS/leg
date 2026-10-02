@@ -502,6 +502,10 @@ class Fixture:
                 "navigation_recorded_workspace_returned",
                 self.workspace is not None and str(self.workspace.resolve()) in history,
             )
+            self.check(
+                "navigation_other_session_history_excluded",
+                "TRIAL-NAV-LOSER" not in history,
+            )
             self.send_stream(handler, [{"type": "text", "text": "The reopened session kept its prior tool history and workspace."}])
             return
         if marker == "TRIAL-SEARCH-LARGE-TOOL":
@@ -636,7 +640,7 @@ class Fixture:
                 f"Long fixture line {i:03d}: preserve this historical row while new content arrives."
                 for i in range(1, 181)
             ) + "\nEND OF FIXTURE ANSWER"
-            self.send_stream(handler, [{"type": "text", "text": long_text}], pause_ms=900, marker=marker)
+            self.send_stream(handler, [{"type": "text", "text": long_text}], pause_ms=1500, marker=marker)
             return
         if marker == "TRIAL-TUI-MAX-TOKENS":
             self.send_stream(

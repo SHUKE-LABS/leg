@@ -237,10 +237,15 @@ cargo run --locked --manifest-path companions/Cargo.toml -p leg-tui -- \
 
 The UI inherits provider configuration from its launching environment. It
 requires terminals on both stdin and stdout; `leg-tui --help` also works with
-redirected streams. Choose an existing workspace directory, review the warning
-and keyboard guide, then compose a prompt. The first-run warning reads exactly:
+redirected streams. On first use, choose a workspace directory, review the
+warning and keyboard guide, then compose a prompt. Later starts open the session
+picker when the catalog contains sessions. The first-run warning reads exactly:
 
 > Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.
+
+When another interface has already populated the catalog, the TUI still shows
+the warning before starting its first new session or sending a prompt. Enter
+records the acknowledgement in the catalog for later TUI sessions.
 
 The minimum terminal size is 80 columns by 24 rows. Below that size the UI asks
 you to resize; it keeps the draft and active turn, and rejects sends until the
@@ -257,6 +262,41 @@ turn; when idle it exits and keeps the draft. External SIGINT and SIGTERM use
 the shared turn controller to stop an active turn, wait for process cleanup,
 save the draft, and restore the terminal. Editing stays available during a
 turn, but another Ctrl-S is rejected while busy.
+
+F3 opens the session picker. It shows each title, workspace, recent activity,
+turn count, and state. Use `/` to filter titles, Up/Down to select, Enter to
+reopen, N to create, R to rename, W to replace a missing workspace, and S to
+search. Busy, recovered, read-only, missing-workspace, and unverified ownership
+states are labeled in the picker and have an actionable status when opened.
+Reopening only reads history; it does not send a request. Each open session keeps
+its own composer draft and scroll position. An active turn continues in the
+background while another session is viewed, and the header reports that
+activity. Returning to it does not submit the prompt again.
+
+Ctrl-F searches session titles and the displayed prompt, reply, tool arguments,
+and tool output. Up/Down moves between matches, Enter opens the matching session
+and turn, Ctrl-U clears the query, and Esc closes search. F4 opens the selected
+turn's inspector. Up/Down selects prompt, reply, tool arguments, results, errors,
+timestamps, and status fields; `[` and `]` select a neighboring turn. Long
+inspector fields can be read with Shift-PageUp/Down. The transcript stays
+compact, and the visible turn window avoids redrawing the full history.
+
+Tool details pair results with the call id inside the same turn. The inspector
+shows completed, failed, denied, pending, and interrupted calls as text, along
+with timestamps, literal arguments and results, missing-result markers, and
+truncation warnings. Tool details use the same terminal-control sanitation as
+the transcript. A failed, interrupted, or incomplete turn is never replayed by
+viewing it.
+
+F5 requests a terminal OSC 52 copy of the selected inspector field; copying is
+explicit and never executes the text. If the terminal blocks clipboard access,
+F7 saves the selected field to a file. F6 exports transcript data only, without
+catalog metadata or inherited keys, and asks before replacing an existing file.
+F1 lists every keyboard action and the retry warning; F2 opens the shorter
+action menu. In the inspector, Ctrl-R offers an explicit retry only for the
+latest failed, interrupted, or incomplete turn. Confirm with Y after reading
+`Retry sends this prompt again and may repeat tool side effects.` Press N or Esc
+to cancel; Enter does not retry.
 
 The conversation header shows Idle, Starting, Running, Stopping, Succeeded,
 Failed, Interrupted, Incomplete, Capped, or `Succeeded (truncated)`,
@@ -279,8 +319,12 @@ to retry or N/Esc to cancel. Enter remains a newline and never retries.
 
 The native Linux/macOS PTY smoke test uses the local fake provider and explicit
 binary paths. It covers both supported sizes, resize recovery, signal cleanup,
-non-TTY startup, color-disabled output, the composer and active-turn workflows,
-and the delayed Stop regression. It uses the pinned Python VT parser in
+non-TTY startup, color-disabled output, session creation/rename/reopen after
+restart, history search and inspection, cross-interface busy rejection, draft
+and scroll retention, copy/export confirmation, a 1,000-turn history, composer
+and active-turn workflows, and the delayed Stop regression. The history test
+records open and inspector response times against the 200 ms target on the
+reference machine; catalog loading is measured separately. It uses the pinned Python VT parser in
 `companions/leg-tui/tests/requirements.txt`; install that test-only dependency
 in a virtual environment before running it:
 
@@ -290,8 +334,10 @@ python3 -m venv /tmp/leg-pty-test-venv
 cargo build --locked --bin leg
 cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
 cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui
+cargo build --locked --manifest-path companions/Cargo.toml -p leg-web
 /tmp/leg-pty-test-venv/bin/python companions/leg-tui/tests/pty_smoke.py \
   --tui-bin companions/target/debug/leg-tui \
   --leg-bin target/debug/leg \
-  --supervisor-bin companions/target/debug/leg-ui-supervisor
+  --supervisor-bin companions/target/debug/leg-ui-supervisor \
+  --web-bin companions/target/debug/leg-web
 ```
