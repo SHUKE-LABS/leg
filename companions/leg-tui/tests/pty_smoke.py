@@ -1300,6 +1300,13 @@ def select_picker_session(
         capture,
         "Sessions · title · workspace · recent · status",
     )
+    read_until_not_contains(
+        master_fd,
+        child,
+        capture,
+        "S search transcript  ·  F3/Esc back  ·  browse is read-only and never sends",
+    )
+    read_until(master_fd, child, capture, "Composer (")
 
 
 def seed_catalog_session(
@@ -2199,7 +2206,8 @@ def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
             )
             select_picker_session(master_fd, child, output, "Alpha")
             read_until(master_fd, child, output, "Succeeded")
-            assert "The first live text is visible." in output.text(), output.text()
+            read_until(master_fd, child, output, "The first live text is visible.")
+            assert "status: Succeeded" in output.text(), output.text()
             read_until(master_fd, child, output, alpha_draft)
             assert request_status(status_url)["requests"] == 1
             select_picker_session(master_fd, child, output, "Beta")
