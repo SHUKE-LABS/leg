@@ -312,3 +312,40 @@ Fill raw paired observations only after human sessions. Each ticket can run its
 fixture command; run the calculator after both interfaces' measurements are in
 the shared file. The umbrella ends when both child trial tickets are delivered.
 Evidence informs shuke's separate public-release decision.
+
+## Resource measurements
+
+Measure TUI and Web on the same reference machine, OS, workspace fixture,
+session length, and browser build. Record the OS version, CPU model and
+architecture, physical memory, browser/version, core/UI revisions, and the
+exact bundle files. These resource measurements describe setup cost; they do
+not determine a usability winner.
+
+Startup time begins when the interface process starts and ends when its first
+workspace-selection control is visible. For TUI, use the first rendered
+workspace chooser. For Web, start the host, open its printed authenticated URL
+in the selected browser, and stop when the workspace field is visible.
+
+For idle RSS, leave the initial screen idle for 10 seconds, then sample once
+per second for 10 samples with
+[`companions/trials/sample_process_rss.py`](../companions/trials/sample_process_rss.py).
+The script uses `ps -axo pid=,ppid=,rss=,command=` and sums RSS for each
+specified process root and its descendants; report the median sampled sum.
+Count the TUI process tree rooted at `leg-tui`. For Web, count the `leg-web`
+host tree and the browser process tree rooted at the browser process (not the
+Playwright driver). Also measure that same browser with `about:blank` and no
+Web host. Record the combined Web RSS, browser-only baseline, and their
+difference; the difference is Web's incremental idle RSS. Example sampling
+commands, once each PID has been identified:
+
+```sh
+python3 companions/trials/sample_process_rss.py --root-pid "$TUI_PID"
+python3 companions/trials/sample_process_rss.py --root-pid "$WEB_PID" --root-pid "$BROWSER_PID"
+python3 companions/trials/sample_process_rss.py --root-pid "$BROWSER_PID"
+```
+
+Record bundle size as the exact byte length of the compressed trial archive.
+Use Python's `os.path.getsize()` or an equivalent byte-counting command. Keep
+both archives and all measurements from the same source revisions and host.
+The Web report records the browser-only baseline separately so its incremental
+host-and-page cost can be interpreted.

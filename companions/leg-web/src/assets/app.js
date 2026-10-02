@@ -118,6 +118,7 @@ const state = {
   transcriptAverageHeight: INITIAL_TURN_HEIGHT,
   transcriptRange: null,
   transcriptRenderQueued: false,
+  followTranscriptToBottom: false,
   transcriptSearchMatches: [],
   transcriptSearchIndex: -1,
   preserveDraftRetry: null,
@@ -515,6 +516,7 @@ async function activateSession(sessionId) {
   const switchGeneration = ++state.switchGeneration;
   state.streamGeneration += 1;
   state.streamAbort?.abort();
+  state.followTranscriptToBottom = false;
   state.sessionId = sessionId;
   state.snapshot = null;
   state.active = null;
@@ -1149,7 +1151,7 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
   const items = buildTranscriptItems();
   const previousTop = scroller.scrollTop;
   const previousBottomGap = scroller.scrollHeight - scroller.clientHeight - previousTop;
-  const wasAtBottom = previousBottomGap < 36;
+  const wasAtBottom = state.followTranscriptToBottom || previousBottomGap < 36;
   const anchor = findScrollAnchor(scroller);
   const restore = state.restoreReadingPosition;
   state.transcriptItems = items;
@@ -1162,18 +1164,21 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
     state.transcriptSessionId = state.sessionId;
   }
 
+  let windowScrollTop = previousTop;
   if (restore?.atBottom) {
-    scroller.scrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
+    windowScrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
   } else if (restore?.key) {
     const restoreIndex = items.findIndex((item) => item.key === restore.key);
     if (restoreIndex >= 0) {
-      scroller.scrollTop = Math.max(0, estimatedHeightBefore(items, restoreIndex) - restore.offset);
+      windowScrollTop = Math.max(0, estimatedHeightBefore(items, restoreIndex) - restore.offset);
+      scroller.scrollTop = windowScrollTop;
+      windowScrollTop = scroller.scrollTop;
     }
   } else if (wasAtBottom) {
-    scroller.scrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
+    windowScrollTop = Math.max(0, estimatedTranscriptHeight(items) - scroller.clientHeight);
   }
 
-  let { start, end } = transcriptWindow(items, scroller.scrollTop, scroller.clientHeight);
+  let { start, end } = transcriptWindow(items, windowScrollTop, scroller.clientHeight);
   const focusedTurn = document.activeElement?.closest?.(".transcript-turn");
   if (focusedTurn) {
     const focusedIndex = items.findIndex((item) => item.key === focusedTurn.dataset.key);
@@ -1188,7 +1193,15 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
   }
   const sameRange = state.transcriptRange?.start === start && state.transcriptRange?.end === end;
   if (!force && sameRange) {
+    if (restore) {
+      restoreReadingPosition(scroller, restore);
+      state.restoreReadingPosition = null;
+    } else if (wasAtBottom) {
+      scroller.scrollTop = scroller.scrollHeight;
+      ui["new-content"].hidden = true;
+    }
     renderTranscriptSearch();
+    if (!state.active) state.followTranscriptToBottom = false;
     return;
   }
 
@@ -1226,6 +1239,7 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
         ?.focus({ preventScroll: true });
     }
     renderTranscriptSearch();
+    if (!state.active) state.followTranscriptToBottom = false;
     return;
   }
 
@@ -1263,6 +1277,7 @@ function renderTranscript({ eventsArrived = false, force = true } = {}) {
     replacement?.focus({ preventScroll: true });
   }
   renderTranscriptSearch();
+  if (!state.active) state.followTranscriptToBottom = false;
 }
 
 function estimatedHeightBefore(items, endIndex) {
@@ -1422,6 +1437,7 @@ function renderTranscriptSearch({ reset = false, navigate = false } = {}) {
 }
 
 function scrollToSearchMatch(match) {
+  state.followTranscriptToBottom = false;
   const index = state.transcriptItems.findIndex((item) => item.key === match.key);
   if (index < 0) return;
   const query = ui["transcript-search"].value.trim();
@@ -1792,6 +1808,8 @@ function appendToolInspector(article, tool, toolIndex) {
   card.append(details);
   if (expanded) appendToolDetails(details, tool);
   button.addEventListener("click", () => {
+    const anchor = findScrollAnchor(ui.transcript);
+    const previousTop = ui.transcript.scrollTop;
     const open = button.getAttribute("aria-expanded") !== "true";
     button.setAttribute("aria-expanded", String(open));
     button.textContent = `Tool ${tool.name} · ${tool.id || "ID unavailable"} · ${toolStatusLabel(tool.status)} · ${open ? "Hide details" : "Show details"}`;
@@ -1806,6 +1824,7 @@ function appendToolInspector(article, tool, toolIndex) {
     saveExpandedTools();
     measureTranscriptTurns();
     refreshTranscriptSpacers();
+    restoreScrollAnchor(ui.transcript, anchor, previousTop);
   });
   article.append(card);
 }
@@ -2303,6 +2322,7 @@ function openNewConversation() {
   state.switchGeneration += 1;
   state.streamGeneration += 1;
   state.streamAbort?.abort();
+  state.followTranscriptToBottom = false;
   state.sessionId = null;
   state.snapshot = null;
   state.active = null;
@@ -2421,12 +2441,30 @@ ui["transcript-search-clear"].addEventListener("click", () => {
 ui["download-transcript"].addEventListener("click", downloadTranscript);
 ui["stop-turn"].addEventListener("click", () => void stopTurn());
 ui["new-content"].addEventListener("click", () => {
+  state.followTranscriptToBottom = true;
+  state.restoreReadingPosition = null;
   ui["new-content"].hidden = true;
   ui.transcript.scrollTop = ui.transcript.scrollHeight;
+  saveReadingPosition();
+  renderTranscript();
   ui.transcript.focus({ preventScroll: true });
 });
+ui.transcript.addEventListener("pointerdown", () => {
+  state.followTranscriptToBottom = false;
+});
+ui.transcript.addEventListener("wheel", () => {
+  state.followTranscriptToBottom = false;
+}, { passive: true });
+ui.transcript.addEventListener("touchstart", () => {
+  state.followTranscriptToBottom = false;
+}, { passive: true });
 ui.transcript.addEventListener("keydown", (event) => {
   if (event.target !== ui.transcript) return;
+  if (event.key === "End") {
+    state.followTranscriptToBottom = true;
+  } else if (["Home", "PageUp", "PageDown"].includes(event.key)) {
+    state.followTranscriptToBottom = false;
+  }
   const page = Math.max(120, Math.floor(ui.transcript.clientHeight * 0.8));
   if (event.key === "Home") {
     event.preventDefault();

@@ -647,6 +647,7 @@ textarea:focus-visible,
   position: relative;
   min-height: 0;
   overflow: auto;
+  overflow-anchor: none;
   overscroll-behavior: contain;
   padding: 1.25rem clamp(1rem, 3vw, 2.25rem) 1.5rem;
   scroll-behavior: auto;
