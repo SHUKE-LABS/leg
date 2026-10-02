@@ -39,6 +39,7 @@ PASTED_TEXT = "first line: 中文\r\nsecond: 👩‍👩‍👧‍👦 e\u0301\r
 PROMPT = "?typed line\nfirst line: 中文\nsecond: 👩‍👩‍👧‍👦 e\u0301\nthird line\nfourth line?"
 NEXT_DRAFT = "next draft"
 EXCHANGE_SCHEMA = "baton.exchange/v1"
+WARNING_ACK_KEY = "tui_first_run_warning_acknowledged"
 LIVE_TEXT = "The first live text is visible."
 STOP_LIVE_TEXT = "Request 2: The first live text is visible."
 NEGATIVE_LIVE_TEXT = "Request 3: The first live text is visible."
@@ -1147,7 +1148,10 @@ def seed_windowed_catalog(state_dir: Path, workspace: Path, turn_count: int = 10
             "created_at_ms": now_ms,
             "updated_at_ms": now_ms,
             "drafts": {"tui": "Alpha draft survives session changes"},
-            "display": {"private_catalog_marker": "DO_NOT_EXPORT_CATALOG_DATA"},
+            "display": {
+                "private_catalog_marker": "DO_NOT_EXPORT_CATALOG_DATA",
+                WARNING_ACK_KEY: True,
+            },
         },
         "draft-windowed-beta": {
             "name": "Beta fixture",
@@ -1255,6 +1259,7 @@ def seed_catalog_session(
     reply: str,
     updated_at_ms: int,
     recovered: bool = False,
+    other_drafts: dict[str, str] | None = None,
 ) -> None:
     sessions_dir = state_dir / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -1298,7 +1303,7 @@ def seed_catalog_session(
         "name": title,
         "created_at_ms": updated_at_ms,
         "updated_at_ms": updated_at_ms,
-        "drafts": {"tui": draft},
+        "drafts": {"tui": draft, **(other_drafts or {})},
     }
     if workspace is not None:
         record["cwd"] = str(workspace)
@@ -1591,6 +1596,8 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
 
             os.write(master_fd, b"\x1bOR")
             read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
+            read_until(master_fd, child, output, str(workspace.resolve()))
+            read_until(master_fd, child, output, "Ready")
             picker = output.text()
             assert str(workspace.resolve()) in picker and "Ready" in picker, picker
             os.write(master_fd, b"r")
@@ -1846,7 +1853,10 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             assert output.contains("removed-beta-works"), output.text()
             os.write(master_fd, b"\x7f" * len(str(missing_workspace)))
             os.write(master_fd, str(replacement_workspace).encode() + b"\r")
-            read_until(master_fd, child, output, "workspace: " + str(replacement_workspace))
+            read_until(master_fd, child, output, WARNING)
+            assert "Press Enter to acknowledge" in output.text(), output.text()
+            os.write(master_fd, b"\r")
+            read_until_not_contains(master_fd, child, output, WARNING)
             read_until(master_fd, child, output, "Beta  |  model:")
             read_until_not_contains(
                 master_fd,
@@ -1922,6 +1932,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             "Recovered history reply",
             now_ms,
             recovered=True,
+            other_drafts={"web": "Existing web draft"},
         )
         env = os.environ.copy()
         env.update(
@@ -1956,7 +1967,15 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"n")
             read_until(master_fd, child, output, "Choose a workspace for the new session")
             os.write(master_fd, str(workspace).encode() + b"\r")
-            read_until(master_fd, child, output, "New session draft")
+            read_until(master_fd, child, output, WARNING)
+            assert "Press Enter to acknowledge" in output.text(), output.text()
+            blocked_prompt = "This must not be sent before warning acknowledgement"
+            os.write(master_fd, blocked_prompt.encode() + b"\x13")
+            drain_for(master_fd, output, 0.15, child)
+            assert blocked_prompt not in output.text(), output.text()
+            assert output.contains(WARNING), output.text()
+            os.write(master_fd, b"\r")
+            read_until_not_contains(master_fd, child, output, WARNING)
             new_draft = "This belongs to the new session"
             os.write(master_fd, new_draft.encode())
             read_until(master_fd, child, output, new_draft)
@@ -1972,6 +1991,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             assert recovered_record.get("cwd") is None, recovered_record
             assert recovered_record.get("recovered") is True, recovered_record
             assert recovered_record["drafts"]["tui"] == recovered_draft, recovered_record
+            assert recovered_record["drafts"]["web"] == "Existing web draft", recovered_record
             new_sessions = {
                 session_id: record
                 for session_id, record in catalog["sessions"].items()
@@ -1981,6 +2001,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             new_session = next(iter(new_sessions.values()))
             assert new_session["cwd"] == str(workspace), new_session
             assert new_session["drafts"]["tui"] == new_draft, new_session
+            assert new_session["display"][WARNING_ACK_KEY] is True, new_session
         finally:
             if child is not None:
                 kill_owned_process_group(child)

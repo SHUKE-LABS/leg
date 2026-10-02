@@ -48,6 +48,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
+const WARNING_ACK_KEY: &str = "tui_first_run_warning_acknowledged";
 const HELP: &str = "Ctrl-S send · F3 sessions · Ctrl-F search · F4 inspect · F5 copy · F6 export · F7 save copy · F1 help · F2 actions · Ctrl-C stop/exit";
 const NARROW_HELP: &str = "Ctrl-S send · Ctrl-C stop/exit · F1 help · F2 actions · F3 sessions";
 const MIN_TERMINAL_COLUMNS: u16 = 80;
@@ -291,6 +292,7 @@ struct App {
     catalog: SessionCatalog,
     screen: Screen,
     workspace_flow: WorkspaceFlow,
+    warning_acknowledged: bool,
     workspace_input: String,
     view: ConversationState,
     views: HashMap<String, ConversationState>,
@@ -513,6 +515,7 @@ impl App {
             catalog,
             screen: Screen::Workspace,
             workspace_flow: WorkspaceFlow::Initial,
+            warning_acknowledged: false,
             workspace_input: String::new(),
             view: ConversationState::empty(),
             views: HashMap::new(),
@@ -550,6 +553,13 @@ impl App {
         match self.catalog.list() {
             Ok(sessions) => {
                 self.sessions = sessions;
+                self.warning_acknowledged |= self.sessions.iter().any(|session| {
+                    session
+                        .display
+                        .get(WARNING_ACK_KEY)
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                });
                 if let Some(session_id) = self.session_id.as_ref() {
                     self.view_aliases
                         .insert(session_id.clone(), self.state_key.clone());
@@ -717,10 +727,18 @@ impl App {
         }
         self.views.insert(outgoing.state_key.clone(), outgoing);
         self.workspace_flow = WorkspaceFlow::Initial;
-        self.screen = Screen::Conversation;
+        self.screen = if self.warning_acknowledged {
+            Screen::Conversation
+        } else {
+            Screen::Warning
+        };
         self.inspector_open = false;
         self.refresh_sessions();
-        self.status = "New session draft. Rename it with F3, then type a prompt.".to_string();
+        self.status = if self.warning_acknowledged {
+            "New session draft. Rename it with F3, then type a prompt.".to_string()
+        } else {
+            "Review and acknowledge the first-run warning".to_string()
+        };
     }
 
     fn visible_session_indices(&self) -> Vec<usize> {
@@ -1237,8 +1255,16 @@ impl App {
                     self.view_aliases
                         .insert(session.id.clone(), self.state_key.clone());
                     self.workspace_flow = WorkspaceFlow::Initial;
-                    self.screen = Screen::Conversation;
-                    self.status = "Replacement workspace selected".to_string();
+                    self.screen = if self.warning_acknowledged {
+                        Screen::Conversation
+                    } else {
+                        Screen::Warning
+                    };
+                    self.status = if self.warning_acknowledged {
+                        "Replacement workspace selected".to_string()
+                    } else {
+                        "Review and acknowledge the first-run warning".to_string()
+                    };
                     self.refresh_sessions();
                 }
             },
@@ -1248,15 +1274,37 @@ impl App {
 
     fn handle_warning_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => {
-                self.screen = Screen::Conversation;
-                self.status = "Ready".to_string();
-            }
+            KeyCode::Enter => self.acknowledge_warning(),
             KeyCode::Esc => {
                 self.screen = Screen::Workspace;
                 self.status = "Choose a workspace".to_string();
             }
             _ => {}
+        }
+    }
+
+    fn acknowledge_warning(&mut self) {
+        self.warning_acknowledged = true;
+        self.screen = Screen::Conversation;
+        self.status = "Ready".to_string();
+        let record_id = self
+            .session_id
+            .as_deref()
+            .or(self.draft_id.as_deref())
+            .map(str::to_owned);
+        let Some(record_id) = record_id else {
+            return;
+        };
+        match self.catalog.save_display_metadata(
+            &record_id,
+            WARNING_ACK_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        ) {
+            Ok(()) => self.refresh_sessions(),
+            Err(error) => {
+                self.status =
+                    format!("Warning acknowledged for this run but could not be saved: {error}");
+            }
         }
     }
 
@@ -1625,6 +1673,12 @@ impl App {
     }
 
     fn start_prompt(&mut self, prompt: String, retry: Option<RetryIntent>) {
+        if !self.warning_acknowledged {
+            self.retry_confirmation = None;
+            self.screen = Screen::Warning;
+            self.status = "Review and acknowledge the first-run warning".to_string();
+            return;
+        }
         let Some(draft_id) = self.draft_id.as_deref() else {
             self.status = "Choose a workspace before sending".to_string();
             return;

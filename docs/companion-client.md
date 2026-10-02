@@ -243,6 +243,10 @@ picker when the catalog contains sessions. The first-run warning reads exactly:
 
 > Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.
 
+When another interface has already populated the catalog, the TUI still shows
+the warning before starting its first new session or sending a prompt. Enter
+records the acknowledgement in the catalog for later TUI sessions.
+
 The minimum terminal size is 80 columns by 24 rows. Below that size the UI asks
 you to resize; it keeps the draft and active turn, and rejects sends until the
 terminal is large enough again. `NO_COLOR` and `TERM=dumb` disable color while
