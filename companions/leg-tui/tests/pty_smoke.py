@@ -622,6 +622,7 @@ def start_prompt(
     if exercise_keyboard:
         os.write(master_fd, b"\x1bOP")
         read_until(master_fd, child, capture, "Keyboard help")
+        read_until(master_fd, child, capture, "Enter never confirms a retry")
         keyboard_help = capture.text()
         for hint in (
             "Ctrl-Z/Y undo/redo",
@@ -2273,8 +2274,11 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             read_until_fast(master_fd, child, output, "of 1000", timeout=0.2)
             open_elapsed = time.perf_counter() - open_started
             assert open_elapsed <= 0.2, f"opening known 1,000-turn session took {open_elapsed * 1000:.1f} ms"
+            statuses = ("Tool denied", "Tool pending", "Tool interrupted", "Tool completed")
+            for status in statuses:
+                read_until(master_fd, child, output, status)
             conversation = output.text()
-            for status in ("Tool denied", "Tool pending", "Tool interrupted", "Tool completed"):
+            for status in statuses:
                 assert status in conversation, f"transcript omitted {status!r}: {conversation!r}"
             assert "history fixture prompt 0999" in conversation
             assert "literal Ω output from turn 0999" in conversation
