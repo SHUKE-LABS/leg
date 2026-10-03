@@ -65,10 +65,13 @@ const ui = Object.fromEntries(
     "turn-status",
     "active-tool",
     "stop-turn",
+    "open-transcript-search",
+    "close-transcript-search",
     "workspace-warning",
     "connection-message",
     "transcript-warnings",
     "transcript",
+    "transcript-find-bar",
     "messages",
     "empty-transcript",
     "new-content",
@@ -126,6 +129,7 @@ const state = {
 
 let elapsedTimer = null;
 const messageRenderState = new WeakMap();
+const toastTimers = new WeakMap();
 
 class HostError extends Error {
   constructor(code, status) {
@@ -539,9 +543,8 @@ async function activateSession(sessionId) {
     state.transcriptSearchMatches = [];
     state.transcriptSearchIndex = -1;
     renderTranscriptSearch();
-    ui["copy-status"].hidden = true;
-    ui["copy-status"].textContent = "";
-    ui["download-status"].textContent = "";
+    clearTransientToast(ui["copy-status"]);
+    clearTransientToast(ui["download-status"]);
   }
   const savedDraft = window.sessionStorage.getItem(storageKey(draftPrefix, sessionId));
   ui.prompt.value = savedDraft !== null
@@ -1424,7 +1427,7 @@ function renderTranscriptSearch({ reset = false, navigate = false } = {}) {
   const excerptStart = Math.max(0, match.start - 36);
   const excerptEnd = Math.min(match.text.length, match.end + 52);
   const excerpt = `${excerptStart ? "…" : ""}${match.text.slice(excerptStart, excerptEnd).replace(/\s+/g, " ")}${excerptEnd < match.text.length ? "…" : ""}`;
-  ui["transcript-search-status"].textContent = `Match ${state.transcriptSearchIndex + 1} of ${count} · ${match.label}: ${excerpt}`;
+  ui["transcript-search-status"].textContent = `${state.transcriptSearchIndex + 1}/${count} · ${match.label}: ${excerpt}`;
 
   const turn = [...ui.messages.querySelectorAll(".transcript-turn")].find((node) => node.dataset.key === match.key);
   if (turn) {
@@ -1465,6 +1468,40 @@ function moveTranscriptSearch(direction) {
   if (!count) return;
   state.transcriptSearchIndex = (state.transcriptSearchIndex + direction + count) % count;
   renderTranscriptSearch({ navigate: true });
+}
+
+function openTranscriptSearch() {
+  ui["transcript-find-bar"].hidden = false;
+  ui["open-transcript-search"].setAttribute("aria-expanded", "true");
+  ui["transcript-search"].focus({ preventScroll: true });
+  ui["transcript-search"].select();
+}
+
+function closeTranscriptSearch() {
+  ui["transcript-search"].value = "";
+  renderTranscriptSearch({ reset: true });
+  ui["transcript-find-bar"].hidden = true;
+  ui["open-transcript-search"].setAttribute("aria-expanded", "false");
+  ui["open-transcript-search"].focus({ preventScroll: true });
+}
+
+function showTransientToast(element, message) {
+  clearTransientToast(element);
+  element.textContent = message;
+  element.hidden = false;
+  toastTimers.set(element, window.setTimeout(() => {
+    element.hidden = true;
+    element.textContent = "";
+    toastTimers.delete(element);
+  }, 3500));
+}
+
+function clearTransientToast(element) {
+  const timer = toastTimers.get(element);
+  if (timer) window.clearTimeout(timer);
+  toastTimers.delete(element);
+  element.hidden = true;
+  element.textContent = "";
 }
 
 function transcriptExportValue(value) {
@@ -1521,9 +1558,9 @@ function downloadTranscript() {
     link.click();
     link.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
-    ui["download-status"].textContent = "Transcript download started.";
+    showTransientToast(ui["download-status"], "Transcript download started.");
   } catch {
-    ui["download-status"].textContent = "Transcript download could not be created.";
+    showTransientToast(ui["download-status"], "Transcript download could not be created.");
   }
 }
 
@@ -1725,18 +1762,16 @@ function canRetryTurn(turn) {
 function appendRetryTurnControl(article, turn) {
   const control = document.createElement("div");
   control.className = "retry-turn-control";
-  const warning = document.createElement("p");
-  warning.className = "retry-turn-warning";
-  warning.textContent = "Retry sends this prompt again and may repeat tool side effects.";
   const retry = document.createElement("button");
   retry.type = "button";
   retry.className = "retry-turn-button";
   retry.dataset.turnIndex = String(turn.turn_index);
   retry.textContent = "Retry turn";
   retry.setAttribute("aria-label", `Retry turn ${turn.turn_index}`);
+  retry.title = "Resubmits this prompt; tool side effects may repeat";
   retry.disabled = !canRetryTurn(turn);
   retry.addEventListener("click", () => submitRecordedTurn(turn));
-  control.append(warning, retry);
+  control.append(retry);
   article.append(control);
 }
 
@@ -1850,8 +1885,7 @@ async function copyTranscriptText(text, fallbackContainer) {
     }
     await navigator.clipboard.writeText(text);
     fallbackContainer.querySelector(".copy-fallback")?.remove();
-    ui["copy-status"].textContent = "Copied to clipboard.";
-    ui["copy-status"].hidden = false;
+    showTransientToast(ui["copy-status"], "Copied to clipboard.");
   } catch {
     fallbackContainer.querySelector(".copy-fallback")?.remove();
     const fallback = document.createElement("div");
@@ -1869,8 +1903,7 @@ async function copyTranscriptText(text, fallbackContainer) {
     fallbackContainer.append(fallback);
     textarea.focus();
     textarea.select();
-    ui["copy-status"].textContent = "Clipboard copy failed. Select the displayed text and copy it manually.";
-    ui["copy-status"].hidden = false;
+    showTransientToast(ui["copy-status"], "Clipboard copy failed. Select the displayed text and copy it manually.");
   }
 }
 
@@ -2432,6 +2465,24 @@ ui.prompt.addEventListener("keydown", (event) => {
   void submitPrompt();
 });
 ui["retry-submission"].addEventListener("click", () => void submitPrompt({ retry: true }));
+ui["open-transcript-search"].addEventListener("click", openTranscriptSearch);
+ui["close-transcript-search"].addEventListener("click", closeTranscriptSearch);
+ui.conversation.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !ui["transcript-find-bar"].hidden) {
+    event.preventDefault();
+    closeTranscriptSearch();
+    return;
+  }
+  if (!(event.ctrlKey || event.metaKey) || !event.shiftKey || event.altKey || event.key.toLowerCase() !== "f") return;
+  event.preventDefault();
+  openTranscriptSearch();
+});
+ui["transcript-find-bar"].addEventListener("keydown", (event) => {
+  if (event.target === ui["transcript-search"] && event.key === "Enter") {
+    event.preventDefault();
+    moveTranscriptSearch(event.shiftKey ? -1 : 1);
+  }
+});
 ui["transcript-search"].addEventListener("input", () => renderTranscriptSearch({ reset: true, navigate: true }));
 ui["transcript-search-prev"].addEventListener("click", () => moveTranscriptSearch(-1));
 ui["transcript-search-next"].addEventListener("click", () => moveTranscriptSearch(1));

@@ -67,7 +67,14 @@
               </div>
               <div class="conversation-controls">
                 <button id="stop-turn" class="stop-button" type="button" hidden>Stop</button>
-                <div class="header-action-slot" aria-hidden="true"></div>
+                <div class="header-action-slot">
+                  <button id="open-transcript-search" class="header-icon-button" type="button" aria-label="Search transcript" title="Search transcript (Ctrl/Cmd+Shift+F)" aria-controls="transcript-find-bar" aria-expanded="false">
+                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.8" cy="10.8" r="6.3"></circle><path d="m15.5 15.5 5 5"></path></svg>
+                  </button>
+                  <button id="download-transcript" class="header-icon-button" type="button" aria-label="Download transcript" title="Download transcript">
+                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3.5v11"></path><path d="m7.5 10.5 4.5 4.5 4.5-4.5"></path><path d="M4.5 17v3h15v-3"></path></svg>
+                  </button>
+                </div>
               </div>
             </header>
 
@@ -92,26 +99,15 @@
 
               <aside id="transcript-warnings" class="transcript-warnings" role="note" hidden></aside>
 
-              <section class="transcript-controls" aria-label="Transcript search and export">
-                <div class="transcript-search">
-                  <label for="transcript-search">Search this transcript</label>
-                  <div class="transcript-search-row">
-                    <input id="transcript-search" type="search" autocomplete="off" placeholder="Search prompts, replies, and tool text" />
-                    <button id="transcript-search-prev" class="quiet-button" type="button" disabled>Previous</button>
-                    <button id="transcript-search-next" class="quiet-button" type="button" disabled>Next</button>
-                    <button id="transcript-search-clear" class="quiet-button" type="button" disabled>Clear</button>
-                  </div>
-                  <p id="transcript-search-status" class="transcript-search-status" role="status" aria-live="polite">Enter text to search this transcript.</p>
-                </div>
-                <div class="transcript-download">
-                  <button id="download-transcript" class="quiet-button" type="button">Download transcript</button>
-                  <p id="download-status" class="transcript-search-status" role="status" aria-live="polite"></p>
-                </div>
-              </section>
-              <p class="workbench-help">Title and transcript searches stay local; Previous and Next navigate matches, and Clear resets the query. Copy and download are explicit. “Retry turn” resubmits a finished prompt and may repeat tool side effects; “Retry same send” appears only when the host confirms a send was not accepted.</p>
-              <p id="copy-status" class="transcript-search-status copy-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
-
               <div id="transcript" class="transcript" tabindex="0" aria-label="Conversation transcript. Use Home, End, Page Up, and Page Down to browse history.">
+                <section id="transcript-find-bar" class="transcript-find-bar" role="search" aria-label="Search this transcript" hidden>
+                  <input id="transcript-search" type="search" aria-label="Search this transcript" autocomplete="off" placeholder="Find in conversation" />
+                  <button id="transcript-search-clear" class="find-bar-button" type="button" aria-label="Clear search" title="Clear search" disabled>×</button>
+                  <button id="transcript-search-prev" class="find-bar-button" type="button" aria-label="Previous match" title="Previous match" disabled>↑</button>
+                  <button id="transcript-search-next" class="find-bar-button" type="button" aria-label="Next match" title="Next match" disabled>↓</button>
+                  <button id="close-transcript-search" class="find-bar-button" type="button" aria-label="Close search" title="Close search">×</button>
+                  <p id="transcript-search-status" class="transcript-search-status" role="status" aria-live="polite" aria-atomic="true">Enter text to search this transcript.</p>
+                </section>
                 <div id="messages" class="messages"></div>
                 <p id="empty-transcript" class="empty-transcript">Your conversation will appear here.</p>
                 <button id="new-content" class="new-content-button" type="button" hidden>New content · Jump to latest</button>
@@ -140,6 +136,10 @@
                 <span id="elapsed-time" class="elapsed-time" hidden></span>
               </div>
               <span id="connection-state" class="status-line-item connection-state" role="status">Connecting to local host…</span>
+            </div>
+            <div class="action-toasts" aria-label="Action status">
+              <p id="download-status" class="action-toast" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+              <p id="copy-status" class="action-toast" role="status" aria-live="polite" aria-atomic="true" hidden></p>
             </div>
           </section>
 
