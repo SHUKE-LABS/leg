@@ -838,7 +838,7 @@ async def run(
                 await wait_status(page, "Running")
                 assert await page.locator("#elapsed-time").is_visible()
                 assert (await page.locator("#elapsed-time").inner_text()).startswith("Elapsed ")
-                active_draft = "A draft remains editable while this turn runs."
+                active_draft = "A draft remains editable\nwhile this turn runs.\nAcross three lines."
                 await composer.fill(active_draft)
                 assert await composer.input_value() == active_draft
                 assert await page.get_by_role("button", name="Send").is_disabled()
@@ -870,6 +870,15 @@ async def run(
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 assert await composer.is_enabled()
                 assert await composer.input_value() == active_draft
+                restored_layout = await composer.evaluate(
+                    """element => ({
+                      height: element.getBoundingClientRect().height,
+                      scrollHeight: element.scrollHeight,
+                      clientHeight: element.clientHeight,
+                    })"""
+                )
+                assert restored_layout["height"] > idle_composer["prompt"]["height"], restored_layout
+                assert restored_layout["scrollHeight"] <= restored_layout["clientHeight"] + 1, restored_layout
                 assert await page.get_by_role("button", name="Send").is_disabled()
                 await asyncio.to_thread(wait_high_water, authority, token, session_id, 3)
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 3)

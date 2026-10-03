@@ -555,12 +555,12 @@ async function activateSession(sessionId) {
   ui.prompt.value = savedDraft !== null
     ? savedDraft
     : state.pending?.preserveDraft ? "" : state.pending?.prompt || "";
-  adjustTextarea();
   showSendError("");
   ui["rename-form"].hidden = true;
   ui["set-workspace-form"].hidden = true;
   ui.welcome.hidden = true;
   ui.conversation.hidden = false;
+  adjustTextarea();
   const selected = state.sessions.find((session) => session.id === sessionId);
   ui["session-title"].textContent = selected ? sessionName(selected) : "Opening conversation…";
   ui["empty-transcript"].textContent = "Opening conversation…";
