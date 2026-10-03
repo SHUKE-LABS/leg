@@ -772,9 +772,45 @@ async def run(
                 assert len([url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]) - before_first_send == 1
                 assert await page.locator("#provider-model").text_content() == "anthropic · trial-fixture"
                 assert await page.locator("#provider-model").is_visible()
+                assert len(first["session"]["turns"]) == 1, first
+                assert first["session"]["turns"][0]["outcome"] == "succeeded", first
+                assert first["active"] is None, first
+                await page.get_by_text(
+                    "Three lines received, including the Chinese second line.", exact=False
+                ).wait_for()
                 transcript_text = await page.locator("#messages").inner_text()
                 assert transcript_text.count("Three lines received, including the Chinese second line.") == 1
                 assert "anthropic · trial-fixture" in transcript_text
+                assert await page.locator("#messages .transcript-turn").count() == 1
+
+                await page.set_viewport_size({"width": 1280, "height": 650})
+                await page.evaluate(
+                    """() => new Promise(resolve => requestAnimationFrame(
+                      () => requestAnimationFrame(resolve)
+                    ))"""
+                )
+                transcript_layout = await page.evaluate(
+                    """() => {
+                      const rect = document.querySelector('#transcript').getBoundingClientRect();
+                      return {
+                        height: rect.height,
+                        viewportHeight: window.innerHeight,
+                        ratio: rect.height / window.innerHeight,
+                      };
+                    }"""
+                )
+                print(
+                    f"Transcript height ({browser_name}, 1280x650): "
+                    f"{transcript_layout['height']:.1f}/{transcript_layout['viewportHeight']:.1f}px "
+                    f"({transcript_layout['ratio']:.1%})"
+                )
+                assert transcript_layout["ratio"] >= 0.7, (
+                    "#transcript must be at least 70% of the 1280x650 viewport: "
+                    f"height={transcript_layout['height']:.1f}px, "
+                    f"viewport={transcript_layout['viewportHeight']:.1f}px, "
+                    f"ratio={transcript_layout['ratio']:.1%}"
+                )
+                await page.set_viewport_size({"width": 1280, "height": 800})
 
                 retry_ids: list[int] = []
                 dropped = False
