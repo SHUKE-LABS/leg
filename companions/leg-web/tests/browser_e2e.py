@@ -875,6 +875,10 @@ async def run(
                       height: element.getBoundingClientRect().height,
                       scrollHeight: element.scrollHeight,
                       clientHeight: element.clientHeight,
+                      inlineHeight: element.style.height,
+                      computedHeight: getComputedStyle(element).height,
+                      maxHeight: getComputedStyle(element).maxHeight,
+                      conversationHidden: document.querySelector('#conversation').hidden,
                     })"""
                 )
                 assert restored_layout["height"] > idle_composer["prompt"]["height"], restored_layout

@@ -560,7 +560,12 @@ async function activateSession(sessionId) {
   ui["set-workspace-form"].hidden = true;
   ui.welcome.hidden = true;
   ui.conversation.hidden = false;
-  adjustTextarea();
+  // Let the restored content reach layout before measuring scrollHeight.
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      if (isCurrentSession(sessionId, switchGeneration)) adjustTextarea();
+    });
+  });
   const selected = state.sessions.find((session) => session.id === sessionId);
   ui["session-title"].textContent = selected ? sessionName(selected) : "Opening conversation…";
   ui["empty-transcript"].textContent = "Opening conversation…";
