@@ -662,7 +662,7 @@ textarea:focus-visible,
   overflow: auto;
   overflow-anchor: none;
   overscroll-behavior: contain;
-  padding: 1.25rem clamp(1rem, 3vw, 2.25rem) 1.5rem;
+  padding: 1.25rem clamp(0.75rem, 1.5vw, 1.25rem) 1.5rem;
   scroll-behavior: auto;
 }
 
@@ -729,6 +729,28 @@ textarea:focus-visible,
   line-height: 1.35;
 }
 
+.transcript::before,
+.transcript::after {
+  position: sticky;
+  z-index: 0;
+  display: block;
+  height: 1rem;
+  pointer-events: none;
+  content: "";
+}
+
+.transcript::before {
+  top: 0;
+  margin-bottom: -1rem;
+  background: linear-gradient(to bottom, #f8faf8, transparent);
+}
+
+.transcript::after {
+  bottom: 0;
+  margin-top: -1rem;
+  background: linear-gradient(to top, #f8faf8, transparent);
+}
+
 .conversation-content > :not(.transcript) {
   flex: 0 0 auto;
 }
@@ -737,7 +759,7 @@ textarea:focus-visible,
   display: flex;
   flex-direction: column;
   gap: 0;
-  width: min(100%, 58rem);
+  width: min(100%, 72rem);
   margin: 0 auto;
 }
 
@@ -764,14 +786,13 @@ textarea:focus-visible,
 }
 
 .message-user {
-  align-self: flex-end;
-  width: min(92%, 44rem);
+  margin-left: auto;
+  width: min(80%, 48rem);
   border: 1px solid #c7d6ce;
   background: #eef5f0;
 }
 
 .message-assistant {
-  align-self: stretch;
   border: 1px solid #e0e5e2;
   background: #fff;
 }
