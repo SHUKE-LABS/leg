@@ -9,11 +9,6 @@
   </head>
   <body>
     <div class="app-shell">
-      <header class="topbar">
-        <a class="brand" href="/" aria-label="Leg Web home">Leg <span>Web</span></a>
-        <div id="connection-state" class="connection-state" role="status">Connecting to local host…</div>
-      </header>
-
       <div class="workbench">
         <nav class="session-rail" aria-label="Sessions">
           <div class="rail-heading">
@@ -64,67 +59,59 @@
           <section id="conversation" class="conversation" aria-label="Current conversation" hidden>
             <header class="conversation-header">
               <div class="session-heading">
-                <p class="eyebrow">Current conversation</p>
                 <h2 id="session-title">Conversation</h2>
-                <p id="workspace-label" class="workspace-label">Workspace not set</p>
               </div>
-              <div class="turn-meta" aria-label="Turn details">
-                <p id="provider-model" class="provider-model">Model reported when a turn starts</p>
-                <p id="elapsed-time" class="elapsed-time" hidden></p>
+              <div class="conversation-controls">
+                <button id="stop-turn" class="stop-button" type="button" hidden>Stop</button>
+                <div class="header-action-slot" aria-hidden="true"></div>
               </div>
             </header>
 
-            <aside id="session-guidance" class="session-guidance" role="status" hidden></aside>
-            <form id="set-workspace-form" class="recovery-form" hidden>
-              <label for="recovery-workspace-input">Workspace folder path</label>
-              <input id="recovery-workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace" />
-              <div class="recovery-actions">
-                <button class="primary-button" type="submit">Set workspace</button>
-                <button id="cancel-workspace" class="quiet-button" type="button">Cancel</button>
-              </div>
-              <p id="recovery-error" class="error-message" role="alert" hidden></p>
-            </form>
-
-            <div class="activity-bar">
-              <div class="activity-copy">
-                <span id="turn-status" class="status-text">Idle</span>
-                <span id="active-tool" class="active-tool" hidden></span>
-              </div>
-              <button id="stop-turn" class="stop-button" type="button" hidden>Stop</button>
-            </div>
-
-            <aside id="workspace-warning" class="workspace-warning" role="note">
-              <strong>Before you send</strong>
-              <span>Leg can run shell commands and modify files as your OS user. The workspace shown above is its working directory, not a sandbox.</span>
-            </aside>
-
-            <p id="connection-message" class="connection-message" role="status" hidden></p>
-
-            <aside id="transcript-warnings" class="transcript-warnings" role="note" hidden></aside>
-
-            <section class="transcript-controls" aria-label="Transcript search and export">
-              <div class="transcript-search">
-                <label for="transcript-search">Search this transcript</label>
-                <div class="transcript-search-row">
-                  <input id="transcript-search" type="search" autocomplete="off" placeholder="Search prompts, replies, and tool text" />
-                  <button id="transcript-search-prev" class="quiet-button" type="button" disabled>Previous</button>
-                  <button id="transcript-search-next" class="quiet-button" type="button" disabled>Next</button>
-                  <button id="transcript-search-clear" class="quiet-button" type="button" disabled>Clear</button>
+            <div class="conversation-content">
+              <aside id="session-guidance" class="session-guidance" role="status" hidden></aside>
+              <form id="set-workspace-form" class="recovery-form" hidden>
+                <label for="recovery-workspace-input">Workspace folder path</label>
+                <input id="recovery-workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace" />
+                <div class="recovery-actions">
+                  <button class="primary-button" type="submit">Set workspace</button>
+                  <button id="cancel-workspace" class="quiet-button" type="button">Cancel</button>
                 </div>
-                <p id="transcript-search-status" class="transcript-search-status" role="status" aria-live="polite">Enter text to search this transcript.</p>
-              </div>
-              <div class="transcript-download">
-                <button id="download-transcript" class="quiet-button" type="button">Download transcript</button>
-                <p id="download-status" class="transcript-search-status" role="status" aria-live="polite"></p>
-              </div>
-            </section>
-            <p class="workbench-help">Title and transcript searches stay local; Previous and Next navigate matches, and Clear resets the query. Copy and download are explicit. “Retry turn” resubmits a finished prompt and may repeat tool side effects; “Retry same send” appears only when the host confirms a send was not accepted.</p>
-            <p id="copy-status" class="transcript-search-status copy-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+                <p id="recovery-error" class="error-message" role="alert" hidden></p>
+              </form>
 
-            <div id="transcript" class="transcript" tabindex="0" aria-label="Conversation transcript. Use Home, End, Page Up, and Page Down to browse history.">
-              <div id="messages" class="messages"></div>
-              <p id="empty-transcript" class="empty-transcript">Your conversation will appear here.</p>
-              <button id="new-content" class="new-content-button" type="button" hidden>New content · Jump to latest</button>
+              <aside id="workspace-warning" class="workspace-warning" role="note">
+                <strong>Before you send</strong>
+                <span>Leg can run shell commands and modify files as your OS user. The workspace shown above is its working directory, not a sandbox.</span>
+              </aside>
+
+              <p id="connection-message" class="connection-message" role="status" hidden></p>
+
+              <aside id="transcript-warnings" class="transcript-warnings" role="note" hidden></aside>
+
+              <section class="transcript-controls" aria-label="Transcript search and export">
+                <div class="transcript-search">
+                  <label for="transcript-search">Search this transcript</label>
+                  <div class="transcript-search-row">
+                    <input id="transcript-search" type="search" autocomplete="off" placeholder="Search prompts, replies, and tool text" />
+                    <button id="transcript-search-prev" class="quiet-button" type="button" disabled>Previous</button>
+                    <button id="transcript-search-next" class="quiet-button" type="button" disabled>Next</button>
+                    <button id="transcript-search-clear" class="quiet-button" type="button" disabled>Clear</button>
+                  </div>
+                  <p id="transcript-search-status" class="transcript-search-status" role="status" aria-live="polite">Enter text to search this transcript.</p>
+                </div>
+                <div class="transcript-download">
+                  <button id="download-transcript" class="quiet-button" type="button">Download transcript</button>
+                  <p id="download-status" class="transcript-search-status" role="status" aria-live="polite"></p>
+                </div>
+              </section>
+              <p class="workbench-help">Title and transcript searches stay local; Previous and Next navigate matches, and Clear resets the query. Copy and download are explicit. “Retry turn” resubmits a finished prompt and may repeat tool side effects; “Retry same send” appears only when the host confirms a send was not accepted.</p>
+              <p id="copy-status" class="transcript-search-status copy-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+
+              <div id="transcript" class="transcript" tabindex="0" aria-label="Conversation transcript. Use Home, End, Page Up, and Page Down to browse history.">
+                <div id="messages" class="messages"></div>
+                <p id="empty-transcript" class="empty-transcript">Your conversation will appear here.</p>
+                <button id="new-content" class="new-content-button" type="button" hidden>New content · Jump to latest</button>
+              </div>
             </div>
 
             <form id="composer" class="composer">
@@ -139,6 +126,17 @@
               </div>
               <p id="send-error" class="error-message" role="alert" hidden></p>
             </form>
+
+            <div class="conversation-status-line" role="group" aria-label="Conversation status">
+              <span id="workspace-label" class="status-line-item workspace-label" title="Workspace not set">Workspace not set</span>
+              <span id="provider-model" class="status-line-item provider-model" hidden></span>
+              <div class="status-line-item turn-status-group" role="group" aria-label="Turn details">
+                <span id="turn-status" class="status-text">Idle</span>
+                <span id="active-tool" class="active-tool" hidden></span>
+                <span id="elapsed-time" class="elapsed-time" hidden></span>
+              </div>
+              <span id="connection-state" class="status-line-item connection-state" role="status">Connecting to local host…</span>
+            </div>
           </section>
 
           <p id="live-status" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
