@@ -360,6 +360,59 @@ async def assert_control_visible_in_viewport(page, selector: str) -> None:
     assert bounds["y"] + bounds["height"] <= viewport["height"], (selector, bounds, viewport)
 
 
+async def assert_conversation_layout(
+    page, width: int, height: int, *, reconnecting: bool = False, running: bool = False
+) -> None:
+    await page.set_viewport_size({"width": width, "height": height})
+    layout = await page.evaluate(
+        """() => {
+          const header = document.querySelector('.conversation-header');
+          const statusLine = document.querySelector('.conversation-status-line');
+          const workspace = document.querySelector('#workspace-label');
+          const originalWorkspace = workspace.textContent;
+          workspace.textContent = '/very-long-workspace/' + 'nested-directory/'.repeat(80) + 'project';
+          const workspaceStyle = getComputedStyle(workspace);
+          const result = {
+            headerHeight: header.getBoundingClientRect().height,
+            statusHeight: statusLine.getBoundingClientRect().height,
+            statusWhiteSpace: getComputedStyle(statusLine).whiteSpace,
+            workspaceWidth: workspace.getBoundingClientRect().width,
+            workspaceScrollWidth: workspace.scrollWidth,
+            workspaceOverflow: workspaceStyle.overflow,
+            workspaceTextOverflow: workspaceStyle.textOverflow,
+            workspaceDirection: workspaceStyle.direction,
+            statusRole: document.querySelector('#connection-state').getAttribute('role'),
+          };
+          workspace.textContent = originalWorkspace;
+          return result;
+        }"""
+    )
+    assert layout["headerHeight"] <= 48, (width, height, layout)
+    assert layout["statusHeight"] <= 28, (width, height, layout)
+    assert layout["statusWhiteSpace"] == "nowrap", (width, height, layout)
+    assert layout["workspaceWidth"] > 0, (width, height, layout)
+    assert layout["workspaceScrollWidth"] > layout["workspaceWidth"], (width, height, layout)
+    assert layout["workspaceOverflow"] == "hidden", (width, height, layout)
+    assert layout["workspaceTextOverflow"] == "ellipsis", (width, height, layout)
+    assert layout["workspaceDirection"] == "rtl", (width, height, layout)
+    assert layout["statusRole"] == "status", (width, height, layout)
+
+    if reconnecting:
+        connection = page.locator("#connection-state")
+        assert await connection.is_visible(), (width, height)
+        assert "Reconnecting" in await connection.inner_text(), (width, height)
+        assert await connection.bounding_box(), (width, height)
+
+    if running:
+        for selector in ("#turn-status", "#active-tool", "#elapsed-time", "#stop-turn"):
+            assert await page.locator(selector).is_visible(), (width, height, selector)
+            bounds = await page.locator(selector).bounding_box()
+            assert bounds and bounds["width"] > 0, (width, height, selector, bounds)
+        assert await page.locator("#live-status").get_attribute("role") == "status"
+        assert await page.locator("#live-status").get_attribute("aria-live") == "polite"
+        await assert_control_visible_in_viewport(page, "#stop-turn")
+
+
 async def run(
     web_bin: Path, leg_bin: Path, supervisor_bin: Path, browser_name: str
 ) -> None:
@@ -452,6 +505,8 @@ async def run(
                 await page.route("**/*", local_only)
                 await page.goto(launch_url, wait_until="load")
                 assert await page.title() == "Leg Web"
+                assert await page.locator(".topbar").count() == 0
+                assert await page.locator(".brand").count() == 0
                 assert await page.locator("#workspace-warning").count() == 1
                 await page.locator("#workspace-input").fill(str(workspace))
 
@@ -469,15 +524,32 @@ async def run(
                     timeout=5000,
                 )
                 assert "Reconnecting" in await page.locator("#connection-state").inner_text()
+                for width, height in ((1280, 800), (768, 1024), (384, 512), (1280, 650)):
+                    await assert_conversation_layout(
+                        page, width, height, reconnecting=True
+                    )
+                await page.set_viewport_size({"width": 1280, "height": 800})
                 await page.wait_for_function(
-                    "() => document.querySelector('#connection-state')?.textContent.includes('Connected')",
+                    "() => document.querySelector('#connection-state')?.textContent === ''",
                     timeout=10000,
                 )
+                assert await page.locator("#connection-state").get_attribute("role") == "status"
+                assert await page.get_by_text("Connected to local host.", exact=True).count() == 0
                 await page.unroute("**/events?after=**", break_first_event_stream)
 
                 session_id = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
                 token = await page.evaluate("sessionStorage.getItem('leg-web-launch-token')")
                 assert session_id and token
+                await page.wait_for_function(
+                    """id => {
+                      const title = document.querySelector('#session-title');
+                      const entry = [...document.querySelectorAll('#session-list .session-select')]
+                        .find(item => item.dataset.sessionId === id);
+                      return title?.dataset.sessionId === id &&
+                        title.textContent === entry?.querySelector('.session-entry-name')?.textContent;
+                    }""",
+                    arg=session_id,
+                )
                 unauthenticated = api_status(
                     authority,
                     "POST",
@@ -499,6 +571,9 @@ async def run(
                 )
                 assert hostile_origin == 403, hostile_origin
                 assert await page.locator("#turn-status").inner_text() == "Idle"
+                assert await page.locator("#provider-model").is_hidden()
+                assert await page.locator("#workspace-label").text_content() == str(workspace)
+                assert await page.locator("#workspace-label").get_attribute("title") == str(workspace)
                 assert await page.locator("#workspace-warning").is_visible()
                 assert await page.get_by_role("button", name="Send").is_disabled()
                 assert host_snapshot(authority, token, session_id)["high_water"] == 0
@@ -596,7 +671,8 @@ async def run(
                 assert first["high_water"] == 1, first
                 assert fixture_status(provider_authority)["input_checks"].get("chinese_multiline_prompt") is True
                 assert len([url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]) - before_first_send == 1
-                assert "anthropic · trial-fixture" in (await page.locator("#provider-model").inner_text())
+                assert await page.locator("#provider-model").text_content() == "anthropic · trial-fixture"
+                assert await page.locator("#provider-model").is_visible()
                 transcript_text = await page.locator("#messages").inner_text()
                 assert transcript_text.count("Three lines received, including the Chinese second line.") == 1
                 assert "anthropic · trial-fixture" in transcript_text
@@ -653,6 +729,9 @@ async def run(
                 assert paused["active"]["provider"] == "anthropic"
                 assert paused["active"]["model"] == "trial-fixture"
                 await page.set_viewport_size({"width": 1280, "height": 800})
+                await assert_control_visible_in_viewport(page, "#composer")
+                await assert_control_visible_in_viewport(page, "#stop-turn")
+                await page.set_viewport_size({"width": 1280, "height": 650})
                 await assert_control_visible_in_viewport(page, "#composer")
                 await assert_control_visible_in_viewport(page, "#stop-turn")
                 await page.set_viewport_size({"width": 768, "height": 1024})
@@ -935,6 +1014,9 @@ async def run(
                         f"pending tool disclosure did not render; state={page_state}; page errors={page_errors}"
                     ) from error
                 assert "Pending" in await pending_tool.inner_text()
+                for width, height in ((1280, 800), (768, 1024), (384, 512), (1280, 650)):
+                    await assert_conversation_layout(page, width, height, running=True)
+                await page.set_viewport_size({"width": 1280, "height": 800})
                 await pending_tool.click()
                 assert await pending_tool.get_attribute("aria-expanded") == "true"
                 await page.reload(wait_until="load")
@@ -1191,15 +1273,19 @@ async def run_session_navigation(
                 await page.route("**/*", local_only)
                 await page.goto(launch_url, wait_until="load")
 
-                async def open_session(target_page, session_id: str, title: str) -> None:
+                async def open_session(target_page, session_id: str, title: str | None) -> None:
                     await target_page.locator(
                         f'#session-list .session-select[data-session-id="{session_id}"]'
                     ).click()
                     await target_page.wait_for_function(
                         "({id, title}) => !document.querySelector('#conversation').hidden && "
-                        "document.querySelector('#session-title')?.dataset.sessionId === id && "
-                        "document.querySelector('#session-title')?.textContent === title && "
-                        "document.querySelector('#connection-state')?.textContent === 'Connected to local host.'",
+                        "(() => { const heading = document.querySelector('#session-title'); "
+                        "const entry = [...document.querySelectorAll('#session-list .session-select')] "
+                        ".find(item => item.dataset.sessionId === id); "
+                        "const railTitle = entry?.querySelector('.session-entry-name')?.textContent; "
+                        "return heading?.dataset.sessionId === id && (!title || heading.textContent === title) && "
+                        "heading.textContent === railTitle && "
+                        "document.querySelector('#connection-state')?.textContent === ''; })()",
                         arg={"id": session_id, "title": title},
                         timeout=10000,
                     )
@@ -1303,7 +1389,7 @@ async def run_session_navigation(
                     return result
 
                 await page.locator(f'#session-list .session-select[data-session-id="{missing_id}"]').wait_for()
-                await open_session(page, missing_id, "Conversation")
+                await open_session(page, missing_id, None)
                 assert "Choose a workspace folder" in await page.locator("#session-guidance").inner_text()
                 assert await page.get_by_role("button", name="Send").is_disabled()
                 await page.locator("#session-guidance").get_by_role("button", name="Set workspace").click()
@@ -1314,7 +1400,7 @@ async def run_session_navigation(
                 )
                 assert await page.locator("#session-guidance").is_hidden()
 
-                await open_session(page, recovered_id, "Conversation")
+                await open_session(page, recovered_id, None)
                 assert "recovered conversation" in (await page.locator("#session-guidance").inner_text()).lower()
                 await page.locator("#session-guidance").get_by_role("button", name="Set workspace").click()
                 await page.locator("#recovery-workspace-input").fill(str(workspace_a))
@@ -1324,7 +1410,7 @@ async def run_session_navigation(
                     "document.querySelector('#session-guidance')?.hidden"
                 )
 
-                await open_session(page, readonly_id, "Conversation")
+                await open_session(page, readonly_id, None)
                 assert "recovered conversation" in (await page.locator("#session-guidance").inner_text()).lower()
                 await page.locator("#session-guidance").get_by_role("button", name="Set workspace").click()
                 await page.locator("#recovery-workspace-input").fill(str(workspace_a))
@@ -2182,7 +2268,7 @@ async def run_session_navigation(
                 page2 = await context.new_page()
                 page2.on("pageerror", lambda error: page_errors.append(str(error)))
                 await page2.goto(launch_url, wait_until="load")
-                await open_session(page2, cross_tab_id, "Conversation")
+                await open_session(page2, cross_tab_id, None)
                 cross_tab_draft = "TRIAL-TAB-DRAFT: preserve this local text"
                 cross_tab_prompt = "TRIAL-CROSS-TAB: show the host-accepted prompt"
                 await page.locator("#prompt").fill(cross_tab_draft)

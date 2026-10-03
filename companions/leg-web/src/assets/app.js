@@ -436,9 +436,10 @@ async function api(path, { method = "GET", body } = {}) {
 
 function setConnection(text, reconnecting = false) {
   state.reconnecting = reconnecting;
+  const visibleText = text === "Connected to local host." ? "" : text;
   if (state.connectionText !== text) {
     state.connectionText = text;
-    ui["connection-state"].textContent = text;
+    ui["connection-state"].textContent = visibleText;
   }
   ui["connection-message"].hidden = !reconnecting;
   ui["connection-message"].textContent = reconnecting
@@ -944,9 +945,10 @@ function renderAll(options = {}) {
   }
   const session = state.snapshot.session;
   ui["session-title"].dataset.sessionId = session.id;
-  ui["session-title"].textContent = session.name || "Conversation";
+  ui["session-title"].textContent = sessionName(session);
   const cwd = session.cwd || "Workspace not set";
-  ui["workspace-label"].textContent = `Workspace: ${cwd}`;
+  ui["workspace-label"].textContent = cwd;
+  ui["workspace-label"].title = cwd;
   ui["workspace-warning"].hidden = Boolean((session.turns || []).length || state.snapshot.high_water > 0);
   renderSessionGuidance();
   renderProviderModel();
@@ -978,9 +980,9 @@ function renderProviderModel() {
     provider ||= metadata?.provider;
     model ||= metadata?.model;
   }
-  ui["provider-model"].textContent = provider && model
-    ? `Effective: ${provider} · ${model}`
-    : "Effective model and provider appear when leg reports turn metadata.";
+  const hasMetadata = Boolean(provider && model);
+  ui["provider-model"].textContent = hasMetadata ? `${provider} · ${model}` : "";
+  ui["provider-model"].hidden = !hasMetadata;
 }
 
 function renderElapsed() {
