@@ -1294,6 +1294,7 @@ async def run_session_navigation(
                     entry = target_page.locator(
                         f'#session-list .session-entry:has(.session-select[data-session-id="{session_id}"])'
                     )
+                    await entry.hover()
                     await entry.locator(".session-rename").click()
                     await target_page.locator("#rename-input").fill(name)
                     await target_page.get_by_role("button", name="Save name").click()
@@ -1464,7 +1465,48 @@ async def run_session_navigation(
                 await open_session(page, beta_draft_id, "Beta")
                 assert await page.locator("#prompt").input_value() == beta_draft
 
-                session_filter = page.locator("#session-filter")
+                session_filter = page.get_by_role("searchbox", name="Filter sessions by title")
+                assert await session_filter.count() == 1
+                assert await page.locator('label[for="session-filter"]').count() == 0
+                assert await page.get_by_role("list", name="Recent sessions").count() == 1
+                heading_box = await page.locator("#session-list-heading").bounding_box()
+                assert (
+                    heading_box
+                    and heading_box["width"] <= 1
+                    and heading_box["height"] <= 1
+                ), heading_box
+                assert await page.locator(".rail-help").count() == 0
+
+                alpha_entry = page.locator(
+                    f'#session-list .session-entry:has(.session-select[data-session-id="{alpha_id}"])'
+                )
+                rename_button = alpha_entry.locator(".session-rename")
+                await page.mouse.move(1200, 780)
+                idle_rename_state = await rename_button.evaluate(
+                    "element => { const style = getComputedStyle(element); return { "
+                    "opacity: style.opacity, display: style.display, visibility: style.visibility, "
+                    "tabIndex: element.tabIndex }; }"
+                )
+                assert idle_rename_state["opacity"] == "0", idle_rename_state
+                assert idle_rename_state["display"] != "none", idle_rename_state
+                assert idle_rename_state["visibility"] != "hidden", idle_rename_state
+                assert idle_rename_state["tabIndex"] >= 0, idle_rename_state
+
+                await alpha_entry.hover()
+                assert await rename_button.evaluate("element => getComputedStyle(element).opacity") == "1"
+                await page.mouse.move(1200, 780)
+                await alpha_entry.locator(".session-select").focus()
+                await page.keyboard.press("Tab")
+                assert await rename_button.evaluate("element => document.activeElement === element")
+                assert await rename_button.evaluate("element => getComputedStyle(element).opacity") == "1"
+
+                await page.locator("#new-conversation").focus()
+                await page.set_viewport_size({"width": 760, "height": 800})
+                await page.mouse.move(700, 780)
+                assert await rename_button.evaluate("element => getComputedStyle(element).opacity") == "1"
+                await page.set_viewport_size({"width": 1280, "height": 800})
+                await page.mouse.move(1200, 780)
+
                 await session_filter.fill("alpha")
                 assert await page.locator("#session-list .session-entry").count() == 1
                 assert await page.locator("#session-list .session-entry-name").inner_text() == "Alpha"

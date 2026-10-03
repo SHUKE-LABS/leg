@@ -16,8 +16,13 @@
             <button id="new-conversation" class="quiet-button" type="button">New</button>
           </div>
           <div class="session-filter">
-            <label for="session-filter">Filter by title</label>
-            <input id="session-filter" type="search" autocomplete="off" placeholder="Search session titles" />
+            <input
+              id="session-filter"
+              type="search"
+              autocomplete="off"
+              placeholder="Search session titles"
+              aria-label="Filter sessions by title"
+            />
           </div>
           <form id="rename-form" class="rail-form" hidden>
             <label for="rename-input">Session name</label>
@@ -28,12 +33,11 @@
             </div>
             <p id="rename-error" class="error-message" role="alert" hidden></p>
           </form>
-          <p id="session-list-heading" class="rail-section-label">Recent sessions</p>
+          <p id="session-list-heading" class="visually-hidden">Recent sessions</p>
           <ul id="session-list" class="session-list" aria-labelledby="session-list-heading"></ul>
           <p id="session-list-empty" class="rail-note" hidden>No saved sessions yet. Choose New to begin.</p>
           <p id="session-list-no-results" class="rail-note" role="status" hidden>No sessions match this title.</p>
           <p id="session-list-error" class="rail-message" role="status" hidden></p>
-          <p class="rail-note rail-help">The workspace is the working directory for tools.</p>
         </nav>
 
         <main class="main-panel">
