@@ -1777,6 +1777,29 @@ async def run_session_navigation(
                 assert "2/180" in await page.locator("#transcript-search-status").inner_text()
                 await page.locator("#transcript-search-prev").click()
                 assert "1/180" in await page.locator("#transcript-search-status").inner_text()
+                composing_enter_prevented = await transcript_search.evaluate(
+                    """input => {
+                      const event = new KeyboardEvent('keydown', {
+                        key: 'Enter', bubbles: true, cancelable: true, isComposing: true,
+                      });
+                      input.dispatchEvent(event);
+                      return event.defaultPrevented;
+                    }"""
+                )
+                assert not composing_enter_prevented
+                assert "1/180" in await page.locator("#transcript-search-status").inner_text()
+                legacy_composing_enter_prevented = await transcript_search.evaluate(
+                    """input => {
+                      const event = new KeyboardEvent('keydown', {
+                        key: 'Enter', bubbles: true, cancelable: true,
+                      });
+                      Object.defineProperty(event, 'keyCode', { value: 229 });
+                      input.dispatchEvent(event);
+                      return event.defaultPrevented;
+                    }"""
+                )
+                assert not legacy_composing_enter_prevented
+                assert "1/180" in await page.locator("#transcript-search-status").inner_text()
                 await transcript_search.press("Enter")
                 assert "2/180" in await page.locator("#transcript-search-status").inner_text()
                 await transcript_search.press("Shift+Enter")

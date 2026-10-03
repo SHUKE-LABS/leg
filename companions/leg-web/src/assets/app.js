@@ -2479,6 +2479,7 @@ ui.conversation.addEventListener("keydown", (event) => {
 });
 ui["transcript-find-bar"].addEventListener("keydown", (event) => {
   if (event.target === ui["transcript-search"] && event.key === "Enter") {
+    if (event.isComposing || event.keyCode === 229) return;
     event.preventDefault();
     moveTranscriptSearch(event.shiftKey ? -1 : 1);
   }
