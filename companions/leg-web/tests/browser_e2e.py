@@ -619,6 +619,46 @@ async def run(
                 assert host_snapshot(authority, token, session_id)["high_water"] == 0
                 assert fixture_status(provider_authority)["requests"] == 0
 
+                await page.set_viewport_size({"width": 1280, "height": 650})
+                idle_composer = await page.evaluate(
+                    """() => {
+                      const bounds = element => {
+                        const rect = element.getBoundingClientRect();
+                        return { top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom, height: rect.height };
+                      };
+                      const form = document.querySelector('#composer');
+                      const field = document.querySelector('.composer-field');
+                      const prompt = document.querySelector('#prompt');
+                      const send = document.querySelector('#send');
+                      return {
+                        formHeight: bounds(form).height,
+                        field: bounds(field),
+                        prompt: bounds(prompt),
+                        send: bounds(send),
+                        rows: prompt.rows,
+                        ariaLabel: prompt.getAttribute('aria-label'),
+                        placeholder: prompt.placeholder,
+                        retryHidden: document.querySelector('#retry-submission').hidden,
+                        errorHidden: document.querySelector('#send-error').hidden,
+                        keyHelpExists: Boolean(document.querySelector('.key-help')),
+                      };
+                    }"""
+                )
+                assert idle_composer["formHeight"] <= 64, idle_composer
+                assert idle_composer["rows"] == 1, idle_composer
+                assert idle_composer["ariaLabel"] == "Message", idle_composer
+                assert idle_composer["placeholder"].startswith("Message — "), idle_composer
+                assert (
+                    "Ctrl+Enter" in idle_composer["placeholder"] or "⌘+Enter" in idle_composer["placeholder"]
+                ), idle_composer
+                assert idle_composer["prompt"]["right"] <= idle_composer["send"]["left"], idle_composer
+                assert idle_composer["send"]["right"] <= idle_composer["field"]["right"], idle_composer
+                assert idle_composer["send"]["top"] >= idle_composer["field"]["top"], idle_composer
+                assert idle_composer["send"]["bottom"] <= idle_composer["field"]["bottom"], idle_composer
+                assert idle_composer["retryHidden"] and idle_composer["errorHidden"], idle_composer
+                assert not idle_composer["keyHelpExists"], idle_composer
+                await page.set_viewport_size({"width": 1280, "height": 800})
+
                 composer = page.get_by_role("textbox", name="Message")
                 await composer.fill("Plain Enter keeps this as a draft")
                 await composer.press("End")
@@ -651,6 +691,25 @@ async def run(
                 assert await composer.input_value() == pasted
                 await composer.fill(chinese_prompt)
                 assert await composer.input_value() == chinese_prompt
+                await page.set_viewport_size({"width": 1280, "height": 650})
+                multiline_height = await composer.evaluate("element => element.getBoundingClientRect().height")
+                assert multiline_height > idle_composer["prompt"]["height"], multiline_height
+                assert multiline_height < 650 * 0.4, multiline_height
+                await composer.fill("\n".join(f"long line {index}" for index in range(80)))
+                capped_composer = await composer.evaluate(
+                    """element => ({
+                      height: element.getBoundingClientRect().height,
+                      scrollHeight: element.scrollHeight,
+                      clientHeight: element.clientHeight,
+                      overflowY: getComputedStyle(element).overflowY,
+                      cap: innerHeight * 0.4,
+                    })"""
+                )
+                assert abs(capped_composer["height"] - capped_composer["cap"]) <= 1, capped_composer
+                assert capped_composer["overflowY"] == "auto", capped_composer
+                assert capped_composer["scrollHeight"] > capped_composer["clientHeight"], capped_composer
+                await composer.fill(chinese_prompt)
+                await page.set_viewport_size({"width": 1280, "height": 800})
 
                 before_first_send = len([url for method, url in browser_requests if method == "POST" and url.endswith("/submit")])
                 draft_session_id = session_id
@@ -735,6 +794,25 @@ async def run(
                 await composer.fill("TRIAL-CONTINUE: retry the same request ID after a lost connection")
                 await page.get_by_role("button", name="Send").click()
                 await page.get_by_role("button", name="Retry same send").wait_for(state="visible")
+                retry_layout = await page.evaluate(
+                    """() => {
+                      const bounds = selector => {
+                        const rect = document.querySelector(selector).getBoundingClientRect();
+                        return { top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left };
+                      };
+                      return {
+                        field: bounds('.composer-field'),
+                        prompt: bounds('#prompt'),
+                        retry: bounds('#retry-submission'),
+                        send: bounds('#send'),
+                      };
+                    }"""
+                )
+                assert retry_layout["prompt"]["right"] <= retry_layout["retry"]["left"], retry_layout
+                assert retry_layout["retry"]["right"] <= retry_layout["send"]["left"], retry_layout
+                assert retry_layout["send"]["right"] <= retry_layout["field"]["right"], retry_layout
+                assert retry_layout["retry"]["top"] >= retry_layout["field"]["top"], retry_layout
+                assert retry_layout["send"]["bottom"] <= retry_layout["field"]["bottom"], retry_layout
                 snapshot_before_retry = host_snapshot(authority, token, session_id)
                 assert snapshot_before_retry["high_water"] == 1
                 assert snapshot_before_retry["next_request_id"] == 2

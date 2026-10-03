@@ -88,6 +88,10 @@ const ui = Object.fromEntries(
     "live-status",
   ].map((id) => [id, document.getElementById(id)]),
 );
+const platform = navigator.userAgentData?.platform || navigator.platform || "";
+ui.prompt.placeholder = /mac/i.test(platform)
+  ? "Message — ⌘+Enter to send"
+  : "Message — Ctrl+Enter to send";
 
 const state = {
   sessionId: window.sessionStorage.getItem(sessionKey),
@@ -478,7 +482,11 @@ function savePending() {
 }
 
 function adjustTextarea() {
-  ui.prompt.rows = Math.min(8, Math.max(3, ui.prompt.value.split("\n").length));
+  ui.prompt.style.height = "auto";
+  const maxHeight = window.innerHeight * 0.4;
+  const contentHeight = ui.prompt.scrollHeight;
+  ui.prompt.style.height = `${Math.min(contentHeight, maxHeight)}px`;
+  ui.prompt.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
 }
 
 function absoluteWorkspace(value) {
@@ -2423,6 +2431,7 @@ ui.composer.addEventListener("submit", (event) => {
   void submitPrompt();
 });
 ui.prompt.addEventListener("input", formatPromptChange);
+window.addEventListener("resize", adjustTextarea);
 ui.prompt.addEventListener("compositionstart", () => { state.composition = true; });
 ui.prompt.addEventListener("compositionend", () => { state.composition = false; });
 ui.prompt.addEventListener("keydown", (event) => {
