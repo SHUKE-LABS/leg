@@ -63,38 +63,10 @@ textarea:focus-visible,
 
 .app-shell {
   display: grid;
-  grid-template-rows: 3.6rem minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   width: 100%;
   height: 100dvh;
   min-height: 0;
-}
-
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  border-bottom: 1px solid #d5ded9;
-  padding: 0 1.25rem;
-  background: #fff;
-}
-
-.brand {
-  color: #173c30;
-  font-size: 1.05rem;
-  font-weight: 750;
-  letter-spacing: -0.025em;
-  text-decoration: none;
-}
-
-.brand span {
-  color: #66776f;
-  font-weight: 500;
-}
-
-.connection-state {
-  color: #35463f;
-  font-size: 0.875rem;
 }
 
 .workbench {
@@ -481,20 +453,130 @@ textarea:focus-visible,
 
 .conversation {
   display: grid;
-  grid-template-rows: auto auto auto auto auto auto minmax(5rem, 1fr) auto;
+  grid-template-rows: 3rem minmax(0, 1fr) auto 1.75rem;
   width: 100%;
   height: 100%;
   min-height: 0;
 }
 
+.conversation-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .conversation-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.75rem;
+  min-width: 0;
+  min-height: 0;
+  max-height: 3rem;
   border-bottom: 1px solid #dbe3de;
-  padding: 1rem clamp(1rem, 3vw, 2.25rem) 0.85rem;
+  padding: 0.25rem clamp(0.75rem, 1.5vw, 1.25rem);
   background: #f8faf8;
+}
+
+.session-heading {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.session-heading h2 {
+  overflow: hidden;
+  font-size: 1rem;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.header-action-slot {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.conversation-status-line {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+  min-height: 1.75rem;
+  max-height: 1.75rem;
+  overflow: hidden;
+  border-top: 1px solid #dbe3de;
+  padding: 0 0.75rem;
+  color: #54645c;
+  background: #fff;
+  font-size: 0.7rem;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.status-line-item {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.status-line-item:not(:first-child)::before {
+  flex: 0 0 auto;
+  margin: 0 0.4rem;
+  color: #89968f;
+  content: "·";
+}
+
+.workspace-label {
+  display: block;
+  flex-basis: 30%;
+  max-width: 30%;
+  min-width: 2.25rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  unicode-bidi: plaintext;
+}
+
+.provider-model {
+  display: block;
+  min-width: 3ch;
+  max-width: 25%;
+  overflow: hidden;
+  color: #42564c;
+  text-overflow: ellipsis;
+}
+
+.turn-status-group {
+  flex: 1 1 auto;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.connection-state {
+  display: block;
+  min-width: 4rem;
+  max-width: 24%;
+  color: #35463f;
+  text-overflow: ellipsis;
+}
+
+.connection-state:empty {
+  display: none;
 }
 
 .session-guidance {
@@ -527,73 +609,39 @@ textarea:focus-visible,
   max-width: 22rem;
 }
 
-.session-heading {
-  min-width: 0;
-}
-
-.session-heading h2 {
-  overflow-wrap: anywhere;
-  font-size: 1.25rem;
-}
-
-.workspace-label {
-  max-width: 56vw;
-  margin: 0.3rem 0 0;
-  overflow-wrap: anywhere;
-  color: #51635a;
-  font-size: 0.82rem;
-}
-
-.turn-meta {
-  flex: 0 0 auto;
-  max-width: 40%;
-  text-align: right;
-}
-
-.provider-model,
-.elapsed-time {
-  margin: 0.2rem 0 0;
-  color: #42564c;
-  font-size: 0.8rem;
-  overflow-wrap: anywhere;
-}
-
-.elapsed-time {
-  font-variant-numeric: tabular-nums;
-}
-
-.activity-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  min-height: 3rem;
-  border-bottom: 1px solid #e1e7e3;
-  padding: 0.4rem clamp(1rem, 3vw, 2.25rem);
-  background: #fff;
-}
-
-.activity-copy {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.55rem 1rem;
-  min-width: 0;
-}
-
 .status-text {
-  font-size: 0.85rem;
+  flex: 0 0 auto;
+  font-size: 0.7rem;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .active-tool {
+  flex: 0 1 auto;
+  min-width: 3ch;
+  overflow: hidden;
   color: #3f5148;
-  font-size: 0.82rem;
-  overflow-wrap: anywhere;
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.elapsed-time {
+  flex: 0 0 auto;
+  max-width: 5.5rem;
+  margin: 0;
+  overflow: hidden;
+  color: #42564c;
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .stop-button {
   flex: 0 0 auto;
+  min-height: 2.5rem;
+  padding: 0.35rem 0.75rem;
   border-color: #8f3333;
   color: #842c2c;
   font-weight: 700;
@@ -645,12 +693,17 @@ textarea:focus-visible,
 
 .transcript {
   position: relative;
+  flex: 1 1 0;
   min-height: 0;
   overflow: auto;
   overflow-anchor: none;
   overscroll-behavior: contain;
   padding: 1.25rem clamp(1rem, 3vw, 2.25rem) 1.5rem;
   scroll-behavior: auto;
+}
+
+.conversation-content > :not(.transcript) {
+  flex: 0 0 auto;
 }
 
 .messages {
@@ -948,9 +1001,6 @@ textarea:focus-visible,
 }
 
 .composer {
-  position: sticky;
-  bottom: 0;
-  z-index: 2;
   border-top: 1px solid #d4ded8;
   padding: 0.8rem clamp(1rem, 3vw, 2.25rem) 0.9rem;
   background: #fff;
@@ -1029,14 +1079,6 @@ textarea:focus-visible,
     display: none;
   }
 
-  .workspace-label {
-    max-width: 100%;
-  }
-
-  .turn-meta {
-    max-width: 45%;
-  }
-
   .workspace-warning {
     align-items: flex-start;
     flex-direction: column;
@@ -1049,29 +1091,13 @@ textarea:focus-visible,
 }
 
 @media (max-width: 25rem) {
-  .topbar {
-    padding-inline: 0.75rem;
-  }
-
   .connection-state {
-    max-width: 58%;
-    font-size: 0.75rem;
-    text-align: right;
+    font-size: 0.68rem;
   }
 
-  .conversation-header {
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-
-  .turn-meta {
-    max-width: 100%;
-    text-align: left;
-  }
-
-  .provider-model,
-  .elapsed-time {
-    font-size: 0.75rem;
+  .conversation-status-line {
+    padding-inline: 0.4rem;
+    font-size: 0.64rem;
   }
 
   .composer-footer {
@@ -1089,14 +1115,9 @@ textarea:focus-visible,
   }
 
   .app-shell {
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
     min-height: 100dvh;
     height: 100dvh;
-  }
-
-  .topbar {
-    min-height: 3.4rem;
-    padding-inline: 0.85rem;
   }
 
   .workbench {
@@ -1179,36 +1200,8 @@ textarea:focus-visible,
     padding: 1.15rem;
   }
 
-  .conversation-header {
-    flex-direction: column;
-    gap: 0.35rem;
-    padding: 0.7rem 0.85rem;
-  }
-
   .session-heading h2 {
-    font-size: 1.1rem;
-  }
-
-  .workspace-label {
-    max-width: 100%;
-  }
-
-  .turn-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem 0.75rem;
-    max-width: 100%;
-    text-align: left;
-  }
-
-  .provider-model,
-  .elapsed-time {
-    margin-top: 0;
-  }
-
-  .activity-bar {
-    min-height: 2.7rem;
-    padding-inline: 0.85rem;
+    font-size: 0.9rem;
   }
 
   .workspace-warning {
@@ -1278,14 +1271,6 @@ textarea:focus-visible,
 }
 
 @media (max-height: 620px) {
-  .conversation-header {
-    padding-block: 0.45rem;
-  }
-
-  .activity-bar {
-    min-height: 2.5rem;
-  }
-
   .workspace-warning {
     padding-block: 0.35rem;
   }
