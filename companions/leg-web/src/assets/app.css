@@ -139,7 +139,6 @@ textarea:focus-visible,
   gap: 0.35rem;
 }
 
-.session-filter label,
 .transcript-search label {
   color: #42564c;
   font-size: 0.75rem;
@@ -167,15 +166,6 @@ textarea:focus-visible,
 
 .rail-note {
   margin-top: auto;
-}
-
-.rail-section-label {
-  margin: 0;
-  color: #42564c;
-  font-size: 0.75rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
 .session-list {
@@ -311,6 +301,14 @@ textarea:focus-visible,
   color: #355b4b;
   font-size: 0.75rem;
   background: transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.session-entry:hover .session-rename,
+.session-entry:focus-within .session-rename {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .session-rename:hover:not(:disabled) {
@@ -360,10 +358,6 @@ textarea:focus-visible,
   color: #842c2c;
   font-size: 0.78rem;
   line-height: 1.4;
-}
-
-.rail-help {
-  margin-top: auto;
 }
 
 .main-panel {
@@ -1024,11 +1018,6 @@ textarea:focus-visible,
     width: 100%;
   }
 
-  .rail-section-label,
-  .rail-help {
-    display: none;
-  }
-
   .workspace-label {
     max-width: 100%;
   }
@@ -1045,6 +1034,13 @@ textarea:focus-visible,
 
   .composer-footer {
     flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 760px) {
+  .session-rename {
+    opacity: 1;
+    pointer-events: auto;
   }
 }
 
