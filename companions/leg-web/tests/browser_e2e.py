@@ -413,6 +413,46 @@ async def assert_conversation_layout(
         await assert_control_visible_in_viewport(page, "#stop-turn")
 
 
+async def assert_transcript_body_width(page) -> None:
+    await page.set_viewport_size({"width": 1280, "height": 650})
+    layout = await page.evaluate(
+        """() => {
+          const transcript = document.querySelector('#transcript');
+          const transcriptStyle = getComputedStyle(transcript);
+          const messages = document.querySelector('#messages');
+          const assistant = document.querySelector('#messages .message-assistant');
+          const user = document.querySelector('#messages .message-user');
+          const before = getComputedStyle(transcript, '::before');
+          const after = getComputedStyle(transcript, '::after');
+          const jump = document.querySelector('#new-content');
+          return {
+            innerWidth: transcript.clientWidth
+              - parseFloat(transcriptStyle.paddingLeft)
+              - parseFloat(transcriptStyle.paddingRight),
+            assistantWidth: assistant?.getBoundingClientRect().width ?? null,
+            messagesWidth: messages.getBoundingClientRect().width,
+            messagesRight: messages.getBoundingClientRect().right,
+            userWidth: user?.getBoundingClientRect().width ?? null,
+            userRight: user?.getBoundingClientRect().right ?? null,
+            beforePointerEvents: before.pointerEvents,
+            afterPointerEvents: after.pointerEvents,
+            beforeZIndex: Number(before.zIndex),
+            afterZIndex: Number(after.zIndex),
+            jumpZIndex: Number(getComputedStyle(jump).zIndex),
+          };
+        }"""
+    )
+    assert layout["assistantWidth"] is not None and layout["userWidth"] is not None, layout
+    assert layout["assistantWidth"] >= layout["innerWidth"] * 0.8, layout
+    expected_user_width = min(layout["messagesWidth"] * 0.8, 48 * 16)
+    assert abs(layout["userWidth"] - expected_user_width) <= 1, layout
+    assert abs(layout["messagesRight"] - layout["userRight"]) <= 1, layout
+    assert layout["beforePointerEvents"] == "none", layout
+    assert layout["afterPointerEvents"] == "none", layout
+    assert layout["jumpZIndex"] > layout["beforeZIndex"], layout
+    assert layout["jumpZIndex"] > layout["afterZIndex"], layout
+
+
 async def run(
     web_bin: Path, leg_bin: Path, supervisor_bin: Path, browser_name: str
 ) -> None:
@@ -890,6 +930,7 @@ async def run(
                 await wait_status(page, "Succeeded")
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 10)
                 await page.get_by_text("END OF FIXTURE ANSWER", exact=False).wait_for()
+                await assert_transcript_body_width(page)
 
                 transcript = page.locator("#transcript")
                 await transcript.evaluate("element => { element.scrollTop = Math.round(element.scrollHeight * 0.45); }")
