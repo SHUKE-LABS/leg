@@ -1798,7 +1798,31 @@ async def run_session_navigation(
                 await open_session(page, alpha_id, "Alpha")
                 assert await page.locator("#prompt").input_value() == alpha_local_draft
                 assert await page.evaluate("() => navigator.clipboard.readText()") == "NO_AUTO_COPY_SENTINEL"
-                assert "Title and transcript searches stay local" in await page.locator(".workbench-help").inner_text()
+                assert await page.locator(".workbench-help").count() == 0
+                assert await page.locator("#transcript-find-bar").is_hidden()
+                assert await page.locator(".transcript-controls").count() == 0
+                await page.locator("#open-transcript-search").focus()
+                await page.keyboard.press("Tab")
+                assert await page.evaluate("() => document.activeElement?.id") == "download-transcript"
+                await page.locator("#open-transcript-search").click()
+                assert await page.evaluate("() => document.activeElement?.id") == "transcript-search"
+                await page.locator("#transcript-search").press("Escape")
+                assert await page.locator("#transcript-find-bar").is_hidden()
+                assert await page.evaluate("() => document.activeElement?.id") == "open-transcript-search"
+                await page.locator("#transcript").evaluate("element => { element.scrollTop = element.scrollHeight; }")
+                await page.locator("#transcript").focus()
+                await page.keyboard.press("Control+Shift+F")
+                await page.locator("#transcript-find-bar").wait_for(state="visible")
+                assert await page.evaluate("() => document.activeElement?.id") == "transcript-search"
+                find_bar_bounds = await page.evaluate(
+                    """() => {
+                      const bar = document.querySelector('#transcript-find-bar').getBoundingClientRect();
+                      const transcript = document.querySelector('#transcript').getBoundingClientRect();
+                      return {barTop: bar.top, barBottom: bar.bottom, transcriptTop: transcript.top, transcriptBottom: transcript.bottom};
+                    }"""
+                )
+                assert find_bar_bounds["transcriptTop"] <= find_bar_bounds["barTop"] < find_bar_bounds["transcriptTop"] + 40, find_bar_bounds
+                assert find_bar_bounds["barBottom"] <= find_bar_bounds["transcriptBottom"], find_bar_bounds
 
                 provider_before_search = await asyncio.to_thread(fixture_status, provider_authority)
                 submit_count_before_search = len(
@@ -1808,7 +1832,7 @@ async def run_session_navigation(
                 await transcript_search.fill("Long fixture line")
                 try:
                     await page.wait_for_function(
-                        "() => document.querySelector('#transcript-search-status')?.textContent.includes('Match 1 of 180')",
+                        "() => document.querySelector('#transcript-search-status')?.textContent.includes('1/180')",
                         timeout=5000,
                     )
                 except PlaywrightTimeoutError as error:
@@ -1841,12 +1865,44 @@ async def run_session_navigation(
                     ) from error
                 search_status = await page.locator("#transcript-search-status").inner_text()
                 await page.locator("#transcript-search-next").click()
-                assert "Match 2 of 180" in await page.locator("#transcript-search-status").inner_text()
+                assert "2/180" in await page.locator("#transcript-search-status").inner_text()
                 await page.locator("#transcript-search-prev").click()
-                assert "Match 1 of 180" in await page.locator("#transcript-search-status").inner_text()
+                assert "1/180" in await page.locator("#transcript-search-status").inner_text()
+                composing_enter_prevented = await transcript_search.evaluate(
+                    """input => {
+                      const event = new KeyboardEvent('keydown', {
+                        key: 'Enter', bubbles: true, cancelable: true, isComposing: true,
+                      });
+                      input.dispatchEvent(event);
+                      return event.defaultPrevented;
+                    }"""
+                )
+                assert not composing_enter_prevented
+                assert "1/180" in await page.locator("#transcript-search-status").inner_text()
+                legacy_composing_enter_prevented = await transcript_search.evaluate(
+                    """input => {
+                      const event = new KeyboardEvent('keydown', {
+                        key: 'Enter', bubbles: true, cancelable: true,
+                      });
+                      Object.defineProperty(event, 'keyCode', { value: 229 });
+                      input.dispatchEvent(event);
+                      return event.defaultPrevented;
+                    }"""
+                )
+                assert not legacy_composing_enter_prevented
+                assert "1/180" in await page.locator("#transcript-search-status").inner_text()
+                await transcript_search.press("Enter")
+                assert "2/180" in await page.locator("#transcript-search-status").inner_text()
+                await transcript_search.press("Shift+Enter")
+                assert "1/180" in await page.locator("#transcript-search-status").inner_text()
                 await transcript_search.fill("no-match-sentinel")
                 await page.get_by_text("No matches found in this transcript.", exact=True).wait_for()
                 await page.locator("#transcript-search-clear").click()
+                await transcript_search.press("Escape")
+                assert await page.locator("#transcript-find-bar").is_hidden()
+                assert await transcript_search.input_value() == ""
+                assert await page.evaluate("() => document.activeElement?.id") == "open-transcript-search"
+                await page.locator("#open-transcript-search").click()
                 assert await page.evaluate("() => navigator.clipboard.readText()") == "NO_AUTO_COPY_SENTINEL"
                 assert await page.locator("#prompt").input_value() == alpha_local_draft
                 assert await page.evaluate("() => navigator.clipboard.readText()") == "NO_AUTO_COPY_SENTINEL"
@@ -1955,6 +2011,7 @@ async def run_session_navigation(
                 await page.locator("#copy-status").wait_for(state="visible")
                 assert await page.locator("#copy-status").inner_text() == "Copied to clipboard."
                 assert await page.evaluate("() => navigator.clipboard.readText()") == unicode_reply
+                await page.locator("#copy-status").wait_for(state="hidden")
                 await page.locator('#messages [data-key="turn-5-assistant"] .code-copy-button').click()
                 assert await page.evaluate("() => navigator.clipboard.readText()") == "const greeting = '你好';\nsecond line Δ\n"
                 tool_result_text = seed["session"]["turns"][0]["tools"][0]["result"]["result"]
@@ -2075,6 +2132,7 @@ async def run_session_navigation(
                     "trial-only-not-a-secret",
                 ):
                     assert secret not in exported_text, secret
+                await page.locator("#download-status").wait_for(state="hidden")
                 await page.unroute(export_pattern, inject_export_sentinels)
                 provider_after_local_controls = await asyncio.to_thread(fixture_status, provider_authority)
                 submit_count_after_local_controls = len(
@@ -2101,9 +2159,10 @@ async def run_session_navigation(
                 retry_action = page.locator('#messages [data-key="turn-0-assistant"] .retry-turn-button')
                 await retry_action.wait_for(state="visible")
                 assert await retry_action.inner_text() == "Retry turn"
+                assert await retry_action.get_attribute("title") == "Resubmits this prompt; tool side effects may repeat"
                 assert await page.get_by_text(
                     "Retry sends this prompt again and may repeat tool side effects.", exact=True
-                ).is_visible()
+                ).count() == 0
                 failed_provider_status = await asyncio.to_thread(fixture_status, provider_authority)
                 assert failed_provider_status["scenario_requests"].get("TRIAL-REOPEN-FAILURE") == 1
 

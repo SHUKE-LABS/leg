@@ -157,21 +157,25 @@ from that tab's pending send or the host snapshot, while the draft stays in the
 composer.
 
 Use **Filter by title** in the session rail to narrow the already loaded
-session list. **Search this transcript** searches the selected snapshot's
-prompts, replies, failure details, outcomes, and tool names, inputs, statuses,
-results, and errors locally. Previous and Next move through matches; Clear removes the
-query, and a no-match message is shown when nothing matches. Search includes
-the full transcript text even when a large tool result is shown as a summary.
-It does not submit a request or load tool details. Searching and switching
-sessions leave the composer draft intact.
+session list. The **Search transcript** header button, or Ctrl/Cmd+Shift+F
+while the conversation has focus, opens the find bar over the transcript. It
+searches the selected snapshot's prompts, replies, failure details, outcomes,
+and tool names, inputs, statuses, results, and errors locally. The bar shows the
+current match and total as `n/m`; its Previous and Next arrow buttons or Enter
+and Shift+Enter move through matches. Clear removes the query, and a no-match
+message appears when nothing matches. Escape closes and clears the bar, then
+returns focus to the search button. Search includes the full transcript text
+even when a large tool result is shown as a summary. It does not submit a
+request or load tool details. Searching and switching sessions leave the
+composer draft intact.
 
 Copy is always an explicit action on a prompt, reply, code block, or tool input,
 result, or error. Reply and tool text retain their newlines and Unicode. The UI
-reports clipboard success; if clipboard access is denied or unavailable, it
-shows selectable text for manual copying. Selecting or viewing transcript text
-does not copy it.
+briefly reports clipboard success; if clipboard access is denied or unavailable,
+it shows selectable text for manual copying. Selecting or viewing transcript
+text does not copy it.
 
-**Download transcript** creates a local JSON file with schema
+The **Download transcript** header button creates a local JSON file with schema
 `leg-web.transcript/v1`. Its allowlist is `turn_index`, `prompt`, optional
 `reply`, optional `failure_message`, `outcome`, and `tools`. Each tool includes
 `tool_name`, `input`, and optional `result` containing `status`, optional
@@ -182,15 +186,15 @@ structured tool inputs, including generic token fields and token names using
 camel, snake, or kebab case; authorization or auth headers, keys, or tokens;
 API, access, refresh, session, bearer, ID, or launch tokens; client secrets and
 secret, private, or signing keys; credentials; and passwords. Transcript text
-and free-form tool output are kept as recorded.
-Searching, copying, viewing, and downloading do not call a provider or execute
-tools.
+and free-form tool output are kept as recorded. A short-lived status toast
+reports the download result. Searching, copying, viewing, and downloading do
+not call a provider or execute tools.
 
 For a finished failed or interrupted turn, **Retry turn** explicitly submits
 that turn's recorded prompt with the host's next request ID and leaves the
 composer draft unchanged. It is disabled while the session is busy or
-read-only, or a submission is unresolved. The warning is: “Retry sends this
-prompt again and may repeat tool side effects.” **Retry same send** is separate:
+read-only, or a submission is unresolved. Its title warns that resubmitting may
+repeat tool side effects. **Retry same send** is separate:
 it appears only when the host proves that a pending submission was not
 accepted, then reuses that send's ID and exact text for reconciliation.
 
