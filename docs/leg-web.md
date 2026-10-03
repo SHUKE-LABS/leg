@@ -211,13 +211,16 @@ incomplete, and catalog warnings remain visible apart from normal success.
 Expanding a card only renders the saved display data; it does not contact the
 provider.
 
-Long histories use a bounded scrolling window so the page does not mount every
-turn or tool detail at once. Focus the transcript and use Home, End, Page Up,
-or Page Down to reach any part of the conversation. Unmounted turns are not
-included in the browser's Find search (Ctrl+F); use transcript navigation to
-reach older content first. The browser E2E reports session-selection and
-inspector feedback through the first animation frame, plus mounted turn/detail
-counts and the Chromium version.
+Assistant replies use the available transcript width; submitted prompts stay
+narrower and right-aligned. Soft fades at the transcript edges help clipped
+lines read as scrollable content. Long histories use a bounded scrolling window
+so the page does not mount every turn or tool detail at once. Focus the
+transcript and use Home, End, Page Up, or Page Down to reach any part of the
+conversation.
+Unmounted turns are not included in the browser's Find search (Ctrl+F); use
+transcript navigation to reach older content first. The browser E2E reports
+session-selection and inspector feedback through the first animation frame,
+plus mounted turn/detail counts and the Chromium version.
 
 Session history browsing and detailed execution inspection are covered by
 #85. The manual keyboard and screen-reader checklist is
