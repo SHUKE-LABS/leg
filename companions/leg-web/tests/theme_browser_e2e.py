@@ -510,7 +510,7 @@ async def run(
                     "submit": len([item for item in requests if item[1].endswith("/submit")]),
                     "stop": len([item for item in requests if item[1].endswith("/stop")]),
                 }
-                await common.send_with_keyboard(page)
+                await common.send_with_keyboard(page, wait_ready=False)
                 assert await page.locator("#prompt").input_value() == draft
                 assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
                 await choose_theme(page, "fixture", wait_for_session=False)

@@ -351,9 +351,39 @@ async def wait_status(page, expected: str, timeout: int = 30000) -> None:
     )
 
 
-async def send_with_keyboard(page) -> None:
+async def wait_for_keyboard_send_ready(page) -> None:
+    """Mirror the former Send button's readiness using existing rendered state."""
+    await page.wait_for_function(
+        """() => {
+          const sessionId = sessionStorage.getItem('leg-web-current-session');
+          const conversation = document.querySelector('#conversation');
+          const title = document.querySelector('#session-title');
+          const connection = document.querySelector('#connection-state');
+          const guidance = document.querySelector('#session-guidance');
+          const status = document.querySelector('#turn-status')?.textContent;
+          const retry = document.querySelector('#retry-submission');
+          const stop = document.querySelector('#stop-turn');
+          return Boolean(sessionId && title?.dataset.sessionId === sessionId &&
+            conversation && !conversation.hidden && connection?.textContent === '' &&
+            guidance?.hidden === true && retry?.hidden === true && stop?.hidden === true &&
+            status && !['Starting', 'Running', 'Stopping', 'Reconnecting'].includes(status));
+        }""",
+        timeout=15000,
+    )
+
+
+async def send_with_keyboard(page, *, wait_ready: bool = True) -> None:
+    if wait_ready:
+        await wait_for_keyboard_send_ready(page)
     modifier = "Meta" if platform.system() == "Darwin" else "Control"
-    await page.locator("#prompt").press(f"{modifier}+Enter")
+    if wait_ready:
+        async with page.expect_request(
+            lambda request: request.method == "POST" and request.url.endswith("/submit"),
+            timeout=5000,
+        ):
+            await page.locator("#prompt").press(f"{modifier}+Enter")
+    else:
+        await page.locator("#prompt").press(f"{modifier}+Enter")
 
 
 async def assert_control_visible_in_viewport(page, selector: str) -> None:
@@ -673,7 +703,7 @@ async def run(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
                 )
                 await composer.fill(" \t\n ")
-                await send_with_keyboard(page)
+                await send_with_keyboard(page, wait_ready=False)
                 assert host_snapshot(authority, token, session_id)["high_water"] == 0
                 assert len(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
@@ -749,7 +779,13 @@ async def run(
                 first_receipt_task = None
                 try:
                     await send_with_keyboard(page)
-                    await send_with_keyboard(page)
+                    submit_count_after_first = len(
+                        [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                    )
+                    await send_with_keyboard(page, wait_ready=False)
+                    assert len(
+                        [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                    ) == submit_count_after_first
                     await page.wait_for_function(
                         "() => document.querySelector('#turn-status')?.textContent === 'Starting'",
                         timeout=5000,
@@ -886,7 +922,7 @@ async def run(
                 active_submit_count = len(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
                 )
-                await send_with_keyboard(page)
+                await send_with_keyboard(page, wait_ready=False)
                 assert await composer.input_value() == active_draft
                 assert len(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
