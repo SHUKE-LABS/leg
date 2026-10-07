@@ -965,6 +965,12 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
+.tool-round-text {
+  margin: 0.55rem 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .tool-inspector {
   margin-top: 0.75rem;
   border: 1px solid #d9e1dc;

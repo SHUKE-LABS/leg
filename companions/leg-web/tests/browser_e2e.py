@@ -279,6 +279,103 @@ def long_history_fixture(session_id: str, count: int = 1000) -> str:
     return "".join(json.dumps(event) + "\n" for event in events)
 
 
+def chronological_history_fixture(session_id: str) -> str:
+    coordinates = {"schema": "baton.exchange/v1", "session_id": session_id, "turn_index": 0}
+    first_tool = {
+        "type": "tool_use",
+        "id": "fixture-tool-one",
+        "name": "fixture-one",
+        "input": {"value": 1},
+    }
+    second_tool = {
+        "type": "tool_use",
+        "id": "fixture-tool-two",
+        "name": "fixture-two",
+        "input": {"value": 2},
+    }
+    orphan_tool = {
+        "id": "fixture-tool-orphan",
+        "name": "fixture-orphan",
+        "input": {"value": 3},
+    }
+    events = [
+        {"schema": "baton.exchange/v1", "event": "session_start", "ts_ms": 1, "session_id": session_id},
+        {
+            **coordinates,
+            "event": "request",
+            "ts_ms": 2,
+            "model": "fixture",
+            "base_url": "http://fixture.invalid",
+            "prompt": "CHRONO_SNAPSHOT_PROMPT",
+        },
+        {
+            **coordinates,
+            "event": "tool_round",
+            "ts_ms": 3,
+            "content": [{"type": "text", "text": "CHRONO_ROUND_A"}, first_tool],
+        },
+        {
+            **coordinates,
+            "event": "tool_call",
+            "ts_ms": 4,
+            "tool_use_id": first_tool["id"],
+            "tool_name": first_tool["name"],
+            "input": first_tool["input"],
+        },
+        {
+            **coordinates,
+            "event": "tool_result",
+            "ts_ms": 5,
+            "tool_use_id": first_tool["id"],
+            "tool_name": first_tool["name"],
+            "status": "completed",
+            "result": "fixture result one",
+        },
+        {**coordinates, "event": "tool_round", "ts_ms": 6, "content": [second_tool]},
+        {
+            **coordinates,
+            "event": "tool_call",
+            "ts_ms": 7,
+            "tool_use_id": second_tool["id"],
+            "tool_name": second_tool["name"],
+            "input": second_tool["input"],
+        },
+        {
+            **coordinates,
+            "event": "tool_result",
+            "ts_ms": 8,
+            "tool_use_id": second_tool["id"],
+            "tool_name": second_tool["name"],
+            "status": "completed",
+            "result": "fixture result two",
+        },
+        {
+            **coordinates,
+            "event": "tool_call",
+            "ts_ms": 9,
+            "tool_use_id": orphan_tool["id"],
+            "tool_name": orphan_tool["name"],
+            "input": orphan_tool["input"],
+        },
+        {
+            **coordinates,
+            "event": "tool_result",
+            "ts_ms": 10,
+            "tool_use_id": orphan_tool["id"],
+            "tool_name": orphan_tool["name"],
+            "status": "completed",
+            "result": "fixture orphan result",
+        },
+        {
+            **coordinates,
+            "event": "response_ok",
+            "ts_ms": 11,
+            "reply": "CHRONO_FINAL_REPLY_R",
+        },
+    ]
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
 def wait_until(predicate, description: str, timeout: float = 25):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1366,6 +1463,121 @@ async def run(
                 )
                 assert submits_after_provider_retry - submits_before_provider_retry == 1
 
+                restart_token = urlsplit(restart_url).fragment
+                chronology_before = await asyncio.to_thread(
+                    host_snapshot, restart_authority, restart_token, retry_session_id
+                )
+                chronology_request_id = int(chronology_before["next_request_id"])
+                chronology_prompt = "TRIAL-CHRONOLOGICAL-ORDER: render tool rounds chronologically"
+                await page.locator("#prompt").fill(chronology_prompt)
+                await send_with_keyboard(page)
+                await page.wait_for_function(
+                    """() => {
+                      const turn = [...document.querySelectorAll('#messages .transcript-turn')].at(-1);
+                      return turn?.querySelector('.message-assistant .message-content')?.textContent.trim() === 'CHRONO_FINAL_REPLY_R' &&
+                        document.querySelector('#turn-status')?.textContent === 'Running';
+                    }""",
+                    timeout=10000,
+                )
+                live_chronology = await asyncio.to_thread(
+                    host_snapshot, restart_authority, restart_token, retry_session_id
+                )
+                live_turn = live_chronology["session"]["turns"][-1]
+                assert len(live_turn["tool_rounds"]) == 2, live_turn
+                first_live_tool = live_turn["tool_rounds"][0][1]["id"]
+                second_live_tool = live_turn["tool_rounds"][1][0]["id"]
+                live_order = await page.locator("#messages .transcript-turn").last.evaluate(
+                    """turn => {
+                      const order = [turn.querySelector('.message-user .message-content')?.textContent.trim()];
+                      const assistant = turn.querySelector('.message-assistant');
+                      for (const node of assistant.children) {
+                        if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                        else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
+                      }
+                      return order;
+                    }"""
+                )
+                assert live_order == [
+                    chronology_prompt,
+                    "CHRONO_ROUND_A",
+                    first_live_tool,
+                    second_live_tool,
+                    "CHRONO_FINAL_REPLY_R",
+                    "outcome:Running",
+                ], live_order
+                assert await page.locator("#empty-transcript").is_hidden()
+
+                await page.reload(wait_until="load")
+                await page.wait_for_function(
+                    """() => {
+                      const turn = [...document.querySelectorAll('#messages .transcript-turn')].at(-1);
+                      return turn?.querySelector('.message-assistant .message-content')?.textContent.trim() === 'CHRONO_FINAL_REPLY_R' &&
+                        document.querySelector('#turn-status')?.textContent === 'Running';
+                    }""",
+                    timeout=5000,
+                )
+                reloaded_live_order = await page.locator("#messages .transcript-turn").last.evaluate(
+                    """turn => {
+                      const order = [turn.querySelector('.message-user .message-content')?.textContent.trim()];
+                      const assistant = turn.querySelector('.message-assistant');
+                      for (const node of assistant.children) {
+                        if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                        else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
+                      }
+                      return order;
+                    }"""
+                )
+                assert reloaded_live_order == live_order, reloaded_live_order
+                assert await page.locator("#empty-transcript").is_hidden()
+
+                completed_chronology = await asyncio.to_thread(
+                    wait_completed_submission,
+                    restart_authority,
+                    restart_token,
+                    retry_session_id,
+                    chronology_request_id,
+                )
+                await wait_status(page, "Succeeded")
+                assert completed_chronology["last_submission"]["status"] == "succeeded", completed_chronology
+                await page.reload(wait_until="load")
+                await wait_status(page, "Succeeded")
+                reopened_order = await page.locator("#messages .transcript-turn").last.evaluate(
+                    """turn => {
+                      const order = [turn.querySelector('.message-user .message-content')?.textContent.trim()];
+                      const assistant = turn.querySelector('.message-assistant');
+                      for (const node of assistant.children) {
+                        if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                        else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
+                      }
+                      return order;
+                    }"""
+                )
+                assert reopened_order == [
+                    chronology_prompt,
+                    "CHRONO_ROUND_A",
+                    first_live_tool,
+                    second_live_tool,
+                    "CHRONO_FINAL_REPLY_R",
+                    "outcome:Succeeded",
+                ], reopened_order
+                reopened_layout = await page.evaluate(
+                    """() => {
+                      const transcript = document.querySelector('#transcript').getBoundingClientRect();
+                      const turn = [...document.querySelectorAll('#messages .transcript-turn')].at(-1);
+                      const reply = turn?.querySelector('.message-assistant .message-content');
+                      const rect = reply?.getBoundingClientRect();
+                      return Boolean(rect && rect.top >= transcript.top && rect.bottom <= transcript.bottom);
+                    }"""
+                )
+                assert reopened_layout, "the reopened final reply should be visible in the transcript"
+                assert fixture_status(provider_authority)["scenario_requests"].get("TRIAL-CHRONOLOGICAL-ORDER") == 3
+
                 await context.close()
                 if not persistent_context:
                     await browser.close()
@@ -1391,12 +1603,16 @@ async def run_session_navigation(
         recovered_id = "sess-103-701"
         readonly_id = "sess-103-702"
         long_history_id = "sess-104-1000"
+        chronological_id = "sess-105-159"
         (sessions_dir / f"{recovered_id}.jsonl").write_text(
             recovered_request_event(recovered_id, "recovered transcript"), encoding="utf-8"
         )
         (sessions_dir / f"{readonly_id}.jsonl").write_text("not json\n", encoding="utf-8")
         (sessions_dir / f"{long_history_id}.jsonl").write_text(
             long_history_fixture(long_history_id), encoding="utf-8"
+        )
+        (sessions_dir / f"{chronological_id}.jsonl").write_text(
+            chronological_history_fixture(chronological_id), encoding="utf-8"
         )
 
         provider, provider_lines = start_process(
@@ -1604,6 +1820,72 @@ async def run_session_navigation(
                         ) from error
                     await wait_status(target_page, "Succeeded")
                     return result
+
+                await page.locator(
+                    f'#session-list .session-select[data-session-id="{chronological_id}"]'
+                ).wait_for()
+                await open_session(page, chronological_id, None)
+                snapshot_fixture = host_snapshot(authority, token, chronological_id)
+                snapshot_turn = snapshot_fixture["session"]["turns"][0]
+                assert snapshot_turn["tool_rounds"][0][0] == {
+                    "type": "text",
+                    "text": "CHRONO_ROUND_A",
+                }, snapshot_turn
+                assert snapshot_turn["tool_rounds"][0][1]["type"] == "tool_use", snapshot_turn
+                assert snapshot_turn["tool_rounds"][1][0]["type"] == "tool_use", snapshot_turn
+                snapshot_order = await page.locator(
+                    '#messages .transcript-turn[data-turn-index="0"]'
+                ).evaluate(
+                    """turn => {
+                      const order = [turn.querySelector('.message-user .message-content')?.textContent.trim()];
+                      const assistant = turn.querySelector('.message-assistant');
+                      for (const node of assistant.children) {
+                        if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                        else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
+                        else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
+                      }
+                      return order;
+                    }"""
+                )
+                assert snapshot_order == [
+                    "CHRONO_SNAPSHOT_PROMPT",
+                    "CHRONO_ROUND_A",
+                    "fixture-tool-one",
+                    "fixture-tool-two",
+                    "fixture-tool-orphan",
+                    "CHRONO_FINAL_REPLY_R",
+                    "outcome:Succeeded",
+                ], snapshot_order
+                assert await page.locator("#empty-transcript").is_hidden()
+                snapshot_layout = await page.evaluate(
+                    """() => {
+                      const transcript = document.querySelector('#transcript').getBoundingClientRect();
+                      const reply = document.querySelector('#messages .message-assistant .message-content').getBoundingClientRect();
+                      const composer = document.querySelector('#composer').getBoundingClientRect();
+                      return {
+                        replyVisible: reply.top >= transcript.top && reply.bottom <= transcript.bottom,
+                        composerBelowTranscript: composer.top + 1 >= transcript.bottom,
+                        replyAboveComposer: reply.bottom <= composer.top,
+                      };
+                    }"""
+                )
+                assert (
+                    snapshot_layout["replyVisible"]
+                    and snapshot_layout["composerBelowTranscript"]
+                    and snapshot_layout["replyAboveComposer"]
+                ), snapshot_layout
+                await page.locator("#open-transcript-search").click()
+                await page.locator("#transcript-search").fill("CHRONO_ROUND_A")
+                await page.wait_for_function(
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool round text')"
+                )
+                await page.locator("#transcript-search").press("Escape")
+                await page.locator(
+                    '#messages .transcript-turn[data-turn-index="0"] .message-assistant .message-copy-button'
+                ).click()
+                await page.locator("#copy-status").wait_for(state="visible")
+                assert await page.evaluate("() => navigator.clipboard.readText()") == "CHRONO_FINAL_REPLY_R"
 
                 await page.locator(f'#session-list .session-select[data-session-id="{missing_id}"]').wait_for()
                 await open_session(page, missing_id, None)
