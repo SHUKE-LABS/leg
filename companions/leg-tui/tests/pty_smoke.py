@@ -2541,7 +2541,8 @@ def run_background_stop_chooser_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x03")
             status = drain_until_exit(master_fd, child, output)
             assert status == 0, f"TUI exit status was {status}"
-            assert_terminal_restored(bytes(output.raw), slave_fd, initial_termios, child)
+            termios_fd = master_fd if sys.platform == "darwin" else slave_fd
+            assert_terminal_restored(bytes(output.raw), termios_fd, initial_termios, child)
             catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
             gamma_record = next(
                 record
