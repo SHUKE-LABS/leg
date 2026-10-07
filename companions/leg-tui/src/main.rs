@@ -36,14 +36,14 @@ use leg_ui_client::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use signal_hook::SigId;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use signal_hook::low_level::unregister;
-use transcript::TranscriptTurn;
+use transcript::{TranscriptBlockKind, TranscriptSourceId, TranscriptTurn};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -352,6 +352,7 @@ struct ConversationState {
     active_draft_edited: bool,
     retry_confirmation: Option<RetryIntent>,
     transcript_follow_tail: bool,
+    transcript_anchor: Option<TranscriptAnchor>,
     transcript_scroll: usize,
     transcript_max_scroll: usize,
     transcript_page_rows: usize,
@@ -366,6 +367,7 @@ struct ConversationState {
 struct SearchHit {
     session_id: String,
     turn_index: Option<usize>,
+    anchor: Option<TranscriptAnchor>,
     label: String,
     excerpt: String,
 }
@@ -375,6 +377,22 @@ struct SearchEntry {
     turn_index: Option<usize>,
     label: String,
     text: String,
+    sources: Vec<SearchSourceSpan>,
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptAnchor {
+    turn_index: usize,
+    source_id: TranscriptSourceId,
+    source_order: usize,
+    byte_offset: usize,
+}
+
+struct SearchSourceSpan {
+    start: usize,
+    end: usize,
+    source_id: TranscriptSourceId,
+    source_order: usize,
 }
 
 #[derive(Clone)]
@@ -405,6 +423,7 @@ impl ConversationState {
             active_draft_edited: false,
             retry_confirmation: None,
             transcript_follow_tail: true,
+            transcript_anchor: None,
             transcript_scroll: 0,
             transcript_max_scroll: 0,
             transcript_page_rows: 1,
@@ -677,10 +696,28 @@ impl App {
                     turn_index: None,
                     label: format!("Title · {title}"),
                     text: sanitize::terminal_safe_text(title),
+                    sources: Vec::new(),
                 });
             }
             for (index, turn) in session.turns.iter().enumerate() {
                 let transcript = TranscriptTurn::from_trail(turn);
+                let mut text = String::new();
+                let mut sources = Vec::new();
+                for (source_order, (source_id, source_text)) in
+                    transcript.searchable_sources().into_iter().enumerate()
+                {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    let start = text.len();
+                    text.push_str(&source_text);
+                    sources.push(SearchSourceSpan {
+                        start,
+                        end: text.len(),
+                        source_id,
+                        source_order,
+                    });
+                }
                 entries.push(SearchEntry {
                     session_id: session.id.clone(),
                     turn_index: Some(index),
@@ -689,7 +726,8 @@ impl App {
                         title.unwrap_or("Conversation"),
                         turn.turn_index + 1
                     ),
-                    text: transcript.searchable_text(),
+                    text,
+                    sources,
                 });
             }
         }
@@ -706,12 +744,32 @@ impl App {
         self.search_hits = self
             .search_entries
             .iter()
-            .filter(|entry| entry.text.to_lowercase().contains(&query))
-            .map(|entry| SearchHit {
-                session_id: entry.session_id.clone(),
-                turn_index: entry.turn_index,
-                label: entry.label.clone(),
-                excerpt: search_excerpt(&entry.text, &query),
+            .filter_map(|entry| {
+                let match_offset = find_case_insensitive(&entry.text, &query)?;
+                let source = entry
+                    .sources
+                    .iter()
+                    .find(|source| source.start <= match_offset && match_offset < source.end)
+                    .or_else(|| entry.sources.last());
+                let anchor =
+                    entry
+                        .turn_index
+                        .zip(source)
+                        .map(|(turn_index, source)| TranscriptAnchor {
+                            turn_index,
+                            source_id: source.source_id.clone(),
+                            source_order: source.source_order,
+                            byte_offset: match_offset
+                                .saturating_sub(source.start)
+                                .min(source.end.saturating_sub(source.start)),
+                        });
+                Some(SearchHit {
+                    session_id: entry.session_id.clone(),
+                    turn_index: entry.turn_index,
+                    anchor,
+                    label: entry.label.clone(),
+                    excerpt: search_excerpt(&entry.text, &query),
+                })
             })
             .collect();
         self.search_index = self
@@ -719,7 +777,12 @@ impl App {
             .min(self.search_hits.len().saturating_sub(1));
     }
 
-    fn open_session(&mut self, session_id: &str, turn_index: Option<usize>) -> bool {
+    fn open_session(
+        &mut self,
+        session_id: &str,
+        turn_index: Option<usize>,
+        anchor: Option<TranscriptAnchor>,
+    ) -> bool {
         let Some(session) = self
             .sessions
             .iter()
@@ -734,7 +797,7 @@ impl App {
                 }
             }
             self.rebuild_search_entries();
-            return self.open_session(session_id, turn_index);
+            return self.open_session(session_id, turn_index, anchor);
         };
         let target_key = self
             .view_aliases
@@ -745,7 +808,13 @@ impl App {
             if let Some(index) = turn_index {
                 self.inspector_turn = index.min(self.transcript.len().saturating_sub(1));
                 self.transcript_follow_tail = false;
-                self.transcript_scroll = self.inspector_turn;
+                self.transcript_anchor = Some(anchor.unwrap_or(TranscriptAnchor {
+                    turn_index: self.inspector_turn,
+                    source_id: TranscriptSourceId::Prompt,
+                    source_order: 0,
+                    byte_offset: 0,
+                }));
+                self.transcript_new_content = false;
                 self.inspector_open = true;
                 self.inspector_field = 0;
                 self.inspector_scroll = 0;
@@ -775,7 +844,13 @@ impl App {
         if let Some(index) = turn_index {
             self.inspector_turn = index.min(self.transcript.len().saturating_sub(1));
             self.transcript_follow_tail = false;
-            self.transcript_scroll = self.inspector_turn;
+            self.transcript_anchor = Some(anchor.unwrap_or(TranscriptAnchor {
+                turn_index: self.inspector_turn,
+                source_id: TranscriptSourceId::Prompt,
+                source_order: 0,
+                byte_offset: 0,
+            }));
+            self.transcript_new_content = false;
         }
         self.inspector_field = 0;
         self.inspector_scroll = 0;
@@ -874,7 +949,7 @@ impl App {
     }
 
     fn begin_workspace_replacement(&mut self, session_id: &str) {
-        if !self.open_session(session_id, None) {
+        if !self.open_session(session_id, None, None) {
             return;
         }
         if let Some(session) = self
@@ -1030,7 +1105,7 @@ impl App {
             KeyCode::Enter => {
                 if let Some(session_id) = self.selected_session().map(|session| session.id.clone())
                 {
-                    self.open_session(&session_id, None);
+                    self.open_session(&session_id, None, None);
                 }
             }
             KeyCode::Char('/') => self.picker_searching = true,
@@ -1063,7 +1138,8 @@ impl App {
                 if let Some(hit) = self.search_hits.get(self.search_index) {
                     let session_id = hit.session_id.clone();
                     let turn_index = hit.turn_index;
-                    self.open_session(&session_id, turn_index);
+                    let anchor = hit.anchor.clone();
+                    self.open_session(&session_id, turn_index, anchor);
                 }
             }
             KeyCode::Backspace => {
@@ -1945,32 +2021,34 @@ impl App {
     }
 
     fn scroll_transcript_up(&mut self) {
-        if self.transcript_follow_tail {
-            self.transcript_follow_tail = false;
-            self.transcript_scroll = self
-                .transcript_max_scroll
-                .saturating_sub(self.transcript_page_rows);
-        } else {
-            self.transcript_scroll = self
-                .transcript_scroll
-                .saturating_sub(self.transcript_page_rows);
-        }
+        self.transcript_scroll = transcript_page_up_start(
+            self.transcript_scroll,
+            self.transcript_max_scroll,
+            self.transcript_page_rows,
+            self.transcript_follow_tail,
+        );
+        self.transcript_follow_tail = false;
+        self.transcript_anchor = None;
     }
 
     fn scroll_transcript_down(&mut self) {
-        let next = self
-            .transcript_scroll
-            .saturating_add(self.transcript_page_rows);
-        if next >= self.transcript_max_scroll {
-            self.scroll_to_newest();
-        } else {
+        if let Some(next) = transcript_page_down_start(
+            self.transcript_scroll,
+            self.transcript_max_scroll,
+            self.transcript_page_rows,
+        ) {
             self.transcript_follow_tail = false;
             self.transcript_scroll = next;
+            self.transcript_anchor = None;
+        } else {
+            self.scroll_to_newest();
         }
     }
 
     fn scroll_to_newest(&mut self) {
         self.transcript_follow_tail = true;
+        self.transcript_anchor = None;
+        self.transcript_scroll = 0;
         self.transcript_new_content = false;
     }
 
@@ -2270,6 +2348,559 @@ fn format_duration(duration: Duration) -> String {
     format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
+struct TranscriptRow {
+    line: Line<'static>,
+    anchor: TranscriptAnchor,
+}
+
+struct RenderRun {
+    text: String,
+    style: Style,
+    source_offset: usize,
+    tracks_source: bool,
+}
+
+fn build_transcript_rows(
+    turns: &[TranscriptTurn],
+    width: usize,
+    use_color: bool,
+) -> Vec<TranscriptRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for (turn_index, turn) in turns.iter().enumerate() {
+        let header_anchor = TranscriptAnchor {
+            turn_index,
+            source_id: TranscriptSourceId::Prompt,
+            source_order: usize::MAX,
+            byte_offset: 0,
+        };
+        rows.push(TranscriptRow {
+            line: Line::from(Span::styled(
+                format!("Turn {}", turn_index + 1),
+                transcript_style(TranscriptBlockKind::Outcome, use_color),
+            )),
+            anchor: header_anchor,
+        });
+
+        for (source_order, block) in turn.source_blocks().into_iter().enumerate() {
+            let anchor = TranscriptAnchor {
+                turn_index,
+                source_id: block.source_id.clone(),
+                source_order,
+                byte_offset: 0,
+            };
+            match block.kind {
+                TranscriptBlockKind::Prompt => {
+                    push_wrapped_text_block(
+                        &mut rows,
+                        &block.text,
+                        &anchor,
+                        width,
+                        Some(("You: ", transcript_style(block.kind, use_color))),
+                        transcript_style(block.kind, use_color),
+                    );
+                }
+                TranscriptBlockKind::Assistant => {
+                    rows.push(TranscriptRow {
+                        line: Line::from(Span::styled(
+                            "Assistant",
+                            transcript_style(block.kind, use_color),
+                        )),
+                        anchor: anchor.clone(),
+                    });
+                    for (line_offset, runs) in markdown_display_lines(&block.text, use_color) {
+                        push_wrapped_runs(&mut rows, &runs, &anchor, line_offset, width);
+                    }
+                }
+                TranscriptBlockKind::Tool => push_wrapped_text_block(
+                    &mut rows,
+                    &block.text,
+                    &anchor,
+                    width,
+                    None,
+                    transcript_style(block.kind, use_color),
+                ),
+                TranscriptBlockKind::Outcome => push_labeled_text_block(
+                    &mut rows,
+                    "Outcome: ",
+                    &block.text,
+                    &anchor,
+                    width,
+                    transcript_style(block.kind, use_color),
+                ),
+                TranscriptBlockKind::Error => push_labeled_text_block(
+                    &mut rows,
+                    "Error: ",
+                    &block.text,
+                    &anchor,
+                    width,
+                    transcript_style(block.kind, use_color),
+                ),
+                TranscriptBlockKind::Warning => push_labeled_text_block(
+                    &mut rows,
+                    "Warning: ",
+                    &block.text,
+                    &anchor,
+                    width,
+                    transcript_style(block.kind, use_color),
+                ),
+            }
+            rows.push(TranscriptRow {
+                line: Line::from(""),
+                anchor: TranscriptAnchor {
+                    byte_offset: block.text.len(),
+                    ..anchor
+                },
+            });
+        }
+    }
+    rows
+}
+
+fn transcript_style(kind: TranscriptBlockKind, use_color: bool) -> Style {
+    let (color, modifier) = match kind {
+        TranscriptBlockKind::Prompt => (Color::Blue, Modifier::BOLD),
+        TranscriptBlockKind::Assistant => (Color::Green, Modifier::BOLD),
+        TranscriptBlockKind::Tool => (Color::Yellow, Modifier::BOLD),
+        TranscriptBlockKind::Outcome => (Color::Magenta, Modifier::BOLD),
+        TranscriptBlockKind::Error => (Color::Red, Modifier::BOLD | Modifier::UNDERLINED),
+        TranscriptBlockKind::Warning => (Color::Yellow, Modifier::BOLD | Modifier::UNDERLINED),
+    };
+    if use_color {
+        Style::default().fg(color).add_modifier(modifier)
+    } else {
+        Style::default().add_modifier(modifier)
+    }
+}
+
+fn markdown_style(use_color: bool, color: Color) -> Style {
+    if use_color {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+}
+
+fn source_run(text: &str, style: Style, source_offset: usize) -> RenderRun {
+    RenderRun {
+        text: text.to_string(),
+        style,
+        source_offset,
+        tracks_source: true,
+    }
+}
+
+fn visual_run(text: &str, style: Style, source_offset: usize) -> RenderRun {
+    RenderRun {
+        text: text.to_string(),
+        style,
+        source_offset,
+        tracks_source: false,
+    }
+}
+
+fn push_labeled_text_block(
+    rows: &mut Vec<TranscriptRow>,
+    label: &str,
+    text: &str,
+    anchor: &TranscriptAnchor,
+    width: usize,
+    style: Style,
+) {
+    let mut offset = 0;
+    for (line_index, logical_line) in text.split('\n').enumerate() {
+        let mut runs = Vec::new();
+        if line_index == 0 {
+            runs.push(visual_run(label, style, offset));
+        } else {
+            runs.push(visual_run("  ", style, offset));
+        }
+        runs.push(source_run(logical_line, style, offset));
+        push_wrapped_runs(rows, &runs, anchor, offset, width);
+        offset += logical_line.len() + 1;
+    }
+}
+
+fn push_wrapped_text_block(
+    rows: &mut Vec<TranscriptRow>,
+    text: &str,
+    anchor: &TranscriptAnchor,
+    width: usize,
+    first_prefix: Option<(&str, Style)>,
+    body_style: Style,
+) {
+    let mut offset = 0;
+    for (line_index, logical_line) in text.split('\n').enumerate() {
+        let mut runs = Vec::new();
+        if line_index == 0 {
+            if let Some((prefix, style)) = first_prefix {
+                runs.push(visual_run(prefix, style, offset));
+            }
+        } else if first_prefix.is_some() {
+            runs.push(visual_run("  ", body_style, offset));
+        }
+        runs.push(source_run(logical_line, body_style, offset));
+        push_wrapped_runs(rows, &runs, anchor, offset, width);
+        offset += logical_line.len() + 1;
+    }
+}
+
+fn push_wrapped_runs(
+    rows: &mut Vec<TranscriptRow>,
+    runs: &[RenderRun],
+    anchor: &TranscriptAnchor,
+    fallback_offset: usize,
+    width: usize,
+) {
+    let width = width.max(1);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut row_width = 0_usize;
+    let mut row_offset = None;
+    for run in runs {
+        for (relative_offset, grapheme) in
+            UnicodeSegmentation::grapheme_indices(run.text.as_str(), true)
+        {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+                rows.push(TranscriptRow {
+                    line: Line::from(std::mem::take(&mut spans)),
+                    anchor: TranscriptAnchor {
+                        byte_offset: row_offset.unwrap_or(fallback_offset),
+                        ..anchor.clone()
+                    },
+                });
+                row_width = 0;
+                row_offset = None;
+            }
+            if row_offset.is_none() {
+                row_offset = Some(if run.tracks_source {
+                    run.source_offset + relative_offset
+                } else {
+                    fallback_offset
+                });
+            }
+            if let Some(last) = spans.last_mut()
+                && last.style == run.style
+            {
+                last.content.to_mut().push_str(grapheme);
+            } else {
+                spans.push(Span::styled(grapheme.to_string(), run.style));
+            }
+            row_width = row_width.saturating_add(grapheme_width);
+        }
+    }
+    rows.push(TranscriptRow {
+        line: Line::from(spans),
+        anchor: TranscriptAnchor {
+            byte_offset: row_offset.unwrap_or(fallback_offset),
+            ..anchor.clone()
+        },
+    });
+}
+
+fn markdown_display_lines(text: &str, use_color: bool) -> Vec<(usize, Vec<RenderRun>)> {
+    let base_style = Style::default();
+    let heading_style = markdown_style(use_color, Color::Cyan);
+    let list_style = markdown_style(use_color, Color::Blue);
+    let code_style = if use_color {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    };
+    let lines = text
+        .split('\n')
+        .scan(0_usize, |offset, line| {
+            let current = *offset;
+            *offset += line.len() + 1;
+            Some((current, line))
+        })
+        .collect::<Vec<_>>();
+    let mut rendered = Vec::new();
+    let mut fence: Option<(char, usize, String)> = None;
+
+    for (line_offset, line) in lines {
+        if let Some((marker, length, _)) = &fence {
+            if is_closing_fence(line, *marker, *length) {
+                fence = None;
+                continue;
+            }
+            rendered.push((line_offset, vec![source_run(line, code_style, line_offset)]));
+            continue;
+        }
+        if let Some((marker, length, language)) = opening_fence(line) {
+            let label = if language.is_empty() {
+                "Code block:".to_string()
+            } else {
+                format!("Code block ({language}):")
+            };
+            rendered.push((
+                line_offset,
+                vec![visual_run(&label, heading_style, line_offset)],
+            ));
+            fence = Some((marker, length, language));
+            continue;
+        }
+
+        let (content_offset, content, style, prefix) =
+            if let Some((level, offset)) = heading_content(line) {
+                (
+                    line_offset + offset,
+                    &line[offset..],
+                    heading_style,
+                    format!("{} ", "#".repeat(level)),
+                )
+            } else if let Some((indent, marker_end)) = list_content(line) {
+                let marker = if indent > 0 { "  • " } else { "• " };
+                (
+                    line_offset + marker_end,
+                    &line[marker_end..],
+                    list_style,
+                    marker.to_string(),
+                )
+            } else {
+                (line_offset, line, base_style, String::new())
+            };
+        let mut runs = Vec::new();
+        if !prefix.is_empty() {
+            runs.push(visual_run(&prefix, style, line_offset));
+        }
+        match inline_markdown_runs(content, content_offset, style, code_style, use_color) {
+            Some(inline_runs) => runs.extend(inline_runs),
+            None => runs.push(source_run(line, base_style, line_offset)),
+        }
+        rendered.push((line_offset, runs));
+    }
+    rendered
+}
+
+fn heading_content(line: &str) -> Option<(usize, usize)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut cursor = indent;
+    while bytes.get(cursor) == Some(&b'#') && cursor - indent < 6 {
+        cursor += 1;
+    }
+    let level = cursor - indent;
+    if level == 0 || !matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        return None;
+    }
+    while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    Some((level, cursor))
+}
+
+fn list_content(line: &str) -> Option<(usize, usize)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let marker_start = indent;
+    let marker = *bytes.get(marker_start)?;
+    if matches!(marker, b'-' | b'*' | b'+')
+        && matches!(bytes.get(marker_start + 1), Some(b' ' | b'\t'))
+    {
+        let mut end = marker_start + 2;
+        while matches!(bytes.get(end), Some(b' ' | b'\t')) {
+            end += 1;
+        }
+        return Some((indent, end));
+    }
+    let mut end = marker_start;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if end > marker_start
+        && matches!(bytes.get(end), Some(b'.' | b')'))
+        && matches!(bytes.get(end + 1), Some(b' ' | b'\t'))
+    {
+        end += 2;
+        while matches!(bytes.get(end), Some(b' ' | b'\t')) {
+            end += 1;
+        }
+        return Some((indent, end));
+    }
+    None
+}
+
+fn opening_fence(line: &str) -> Option<(char, usize, String)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let marker = rest.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    if length < 3 {
+        return None;
+    }
+    let language = rest[length..].trim().to_string();
+    if marker == '`' && language.contains('`') {
+        return None;
+    }
+    Some((marker, length, language))
+}
+
+fn is_closing_fence(line: &str, marker: char, minimum_length: usize) -> bool {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let length = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    length >= minimum_length && rest[length..].trim().is_empty()
+}
+
+fn inline_markdown_runs(
+    text: &str,
+    source_offset: usize,
+    base_style: Style,
+    code_style: Style,
+    use_color: bool,
+) -> Option<Vec<RenderRun>> {
+    let mut runs = Vec::new();
+    let mut cursor = 0_usize;
+    let mut plain_start = 0_usize;
+    while let Some(relative_start) = text[cursor..].find('`') {
+        let start = cursor + relative_start;
+        let delimiter_length = text[start..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
+        let content_start = start + delimiter_length;
+        let mut search = content_start;
+        let close = loop {
+            let relative_close = text[search..].find('`')?;
+            let close_start = search + relative_close;
+            let close_length = text[close_start..]
+                .bytes()
+                .take_while(|byte| *byte == b'`')
+                .count();
+            if close_length == delimiter_length {
+                break close_start;
+            }
+            search = close_start + close_length;
+            if search >= text.len() {
+                return None;
+            }
+        };
+        if start > plain_start {
+            runs.push(source_run(
+                &text[plain_start..start],
+                base_style,
+                source_offset + plain_start,
+            ));
+        }
+        if !use_color {
+            runs.push(visual_run(
+                &text[start..content_start],
+                code_style,
+                source_offset + start,
+            ));
+        }
+        runs.push(source_run(
+            &text[content_start..close],
+            code_style,
+            source_offset + content_start,
+        ));
+        if !use_color {
+            let close_end = close + delimiter_length;
+            runs.push(visual_run(
+                &text[close..close_end],
+                code_style,
+                source_offset + close,
+            ));
+        }
+        cursor = close + delimiter_length;
+        plain_start = cursor;
+    }
+    if plain_start < text.len() {
+        runs.push(source_run(
+            &text[plain_start..],
+            base_style,
+            source_offset + plain_start,
+        ));
+    }
+    Some(runs)
+}
+
+fn find_transcript_anchor_row(rows: &[TranscriptRow], anchor: &TranscriptAnchor) -> Option<usize> {
+    let matches_exact_source = |row: &&TranscriptRow| {
+        row.anchor.turn_index == anchor.turn_index
+            && row.anchor.source_id == anchor.source_id
+            && row.anchor.source_order == anchor.source_order
+    };
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| matches_exact_source(row))
+        .filter(|(_, row)| row.anchor.byte_offset <= anchor.byte_offset)
+        .last()
+        .or_else(|| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| matches_exact_source(row))
+                .min_by_key(|(_, row)| row.anchor.byte_offset.abs_diff(anchor.byte_offset))
+        })
+        .or_else(|| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    row.anchor.turn_index == anchor.turn_index
+                        && row.anchor.source_id == anchor.source_id
+                })
+                .min_by_key(|(_, row)| row.anchor.byte_offset.abs_diff(anchor.byte_offset))
+        })
+        .or_else(|| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| row.anchor.turn_index == anchor.turn_index)
+                .min_by_key(|(_, row)| {
+                    (
+                        row.anchor.source_order.abs_diff(anchor.source_order),
+                        row.anchor.byte_offset.abs_diff(anchor.byte_offset),
+                    )
+                })
+        })
+        .map(|(index, _)| index)
+}
+
+fn transcript_page_up_start(
+    current: usize,
+    max_scroll: usize,
+    page_rows: usize,
+    following_tail: bool,
+) -> usize {
+    if following_tail {
+        max_scroll.saturating_sub(page_rows)
+    } else {
+        current.saturating_sub(page_rows)
+    }
+}
+
+fn transcript_page_down_start(
+    current: usize,
+    max_scroll: usize,
+    page_rows: usize,
+) -> Option<usize> {
+    let next = current.saturating_add(page_rows);
+    (next < max_scroll).then_some(next)
+}
+
 fn wrap_transcript(text: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -2398,7 +3029,7 @@ fn draw_warning(frame: &mut Frame<'_>, use_color: bool) {
         Line::from(
             "F1 help; F2 actions; F3 sessions; Ctrl-F search; F4 inspect; F5 copy; F6 export.",
         ),
-        Line::from("PageUp/PageDown scroll history; Ctrl-End newest text."),
+        Line::from("PageUp/PageDown move by transcript rows; Ctrl-End follows new text."),
         Line::from(
             "Bracketed paste preserves Unicode and lines; other control characters are removed.",
         ),
@@ -2549,7 +3180,7 @@ fn draw_search(frame: &mut Frame<'_>, app: &App) {
     let mut lines = vec![Line::from(format!("Search: {}▏", app.search_query))];
     if app.search_query.is_empty() {
         lines.push(Line::from(
-            "Search session titles and displayed transcript text.",
+            "Search titles and complete sanitized transcript source.",
         ));
         lines.push(Line::from(
             "Type to search; Ctrl-U clears; Up/Down select; Enter opens; Esc closes.",
@@ -2772,88 +3403,51 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     let transcript_height = transcript_area.height.saturating_sub(2).max(1) as usize;
     let transcript_len = app.transcript.len();
     let transcript_width = transcript_area.width.saturating_sub(2).max(1) as usize;
-    let wrap_turn = |index: usize, turn: &TranscriptTurn| {
-        let text = format!("Turn {}\n{}", index + 1, turn.lines().join("\n"));
-        wrap_transcript(&sanitize::terminal_safe_text(&text), transcript_width)
-    };
-    let mut tail_window = Vec::new();
-    let mut tail_rows = 0;
-    let mut tail_start = 0;
-    for index in (0..transcript_len).rev() {
-        let lines = wrap_turn(index, &app.transcript[index]);
-        let required_rows = lines.len() + usize::from(!tail_window.is_empty());
-        if !tail_window.is_empty() && tail_rows + required_rows > transcript_height {
-            break;
-        }
-        tail_rows += required_rows;
-        tail_start = index;
-        tail_window.push((index, lines));
-    }
-    tail_window.reverse();
-    app.transcript_max_scroll = tail_start;
-    if app.transcript_follow_tail {
-        app.transcript_scroll = tail_start;
+    let rows = build_transcript_rows(&app.transcript, transcript_width, app.use_color);
+    let max_scroll = rows.len().saturating_sub(transcript_height);
+    app.transcript_max_scroll = max_scroll;
+    app.transcript_page_rows = transcript_height;
+    let start_row = if app.transcript_follow_tail {
+        max_scroll
+    } else if let Some(anchor) = &app.transcript_anchor {
+        find_transcript_anchor_row(&rows, anchor)
+            .unwrap_or(app.transcript_scroll)
+            .min(max_scroll)
     } else {
-        app.transcript_scroll = app.transcript_scroll.min(app.transcript_max_scroll);
+        app.transcript_scroll.min(max_scroll)
+    };
+    app.transcript_scroll = start_row;
+    if app.transcript_follow_tail {
+        app.transcript_anchor = None;
+    } else {
+        app.transcript_anchor = rows.get(start_row).map(|row| row.anchor.clone());
     }
     app.inspector_turn = app
         .inspector_turn
         .min(app.transcript.len().saturating_sub(1));
-    let start_turn = app.transcript_scroll.min(transcript_len.saturating_sub(1));
-    let page_window = if transcript_len == 0 {
-        Vec::new()
-    } else if start_turn == tail_start {
-        tail_window
-    } else {
-        let mut page = Vec::new();
-        let mut used_rows = 0;
-        for index in start_turn..transcript_len {
-            let lines = wrap_turn(index, &app.transcript[index]);
-            let required_rows = lines.len() + usize::from(!page.is_empty());
-            if !page.is_empty() && used_rows + required_rows > transcript_height {
-                break;
-            }
-            used_rows += required_rows;
-            page.push((index, lines));
-        }
-        page
-    };
-    let end_turn = page_window
-        .last()
-        .map(|(index, _)| index + 1)
-        .unwrap_or(start_turn);
-    app.transcript_page_rows = page_window.len().max(1);
+    let end_row = (start_row + transcript_height).min(rows.len());
     let wrapped_transcript = if transcript_len == 0 {
         wrap_transcript(
             "Choose a workspace, acknowledge the warning, then send a prompt with Ctrl-S.",
             transcript_width,
         )
     } else {
-        let mut lines = Vec::new();
-        for (_, turn_lines) in page_window {
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            lines.extend(turn_lines);
-        }
-        lines
+        rows[start_row..end_row]
+            .iter()
+            .map(|row| row.line.clone())
+            .collect()
     };
     let transcript_title = if transcript_len == 0 {
         "Conversation".to_string()
     } else if app.transcript_new_content {
         format!(
-            "Turns {}-{} of {} · new content below (Ctrl-End)",
-            start_turn + 1,
-            end_turn,
-            transcript_len
+            "Rows {}-{} of {} · new content below (Ctrl-End)",
+            start_row + 1,
+            end_row,
+            rows.len()
         )
     } else {
-        format!(
-            "Turns {}-{} of {}",
-            start_turn + 1,
-            end_turn,
-            transcript_len
-        )
+        format!("Rows {}-{} of {}", start_row + 1, end_row, rows.len())
     };
     frame.render_widget(
         Paragraph::new(wrapped_transcript).block(
@@ -2966,11 +3560,11 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("Keyboard help"),
                 Line::from("Enter newline · Ctrl-S send · Ctrl-C stop/exit · Ctrl-Z/Y undo/redo."),
                 Line::from("Left/Right move · Home/End line · Backspace/Delete remove · paste keeps Unicode/newlines."),
-                Line::from("PageUp/Down browse turns · Ctrl-End newest · Esc closes the current overlay."),
+                Line::from("PageUp/Down browse transcript rows · Ctrl-End follows the tail · Esc closes the current overlay."),
                 Line::from("F1 help · F2 actions · F3 sessions: / filter · N new · R rename · W workspace · Enter reopen."),
                 Line::from("F8 shows or hides the session rail at 105 columns and wider."),
-                Line::from("F3 picker: S search · Ctrl-F searches titles and transcript · Up/Down move through results."),
-                Line::from("Search: Enter opens · Ctrl-U clears · Esc closes. F4 inspects the current or selected turn."),
+                Line::from("F3 picker: S search · Ctrl-F searches titles and complete transcript source · Up/Down move through results."),
+                Line::from("Search: Enter opens at the match · Ctrl-U clears · Esc closes. F4 inspects the current or selected turn."),
                 Line::from("Inspector: Up/Down fields · [/] previous/next turn · Shift-PageUp/Down scrolls long fields."),
                 Line::from("F5 copies the selected prompt/reply/code/tool field through terminal OSC 52; it never runs it."),
                 Line::from("If clipboard access is blocked, F7 saves the selected field to a file. F6 exports transcript data only."),
@@ -2990,7 +3584,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             Paragraph::new(vec![
                 Line::from("Keyboard actions"),
                 Line::from("F3  Browse/create/rename/reopen sessions; slash filters titles."),
-                Line::from("Ctrl-F  Search titles and displayed prompt/reply/tool text."),
+                Line::from("Ctrl-F  Search titles and complete sanitized transcript source."),
                 Line::from("F4  Expand the selected turn's tool inspector."),
                 Line::from("Up/Down  Choose inspector field; [/]  Select previous/next turn."),
                 Line::from("F5  Send selected field with terminal OSC 52 clipboard."),
@@ -3000,7 +3594,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                     "Ctrl-R in inspector  Retry latest failed turn after the side-effect warning.",
                 ),
                 Line::from(
-                    "PageUp/Down  Browse history; Shift-PageUp/Down  Scroll inspector text.",
+                    "PageUp/Down  Browse transcript rows; Shift-PageUp/Down  Scroll inspector text.",
                 ),
                 Line::from("F8  Show or hide the session rail at 105 columns and wider."),
                 Line::from(
@@ -3212,6 +3806,23 @@ fn relative_time(timestamp_ms: u64) -> String {
     }
 }
 
+fn find_case_insensitive(text: &str, query: &str) -> Option<usize> {
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let mut lowered = String::with_capacity(text.len());
+    let mut source_offsets = Vec::with_capacity(text.len());
+    for (source_offset, character) in text.char_indices() {
+        let lowered_character = character.to_lowercase().collect::<String>();
+        source_offsets.extend(std::iter::repeat_n(source_offset, lowered_character.len()));
+        lowered.push_str(&lowered_character);
+    }
+    lowered
+        .find(&needle)
+        .and_then(|offset| source_offsets.get(offset).copied())
+}
+
 fn search_excerpt(text: &str, query: &str) -> String {
     let query = query.to_lowercase().chars().collect::<Vec<_>>();
     let characters = text.chars().collect::<Vec<_>>();
@@ -3385,11 +3996,14 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Duration;
 
+    use crate::transcript::{TranscriptSourceId, TranscriptTurn};
+    use leg_ui_client::StreamEvent;
     use serde_json::json;
 
     use super::{
-        TurnStatus, response_stop_reason, restored_draft, should_use_color, successful_status,
-        truncate_to_width,
+        TranscriptAnchor, TurnStatus, build_transcript_rows, find_case_insensitive,
+        find_transcript_anchor_row, response_stop_reason, restored_draft, should_use_color,
+        successful_status, transcript_page_down_start, transcript_page_up_start, truncate_to_width,
     };
     use unicode_width::UnicodeWidthStr;
 
@@ -3481,6 +4095,159 @@ mod tests {
             .map(|row| row.to_string())
             .collect::<Vec<_>>();
         assert_eq!(rows, ["ab界", "cd", ""]);
+    }
+
+    #[test]
+    fn transcript_markdown_keeps_code_literal_and_malformed_source_readable() {
+        let source = "## Heading\n- item with `inline`\n```rust\n  let value = `literal`;\n```\nopen `inline";
+        let mut turn = TranscriptTurn::new("user question");
+        turn.observe(&StreamEvent::TextDelta {
+            seq: 1,
+            round_index: 0,
+            block_index: 0,
+            text: source.to_string(),
+        });
+        let colored = build_transcript_rows(&[turn.clone()], 80, true)
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let monochrome = build_transcript_rows(&[turn], 80, false)
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(colored.contains("You: user question"));
+        assert!(colored.contains("Assistant"));
+        assert!(colored.contains("## Heading"));
+        assert!(colored.contains("• item with inline"));
+        assert!(colored.contains("Code block (rust):\n  let value = `literal`;"));
+        assert!(colored.contains("open `inline"));
+        assert!(monochrome.contains("`inline`"));
+        assert!(monochrome.contains("Code block (rust):"));
+    }
+
+    #[test]
+    fn ten_thousand_line_transcript_pages_and_searches_by_source_row() {
+        let mut source = (1..=10_000)
+            .map(|line| format!("{line:05}: payload {line} stays in its source block"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let family = "👩‍👩‍👧‍👦";
+        source.push('\n');
+        source.push_str(&"中".repeat(36));
+        source.push_str(&family.repeat(24));
+
+        let mut turn = TranscriptTurn::new("long deterministic answer");
+        turn.observe(&StreamEvent::TextDelta {
+            seq: 1,
+            round_index: 0,
+            block_index: 0,
+            text: source.clone(),
+        });
+        let rows = build_transcript_rows(&[turn.clone()], 48, false);
+        let rendered = rows
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("00001: payload 1"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("10000: payload 10000"))
+        );
+        assert!(rendered.iter().any(|line| line.contains(family)));
+
+        let match_offset = find_case_insensitive(&source, "05000: payload").unwrap();
+        let anchor = TranscriptAnchor {
+            turn_index: 0,
+            source_id: TranscriptSourceId::Assistant {
+                round_index: 0,
+                block_index: 0,
+            },
+            source_order: 1,
+            byte_offset: match_offset,
+        };
+        let middle_row = find_transcript_anchor_row(&rows, &anchor).unwrap();
+        assert!(rendered[middle_row].contains("05000: payload"));
+
+        let resized_rows = build_transcript_rows(&[turn], 24, false);
+        let resized_middle_row = find_transcript_anchor_row(&resized_rows, &anchor).unwrap();
+        assert_eq!(
+            resized_rows[resized_middle_row].anchor.byte_offset,
+            match_offset
+        );
+        let resized_line = resized_rows[resized_middle_row].line.to_string();
+        assert!(resized_line.contains("05000: payload"), "{resized_line}");
+
+        let page_rows = 18;
+        let max_scroll = rows.len().saturating_sub(page_rows);
+        let mut start = transcript_page_up_start(max_scroll, max_scroll, page_rows, true);
+        assert_eq!(start, max_scroll.saturating_sub(page_rows));
+        while let Some(next) = transcript_page_down_start(start, max_scroll, page_rows) {
+            assert!(next > start);
+            start = next;
+        }
+        start = max_scroll;
+        assert!(
+            rendered[start..start + page_rows]
+                .iter()
+                .any(|line| line.contains("10000: payload 10000"))
+        );
+        let previous_page = transcript_page_up_start(start, max_scroll, page_rows, true);
+        assert!(previous_page < start);
+        assert_eq!(transcript_page_up_start(0, max_scroll, page_rows, false), 0);
+    }
+
+    #[test]
+    fn transcript_anchor_selects_the_row_containing_search_and_resize_offsets() {
+        let source = (0..40)
+            .map(|word| format!("w{word:02}xx"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut turn = TranscriptTurn::new("anchor test");
+        turn.observe(&StreamEvent::TextDelta {
+            seq: 1,
+            round_index: 0,
+            block_index: 0,
+            text: source.clone(),
+        });
+        let source_id = TranscriptSourceId::Assistant {
+            round_index: 0,
+            block_index: 0,
+        };
+
+        let search_offset = source.find("w02xx").unwrap();
+        let search_anchor = TranscriptAnchor {
+            turn_index: 0,
+            source_id: source_id.clone(),
+            source_order: 1,
+            byte_offset: search_offset,
+        };
+        let search_rows = build_transcript_rows(&[turn.clone()], 20, false);
+        let search_row = find_transcript_anchor_row(&search_rows, &search_anchor).unwrap();
+        assert!(search_rows[search_row].line.to_string().contains("w02xx"));
+
+        let old_width_rows = build_transcript_rows(&[turn.clone()], 16, false);
+        let old_row_anchor = old_width_rows
+            .iter()
+            .map(|row| &row.anchor)
+            .find(|row| {
+                row.turn_index == 0
+                    && row.source_id == source_id
+                    && row.source_order == 1
+                    && row.byte_offset == 16
+            })
+            .unwrap()
+            .clone();
+        let resized_rows = build_transcript_rows(&[turn], 26, false);
+        let resized_row = find_transcript_anchor_row(&resized_rows, &old_row_anchor).unwrap();
+        assert!(resized_rows[resized_row].line.to_string().contains("w03xx"));
     }
 
     #[test]

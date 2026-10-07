@@ -32,6 +32,43 @@ enum RoundPart {
     Tool(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TranscriptSourceId {
+    Prompt,
+    Assistant {
+        round_index: u64,
+        block_index: u64,
+    },
+    AuthoritativeFinal {
+        round_index: u64,
+    },
+    Tool {
+        round_index: u64,
+        tool_use_id: String,
+    },
+    Outcome,
+    Failure,
+    Warning,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscriptBlockKind {
+    Prompt,
+    Assistant,
+    Tool,
+    Outcome,
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug)]
+pub struct TranscriptBlock {
+    pub source_id: TranscriptSourceId,
+    pub kind: TranscriptBlockKind,
+    /// Sanitized source or tool placeholder text, before visual formatting.
+    pub text: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct TranscriptRound {
     text_blocks: BTreeMap<u64, TextBlock>,
@@ -143,23 +180,261 @@ impl TranscriptTurn {
         transcript
     }
 
+    #[cfg(test)]
     pub fn searchable_text(&self) -> String {
-        let mut text = self.lines().join("\n");
-        for round in self.rounds.values() {
-            for tool in round.tools.values() {
-                text.push('\n');
-                text.push_str(&value_text(&tool.input));
-                if let Some(result) = &tool.result {
-                    text.push('\n');
-                    text.push_str(&value_text(result));
+        self.searchable_sources()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Complete sanitized content grouped by the source row that can display
+    /// or inspect it. Tool summaries remain compact in the transcript, while
+    /// their full arguments and results remain searchable from the tool row.
+    pub fn searchable_sources(&self) -> Vec<(TranscriptSourceId, String)> {
+        let mut sources = Vec::new();
+        for block in self.source_blocks() {
+            match &block.source_id {
+                TranscriptSourceId::Tool {
+                    round_index,
+                    tool_use_id,
+                } => {
+                    if let Some(tool) = self
+                        .rounds
+                        .get(round_index)
+                        .and_then(|round| round.tools.get(tool_use_id))
+                    {
+                        let mut text = format!(
+                            "{}\n{}\n{}",
+                            tool.name,
+                            terminal_safe_text(&value_text(&tool.input)),
+                            terminal_safe_text(&tool.status),
+                        );
+                        if let Some(result) = &tool.result {
+                            text.push('\n');
+                            text.push_str(&terminal_safe_text(&value_text(result)));
+                        }
+                        if let Some(error) = &tool.error {
+                            text.push('\n');
+                            text.push_str(&terminal_safe_text(error));
+                        }
+                        sources.push((block.source_id, text));
+                    }
                 }
-                if let Some(error) = &tool.error {
-                    text.push('\n');
-                    text.push_str(error);
+                _ if !block.text.is_empty() => sources.push((block.source_id, block.text)),
+                _ => {}
+            }
+        }
+        sources
+    }
+
+    /// Ordered semantic transcript content. Stable source IDs let the reader
+    /// keep a position when rows are rewrapped or provisional text reconciles.
+    pub fn source_blocks(&self) -> Vec<TranscriptBlock> {
+        let mut blocks = vec![TranscriptBlock {
+            source_id: TranscriptSourceId::Prompt,
+            kind: TranscriptBlockKind::Prompt,
+            text: self.prompt.clone(),
+        }];
+
+        for (round_index, round) in &self.rounds {
+            let final_text = self
+                .authoritative_final
+                .as_ref()
+                .filter(|(index, _)| index == round_index)
+                .map(|(_, text)| text.as_str());
+            let final_source = round
+                .parts
+                .as_ref()
+                .and_then(|parts| {
+                    parts.iter().find_map(|part| match part {
+                        RoundPart::Text(index) => Some(TranscriptSourceId::Assistant {
+                            round_index: *round_index,
+                            block_index: *index,
+                        }),
+                        RoundPart::Tool(_) => None,
+                    })
+                })
+                .or_else(|| {
+                    round
+                        .text_blocks
+                        .keys()
+                        .next()
+                        .map(|index| TranscriptSourceId::Assistant {
+                            round_index: *round_index,
+                            block_index: *index,
+                        })
+                })
+                .unwrap_or(TranscriptSourceId::AuthoritativeFinal {
+                    round_index: *round_index,
+                });
+            let mut rendered_final = false;
+
+            if let Some(parts) = &round.parts {
+                for part in parts {
+                    match part {
+                        RoundPart::Text(index) => {
+                            if let Some(text) = final_text {
+                                if !rendered_final && !text.is_empty() {
+                                    blocks.push(TranscriptBlock {
+                                        source_id: final_source.clone(),
+                                        kind: TranscriptBlockKind::Assistant,
+                                        text: text.to_string(),
+                                    });
+                                    rendered_final = true;
+                                }
+                            } else if let Some(block) = round.text_blocks.get(index)
+                                && !block.text().is_empty()
+                            {
+                                blocks.push(TranscriptBlock {
+                                    source_id: TranscriptSourceId::Assistant {
+                                        round_index: *round_index,
+                                        block_index: *index,
+                                    },
+                                    kind: TranscriptBlockKind::Assistant,
+                                    text: block.text().to_string(),
+                                });
+                            }
+                        }
+                        RoundPart::Tool(id) => {
+                            if let Some(tool) = round.tools.get(id) {
+                                blocks.push(TranscriptBlock {
+                                    source_id: TranscriptSourceId::Tool {
+                                        round_index: *round_index,
+                                        tool_use_id: id.clone(),
+                                    },
+                                    kind: TranscriptBlockKind::Tool,
+                                    text: tool.render(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(text) = final_text
+                    && !rendered_final
+                    && !text.is_empty()
+                {
+                    blocks.push(TranscriptBlock {
+                        source_id: final_source.clone(),
+                        kind: TranscriptBlockKind::Assistant,
+                        text: text.to_string(),
+                    });
+                }
+                for (index, block) in &round.text_blocks {
+                    if !parts.iter().any(
+                        |part| matches!(part, RoundPart::Text(part_index) if part_index == index),
+                    ) && final_text.is_none()
+                        && !block.text().is_empty()
+                    {
+                        blocks.push(TranscriptBlock {
+                            source_id: TranscriptSourceId::Assistant {
+                                round_index: *round_index,
+                                block_index: *index,
+                            },
+                            kind: TranscriptBlockKind::Assistant,
+                            text: block.text().to_string(),
+                        });
+                    }
+                }
+                for id in &round.tool_order {
+                    if !parts
+                        .iter()
+                        .any(|part| matches!(part, RoundPart::Tool(part_id) if part_id == id))
+                        && let Some(tool) = round.tools.get(id)
+                    {
+                        blocks.push(TranscriptBlock {
+                            source_id: TranscriptSourceId::Tool {
+                                round_index: *round_index,
+                                tool_use_id: id.clone(),
+                            },
+                            kind: TranscriptBlockKind::Tool,
+                            text: tool.render(),
+                        });
+                    }
+                }
+            } else if let Some(text) = final_text {
+                if !text.is_empty() {
+                    blocks.push(TranscriptBlock {
+                        source_id: final_source,
+                        kind: TranscriptBlockKind::Assistant,
+                        text: text.to_string(),
+                    });
+                }
+                for id in &round.tool_order {
+                    if let Some(tool) = round.tools.get(id) {
+                        blocks.push(TranscriptBlock {
+                            source_id: TranscriptSourceId::Tool {
+                                round_index: *round_index,
+                                tool_use_id: id.clone(),
+                            },
+                            kind: TranscriptBlockKind::Tool,
+                            text: tool.render(),
+                        });
+                    }
+                }
+            } else {
+                for (index, block) in &round.text_blocks {
+                    if !block.text().is_empty() {
+                        blocks.push(TranscriptBlock {
+                            source_id: TranscriptSourceId::Assistant {
+                                round_index: *round_index,
+                                block_index: *index,
+                            },
+                            kind: TranscriptBlockKind::Assistant,
+                            text: block.text().to_string(),
+                        });
+                    }
+                }
+                for id in &round.tool_order {
+                    if let Some(tool) = round.tools.get(id) {
+                        blocks.push(TranscriptBlock {
+                            source_id: TranscriptSourceId::Tool {
+                                round_index: *round_index,
+                                tool_use_id: id.clone(),
+                            },
+                            kind: TranscriptBlockKind::Tool,
+                            text: tool.render(),
+                        });
+                    }
                 }
             }
         }
-        terminal_safe_text(&text)
+
+        if let Some((round_index, text)) = &self.authoritative_final
+            && !self.rounds.contains_key(round_index)
+            && !text.is_empty()
+        {
+            blocks.push(TranscriptBlock {
+                source_id: TranscriptSourceId::AuthoritativeFinal {
+                    round_index: *round_index,
+                },
+                kind: TranscriptBlockKind::Assistant,
+                text: text.clone(),
+            });
+        }
+        if let Some(outcome) = &self.outcome {
+            blocks.push(TranscriptBlock {
+                source_id: TranscriptSourceId::Outcome,
+                kind: TranscriptBlockKind::Outcome,
+                text: outcome.clone(),
+            });
+        }
+        if let Some(failure) = &self.failure {
+            blocks.push(TranscriptBlock {
+                source_id: TranscriptSourceId::Failure,
+                kind: TranscriptBlockKind::Error,
+                text: failure.clone(),
+            });
+        }
+        if let Some(warning) = &self.completion_warning {
+            blocks.push(TranscriptBlock {
+                source_id: TranscriptSourceId::Warning,
+                kind: TranscriptBlockKind::Warning,
+                text: warning.clone(),
+            });
+        }
+        blocks
     }
 
     pub fn detail_fields(&self) -> Vec<(String, String)> {
@@ -497,93 +772,26 @@ impl TranscriptTurn {
         }
     }
 
+    #[cfg(test)]
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![format!("You: {}", compact_display(&self.prompt, 4_000))];
-        for (round_index, round) in &self.rounds {
-            let final_text = self
-                .authoritative_final
-                .as_ref()
-                .filter(|(index, _)| index == round_index)
-                .map(|(_, text)| text.as_str());
-            if let Some(parts) = &round.parts {
-                let mut rendered_final = false;
-                for part in parts {
-                    match part {
-                        RoundPart::Text(index) => {
-                            if let Some(text) = final_text {
-                                if !rendered_final {
-                                    push_assistant(&mut lines, text);
-                                    rendered_final = true;
-                                }
-                            } else if let Some(block) = round.text_blocks.get(index) {
-                                push_assistant(&mut lines, block.text());
-                            }
-                        }
-                        RoundPart::Tool(id) => {
-                            if let Some(tool) = round.tools.get(id) {
-                                lines.push(tool.render());
-                            }
-                        }
-                    }
+        self.source_blocks()
+            .into_iter()
+            .map(|block| match block.kind {
+                TranscriptBlockKind::Prompt => {
+                    format!("You: {}", compact_display(&block.text, 4_000))
                 }
-                if let Some(text) = final_text
-                    && !rendered_final
-                {
-                    push_assistant(&mut lines, text);
+                TranscriptBlockKind::Assistant => {
+                    format!("Assistant: {}", compact_display(&block.text, 4_000))
                 }
-                for (index, block) in &round.text_blocks {
-                    if !parts.iter().any(
-                        |part| matches!(part, RoundPart::Text(part_index) if part_index == index),
-                    ) && final_text.is_none()
-                    {
-                        push_assistant(&mut lines, block.text());
-                    }
-                }
-                for id in &round.tool_order {
-                    if !parts
-                        .iter()
-                        .any(|part| matches!(part, RoundPart::Tool(part_id) if part_id == id))
-                        && let Some(tool) = round.tools.get(id)
-                    {
-                        lines.push(tool.render());
-                    }
-                }
-            } else if let Some(text) = final_text {
-                push_assistant(&mut lines, text);
-                for id in &round.tool_order {
-                    if let Some(tool) = round.tools.get(id) {
-                        lines.push(tool.render());
-                    }
-                }
-            } else {
-                for block in round.text_blocks.values() {
-                    push_assistant(&mut lines, block.text());
-                }
-                for id in &round.tool_order {
-                    if let Some(tool) = round.tools.get(id) {
-                        lines.push(tool.render());
-                    }
-                }
-            }
-        }
-        if let Some((round_index, text)) = &self.authoritative_final
-            && !self.rounds.contains_key(round_index)
-        {
-            push_assistant(&mut lines, text);
-        }
-        if let Some(outcome) = &self.outcome {
-            lines.push(format!("Turn {outcome}"));
-        }
-        if let Some(failure) = &self.failure {
-            lines.push(format!(
-                "Turn detail: {}",
-                compact_summary(&Value::String(failure.clone()))
-            ));
-        }
-        if let Some(warning) = &self.completion_warning {
-            lines.push(format!("Warning: {warning}"));
-        }
-        lines
+                TranscriptBlockKind::Tool => block.text,
+                TranscriptBlockKind::Outcome => format!("Turn {}", block.text),
+                TranscriptBlockKind::Error => format!(
+                    "Turn detail: {}",
+                    compact_summary(&Value::String(block.text))
+                ),
+                TranscriptBlockKind::Warning => format!("Warning: {}", block.text),
+            })
+            .collect()
     }
 }
 
@@ -638,12 +846,7 @@ fn ensure_tool_part(round: &mut TranscriptRound, id: &str) {
     }
 }
 
-fn push_assistant(lines: &mut Vec<String>, text: &str) {
-    if !text.is_empty() {
-        lines.push(format!("Assistant: {}", compact_display(text, 4_000)));
-    }
-}
-
+#[cfg(test)]
 fn compact_display(text: &str, limit: usize) -> String {
     let mut characters = text.chars();
     let prefix = characters.by_ref().take(limit).collect::<String>();
@@ -691,7 +894,7 @@ mod tests {
     use leg_ui_client::{StreamEvent, TrailTurn};
     use serde_json::{Value, json};
 
-    use super::TranscriptTurn;
+    use super::{TranscriptSourceId, TranscriptTurn};
 
     #[test]
     fn reconciles_multiple_tool_rounds_without_repeating_final_text() {
@@ -865,6 +1068,64 @@ mod tests {
             .expect("result field");
         assert_eq!(detail, output);
         assert!(transcript.lines().join("\n").contains("more characters"));
+        assert!(transcript.searchable_text().contains(&output));
+    }
+
+    #[test]
+    fn final_reconciliation_keeps_a_stable_source_id_and_searches_complete_text() {
+        let mut transcript = TranscriptTurn::new("prompt");
+        transcript.observe(&text(0, 0, "provisional text"));
+        transcript.observe(&tool_round(
+            0,
+            json!([
+                {"type":"text","text":"provisional text"},
+                {"type":"tool_use","id":"call-identity","name":"read","input":{"path":"x"}}
+            ]),
+        ));
+        transcript.reconcile_final(&json!({
+            "kind":"response",
+            "body":"authoritative text\nsecond line"
+        }));
+
+        let blocks = transcript.source_blocks();
+        let final_block = blocks
+            .iter()
+            .find(|block| block.text.starts_with("authoritative text"))
+            .expect("authoritative reply remains visible");
+        assert_eq!(
+            final_block.source_id,
+            TranscriptSourceId::Assistant {
+                round_index: 0,
+                block_index: 0,
+            }
+        );
+        assert!(blocks.iter().any(|block| {
+            block.source_id
+                == TranscriptSourceId::Tool {
+                    round_index: 0,
+                    tool_use_id: "call-identity".to_string(),
+                }
+        }));
+        let searchable = transcript.searchable_text();
+        assert!(searchable.contains("authoritative text\nsecond line"));
+        assert!(!searchable.contains("provisional text"));
+    }
+
+    #[test]
+    fn unknown_supported_schema_event_does_not_erase_known_transcript_content() {
+        let mut transcript = TranscriptTurn::new("prompt");
+        transcript.observe(&text(0, 0, "known assistant content"));
+        assert!(!transcript.observe(&StreamEvent::Unknown {
+            seq: 1,
+            event: "future_event".to_string(),
+            record: json!({"new_field":"future value"}),
+        }));
+        assert!(
+            transcript
+                .source_blocks()
+                .iter()
+                .any(|block| block.text == "known assistant content")
+        );
     }
 
     fn text(round_index: u64, block_index: u64, text: &str) -> StreamEvent {

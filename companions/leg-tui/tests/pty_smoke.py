@@ -48,6 +48,7 @@ RESUMED_TEXT = "The fixture resumes after its fixed pause."
 ROWS = 40
 COLUMNS = 160
 STOP_DELAY_SECONDS = 2.1
+TRANSCRIPT_FRAME_QUIET_SECONDS = 0.12
 
 
 class TerminalCapture:
@@ -76,6 +77,32 @@ class TerminalCapture:
 
     def __bytes__(self) -> bytes:
         return bytes(self.raw)
+
+
+def transcript_pane_text(screen: str) -> str:
+    lines = screen.splitlines()
+    title_index = next(
+        (index for index, line in enumerate(lines) if re.search(r"Rows (\d+-\d+ of \d+)", line)),
+        None,
+    )
+    if title_index is None:
+        return ""
+    title_line = lines[title_index]
+    rows_match = re.search(r"Rows (\d+-\d+ of \d+)", title_line)
+    assert rows_match is not None
+    pane_start = title_line.rfind("┌", 0, rows_match.start())
+    pane_end = title_line.find("┐", rows_match.end())
+    if pane_start < 0 or pane_end < 0:
+        return ""
+    pane_end += 1
+
+    body = []
+    for line in lines[title_index + 1 :]:
+        pane = line[pane_start:pane_end]
+        if pane.startswith("└"):
+            break
+        body.append(pane)
+    return "\n".join(body)
 
 
 def workspace_path_text(capture: TerminalCapture) -> str | None:
@@ -123,6 +150,17 @@ def test_terminal_screen_redraw() -> None:
     wrapped = TerminalCapture(rows=2, columns=6)
     wrapped.feed(b"\x1b[1;1Hfirst second")
     assert wrapped.contains("first second"), wrapped.text()
+
+    transcript = "\n".join(
+        (
+            "┌Sessions┐┌Rows 1-2 of 2┐",
+            "│        ││first      │",
+            "│        ││second     │",
+            "└────────┘└───────────┘",
+        )
+    )
+    assert "first" in transcript_pane_text(transcript)
+    assert "second" in transcript_pane_text(transcript)
 
 
 def read_until(
@@ -179,6 +217,86 @@ def read_until_not_contains(
                 f"current screen={capture.text()[-1200:]!r}"
             )
         ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, 8192)
+        except OSError:
+            continue
+        if chunk:
+            capture.feed(chunk)
+
+
+def read_until_rows_change(
+    master_fd: int,
+    child: subprocess.Popen[bytes],
+    capture: TerminalCapture,
+    previous: str,
+    previous_body: str,
+    timeout: float = 2.0,
+) -> str:
+    deadline = time.monotonic() + timeout
+    settled_at: float | None = None
+    settled_view: tuple[str, str] | None = None
+    while True:
+        screen = capture.text()
+        title_line = next(
+            (line for line in screen.splitlines() if "Rows " in line), None
+        )
+        match = (
+            re.search(r"Rows (\d+-\d+ of \d+)", title_line) if title_line else None
+        )
+        body = transcript_pane_text(screen)
+        changed = bool(
+            match
+            and match.group(1) != previous
+            and body != previous_body
+        )
+        now = time.monotonic()
+        current_view = (title_line, body) if changed and title_line else None
+        if current_view is not None and current_view != settled_view:
+            settled_view = current_view
+            settled_at = now
+        elif current_view is None:
+            settled_view = None
+            settled_at = None
+        if (
+            current_view is not None
+            and settled_at is not None
+            and now - settled_at >= TRANSCRIPT_FRAME_QUIET_SECONDS
+        ):
+            assert match is not None
+            return match.group(1)
+        capture_owned_processes(child)
+        if child.poll() is not None:
+            raise AssertionError(
+                f"TUI exited before transcript rows changed from {previous!r}; "
+                f"exit={child.returncode}; current screen={capture.text()[-1200:]!r}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            current_screen = capture.text()
+            current_title = next(
+                (line for line in current_screen.splitlines() if "Rows " in line), None
+            )
+            current_match = (
+                re.search(r"Rows (\d+-\d+ of \d+)", current_title)
+                if current_title
+                else None
+            )
+            current_body = transcript_pane_text(current_screen)
+            raise AssertionError(
+                f"timed out waiting for transcript rows to change from {previous!r}; "
+                f"current rows={current_match.group(1) if current_match else None!r}; "
+                f"pane changed={current_body != previous_body}; "
+                f"title={current_title!r}; "
+                f"current screen={current_screen[-1200:]!r}"
+            )
+        wait_for = min(0.1, remaining)
+        if current_view is not None and settled_at is not None:
+            quiet_remaining = TRANSCRIPT_FRAME_QUIET_SECONDS - (now - settled_at)
+            wait_for = min(wait_for, max(0.0, quiet_remaining))
+        ready, _, _ = select.select([master_fd], [], [], wait_for)
         if not ready:
             continue
         try:
@@ -603,7 +721,7 @@ def start_prompt(
             "F4 inspect",
             "F5 copy",
             "F6 export",
-            "PageUp/PageDown scroll history",
+            "PageUp/PageDown move by transcript rows",
         ):
             assert hint in first_run_help, (
                 f"first-run help omitted {hint!r}: {first_run_help[-1800:]!r}"
@@ -628,7 +746,7 @@ def start_prompt(
         for hint in (
             "Ctrl-Z/Y undo/redo",
             "Backspace/Delete remove",
-            "Ctrl-End newest",
+            "Ctrl-End follows the tail",
             "F3 sessions",
             "F4 inspects",
             "Ctrl-F searches",
@@ -647,7 +765,7 @@ def start_prompt(
         action_menu = capture.text()
         for action in (
             "F3  Browse/create/rename/reopen sessions",
-            "Ctrl-F  Search titles and displayed prompt/reply/tool text.",
+            "Ctrl-F  Search titles and complete sanitized transcript source.",
             "F4  Expand the selected turn's tool inspector.",
             "F5  Send selected field with terminal OSC 52 clipboard.",
             "F7  Save the copied field to a file",
@@ -1469,15 +1587,25 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             assert request_status(status_url)["requests"] == 12
 
             os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE\x13")
-            read_until(master_fd, child, output, "Long fixture line 020")
+            read_until(master_fd, child, output, "Long fixture line 090")
+            for _ in range(6):
+                screen = output.text()
+                if "Long fixture line 020" in screen:
+                    break
+                row_window = re.search(r"Rows (\d+-\d+ of \d+)", screen)
+                assert row_window, screen
+                previous_body = transcript_pane_text(screen)
+                os.write(master_fd, b"\x1b[5~")
+                read_until_rows_change(
+                    master_fd, child, output, row_window.group(1), previous_body
+                )
+            assert "Long fixture line 020" in output.text(), output.text()
+            read_until(master_fd, child, output, "new content below")
+            assert "Long fixture line 020" in output.text(), (
+                f"stream update moved the transcript reading position: {output.text()!r}"
+            )
             os.write(master_fd, b"\x1bOS\x1b[B\x1b[B")
             read_until(master_fd, child, output, "Inspector")
-            os.write(master_fd, b"\x1b[5~")
-            drain_for(master_fd, output, 0.15)
-            history_screen = output.text()
-            assert "TRIAL-LARGE-TOOL" in history_screen, (
-                f"PageUp did not reveal the prior transcript turn: {history_screen!r}"
-            )
             os.write(master_fd, NEXT_DRAFT.encode())
             read_until(master_fd, child, output, NEXT_DRAFT)
             assert NEXT_DRAFT in output.text(), (
@@ -1487,13 +1615,33 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             drain_for(master_fd, output, 0.3, child)
             assert NEXT_DRAFT not in output.text(), output.text()
             read_until(master_fd, child, output, "Succeeded")
+            os.write(master_fd, b"\x1bOS")
+            drain_for(master_fd, output, 0.1, child)
+            assert "Long fixture line 020" in output.text(), (
+                f"completed stream moved the transcript reading position: {output.text()!r}"
+            )
+            for _ in range(8):
+                screen = output.text()
+                if "TRIAL-LARGE-TOOL" in screen:
+                    break
+                row_window = re.search(r"Rows (\d+-\d+ of \d+)", screen)
+                assert row_window, screen
+                previous_body = transcript_pane_text(screen)
+                os.write(master_fd, b"\x1b[5~")
+                read_until_rows_change(
+                    master_fd, child, output, row_window.group(1), previous_body
+                )
+            history_screen = output.text()
+            assert "TRIAL-LARGE-TOOL" in history_screen, (
+                f"PageUp did not reveal the prior transcript turn: {history_screen!r}"
+            )
+            os.write(master_fd, b"\x1bOS\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Inspector")
             os.write(master_fd, b"\x1b[B")
             read_until(master_fd, child, output, "Assistant reply")
             os.write(master_fd, b"\x1b[6;2~\x1b[6;2~")
             read_until(master_fd, child, output, "Long fixture line 062")
             read_until(master_fd, child, output, "new content below")
-            preserved_screen = output.text()
-            assert "TRIAL-LARGE-TOOL" in preserved_screen, preserved_screen
             os.write(master_fd, b"\x1b[6;2~" * 22)
             read_until(master_fd, child, output, "END OF FIXTURE ANSWER")
             os.write(master_fd, b"\x1b[1;5F")
@@ -1901,13 +2049,12 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x1b[A")
             read_until(master_fd, child, output, "Match 1 of 2")
             os.write(master_fd, b"\x15")
-            read_until(master_fd, child, output, "Search session titles and displayed transcript text.")
+            read_until(master_fd, child, output, "Search titles and complete sanitized transcript source.")
             os.write(master_fd, b"TRIAL-NAV-SEED")
             read_until(master_fd, child, output, "Match 1 of 1")
             os.write(master_fd, b"\r")
             read_until(master_fd, child, output, "Inspector · Up/Down field")
             assert "TRIAL-NAV-SEED" in output.text(), output.text()
-            assert "Tool completed" in output.text(), output.text()
             os.write(master_fd, b"\x1b[B" * 6)
             read_until(master_fd, child, output, "Tool bash · result")
             read_until(master_fd, child, output, "tool-history")
@@ -2063,7 +2210,8 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Filter: Beta")
             os.write(master_fd, b"w")
             read_until(master_fd, child, output, "Choose an existing replacement workspace")
-            assert output.contains("removed-beta-works"), output.text()
+            read_until_workspace_path(master_fd, child, output, str(missing_workspace))
+            assert workspace_path_text(output) == str(missing_workspace), output.text()
             os.write(master_fd, b"\x7f" * (len(str(missing_workspace)) + 2))
             os.write(master_fd, str(replacement_workspace).encode() + b"\r")
             read_until(master_fd, child, output, WARNING)
@@ -2594,21 +2742,41 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
 
             open_started = time.perf_counter()
             os.write(master_fd, b"/History fixture\r\r")
-            read_until_fast(master_fd, child, output, "of 1000", timeout=0.2)
+            read_until_fast(master_fd, child, output, "Rows ", timeout=0.2)
             open_elapsed = time.perf_counter() - open_started
             assert open_elapsed <= 0.2, f"opening known 1,000-turn session took {open_elapsed * 1000:.1f} ms"
-            statuses = ("Tool denied", "Tool pending", "Tool interrupted", "Tool completed")
+            read_until(master_fd, child, output, "history fixture prompt 0999")
+            read_until(master_fd, child, output, "literal Ω output from turn 0999")
+            statuses = (
+                "Tool completed",
+                "Tool interrupted",
+                "Tool pending",
+                "Tool denied",
+                "Tool failed",
+            )
             for status in statuses:
-                read_until(master_fd, child, output, status)
-            conversation = output.text()
-            for status in statuses:
-                assert status in conversation, f"transcript omitted {status!r}: {conversation!r}"
-            assert "history fixture prompt 0999" in conversation
-            assert "literal Ω output from turn 0999" in conversation
+                for _ in range(6):
+                    screen = output.text()
+                    if status in screen:
+                        break
+                    row_window = re.search(r"Rows (\d+-\d+ of \d+)", screen)
+                    assert row_window, screen
+                    previous_body = transcript_pane_text(screen)
+                    os.write(master_fd, b"\x1b[5~")
+                    read_until_rows_change(
+                        master_fd, child, output, row_window.group(1), previous_body
+                    )
+                assert status in output.text(), (
+                    f"history browsing did not reveal {status!r}: {output.text()!r}"
+                )
+            os.write(master_fd, b"\x1b[1;5F")
+            read_until(master_fd, child, output, "literal Ω output from turn 0999")
             os.write(master_fd, b"\x1b[5~")
             read_until(master_fd, child, output, "Tool failed")
             os.write(master_fd, b"\x1b[1;5F")
-            read_until(master_fd, child, output, "Turns 996-1000 of 1000")
+            read_until(master_fd, child, output, "literal Ω output from turn 0999")
+            row_window = re.search(r"Rows (\d+-\d+ of \d+)", output.text())
+            assert row_window, output.text()
 
             inspector_started = time.perf_counter()
             os.write(master_fd, b"\x1bOS")
@@ -2620,9 +2788,15 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
 
             os.write(master_fd, b"\x1b[B" * 6)
             read_until(master_fd, child, output, "literal Ω output from turn 0999")
+            before_page = output.text()
+            previous_window = re.search(r"Rows (\d+-\d+ of \d+)", before_page)
+            assert previous_window, before_page
+            previous_body = transcript_pane_text(before_page)
             os.write(master_fd, b"\x1b[5~")
-            read_until(master_fd, child, output, "Turns 991-996 of 1000")
-            before_switch = re.search(r"Turns (\d+-\d+ of 1000)", output.text())
+            read_until_rows_change(
+                master_fd, child, output, previous_window.group(1), previous_body
+            )
+            before_switch = re.search(r"Rows (\d+-\d+ of \d+)", output.text())
             assert before_switch, output.text()
             scroll_position = before_switch.group(1)
             assert "Alpha draft survives session changes" in output.text()
@@ -2631,7 +2805,7 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Beta draft stays in its own session")
             select_picker_session(master_fd, child, output, "History fixture")
             read_until(master_fd, child, output, "Alpha draft survives session changes")
-            after_switch = re.search(r"Turns (\d+-\d+ of 1000)", output.text())
+            after_switch = re.search(r"Rows (\d+-\d+ of \d+)", output.text())
             assert after_switch and after_switch.group(1) == scroll_position, (
                 scroll_position,
                 output.text(),
@@ -2643,7 +2817,7 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x1b[B")
             read_until(master_fd, child, output, "Match 2 of 8")
             os.write(master_fd, b"\x15")
-            read_until(master_fd, child, output, "Search session titles and displayed transcript text.")
+            read_until(master_fd, child, output, "Search titles and complete sanitized transcript source.")
             os.write(master_fd, "literal Ω output from turn 0999".encode())
             read_until(master_fd, child, output, "Match 1 of 1")
             os.write(master_fd, b"\r")
@@ -2956,11 +3130,6 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
                 master_fd, child, output, "four", rows=24, columns=80
             )
             layout_screen = terminal_screen_text(bytes(output), 24, 80)
-            compare_workbench_capture(
-                "workbench-80x24.txt",
-                layout_screen,
-                getattr(args, "update_workbench_captures", False),
-            )
             layout_lines = layout_screen.splitlines()
             conversation_row = next(
                 index for index, line in enumerate(layout_lines) if "Conversation" in line
@@ -3027,6 +3196,15 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
                 master_fd, child, output, "Succeeded", rows=24, columns=80
             )
             assert request_status(status_url)["requests"] == 1
+            final_80_screen = terminal_screen_text(bytes(output), 24, 80)
+            assert "You: terminal size recovery draft" in final_80_screen, final_80_screen
+            assert "Assistant" in final_80_screen, final_80_screen
+            assert "Outcome: succeeded" in final_80_screen, final_80_screen
+            compare_workbench_capture(
+                "workbench-80x24.txt",
+                final_80_screen,
+                getattr(args, "update_workbench_captures", False),
+            )
             requests = [
                 json.loads(line)
                 for line in event_log.read_text(encoding="utf-8").splitlines()
@@ -3037,7 +3215,7 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             resize_pty(slave_fd, 40, 120)
             drain_for(master_fd, output, 0.2)
             final_screen = terminal_screen_text(bytes(output), 40, 120)
-            assert "Succeeded" in final_screen and "Turns 1-1 of 1" in final_screen, final_screen
+            assert "Succeeded" in final_screen and "Rows " in final_screen, final_screen
             compare_workbench_capture(
                 "workbench-120x40.txt",
                 final_screen,
