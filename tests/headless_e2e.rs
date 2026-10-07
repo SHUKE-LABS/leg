@@ -127,6 +127,92 @@ fn spawn_sse_sequence_server(rounds: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_paced_sse_server(
+    reply: String,
+    event_count: usize,
+    interval: Duration,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind paced SSE server");
+    let addr = listener.local_addr().expect("local addr");
+    let ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string();
+    let content_length = ping.len() * event_count + reply.len();
+    let server = thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        if read_request_body(&mut stream).is_none() {
+            return;
+        }
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(headers.as_bytes()).is_err() || stream.flush().is_err() {
+            return;
+        }
+        for _ in 0..event_count {
+            thread::sleep(interval);
+            if stream.write_all(ping.as_bytes()).is_err() || stream.flush().is_err() {
+                return;
+            }
+        }
+        let _ = stream.write_all(reply.as_bytes());
+        let _ = stream.flush();
+    });
+    (format!("http://{addr}"), server)
+}
+
+struct HeldResponseServer {
+    release: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for HeldResponseServer {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn spawn_held_response_server(send_headers: bool) -> (String, HeldResponseServer) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind held response server");
+    let addr = listener.local_addr().expect("local addr");
+    let (release, released) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        if read_request_body(&mut stream).is_none() {
+            return;
+        }
+        if send_headers {
+            let body = "data: {}\n\n";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(headers.as_bytes()).is_err() || stream.flush().is_err() {
+                return;
+            }
+            if released.recv_timeout(Duration::from_secs(10)).is_err() {
+                return;
+            }
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+        } else {
+            let _ = released.recv_timeout(Duration::from_secs(10));
+        }
+    });
+    (
+        format!("http://{addr}"),
+        HeldResponseServer {
+            release,
+            worker: Some(worker),
+        },
+    )
+}
+
 fn spawn_counting_sse_server() -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting SSE server");
     listener
@@ -3615,5 +3701,141 @@ fn second_signal_exits_immediately_and_kills_bash_process_group() {
     assert_eq!(requests.lock().unwrap().len(), 1);
 
     cleanup.active = false;
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn streamed_reply_survives_ninety_seconds_of_regular_sse_data() {
+    let reply = sse_text_reply("stream stayed alive");
+    let (base_url, server) = spawn_paced_sse_server(reply, 18, Duration::from_secs(5));
+    let cwd = fixture_dir("stream-timeout-long-active");
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env_remove("LEG_TIMEOUT_SECS")
+        .env_remove("LEG_STREAM_IDLE_TIMEOUT_SECS")
+        .env_remove("LEG_PROVIDER")
+        .arg("session");
+
+    let output = run(command, Some("hello\n"));
+    assert!(
+        output.status.success(),
+        "active stream failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "stream stayed alive\n"
+    );
+    server.join().expect("paced SSE server should finish");
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn stalled_stream_fails_with_idle_timeout_in_response_error_trail() {
+    let (base_url, server) = spawn_held_response_server(true);
+    let cwd = fixture_dir("stream-timeout-idle");
+    let trail = cwd.join("trail.jsonl");
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_STREAM_IDLE_TIMEOUT_SECS", "1")
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["exchange", "--stream-json"]);
+
+    let started = Instant::now();
+    let output = run(command, Some("hello\n"));
+    let elapsed = started.elapsed();
+    assert!(!output.status.success(), "stalled stream must fail");
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "idle timeout fired too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "idle timeout was late: {elapsed:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("LEG_STREAM_IDLE_TIMEOUT_SECS"));
+    let events = read_events(&trail);
+    let outcome = events
+        .iter()
+        .find(|event| event["event"] == "response_error")
+        .expect("response error event");
+    assert_eq!(outcome["event"], "response_error");
+    assert!(
+        outcome["message"]
+            .as_str()
+            .expect("response error message")
+            .contains("LEG_STREAM_IDLE_TIMEOUT_SECS"),
+        "{outcome}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn stalled_buffered_response_keeps_the_request_body_timeout() {
+    let (base_url, server) = spawn_held_response_server(true);
+    let cwd = fixture_dir("buffered-response-timeout");
+    let trail = cwd.join("trail.jsonl");
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_TIMEOUT_SECS", "1")
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["ask", "hello"]);
+
+    let started = Instant::now();
+    let output = run(command, None);
+    let elapsed = started.elapsed();
+    assert!(!output.status.success(), "stalled buffered body must fail");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "body timeout was late: {elapsed:?}"
+    );
+    let events = read_events(&trail);
+    let outcome = events
+        .iter()
+        .find(|event| event["event"] == "response_error")
+        .expect("response error event");
+    assert_eq!(outcome["event"], "response_error");
+    drop(server);
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn response_header_timeout_stops_a_server_that_never_sends_headers() {
+    let (base_url, server) = spawn_held_response_server(false);
+    let cwd = fixture_dir("stream-timeout-headers");
+    let trail = cwd.join("trail.jsonl");
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_TIMEOUT_SECS", "1")
+        .env_remove("LEG_MAX_RETRIES")
+        .env_remove("LEG_RETRY_BASE_DELAY_MS")
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["exchange", "--stream-json"]);
+
+    let started = Instant::now();
+    let output = run(command, Some("hello\n"));
+    let elapsed = started.elapsed();
+    assert!(
+        !output.status.success(),
+        "server that never sends headers must fail"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "failed too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "header timeout was late: {elapsed:?}"
+    );
+    let events = read_events(&trail);
+    let outcome = events
+        .iter()
+        .find(|event| event["event"] == "response_error")
+        .expect("response error event");
+    assert_eq!(outcome["event"], "response_error");
+    assert_eq!(outcome["attempts"], 1);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("LEG_TIMEOUT_SECS"));
+    drop(server);
     std::fs::remove_dir_all(&cwd).ok();
 }

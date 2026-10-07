@@ -10,7 +10,10 @@ use super::super::{RetryPolicy, RetryingHttpClient};
 
 pub(crate) fn real_http(config: &LegConfig) -> RetryingHttpClient<UreqHttpClient> {
     let policy = RetryPolicy::new(config.max_retries, config.retry_base_delay);
-    RetryingHttpClient::new(UreqHttpClient::new(config.timeout), policy)
+    RetryingHttpClient::new(
+        UreqHttpClient::with_timeouts(config.timeout, config.stream_idle_timeout),
+        policy,
+    )
 }
 
 pub(crate) fn endpoint(base_url: &str, resource: &str) -> String {

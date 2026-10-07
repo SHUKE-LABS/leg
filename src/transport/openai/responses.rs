@@ -682,6 +682,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "test-model".to_string(),
             timeout: Duration::from_secs(5),
+            stream_idle_timeout: Duration::from_secs(120),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
             max_retries: 0,

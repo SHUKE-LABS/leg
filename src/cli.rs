@@ -232,7 +232,7 @@ fn help_text() -> String {
          flag to attach multiple images. Each base64 image is limited to 10 MB,\n\
          and image requests to 32 MB.\n\
          Also honours LEG_PROVIDER, ANTHROPIC_BASE_URL, OPENAI_BASE_URL,\n\
-         LEG_MODEL, LEG_TIMEOUT_SECS,\n\
+         LEG_MODEL, LEG_TIMEOUT_SECS, LEG_STREAM_IDLE_TIMEOUT_SECS,\n\
          LEG_BASH_TIMEOUT_SECS, LEG_MAX_TOKENS, LEG_MAX_TOOL_ROUNDS,\n\
          LEG_MAX_RETRIES, LEG_RETRY_BASE_DELAY_MS,\n\
          LEG_PRETOOL_HOOK, and LEG_SYSTEM_PROMPT.\n\n\

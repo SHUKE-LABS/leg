@@ -26,8 +26,12 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// Default model id used by either OpenAI wire protocol when `LEG_MODEL` is unset.
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4.1-mini";
 
-/// Default request timeout in seconds when `LEG_TIMEOUT_SECS` is unset.
+/// Default request-phase and buffered-body timeout in seconds when
+/// `LEG_TIMEOUT_SECS` is unset.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// Default idle timeout in seconds for streaming responses.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
 /// Default `bash` command timeout in seconds when `LEG_BASH_TIMEOUT_SECS` is unset.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
@@ -80,10 +84,14 @@ pub struct LegConfig {
     /// Model id to request. From `LEG_MODEL`, defaulting to a provider-specific
     /// model.
     pub model: String,
-    /// Per-request timeout. Derived from `LEG_TIMEOUT_SECS`, defaulting to
-    /// [`DEFAULT_TIMEOUT_SECS`]. Must be a positive integer; zero is rejected
-    /// because a zero deadline fails every request immediately.
+    /// Timeout for request setup phases and total buffered-body reads. Derived
+    /// from `LEG_TIMEOUT_SECS`, defaulting to [`DEFAULT_TIMEOUT_SECS`]. Must be
+    /// a positive integer; zero would fail request phases immediately.
     pub timeout: Duration,
+    /// Maximum silence while reading a streamed response. Derived from
+    /// `LEG_STREAM_IDLE_TIMEOUT_SECS`, defaulting to
+    /// [`DEFAULT_STREAM_IDLE_TIMEOUT_SECS`]. Must be a positive integer.
+    pub stream_idle_timeout: Duration,
     /// Default `bash` command timeout in seconds. Derived from
     /// `LEG_BASH_TIMEOUT_SECS`, defaulting to [`DEFAULT_BASH_TIMEOUT_SECS`].
     /// Must be a positive integer.
@@ -154,6 +162,23 @@ impl LegConfig {
                 parsed
             }
             None => DEFAULT_TIMEOUT_SECS,
+        };
+
+        let stream_idle_timeout_secs = match non_empty(lookup("LEG_STREAM_IDLE_TIMEOUT_SECS")) {
+            Some(raw) => {
+                let parsed = raw.parse::<u64>().map_err(|_| {
+                    LegError::Config(format!(
+                        "LEG_STREAM_IDLE_TIMEOUT_SECS must be a positive integer, got {raw:?}"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(LegError::Config(
+                        "LEG_STREAM_IDLE_TIMEOUT_SECS must be greater than zero".to_string(),
+                    ));
+                }
+                parsed
+            }
+            None => DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
         };
 
         let bash_timeout_secs = match non_empty(lookup("LEG_BASH_TIMEOUT_SECS")) {
@@ -234,6 +259,7 @@ impl LegConfig {
             base_url,
             model,
             timeout: Duration::from_secs(timeout_secs),
+            stream_idle_timeout: Duration::from_secs(stream_idle_timeout_secs),
             bash_timeout_secs,
             max_tokens,
             max_retries,
@@ -374,6 +400,10 @@ mod tests {
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
         assert_eq!(cfg.model, DEFAULT_MODEL);
         assert_eq!(cfg.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            cfg.stream_idle_timeout,
+            Duration::from_secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS)
+        );
         assert_eq!(cfg.bash_timeout_secs, DEFAULT_BASH_TIMEOUT_SECS);
         assert_eq!(cfg.max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(cfg.max_retries, DEFAULT_MAX_RETRIES);
@@ -458,6 +488,7 @@ mod tests {
             ("ANTHROPIC_BASE_URL", "https://proxy.example"),
             ("LEG_MODEL", "claude-opus-4-8"),
             ("LEG_TIMEOUT_SECS", "5"),
+            ("LEG_STREAM_IDLE_TIMEOUT_SECS", "8"),
             ("LEG_BASH_TIMEOUT_SECS", "30"),
             ("LEG_MAX_TOKENS", "42"),
             ("LEG_MAX_RETRIES", "5"),
@@ -469,6 +500,7 @@ mod tests {
         assert_eq!(cfg.base_url, "https://proxy.example");
         assert_eq!(cfg.model, "claude-opus-4-8");
         assert_eq!(cfg.timeout, Duration::from_secs(5));
+        assert_eq!(cfg.stream_idle_timeout, Duration::from_secs(8));
         assert_eq!(cfg.bash_timeout_secs, 30);
         assert_eq!(cfg.max_tokens, 42);
         assert_eq!(cfg.max_retries, 5);
@@ -537,6 +569,19 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, LegError::Config(_)));
+    }
+
+    #[test]
+    fn zero_or_non_integer_stream_idle_timeout_is_rejected() {
+        for raw in ["0", "abc"] {
+            let err = LegConfig::from_lookup(lookup_from(&[
+                ("ANTHROPIC_API_KEY", "secret"),
+                ("LEG_STREAM_IDLE_TIMEOUT_SECS", raw),
+            ]))
+            .unwrap_err();
+            assert!(matches!(err, LegError::Config(_)), "{raw}");
+            assert!(err.to_string().contains("LEG_STREAM_IDLE_TIMEOUT_SECS"));
+        }
     }
 
     #[test]
