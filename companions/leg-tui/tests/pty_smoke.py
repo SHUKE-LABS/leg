@@ -48,6 +48,7 @@ RESUMED_TEXT = "The fixture resumes after its fixed pause."
 ROWS = 40
 COLUMNS = 160
 STOP_DELAY_SECONDS = 2.1
+TRANSCRIPT_FRAME_QUIET_SECONDS = 0.12
 
 
 class TerminalCapture:
@@ -231,18 +232,40 @@ def read_until_rows_change(
     child: subprocess.Popen[bytes],
     capture: TerminalCapture,
     previous: str,
+    previous_body: str,
     timeout: float = 2.0,
 ) -> str:
     deadline = time.monotonic() + timeout
-    previous_body = transcript_pane_text(capture.text())
+    settled_at: float | None = None
+    settled_view: tuple[str, str] | None = None
     while True:
         screen = capture.text()
-        match = re.search(r"Rows (\d+-\d+ of \d+)", screen)
-        if (
+        title_line = next(
+            (line for line in screen.splitlines() if "Rows " in line), None
+        )
+        match = (
+            re.search(r"Rows (\d+-\d+ of \d+)", title_line) if title_line else None
+        )
+        body = transcript_pane_text(screen)
+        changed = bool(
             match
             and match.group(1) != previous
-            and transcript_pane_text(screen) != previous_body
+            and body != previous_body
+        )
+        now = time.monotonic()
+        current_view = (title_line, body) if changed and title_line else None
+        if current_view is not None and current_view != settled_view:
+            settled_view = current_view
+            settled_at = now
+        elif current_view is None:
+            settled_view = None
+            settled_at = None
+        if (
+            current_view is not None
+            and settled_at is not None
+            and now - settled_at >= TRANSCRIPT_FRAME_QUIET_SECONDS
         ):
+            assert match is not None
             return match.group(1)
         capture_owned_processes(child)
         if child.poll() is not None:
@@ -252,11 +275,28 @@ def read_until_rows_change(
             )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            current_screen = capture.text()
+            current_title = next(
+                (line for line in current_screen.splitlines() if "Rows " in line), None
+            )
+            current_match = (
+                re.search(r"Rows (\d+-\d+ of \d+)", current_title)
+                if current_title
+                else None
+            )
+            current_body = transcript_pane_text(current_screen)
             raise AssertionError(
                 f"timed out waiting for transcript rows to change from {previous!r}; "
-                f"current screen={capture.text()[-1200:]!r}"
+                f"current rows={current_match.group(1) if current_match else None!r}; "
+                f"pane changed={current_body != previous_body}; "
+                f"title={current_title!r}; "
+                f"current screen={current_screen[-1200:]!r}"
             )
-        ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+        wait_for = min(0.1, remaining)
+        if current_view is not None and settled_at is not None:
+            quiet_remaining = TRANSCRIPT_FRAME_QUIET_SECONDS - (now - settled_at)
+            wait_for = min(wait_for, max(0.0, quiet_remaining))
+        ready, _, _ = select.select([master_fd], [], [], wait_for)
         if not ready:
             continue
         try:
@@ -1554,8 +1594,11 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
                     break
                 row_window = re.search(r"Rows (\d+-\d+ of \d+)", screen)
                 assert row_window, screen
+                previous_body = transcript_pane_text(screen)
                 os.write(master_fd, b"\x1b[5~")
-                read_until_rows_change(master_fd, child, output, row_window.group(1))
+                read_until_rows_change(
+                    master_fd, child, output, row_window.group(1), previous_body
+                )
             assert "Long fixture line 020" in output.text(), output.text()
             read_until(master_fd, child, output, "new content below")
             assert "Long fixture line 020" in output.text(), (
@@ -1583,8 +1626,11 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
                     break
                 row_window = re.search(r"Rows (\d+-\d+ of \d+)", screen)
                 assert row_window, screen
+                previous_body = transcript_pane_text(screen)
                 os.write(master_fd, b"\x1b[5~")
-                read_until_rows_change(master_fd, child, output, row_window.group(1))
+                read_until_rows_change(
+                    master_fd, child, output, row_window.group(1), previous_body
+                )
             history_screen = output.text()
             assert "TRIAL-LARGE-TOOL" in history_screen, (
                 f"PageUp did not reveal the prior transcript turn: {history_screen!r}"
@@ -2715,8 +2761,11 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
                         break
                     row_window = re.search(r"Rows (\d+-\d+ of \d+)", screen)
                     assert row_window, screen
+                    previous_body = transcript_pane_text(screen)
                     os.write(master_fd, b"\x1b[5~")
-                    read_until_rows_change(master_fd, child, output, row_window.group(1))
+                    read_until_rows_change(
+                        master_fd, child, output, row_window.group(1), previous_body
+                    )
                 assert status in output.text(), (
                     f"history browsing did not reveal {status!r}: {output.text()!r}"
                 )
@@ -2739,10 +2788,14 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
 
             os.write(master_fd, b"\x1b[B" * 6)
             read_until(master_fd, child, output, "literal Ω output from turn 0999")
-            previous_window = re.search(r"Rows (\d+-\d+ of \d+)", output.text())
-            assert previous_window, output.text()
+            before_page = output.text()
+            previous_window = re.search(r"Rows (\d+-\d+ of \d+)", before_page)
+            assert previous_window, before_page
+            previous_body = transcript_pane_text(before_page)
             os.write(master_fd, b"\x1b[5~")
-            read_until_rows_change(master_fd, child, output, previous_window.group(1))
+            read_until_rows_change(
+                master_fd, child, output, previous_window.group(1), previous_body
+            )
             before_switch = re.search(r"Rows (\d+-\d+ of \d+)", output.text())
             assert before_switch, output.text()
             scroll_position = before_switch.group(1)
