@@ -31,6 +31,9 @@ or build from source directly:
 cargo install --git https://github.com/SHUKE-LABS/leg --locked
 ```
 
+From a checkout, run `bash scripts/dev.sh` to update and install `leg` and its UI
+companions.
+
 Per-platform archives for every CI-supported target (`.tar.gz` on
 Unix, `.zip` on Windows) are attached to each
 [GitHub Release](https://github.com/SHUKE-LABS/leg/releases).
