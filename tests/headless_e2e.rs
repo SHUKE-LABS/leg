@@ -3739,9 +3739,20 @@ fn stalled_stream_fails_with_idle_timeout_in_response_error_trail() {
     command
         .env("LEG_STREAM_IDLE_TIMEOUT_SECS", "1")
         .env("LEG_EVENT_LOG", &trail)
-        .arg("session");
+        .args(["exchange", "--stream-json"]);
 
+    let started = Instant::now();
     let output = run(command, Some("hello\n"));
+    let elapsed = started.elapsed();
+    assert!(!output.status.success(), "stalled stream must fail");
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "idle timeout fired too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "idle timeout was late: {elapsed:?}"
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains("LEG_STREAM_IDLE_TIMEOUT_SECS"));
     let events = read_events(&trail);
     let outcome = events
@@ -3800,11 +3811,15 @@ fn response_header_timeout_stops_a_server_that_never_sends_headers() {
         .env_remove("LEG_MAX_RETRIES")
         .env_remove("LEG_RETRY_BASE_DELAY_MS")
         .env("LEG_EVENT_LOG", &trail)
-        .arg("session");
+        .args(["exchange", "--stream-json"]);
 
     let started = Instant::now();
     let output = run(command, Some("hello\n"));
     let elapsed = started.elapsed();
+    assert!(
+        !output.status.success(),
+        "server that never sends headers must fail"
+    );
     assert!(
         elapsed >= Duration::from_millis(800),
         "failed too early: {elapsed:?}"
