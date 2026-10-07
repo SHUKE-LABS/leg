@@ -32,7 +32,20 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
-const APP_CSS: &str = include_str!("assets/app.css");
+const CONTROLLER_JS: &str = include_str!("assets/controller.js");
+#[cfg(feature = "browser-e2e-themes")]
+const THEME_REGISTRY_JS: &str = include_str!("assets/themes/registry-e2e.js");
+#[cfg(not(feature = "browser-e2e-themes"))]
+const THEME_REGISTRY_JS: &str = include_str!("assets/themes/registry.js");
+const DEFAULT_THEME_JS: &str = include_str!("assets/themes/default.js");
+const DEFAULT_THEME_HTML: &str = include_str!("assets/themes/default.html");
+const DEFAULT_THEME_CSS: &str = include_str!("assets/themes/default.css");
+#[cfg(feature = "browser-e2e-themes")]
+const FIXTURE_THEME_JS: &str = include_str!("assets/themes/fixture.js");
+#[cfg(feature = "browser-e2e-themes")]
+const FIXTURE_THEME_HTML: &str = include_str!("assets/themes/fixture.html");
+#[cfg(feature = "browser-e2e-themes")]
+const FIXTURE_THEME_CSS: &str = include_str!("assets/themes/fixture.css");
 const STORE_NAME: &str = "web-host-state.json";
 const LOCK_NAME: &str = ".leg-web.lock";
 const STORE_VERSION: u32 = 1;
@@ -575,10 +588,14 @@ fn api_error(status: StatusCode, message: &'static str) -> ApiError {
 }
 
 fn build_router(state: HostState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
-        .route("/app.css", get(app_css))
+        .route("/controller.js", get(controller_js))
+        .route("/themes/registry.js", get(theme_registry_js))
+        .route("/themes/default.js", get(default_theme_js))
+        .route("/themes/default.html", get(default_theme_html))
+        .route("/themes/default.css", get(default_theme_css))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/select", post(select_session))
         .route("/api/sessions/{id}", get(get_session).patch(rename_session))
@@ -586,7 +603,13 @@ fn build_router(state: HostState) -> Router {
         .route("/api/sessions/{id}/submit", post(submit_turn))
         .route("/api/sessions/{id}/stop", post(stop_turn))
         .route("/api/sessions/{id}/snapshot", get(get_snapshot))
-        .route("/api/sessions/{id}/events", get(events))
+        .route("/api/sessions/{id}/events", get(events));
+    #[cfg(feature = "browser-e2e-themes")]
+    let router = router
+        .route("/themes/fixture.js", get(fixture_theme_js))
+        .route("/themes/fixture.html", get(fixture_theme_html))
+        .route("/themes/fixture.css", get(fixture_theme_css));
+    router
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard_request))
         .with_state(state)
@@ -629,7 +652,7 @@ async fn guard_request(State(state): State<HostState>, request: Request, next: N
         if !authorization_matches(request.headers().get(AUTHORIZATION), &state.inner.token) {
             return api_error(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
-    } else if path != "/" && path != "/app.js" && path != "/app.css" {
+    } else if !is_embedded_asset(&path) {
         return api_error(StatusCode::NOT_FOUND, "not_found").into_response();
     } else if request.method() != Method::GET {
         return api_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed").into_response();
@@ -695,8 +718,55 @@ async fn app_js() -> Response {
     static_response("text/javascript; charset=utf-8", APP_JS)
 }
 
-async fn app_css() -> Response {
-    static_response("text/css; charset=utf-8", APP_CSS)
+async fn controller_js() -> Response {
+    static_response("text/javascript; charset=utf-8", CONTROLLER_JS)
+}
+
+async fn theme_registry_js() -> Response {
+    static_response("text/javascript; charset=utf-8", THEME_REGISTRY_JS)
+}
+
+async fn default_theme_js() -> Response {
+    static_response("text/javascript; charset=utf-8", DEFAULT_THEME_JS)
+}
+
+async fn default_theme_html() -> Response {
+    static_response("text/html; charset=utf-8", DEFAULT_THEME_HTML)
+}
+
+async fn default_theme_css() -> Response {
+    static_response("text/css; charset=utf-8", DEFAULT_THEME_CSS)
+}
+
+#[cfg(feature = "browser-e2e-themes")]
+async fn fixture_theme_js() -> Response {
+    static_response("text/javascript; charset=utf-8", FIXTURE_THEME_JS)
+}
+
+#[cfg(feature = "browser-e2e-themes")]
+async fn fixture_theme_html() -> Response {
+    static_response("text/html; charset=utf-8", FIXTURE_THEME_HTML)
+}
+
+#[cfg(feature = "browser-e2e-themes")]
+async fn fixture_theme_css() -> Response {
+    static_response("text/css; charset=utf-8", FIXTURE_THEME_CSS)
+}
+
+fn is_embedded_asset(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/app.js"
+            | "/controller.js"
+            | "/themes/registry.js"
+            | "/themes/default.js"
+            | "/themes/default.html"
+            | "/themes/default.css"
+    ) || (cfg!(feature = "browser-e2e-themes")
+        && matches!(
+            path,
+            "/themes/fixture.js" | "/themes/fixture.html" | "/themes/fixture.css"
+        ))
 }
 
 fn static_response(content_type: &'static str, content: &'static str) -> Response {
@@ -2695,16 +2765,33 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(!String::from_utf8_lossy(&body).contains(&host.state.inner.token));
         assert!(!APP_JS.contains(&host.state.inner.token));
-        assert!(APP_JS.contains("location.hash"));
-        assert!(APP_JS.contains("sessionStorage"));
-        assert!(APP_JS.contains("replaceState"));
-        assert!(INDEX_HTML.contains("/app.css"));
-        assert!(String::from_utf8_lossy(&body).contains("/app.css"));
-        assert!(APP_CSS.contains(".composer"));
+        assert!(CONTROLLER_JS.contains("location.hash"));
+        assert!(CONTROLLER_JS.contains("sessionStorage"));
+        assert!(CONTROLLER_JS.contains("replaceState"));
+        assert!(!INDEX_HTML.contains("/app.css"));
+        assert!(APP_JS.contains("/themes/registry.js"));
+        assert!(APP_JS.contains("/controller.js"));
+        let controller_response = build_router(host.state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/controller.js")
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(controller_response.status(), StatusCode::OK);
+        assert_eq!(
+            controller_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert!(THEME_REGISTRY_JS.contains("/themes/default.js"));
+        assert!(DEFAULT_THEME_CSS.contains(".composer"));
         let css_response = build_router(host.state.clone())
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/app.css")
+                    .uri("/themes/default.css")
                     .header(HOST, "127.0.0.1:43127")
                     .body(Body::empty())
                     .unwrap(),
@@ -2725,6 +2812,47 @@ mod tests {
                 .unwrap()
                 .contains("style-src 'self'")
         );
+
+        let unknown = build_router(host.state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/themes/not-registered.js")
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let wrong_method = build_router(host.state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/themes/default.html")
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        #[cfg(feature = "browser-e2e-themes")]
+        {
+            assert!(THEME_REGISTRY_JS.contains("id: \"fixture\""));
+            let fixture = build_router(host.state.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/themes/fixture.css")
+                        .header(HOST, "127.0.0.1:43127")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fixture.status(), StatusCode::OK);
+        }
     }
 
     #[test]

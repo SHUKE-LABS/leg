@@ -29,5 +29,15 @@ repeat at 200% browser zoom.
 - [ ] Switching between sessions restores each draft and transcript anchor.
   A running session remains marked in the rail; reopening it reconnects without
   duplicate text or an extra submission.
+- [ ] When multiple themes are registered, the theme selector has an accessible
+  name, is keyboard reachable from every theme, and announces the selected
+  theme. Switching themes restores the selected session, draft, reading
+  position, and pending-send state without submitting, retrying, or stopping.
+  Stop and an eligible explicit same-send retry remain usable afterward.
+- [ ] Repeat the session/workspace, transcript, composer, Stop, recovery, and
+  outcome checks in each theme. If detailed tool inspection is absent, failed,
+  denied, missing, interrupted, and capped results remain readable in the
+  transcript; omitted search/copy/download controls have no hidden controls or
+  shortcuts.
 - [ ] Code and long tool output remain readable without horizontal page
   overflow. A large result is summarized in the transcript.
