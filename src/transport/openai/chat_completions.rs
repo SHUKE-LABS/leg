@@ -80,7 +80,10 @@ impl<H: HttpClient> Transport for OpenAiChatCompletionsClient<H> {
         let url = common::endpoint(&self.config.base_url, "chat/completions");
 
         let mut decoder = SseDecoder::default();
-        let mut assembler = ChatAssembler::default();
+        let mut assembler = ChatAssembler {
+            max_tokens: self.config.max_tokens,
+            ..ChatAssembler::default()
+        };
         let call = {
             let mut accept_event = |event| assembler.accept(event, on_event);
             self.http
@@ -257,6 +260,8 @@ struct ChatAssembler {
     open_blocks: Vec<usize>,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
+    provider_stop_reason: Option<String>,
+    max_tokens: u32,
 }
 
 struct PartialToolCall {
@@ -324,6 +329,7 @@ impl ChatAssembler {
                 }
             }
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.provider_stop_reason = Some(reason.to_string());
                 self.stop_reason = Some(if self.refusal && reason == "stop" {
                     StopReason::Refusal
                 } else {
@@ -520,6 +526,11 @@ impl ChatAssembler {
             }
         }
         if content.is_empty() {
+            if let Some(reason) = self.provider_stop_reason.as_deref()
+                && reason == "length"
+            {
+                return Err(LegError::token_limit_reply(self.max_tokens, reason));
+            }
             return Err(LegError::Decode(
                 "response contained no assistant text or tool call".to_string(),
             ));
@@ -644,6 +655,32 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn length_finish_without_content_has_dedicated_error() {
+        let http = FakeHttp {
+            body: stream(&[json!({"choices":[{"delta":{},"finish_reason":"length"}]})]),
+            request: RefCell::new(None),
+        };
+        let mut config = config();
+        config.max_tokens = 1024;
+        let client = OpenAiChatCompletionsClient::with_http(config, http);
+
+        let error = client
+            .send_conversation(&[Message::user("think")])
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            LegError::TokenLimit {
+                max_tokens: 1024,
+                stop_reason,
+            } if stop_reason == "length"
+        ));
+        assert_eq!(error.kind(), "decode");
+        assert_eq!(error.stop_reason(), Some("length"));
+        assert!(error.to_string().contains("raise LEG_MAX_TOKENS"));
     }
 
     #[test]

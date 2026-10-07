@@ -825,6 +825,7 @@ fn execute_exchange_session_core(
                 duration_ms,
                 kind: err.kind().to_string(),
                 message: body.clone(),
+                stop_reason: err.stop_reason().map(str::to_string),
                 attempts,
                 session_id: Some(session_id.clone()),
                 turn_index: Some(turn_index),

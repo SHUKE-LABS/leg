@@ -115,6 +115,9 @@ pub enum Outcome {
         kind: String,
         /// Human-readable error description.
         message: String,
+        /// Provider terminal reason when a reply failed at its token limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
         /// Total provider attempts in this exchange; absent in older records.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempts: Option<u64>,
@@ -226,6 +229,9 @@ pub enum ExchangeEvent {
         kind: String,
         /// Human-readable error description.
         message: String,
+        /// Provider terminal reason when a reply failed at its token limit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
         /// Total provider attempts used by the exchange.
         #[serde(skip_serializing_if = "Option::is_none")]
         attempts: Option<u64>,
@@ -674,6 +680,7 @@ impl ExchangeEvent {
             duration_ms,
             kind: err.kind().to_string(),
             message: err.to_string(),
+            stop_reason: err.stop_reason().map(str::to_string),
             attempts,
             session_id: session_id.map(str::to_string),
             turn_index,
@@ -745,6 +752,7 @@ impl ExchangeEvent {
                 duration_ms,
                 kind,
                 message,
+                stop_reason,
                 attempts,
                 session_id,
                 turn_index,
@@ -754,6 +762,7 @@ impl ExchangeEvent {
                 duration_ms: *duration_ms,
                 kind: kind.clone(),
                 message: message.clone(),
+                stop_reason: stop_reason.clone(),
                 attempts: *attempts,
                 session_id: session_id.clone(),
                 turn_index: *turn_index,
@@ -887,6 +896,36 @@ mod tests {
         assert_eq!(value["event"], "response_error");
         assert_eq!(value["kind"], "auth");
         assert_eq!(value["message"], err.to_string());
+        assert!(value.get("stop_reason").is_none());
+    }
+
+    #[test]
+    fn response_error_event_serializes_provider_stop_reason() {
+        let err = crate::error::LegError::token_limit_reply(1024, "max_output_tokens");
+        let event = ExchangeEvent::response_error(1, 2, &err);
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+
+        assert_eq!(value["event"], "response_error");
+        assert_eq!(value["kind"], "decode");
+        assert_eq!(value["stop_reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn response_error_mirrored_from_outcome_keeps_stop_reason() {
+        let outcome = Outcome::Error {
+            ts_ms: 2,
+            duration_ms: 1,
+            kind: "decode".to_string(),
+            message: "response decode error".to_string(),
+            stop_reason: Some("length".to_string()),
+            attempts: Some(1),
+            session_id: None,
+            turn_index: None,
+        };
+        let event = ExchangeEvent::from_outcome(&outcome);
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+
+        assert_eq!(value["stop_reason"], "length");
     }
 
     #[test]

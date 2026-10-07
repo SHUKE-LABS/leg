@@ -101,9 +101,9 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
 
         let call = self.http.post_json_with_attempts(&url, &headers, &body);
         let attempts = call.attempts;
-        let result = call
-            .result
-            .and_then(|response| parse_response(response.status, &response.body));
+        let result = call.result.and_then(|response| {
+            parse_response(response.status, &response.body, self.config.max_tokens)
+        });
         TransportCall::new(result, attempts)
     }
 
@@ -132,7 +132,10 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         ];
 
         let mut decoder = SseDecoder::default();
-        let mut assembler = StreamAssembler::default();
+        let mut assembler = StreamAssembler {
+            max_tokens: self.config.max_tokens,
+            ..StreamAssembler::default()
+        };
         let call = {
             let mut accept_event = |event| assembler.accept(event, on_event);
             self.http
@@ -150,7 +153,7 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
                 };
                 result.and_then(|()| assembler.finish())
             }
-            Ok(response) => parse_response(response.status, &response.body),
+            Ok(response) => parse_response(response.status, &response.body, self.config.max_tokens),
         };
         TransportCall::new(result, attempts)
     }
@@ -245,9 +248,9 @@ fn build_request_body_with_stream(
 /// explicit error variant, surfacing the provider's message and optional
 /// error type rather than hiding the failure. A `rate_limit_error` is
 /// rate-limited regardless of HTTP status.
-fn parse_response(status: u16, body: &str) -> Result<AssistantReply> {
+fn parse_response(status: u16, body: &str, max_tokens: u32) -> Result<AssistantReply> {
     if (200..300).contains(&status) {
-        return parse_success(body);
+        return parse_success(body, max_tokens);
     }
 
     let (error_type, message) = extract_error_details(body);
@@ -279,11 +282,13 @@ fn parse_response(status: u16, body: &str) -> Result<AssistantReply> {
 /// skipped so a newer provider shape still decodes. The provider's optional
 /// terminal reason is retained as a [`StopReason`]. A body that fails to
 /// decode, a malformed supported block, or a reply with neither non-empty
-/// text nor a tool call is a [`LegError::Decode`].
-fn parse_success(body: &str) -> Result<AssistantReply> {
+/// text nor a tool call is a [`LegError::Decode`], except a token-limited
+/// reply, which carries its stop reason in [`LegError::TokenLimit`].
+fn parse_success(body: &str, max_tokens: u32) -> Result<AssistantReply> {
     let response: MessagesResponse = serde_json::from_str(body)
         .map_err(|err| LegError::Decode(format!("malformed Messages response: {err}")))?;
 
+    let stop_reason = response.stop_reason;
     let mut content = Vec::new();
     for block in response.content {
         match block.get("type").and_then(serde_json::Value::as_str) {
@@ -304,6 +309,11 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
         .iter()
         .any(|block| matches!(block, ContentBlock::Text { text } if !text.is_empty()));
     if !has_text && !has_tool_use {
+        if let Some(reason) = stop_reason.as_deref()
+            && reason == "max_tokens"
+        {
+            return Err(LegError::token_limit_reply(max_tokens, reason));
+        }
         return Err(LegError::Decode(
             "response contained no assistant text or tool call".to_string(),
         ));
@@ -321,7 +331,7 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
     Ok(AssistantReply::from_blocks(
         content,
         usage,
-        response.stop_reason.as_deref().map(StopReason::from_wire),
+        stop_reason.as_deref().map(StopReason::from_wire),
     ))
 }
 
@@ -338,6 +348,7 @@ struct StreamAssembler {
     completed: BTreeMap<usize, Option<ContentBlock>>,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
+    max_tokens: u32,
 }
 
 impl StreamAssembler {
@@ -530,6 +541,12 @@ impl StreamAssembler {
             .iter()
             .any(|block| matches!(block, ContentBlock::Text { text } if !text.is_empty()));
         if !has_text && !has_tool_use {
+            if let Some(reason @ StopReason::MaxTokens) = self.stop_reason.as_ref() {
+                return Err(LegError::token_limit_reply(
+                    self.max_tokens,
+                    reason.as_str(),
+                ));
+            }
             return Err(LegError::Decode(
                 "response contained no assistant text or tool call".to_string(),
             ));
@@ -1056,7 +1073,7 @@ mod tests {
         assert_eq!(call.attempts, 1);
         assert_eq!(
             reply,
-            parse_success(buffered).expect("buffered reply decodes")
+            parse_success(buffered, DEFAULT_MAX_TOKENS).expect("buffered reply decodes")
         );
         assert_eq!(reply.text, "read notes");
         assert!(matches!(
@@ -1171,6 +1188,92 @@ mod tests {
 
         assert_eq!(reply.text, "unfinished");
         assert_eq!(reply.stop_reason, Some(StopReason::MaxTokens));
+    }
+
+    #[test]
+    fn thinking_only_max_tokens_json_reply_has_dedicated_error() {
+        let body = r#"{
+            "content": [{"type": "thinking", "thinking": "private", "signature": "sig"}],
+            "stop_reason": "max_tokens"
+        }"#;
+        let mut config = config_with("https://api.anthropic.com", "claude-sonnet-4-6");
+        config.max_tokens = 1024;
+        let client = ClaudeClient::with_http(config, FakeHttp::new(200, body));
+
+        let error = client.send(&Prompt::new("hi")).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LegError::TokenLimit {
+                max_tokens: 1024,
+                ref stop_reason,
+            } if stop_reason == "max_tokens"
+        ));
+        assert_eq!(error.kind(), "decode");
+        assert_eq!(error.stop_reason(), Some("max_tokens"));
+        assert_eq!(
+            error.to_string(),
+            "response decode error: reply hit max_tokens (1024) before producing text or a tool call; raise LEG_MAX_TOKENS"
+        );
+    }
+
+    #[test]
+    fn thinking_only_max_tokens_sse_reply_has_dedicated_error() {
+        let mut stream = String::new();
+        stream.push_str(&sse_event(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 1}}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": "sig"}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "private"}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+        ));
+        stream.push_str(&sse_event(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "max_tokens", "stop_sequence": null}
+            }),
+        ));
+        stream.push_str(&sse_event(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}),
+        ));
+
+        let mut config = config_with("https://api.anthropic.com", "claude-sonnet-4-6");
+        config.max_tokens = 1024;
+        let client = ClaudeClient::with_http(config, FakeHttp::new(200, &stream));
+        let call = client
+            .send_conversation_streaming_with_attempts(&[Message::user("hi")], &mut |_| Ok(()));
+
+        let error = call.result.unwrap_err();
+        assert_eq!(call.attempts, 1);
+        assert!(matches!(
+            error,
+            LegError::TokenLimit {
+                max_tokens: 1024,
+                ref stop_reason,
+            } if stop_reason == "max_tokens"
+        ));
     }
 
     #[test]
@@ -1865,6 +1968,7 @@ mod tests {
             r#"{"content": []}"#,
             r#"{"content": [{"type": "text", "text": ""}]}"#,
             r#"{"content": [{"type": "thinking", "thinking": "hmm", "signature": "s"}]}"#,
+            r#"{"content": [{"type": "thinking", "thinking": "hmm", "signature": "s"}], "stop_reason": "end_turn"}"#,
             r#"{"content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "a"}}]}"#,
         ] {
             let client = ClaudeClient::with_http(
