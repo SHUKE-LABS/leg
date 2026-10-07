@@ -87,6 +87,12 @@ deterministic eligibility gates below, but cannot replace human measurements.
 
 ## Shared setup and task script
 
+Facilitator note: the TUI has a searchable action palette at F2 or Ctrl-P;
+disabled entries explain why they are unavailable, and the footer reflects the
+view's enabled actions. Keep task prompts location-neutral and do not direct the
+participant to a particular key or menu; record whether they discover actions
+through the interface.
+
 Prepare two disposable copies of one baseline workspace, one for each UI. Before
 each participant begins, seed both catalogs with the same prior session by
 sending `TRIAL-SEED-SESSION: save this as the prior session seed.` The fixture

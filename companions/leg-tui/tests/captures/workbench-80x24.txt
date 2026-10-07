@@ -21,4 +21,4 @@ workspace: <workspace> · catalog: Ready · <elapsed>
 ┌Composer (Ctrl-S send)────────────────────────────────────────────────────────┐
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
-Ctrl-↑/↓ tools · F4 inspect · Ctrl-S send · F1 help · Ctrl-C stop/exit
+F2/Ctrl-P actions · F1 help · Ctrl-C exit · F3 sessions · F4 inspect · F6 export
