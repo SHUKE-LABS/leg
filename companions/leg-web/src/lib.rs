@@ -48,7 +48,7 @@ const FIXTURE_THEME_HTML: &str = include_str!("assets/themes/fixture.html");
 #[cfg(feature = "browser-e2e-themes")]
 const FIXTURE_THEME_CSS: &str = include_str!("assets/themes/fixture.css");
 /// Fixed default so the launch address stays stable across restarts.
-pub const DEFAULT_PORT: u16 = 54321;
+pub const DEFAULT_PORT: u16 = 13579;
 const STORE_NAME: &str = "web-host-state.json";
 const LOCK_NAME: &str = ".leg-web.lock";
 const STORE_VERSION: u32 = 1;

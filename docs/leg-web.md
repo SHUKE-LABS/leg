@@ -31,7 +31,7 @@ companions/target/debug/leg-web --no-open \
   --supervisor-bin "$PWD/companions/target/debug/leg-ui-supervisor"
 ```
 
-The host binds only `127.0.0.1`, on port `54321` by default, so the address
+The host binds only `127.0.0.1`, on port `13579` by default, so the address
 stays the same across restarts. `--bind 127.0.0.1:<port>` picks another port,
 and `--bind 127.0.0.1:0` asks the OS for a free one; non-loopback addresses are
 rejected. If the port is taken, startup fails with a `--bind` hint instead of
