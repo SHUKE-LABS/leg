@@ -861,6 +861,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_error_outcome_stop_reason_and_legacy_records() {
+        let log = concat!(
+            r#"{"event":"request","ts_ms":1,"model":"m","base_url":"u","prompt":"p"}"#,
+            "\n",
+            r#"{"event":"response_error","ts_ms":2,"duration_ms":7,"kind":"decode","message":"limited","stop_reason":"length"}"#,
+            "\n",
+        );
+        let exchanges = parse_jsonl(Cursor::new(log)).expect("parses").exchanges;
+        assert_eq!(exchanges.len(), 1);
+        match &exchanges[0].outcome {
+            Outcome::Error { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("length"));
+            }
+            other => panic!("expected Error outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_event_tags_are_skipped() {
         let log = concat!(
             r#"{"event":"heartbeat","ts_ms":1}"#,

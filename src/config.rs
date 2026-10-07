@@ -33,7 +33,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 
 /// Default `max_tokens` requested per reply when `LEG_MAX_TOKENS` is unset.
-pub const DEFAULT_MAX_TOKENS: u32 = 1024;
+pub const DEFAULT_MAX_TOKENS: u32 = 32000;
 
 /// Default number of retries for transient provider failures.
 pub const DEFAULT_MAX_RETRIES: usize = 2;
@@ -384,6 +384,11 @@ mod tests {
         assert_eq!(cfg.max_tool_rounds, None);
         assert_eq!(cfg.system_prompt, None);
         assert_eq!(cfg.pre_tool_hook, None);
+    }
+
+    #[test]
+    fn default_max_tokens_is_32000() {
+        assert_eq!(DEFAULT_MAX_TOKENS, 32000);
     }
 
     #[test]

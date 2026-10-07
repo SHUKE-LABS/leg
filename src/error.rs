@@ -92,6 +92,14 @@ pub enum LegError {
     ///
     /// [`AssistantReply`]: crate::model::AssistantReply
     Decode(String),
+    /// A provider stopped at the output-token limit before producing usable
+    /// assistant text or a tool call.
+    TokenLimit {
+        /// The configured maximum output-token count.
+        max_tokens: u32,
+        /// The provider's raw terminal reason.
+        stop_reason: String,
+    },
     /// A local I/O operation failed.
     Io(String),
     /// The active turn was interrupted by a Unix signal.
@@ -114,6 +122,15 @@ pub enum LegError {
 }
 
 impl LegError {
+    /// Builds the decode failure used when a provider exhausts the configured
+    /// output-token limit before returning usable assistant content.
+    pub(crate) fn token_limit_reply(max_tokens: u32, stop_reason: &str) -> Self {
+        LegError::TokenLimit {
+            max_tokens,
+            stop_reason: stop_reason.to_string(),
+        }
+    }
+
     /// A stable, machine-readable class for this error.
     ///
     /// Used by the delivered-error envelope so consumers can branch on the
@@ -130,12 +147,21 @@ impl LegError {
             LegError::RateLimited(_) => "rate_limited",
             LegError::Server { .. } => "server",
             LegError::Api { .. } => "api",
-            LegError::Decode(_) => "decode",
+            LegError::Decode(_) | LegError::TokenLimit { .. } => "decode",
             LegError::Io(_) => "io",
             LegError::Interrupted { .. } => "interrupted",
             LegError::Log(_) => "log",
             LegError::SessionNotFound(_) => "session_not_found",
             LegError::TurnFailure { .. } => "turn_failure",
+        }
+    }
+
+    /// Returns a provider stop reason when the error was caused by a
+    /// token-limited reply.
+    pub(crate) fn stop_reason(&self) -> Option<&str> {
+        match self {
+            LegError::TokenLimit { stop_reason, .. } => Some(stop_reason),
+            _ => None,
         }
     }
 }
@@ -184,6 +210,10 @@ impl fmt::Display for LegError {
                 write!(f, "): {message}")
             }
             LegError::Decode(msg) => write!(f, "response decode error: {msg}"),
+            LegError::TokenLimit { max_tokens, .. } => write!(
+                f,
+                "response decode error: reply hit max_tokens ({max_tokens}) before producing text or a tool call; raise LEG_MAX_TOKENS"
+            ),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
             LegError::Interrupted { signal } => {
                 write!(f, "interrupted by {}", signal.name())

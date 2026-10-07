@@ -92,6 +92,7 @@ impl<T: Transport> LocalParticipant<T> {
                     duration_ms,
                     kind: err.kind().to_string(),
                     message: err.to_string(),
+                    stop_reason: err.stop_reason().map(str::to_string),
                     attempts,
                     session_id: None,
                     turn_index: None,

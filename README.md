@@ -92,6 +92,9 @@ include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_MAX_RETRIES`, `LEG_RETRY_BASE_DELAY_MS`, `LEG_PRETOOL_HOOK`,
 `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
+`LEG_MAX_TOKENS` sets the output-token limit requested for each provider reply
+(default `32000`).
+
 Anthropic Messages remains the default provider. OpenAI-compatible endpoints
 can use either streamed wire protocol:
 
@@ -134,7 +137,9 @@ responses, response-body read failures, and decode errors are surfaced without
 retry. The `attempts` field on `response_ok` and `response_error` trail outcomes
 counts all provider-call attempts in that exchange, including retries and calls
 across tool-loop rounds; it is absent in older trail records, which remain
-readable.
+readable. `stop_reason` is present on `response_ok` when known and on
+`response_error` when a reply hit its token limit; error records preserve the
+provider's raw reason. It is absent in older records and when unknown.
 
 `LEG_PRETOOL_HOOK` optionally names an executable to run before every tool
 dispatch; unset or blank leaves dispatch unchanged. The hook receives this

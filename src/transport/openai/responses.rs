@@ -80,7 +80,10 @@ impl<H: HttpClient> Transport for OpenAiResponsesClient<H> {
         let url = common::endpoint(&self.config.base_url, "responses");
 
         let mut decoder = SseDecoder::default();
-        let mut assembler = ResponsesAssembler::default();
+        let mut assembler = ResponsesAssembler {
+            max_tokens: self.config.max_tokens,
+            ..ResponsesAssembler::default()
+        };
         let call = {
             let mut accept_event = |event| assembler.accept(event, on_event);
             self.http
@@ -227,6 +230,7 @@ struct ResponsesAssembler {
     tool_indexes: BTreeMap<String, usize>,
     open_blocks: BTreeSet<usize>,
     reply: Option<AssistantReply>,
+    max_tokens: u32,
 }
 
 impl ResponsesAssembler {
@@ -480,7 +484,7 @@ impl ResponsesAssembler {
         let response = data.get("response").ok_or_else(|| {
             LegError::Decode("terminal Responses event omitted response".to_string())
         })?;
-        let reply = parse_response(response)?;
+        let reply = parse_response(response, self.max_tokens)?;
         for index in std::mem::take(&mut self.open_blocks) {
             on_event(StreamEvent::ContentBlockStop { index })?;
         }
@@ -530,7 +534,7 @@ fn output_content_index(data: &Value) -> Result<(usize, usize)> {
     Ok((output, content))
 }
 
-fn parse_response(response: &Value) -> Result<AssistantReply> {
+fn parse_response(response: &Value, max_tokens: u32) -> Result<AssistantReply> {
     let output = response
         .get("output")
         .and_then(Value::as_array)
@@ -597,6 +601,14 @@ fn parse_response(response: &Value) -> Result<AssistantReply> {
         .iter()
         .any(|block| matches!(block, ContentBlock::Text { text } if !text.is_empty()));
     if !has_tool_use && !has_text {
+        if response.get("status").and_then(Value::as_str) == Some("incomplete")
+            && let Some(stop_reason) = response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+            && stop_reason == "max_output_tokens"
+        {
+            return Err(LegError::token_limit_reply(max_tokens, stop_reason));
+        }
         return Err(LegError::Decode(
             "response contained no assistant text or tool call".to_string(),
         ));
@@ -867,6 +879,39 @@ mod tests {
             body["input"][0]["content"][1]["image_url"],
             "data:image/jpeg;base64,aGVsbG8="
         );
+    }
+
+    #[test]
+    fn incomplete_output_token_limit_without_content_has_dedicated_error() {
+        let response = json!({
+            "status":"incomplete",
+            "output":[],
+            "incomplete_details":{"reason":"max_output_tokens"}
+        });
+        let body = event(
+            "response.incomplete",
+            json!({"type":"response.incomplete","response":response}),
+        );
+        let http = FakeHttp {
+            body,
+            request: RefCell::new(None),
+        };
+        let mut config = config();
+        config.max_tokens = 1024;
+        let client = OpenAiResponsesClient::with_http(config, http);
+
+        let error = client
+            .send_conversation(&[Message::user("think")])
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            LegError::TokenLimit {
+                max_tokens: 1024,
+                stop_reason,
+            } if stop_reason == "max_output_tokens"
+        ));
+        assert_eq!(error.stop_reason(), Some("max_output_tokens"));
     }
 
     #[test]
