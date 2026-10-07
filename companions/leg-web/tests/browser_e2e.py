@@ -283,18 +283,18 @@ def chronological_history_fixture(session_id: str) -> str:
     coordinates = {"schema": "baton.exchange/v1", "session_id": session_id, "turn_index": 0}
     first_tool = {
         "type": "tool_use",
-        "id": "fixture-tool-one",
+        "id": "call_fixture_tool_one",
         "name": "fixture-one",
         "input": {"value": 1},
     }
     second_tool = {
         "type": "tool_use",
-        "id": "fixture-tool-two",
-        "name": "fixture-two",
-        "input": {"value": 2},
+        "id": "call_fixture_tool_two",
+        "name": "bash",
+        "input": {"command": "printf 'fixture result two\\n'; printf 'fixture stderr\\n' >&2; exit 7"},
     }
     orphan_tool = {
-        "id": "fixture-tool-orphan",
+        "id": "call_fixture_tool_orphan",
         "name": "fixture-orphan",
         "input": {"value": 3},
     }
@@ -331,7 +331,12 @@ def chronological_history_fixture(session_id: str) -> str:
             "status": "completed",
             "result": "fixture result one",
         },
-        {**coordinates, "event": "tool_round", "ts_ms": 6, "content": [second_tool]},
+        {
+            **coordinates,
+            "event": "tool_round",
+            "ts_ms": 6,
+            "content": [{"type": "text", "text": "CHRONO_ROUND_B"}, second_tool],
+        },
         {
             **coordinates,
             "event": "tool_call",
@@ -347,7 +352,14 @@ def chronological_history_fixture(session_id: str) -> str:
             "tool_use_id": second_tool["id"],
             "tool_name": second_tool["name"],
             "status": "completed",
-            "result": "fixture result two",
+            "result": json.dumps({
+                "status": "exited",
+                "exit_code": 7,
+                "stdout": "fixture result two\n",
+                "stderr": "fixture stderr\n",
+                "stdout_omitted_bytes": 9,
+                "stderr_omitted_bytes": 0,
+            }),
         },
         {
             **coordinates,
@@ -1101,8 +1113,9 @@ async def run(
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 5)
                 write_card = page.locator(".tool-inspector").last
                 write_button = write_card.locator(".tool-disclosure")
-                assert "Tool write" in await write_button.inner_text()
-                assert "Completed" in await write_button.inner_text()
+                assert "write" in await write_button.inner_text()
+                assert "Completed" in await write_button.get_attribute("aria-label")
+                assert await write_button.evaluate("button => button.getBoundingClientRect().height") <= 32
                 write_identity = await write_button.get_attribute("data-focus-key")
                 provider_calls_before_write_details = fixture_status(provider_authority)["requests"]
                 mutations_before_write_details = len(
@@ -1130,12 +1143,10 @@ async def run(
                     "button.dataset.focusKey === identity && button.getAttribute('aria-expanded') === 'true')",
                     arg=write_identity,
                 )
-                large_summaries = page.locator(".tool-preview[data-output-chars]")
-                assert await large_summaries.count() >= 1
-                assert int(await large_summaries.last.get_attribute("data-output-chars")) > 10000
-                assert len(await large_summaries.last.inner_text()) < 400
                 large_card = page.locator(".tool-inspector").last
                 large_button = large_card.locator(".tool-disclosure")
+                assert "LLLLLLLL" not in await large_card.inner_text()
+                assert await large_button.evaluate("button => button.getBoundingClientRect().height") <= 32
                 await large_button.click()
                 large_output = await large_card.locator(".tool-detail-field").nth(1).locator("pre").text_content()
                 assert len(large_output) > 10000
@@ -1327,7 +1338,7 @@ async def run(
                     raise AssertionError(
                         f"pending tool disclosure did not render; state={page_state}; page errors={page_errors}"
                     ) from error
-                assert "Pending" in await pending_tool.inner_text()
+                assert "Pending" in await pending_tool.get_attribute("aria-label")
                 for width, height in ((1280, 800), (768, 1024), (384, 512), (1280, 650)):
                     await assert_conversation_layout(page, width, height, running=True)
                 await page.set_viewport_size({"width": 1280, "height": 800})
@@ -1343,7 +1354,7 @@ async def run(
                 pending_tool = pending_turn.locator(".tool-disclosure")
                 await page.wait_for_function(
                     "() => document.querySelectorAll('.tool-disclosure').length > 0 && "
-                    "document.querySelectorAll('.tool-disclosure').item(document.querySelectorAll('.tool-disclosure').length - 1).textContent.includes('Pending')",
+                    "document.querySelectorAll('.tool-disclosure').item(document.querySelectorAll('.tool-disclosure').length - 1).getAttribute('aria-label').includes('Pending')",
                 )
                 assert await pending_tool.get_attribute("aria-expanded") == "true"
                 stalled_pid_path = workspace / "trial-stalled-child.pid"
@@ -1406,7 +1417,7 @@ async def run(
                 interrupted_tool = interrupted_turn.locator(".tool-inspector")
                 assert await interrupted_tool.count() == 1
                 interrupted_button = interrupted_tool.locator(".tool-disclosure")
-                interrupted_status = await interrupted_button.inner_text()
+                interrupted_status = await interrupted_button.get_attribute("aria-label")
                 assert any(label in interrupted_status for label in ("Interrupted", "Missing outcome", "Failed")), interrupted_status
                 await interrupted_button.click()
                 stopped_tool_details = await interrupted_tool.locator(".tool-detail-body").inner_text()
@@ -1493,6 +1504,7 @@ async def run(
                       for (const node of assistant.children) {
                         if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
                         else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                        else if (node.classList.contains('tool-call-group')) order.push(node.querySelector('.tool-group-disclosure')?.textContent.trim());
                         else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
                         else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
                       }
@@ -1507,6 +1519,8 @@ async def run(
                     "CHRONO_FINAL_REPLY_R",
                     "outcome:Running",
                 ], live_order
+                assert await page.locator("#messages .transcript-turn").last.locator(".tool-call-group").count() == 0
+                assert await page.locator("#messages .transcript-turn").last.locator(".tool-disclosure").count() == 2
                 assert await page.locator("#empty-transcript").is_hidden()
 
                 await page.reload(wait_until="load")
@@ -1543,6 +1557,15 @@ async def run(
                 )
                 await wait_status(page, "Succeeded")
                 assert completed_chronology["last_submission"]["status"] == "succeeded", completed_chronology
+                finished_group = page.locator("#messages .transcript-turn").last.locator(".tool-call-group")
+                finished_group_button = finished_group.locator(".tool-group-disclosure")
+                await finished_group_button.wait_for(state="visible")
+                assert await finished_group_button.inner_text() == "2 tool calls"
+                assert await finished_group_button.get_attribute("aria-expanded") == "false"
+                assert await finished_group.locator(".tool-disclosure").count() == 2
+                assert "call_" not in await finished_group.inner_text()
+                await finished_group_button.click()
+                assert await finished_group_button.get_attribute("aria-expanded") == "true"
                 await page.reload(wait_until="load")
                 await wait_status(page, "Succeeded")
                 reopened_order = await page.locator("#messages .transcript-turn").last.evaluate(
@@ -1552,6 +1575,7 @@ async def run(
                       for (const node of assistant.children) {
                         if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
                         else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                        else if (node.classList.contains('tool-call-group')) order.push(node.querySelector('.tool-group-disclosure')?.textContent.trim());
                         else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
                         else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
                       }
@@ -1561,11 +1585,17 @@ async def run(
                 assert reopened_order == [
                     chronology_prompt,
                     "CHRONO_ROUND_A",
-                    first_live_tool,
-                    second_live_tool,
+                    "2 tool calls",
                     "CHRONO_FINAL_REPLY_R",
                     "outcome:Succeeded",
                 ], reopened_order
+                assert await page.locator("#messages .transcript-turn").last.locator(
+                    ".tool-group-disclosure"
+                ).get_attribute("aria-expanded") == "true"
+                reopened_tool_ids = await page.locator("#messages .transcript-turn").last.locator(
+                    ".tool-inspector"
+                ).evaluate_all("rows => rows.map(row => row.dataset.toolUseId)")
+                assert reopened_tool_ids == [first_live_tool, second_live_tool], reopened_tool_ids
                 reopened_layout = await page.evaluate(
                     """() => {
                       const transcript = document.querySelector('#transcript').getBoundingClientRect();
@@ -1832,7 +1862,11 @@ async def run_session_navigation(
                     "text": "CHRONO_ROUND_A",
                 }, snapshot_turn
                 assert snapshot_turn["tool_rounds"][0][1]["type"] == "tool_use", snapshot_turn
-                assert snapshot_turn["tool_rounds"][1][0]["type"] == "tool_use", snapshot_turn
+                assert snapshot_turn["tool_rounds"][1][0] == {
+                    "type": "text",
+                    "text": "CHRONO_ROUND_B",
+                }, snapshot_turn
+                assert snapshot_turn["tool_rounds"][1][1]["type"] == "tool_use", snapshot_turn
                 snapshot_order = await page.locator(
                     '#messages .transcript-turn[data-turn-index="0"]'
                 ).evaluate(
@@ -1842,6 +1876,7 @@ async def run_session_navigation(
                       for (const node of assistant.children) {
                         if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
                         else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                        else if (node.classList.contains('tool-call-group')) order.push(node.querySelector('.tool-group-disclosure')?.textContent.trim());
                         else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
                         else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
                       }
@@ -1851,12 +1886,52 @@ async def run_session_navigation(
                 assert snapshot_order == [
                     "CHRONO_SNAPSHOT_PROMPT",
                     "CHRONO_ROUND_A",
-                    "fixture-tool-one",
-                    "fixture-tool-two",
-                    "fixture-tool-orphan",
+                    "call_fixture_tool_one",
+                    "CHRONO_ROUND_B",
+                    "2 tool calls",
                     "CHRONO_FINAL_REPLY_R",
                     "outcome:Succeeded",
                 ], snapshot_order
+                snapshot_turn_locator = page.locator('#messages .transcript-turn[data-turn-index="0"]')
+                assistant_text = await snapshot_turn_locator.locator(".message-assistant").inner_text()
+                assert "call_" not in assistant_text and '"exit_code"' not in assistant_text, assistant_text
+                assert "Completed" not in assistant_text, assistant_text
+                assert "turn-outcome-succeeded" in await snapshot_turn_locator.locator(".turn-outcome").get_attribute("class")
+                assert await snapshot_turn_locator.locator(".tool-group-disclosure").inner_text() == "2 tool calls"
+                await page.set_viewport_size({"width": 1670, "height": 895})
+                group_height = await snapshot_turn_locator.locator(".tool-group-disclosure").evaluate(
+                    "button => button.getBoundingClientRect().height"
+                )
+                assert group_height <= 32, group_height
+                await page.set_viewport_size({"width": 1280, "height": 800})
+                snapshot_group_button = snapshot_turn_locator.locator(".tool-group-disclosure")
+                await snapshot_group_button.click()
+                assert await snapshot_group_button.get_attribute("aria-expanded") == "true"
+                bash_row = snapshot_turn_locator.locator('.tool-inspector[data-tool-use-id="call_fixture_tool_two"]')
+                bash_button = bash_row.locator(".tool-disclosure")
+                bash_label = await bash_button.get_attribute("aria-label")
+                assert "Failed" in bash_label and "exit 7" in bash_label, bash_label
+                assert "✗" in await bash_button.inner_text()
+                assert "call_fixture_tool_two" not in await bash_button.inner_text()
+                await bash_button.click()
+                bash_fields = bash_row.locator(".tool-detail-field")
+                assert await bash_fields.nth(0).locator("pre code").inner_text() == "printf 'fixture result two\\n'; printf 'fixture stderr\\n' >&2; exit 7"
+                assert await bash_fields.nth(1).locator("strong").inner_text() == "stdout"
+                assert await bash_fields.nth(1).locator("pre").inner_text() == "fixture result two\n"
+                assert await bash_fields.nth(2).locator("strong").inner_text() == "stderr"
+                assert await bash_fields.nth(2).locator("pre").inner_text() == "fixture stderr\n"
+                assert "stdout_omitted_bytes: 9 omitted" in await bash_row.locator(".tool-detail-body").inner_text()
+                assert '"exit_code"' not in await bash_row.locator(".tool-detail-body").inner_text()
+                await bash_row.get_by_role("button", name="Copy tool result").click()
+                assert await page.evaluate("() => navigator.clipboard.readText()") == "fixture result two\nfixture stderr\n"
+                await bash_row.get_by_role("button", name="Copy tool input").click()
+                assert await page.evaluate("() => navigator.clipboard.readText()") == json.dumps(
+                    snapshot_turn["tools"][1]["input"], indent=2
+                )
+                await bash_button.click()
+                assert await bash_button.get_attribute("aria-expanded") == "false"
+                await snapshot_group_button.click()
+                assert await snapshot_group_button.get_attribute("aria-expanded") == "false"
                 assert await page.locator("#empty-transcript").is_hidden()
                 snapshot_layout = await page.evaluate(
                     """() => {
@@ -1875,6 +1950,23 @@ async def run_session_navigation(
                     and snapshot_layout["composerBelowTranscript"]
                     and snapshot_layout["replyAboveComposer"]
                 ), snapshot_layout
+                await page.locator("#open-transcript-search").click()
+                await page.locator("#transcript-search").fill("stdout_omitted_bytes")
+                await page.wait_for_function(
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool result')"
+                )
+                await page.wait_for_function(
+                    """() => {
+                      const turn = document.querySelector('#messages .transcript-turn[data-turn-index="0"]');
+                      return turn?.querySelector('.tool-group-disclosure')?.getAttribute('aria-expanded') === 'true' &&
+                        turn?.querySelector('.tool-inspector[data-tool-use-id="call_fixture_tool_two"] .tool-disclosure')
+                          ?.getAttribute('aria-expanded') === 'true';
+                    }"""
+                )
+                assert await snapshot_group_button.get_attribute("aria-expanded") == "true"
+                assert await bash_button.get_attribute("aria-expanded") == "true"
+                assert "fixture result two" in await bash_row.locator(".tool-detail-body").inner_text()
+                await page.locator("#transcript-search").press("Escape")
                 await page.locator("#open-transcript-search").click()
                 await page.locator("#transcript-search").fill("CHRONO_ROUND_A")
                 await page.wait_for_function(
@@ -2345,7 +2437,13 @@ async def run_session_navigation(
                 assert await page.locator('#messages [data-key="turn-4-assistant"]').evaluate(
                     "element => element.classList.contains('search-match-current')"
                 )
-                assert "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" not in await page.locator("#messages").inner_text()
+                searched_tool = page.locator('#messages [data-key="turn-4-assistant"] .tool-inspector')
+                await page.wait_for_function(
+                    "() => document.querySelector('#messages [data-key=\"turn-4-assistant\"] .tool-inspector .tool-disclosure')"
+                    "?.getAttribute('aria-expanded') === 'true'"
+                )
+                assert await searched_tool.locator(".tool-disclosure").get_attribute("aria-expanded") == "true"
+                assert "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" in await searched_tool.locator(".tool-detail-body").inner_text()
                 await page.locator("#transcript-search-clear").click()
 
                 copy_prompt = "TRIAL-COPY-UNICODE: copy this prompt\nsecond line Ω"
@@ -2381,7 +2479,21 @@ async def run_session_navigation(
                 await page.locator("#copy-status").wait_for(state="hidden")
                 await page.locator('#messages [data-key="turn-5-assistant"] .code-copy-button').click()
                 assert await page.evaluate("() => navigator.clipboard.readText()") == "const greeting = '你好';\nsecond line Δ\n"
-                tool_result_text = seed["session"]["turns"][0]["tools"][0]["result"]["result"]
+                seed_tool = seed["session"]["turns"][0]["tools"][0]
+                tool_result_text = seed_tool["result"]["result"]
+                if seed_tool.get("tool_name") == "bash":
+                    try:
+                        result_envelope = json.loads(tool_result_text)
+                    except (TypeError, json.JSONDecodeError):
+                        result_envelope = None
+                    if isinstance(result_envelope, dict) and any(
+                        key in result_envelope
+                        for key in ("stdout", "stderr", "exit_code", "stdout_omitted_bytes", "stderr_omitted_bytes")
+                    ):
+                        stdout = str(result_envelope.get("stdout", ""))
+                        stderr = str(result_envelope.get("stderr", ""))
+                        separator = "\n" if stdout and stderr and not stdout.endswith("\n") else ""
+                        tool_result_text = stdout + separator + stderr
                 await transcript_search.fill("session-rail-tool-history")
                 await page.wait_for_function(
                     "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool input')",
@@ -2395,7 +2507,13 @@ async def run_session_navigation(
                 await page.locator('#messages [data-key="turn-0-assistant"] .tool-copy-button').filter(
                     has_text="Copy tool result"
                 ).click()
-                assert await page.evaluate("() => navigator.clipboard.readText()") == tool_result_text
+                await page.locator("#copy-status").wait_for(state="visible")
+                copied_tool_result = await page.evaluate("() => navigator.clipboard.readText()")
+                assert copied_tool_result == tool_result_text, {
+                    "tool_name": seed_tool.get("tool_name"),
+                    "expected": tool_result_text,
+                    "actual": copied_tool_result,
+                }
 
                 await transcript_search.fill("TRIAL-COPY-UNICODE")
                 await page.wait_for_function(
@@ -2982,8 +3100,8 @@ async def run_session_navigation(
                 assert mounted_detail_fields == 0, mounted_detail_fields
                 last_turn = page.locator('#messages .transcript-turn[data-turn-index="999"]')
                 last_tool_button = last_turn.locator(".tool-disclosure")
-                assert "reused-tool-use-id" in await last_tool_button.inner_text()
-                assert "Missing outcome" in await last_tool_button.inner_text()
+                assert "reused-tool-use-id" not in await last_tool_button.inner_text()
+                assert "Missing outcome" in await last_tool_button.get_attribute("aria-label")
                 provider_requests_before_expand = fixture_status(provider_authority)["requests"]
                 mutations_before_expand = len(
                     [url for method, url in page_requests if method == "POST" and url.endswith(("/submit", "/stop"))]
@@ -3023,7 +3141,7 @@ async def run_session_navigation(
                     button = page.locator(
                         f'#messages .transcript-turn[data-turn-index="{index}"] .tool-disclosure'
                     )
-                    assert status in await button.inner_text(), (index, await button.inner_text())
+                    assert status in await button.get_attribute("aria-label"), (index, await button.get_attribute("aria-label"))
                 first_turn = page.locator('#messages .transcript-turn[data-turn-index="0"]')
                 await first_turn.locator(".tool-disclosure").click()
                 first_details = first_turn.locator(".tool-detail-body")

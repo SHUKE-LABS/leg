@@ -383,11 +383,17 @@ async def run(
                 await page.locator("#session-list button.session-select[data-session-id='" + outcome_id + "']").click()
                 await page.locator("#messages .transcript-turn[data-turn-index='4']").wait_for()
                 await choose_theme(page, "default")
-                default_outcomes = await page.locator("#messages").inner_text()
+                default_outcomes = await page.locator("#messages").evaluate(
+                    "root => root.innerText + ' ' + [...root.querySelectorAll('.tool-disclosure')]"
+                    ".map(button => button.getAttribute('aria-label')).join(' ')"
+                )
                 for outcome in ("Failed", "Denied", "Interrupted", "Missing outcome"):
                     assert outcome in default_outcomes, outcome
                 assert await page.locator("#messages .tool-disclosure").count() > 0
 
+                first_group = page.locator("#messages .tool-call-group").first
+                if await first_group.count():
+                    await first_group.locator(".tool-group-disclosure").click()
                 first_disclosure = page.locator("#messages .tool-disclosure").first
                 await first_disclosure.click()
                 assert await first_disclosure.get_attribute("aria-expanded") == "true"
@@ -440,24 +446,65 @@ async def run(
                           const assistant = turn.querySelector('.message-assistant');
                           for (const node of assistant.children) {
                             if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
-                            else if (node.classList.contains('tool-inspector') || node.classList.contains('tool-summary')) {
-                              order.push(node.dataset.toolUseId);
-                            } else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
+                            else if (node.classList.contains('tool-call-group')) {
+                              order.push(node.querySelector('.tool-group-disclosure')?.textContent.trim());
+                            } else if (node.classList.contains('tool-inspector')) order.push(node.dataset.toolUseId);
+                            else if (node.classList.contains('tool-summary')) order.push(node.textContent.trim());
+                            else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
                             else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
                           }
                           return order;
                         }"""
                     )
-                    assert order == [
-                        "CHRONO_SNAPSHOT_PROMPT",
-                        "CHRONO_ROUND_A",
-                        "fixture-tool-one",
-                        "fixture-tool-two",
-                        "fixture-tool-orphan",
-                        "CHRONO_FINAL_REPLY_R",
-                        "outcome:Succeeded",
-                    ], (theme_id, order)
+                    if theme_id == "default":
+                        assert order == [
+                            "CHRONO_SNAPSHOT_PROMPT",
+                            "CHRONO_ROUND_A",
+                            "call_fixture_tool_one",
+                            "CHRONO_ROUND_B",
+                            "2 tool calls",
+                            "CHRONO_FINAL_REPLY_R",
+                            "outcome:Succeeded",
+                        ], (theme_id, order)
+                        turn = page.locator("#messages .transcript-turn[data-turn-index='0']")
+                        group_button = turn.locator(".tool-group-disclosure")
+                        assert "call_" not in await turn.locator(".message-assistant").inner_text()
+                        assert '"exit_code"' not in await turn.locator(".message-assistant").inner_text()
+                        await page.set_viewport_size({"width": 1670, "height": 895})
+                        assert await group_button.evaluate(
+                            "button => button.getBoundingClientRect().height"
+                        ) <= 32
+                        await page.set_viewport_size({"width": 1280, "height": 800})
+                        await group_button.focus()
+                        await page.keyboard.press("Enter")
+                        assert await group_button.get_attribute("aria-expanded") == "true"
+                        bash_button = turn.locator(
+                            '.tool-inspector[data-tool-use-id="call_fixture_tool_two"] .tool-disclosure'
+                        )
+                        assert "Failed" in await bash_button.get_attribute("aria-label")
+                        assert "exit 7" in await bash_button.get_attribute("aria-label")
+                        await bash_button.focus()
+                        await page.keyboard.press("Enter")
+                        details = await turn.locator(
+                            '.tool-inspector[data-tool-use-id="call_fixture_tool_two"] .tool-detail-body'
+                        ).inner_text()
+                        assert "fixture result two" in details and "fixture stderr" in details
+                        assert '"exit_code"' not in details
+                    else:
+                        assert order[:2] == ["CHRONO_SNAPSHOT_PROMPT", "CHRONO_ROUND_A"], (theme_id, order)
+                        assert order[3] == "CHRONO_ROUND_B" and order[6:] == [
+                            "CHRONO_FINAL_REPLY_R",
+                            "outcome:Succeeded",
+                        ], (theme_id, order)
+                        assert order[2].startswith("Tool fixture-one: Completed."), (theme_id, order)
+                        assert order[4].startswith("Tool bash: Failed.") and "exit 7" in order[4], (theme_id, order)
+                        assert "fixture result two" in order[4] and "fixture stderr" in order[4], (theme_id, order)
+                        assert '"exit_code"' not in "\n".join(order)
+                        assert "call_" not in "\n".join(order)
                 await choose_theme(page, "default")
+                assert await page.locator(
+                    "#messages .transcript-turn[data-turn-index='0'] .tool-group-disclosure"
+                ).get_attribute("aria-expanded") == "true"
 
                 # A malformed saved trail is read-only in either view.
                 await page.locator("#session-list button.session-select[data-session-id='" + readonly_id + "']").click()

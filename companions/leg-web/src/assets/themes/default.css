@@ -972,41 +972,95 @@ textarea:focus-visible,
 }
 
 .tool-inspector {
-  margin-top: 0.75rem;
-  border: 1px solid #d9e1dc;
-  border-radius: 0.55rem;
-  padding: 0.65rem 0.75rem;
-  background: #f5f7f5;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
   font-size: 0.82rem;
 }
 
-.tool-inspector-denied,
-.tool-inspector-failed,
-.tool-inspector-interrupted,
-.tool-inspector-missing {
-  border-left: 3px solid #9a5134;
+.tool-call-group {
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-size: 0.82rem;
 }
 
-.tool-disclosure {
+.tool-disclosure,
+.tool-group-disclosure {
   width: 100%;
-  min-height: 2.35rem;
+  height: 2rem;
+  min-height: 2rem;
+  max-height: 2rem;
+  box-sizing: border-box;
   border: 0;
-  padding: 0.25rem 0;
+  border-radius: 0.3rem;
+  padding: 0.15rem 0.45rem;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
   text-align: left;
   background: transparent;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.tool-group-disclosure,
+.tool-row-name {
   font-weight: 700;
 }
 
-.tool-disclosure:hover:not(:disabled) {
-  text-decoration: underline;
-  background: transparent;
+.tool-disclosure:hover:not(:disabled),
+.tool-group-disclosure:hover:not(:disabled) {
+  background: #e9efeb;
 }
 
-.tool-preview {
-  margin: 0.3rem 0 0;
+.tool-status-glyph {
+  display: inline-block;
+  flex: 0 0 1rem;
+  text-align: center;
+  color: #367451;
+}
+
+.tool-status-glyph-failed,
+.tool-status-glyph-denied {
+  color: #a13c2f;
+}
+
+.tool-status-glyph-pending {
+  animation: tool-status-spin 1.2s linear infinite;
+}
+
+@keyframes tool-status-spin {
+  to { transform: rotate(1turn); }
+}
+
+.tool-row-name {
+  flex: 0 0 auto;
+}
+
+.tool-row-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: #4c5b53;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+}
+
+.tool-exit-code {
+  flex: 0 0 auto;
+  color: #a13c2f;
+  font-weight: 700;
+}
+
+.tool-call-group-rows {
+  display: grid;
+  gap: 0;
+  margin-left: 0.45rem;
+  border-left: 1px solid #d9e1dc;
+  padding-left: 0.4rem;
 }
 
 .tool-detail-body {
@@ -1038,6 +1092,13 @@ textarea:focus-visible,
   margin-top: 0.7rem;
   color: #4b5d53;
   font-size: 0.78rem;
+}
+
+.turn-outcome-succeeded {
+  width: fit-content;
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  background: #edf3ef;
 }
 
 .turn-warning {

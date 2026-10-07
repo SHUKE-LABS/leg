@@ -20,6 +20,14 @@ repeat at 200% browser zoom.
 - [ ] Idle, starting, running, stopping, succeeded, failed, interrupted,
   incomplete, capped, and reconnecting each have readable text. No state
   depends only on color.
+- [ ] Tool rows and finished-turn group rows are reachable with the keyboard
+  and expose the correct `aria-expanded` state. Running calls stay individual;
+  consecutive finished calls open from their group row. Collapsed rows omit
+  call IDs, non-zero bash exits announce the exit code, and transcript search
+  opens the matching group and tool row.
+- [ ] Expanded bash details show the command as code, preserve stdout line
+  breaks, show stderr after stdout, and report omitted bytes. Copy controls are
+  reachable inside the expanded details.
 - [ ] Enter adds a line; Ctrl+Enter or Cmd+Enter submits; IME composition does
   not submit. A draft remains editable during a turn and remains available
   after a failed turn or reconnect.
