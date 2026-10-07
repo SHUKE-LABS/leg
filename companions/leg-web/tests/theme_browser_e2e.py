@@ -27,6 +27,67 @@ async def wait_theme(page, theme_id: str) -> None:
     )
 
 
+async def wait_placeholder(page, expected: str) -> None:
+    await page.wait_for_function(
+        "expected => document.querySelector('#prompt')?.placeholder === expected",
+        arg=expected,
+    )
+
+
+async def assert_placeholder_for_platform(
+    browser, launch_url: str, extra_contexts, platform_name: str
+) -> None:
+    context = await browser.new_context(viewport={"width": 1280, "height": 800})
+    extra_contexts.append(context)
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'userAgentData', {configurable: true, value: undefined});"
+        f"Object.defineProperty(navigator, 'platform', {{configurable: true, value: {json.dumps(platform_name)}}});"
+    )
+    page = await context.new_page()
+    await page.goto(launch_url, wait_until="load")
+    await wait_theme(page, "default")
+    expected = (
+        "Enter for a new line · ⌘+Enter to send"
+        if "mac" in platform_name.lower()
+        else "Enter for a new line · Ctrl+Enter to send"
+    )
+    await wait_placeholder(page, expected)
+    assert await page.locator("#send").count() == 0, platform_name
+    await page.locator("select[aria-label='Interface theme']").select_option("fixture")
+    await wait_theme(page, "fixture")
+    await wait_placeholder(page, expected)
+    assert await page.locator("#send").count() == 1, platform_name
+
+
+async def assert_status_line_compact(page) -> None:
+    await page.set_viewport_size({"width": 1670, "height": 895})
+    layout = await page.evaluate(
+        """() => {
+          const line = document.querySelector('.conversation-status-line');
+          const lineBounds = line.getBoundingClientRect();
+          const visible = [...line.querySelectorAll('.status-line-item')].filter(item => {
+            const style = getComputedStyle(item);
+            return !item.hidden && style.display !== 'none' && item.getBoundingClientRect().width > 0;
+          });
+          return {
+            limit: lineBounds.left + lineBounds.width * 0.6,
+            items: visible.map(item => {
+              const bounds = item.getBoundingClientRect();
+              return {
+                id: item.id || item.className,
+                right: bounds.right,
+                separator: getComputedStyle(item, '::before').content,
+              };
+            }),
+          };
+        }"""
+    )
+    assert len(layout["items"]) >= 2, layout
+    assert all(item["right"] <= layout["limit"] + 1 for item in layout["items"]), layout
+    assert all(item["separator"].replace('"', "") == "·" for item in layout["items"][1:]), layout
+    await page.set_viewport_size({"width": 1280, "height": 800})
+
+
 async def choose_theme(page, theme_id: str, *, wait_for_session: bool = True) -> None:
     session_id = None
     if wait_for_session:
@@ -145,6 +206,10 @@ async def run(
                 selector = page.locator("select[aria-label='Interface theme']")
                 assert await selector.input_value() == "default"
                 assert await selector.locator("option").count() == 2
+                assert await page.locator("#send").count() == 0
+
+                await assert_placeholder_for_platform(browser, launch_url, extra_contexts, "Win32")
+                await assert_placeholder_for_platform(browser, launch_url, extra_contexts, "MacIntel")
 
                 unknown_context = await browser.new_context(viewport={"width": 1280, "height": 800})
                 extra_contexts.append(unknown_context)
@@ -177,9 +242,12 @@ async def run(
                 await page.reload(wait_until="load")
                 await wait_theme(page, "default")
                 assert await page.locator("#theme-startup-error").is_hidden()
+                assert await page.locator("#send").count() == 0
 
                 session_default = await start_session(page, workspace)
                 assert await page.locator("#workspace-warning").is_visible()
+                await page.wait_for_function("document.querySelector('#connection-state')?.textContent === ''")
+                await assert_status_line_compact(page)
                 default_prompt = "TRIAL-CHINESE: default first line\n第二行 Ω"
                 await page.locator("#prompt").fill(default_prompt)
                 await page.locator("#prompt").evaluate(
@@ -190,7 +258,7 @@ async def run(
                     }"""
                 )
                 assert (await asyncio.to_thread(common.host_snapshot, authority, token, session_default))["high_water"] == 0
-                await page.get_by_role("button", name="Send").click()
+                await common.send_with_keyboard(page)
                 default_turn = await asyncio.to_thread(
                     common.wait_completed_submission, authority, token, session_default, 1
                 )
@@ -367,7 +435,7 @@ async def run(
                     "() => document.querySelector('#session-guidance')?.textContent.includes('read-only')"
                 )
                 assert "read-only" in (await page.locator("#session-guidance").inner_text()).lower()
-                assert await page.locator("#send").is_disabled()
+                assert await page.locator("#send").count() == 0
                 await choose_theme(page, "fixture")
                 assert await page.locator("#send").is_disabled()
                 assert "read-only" in (await page.locator("#session-guidance").inner_text()).lower()
@@ -387,6 +455,7 @@ async def run(
                     }"""
                 )
                 assert (await asyncio.to_thread(common.host_snapshot, authority, token, session_fixture))["high_water"] == 0
+                assert await page.locator("#send").is_enabled()
                 await page.get_by_role("button", name="Send").click()
                 fixture_turn = await asyncio.to_thread(
                     common.wait_completed_submission, authority, token, session_fixture, 1
@@ -429,18 +498,21 @@ async def run(
 
                 await page.route("**/submit", drop_accepted_response)
                 await page.locator("#prompt").fill("TRIAL-PAUSE: live turn across theme reload")
-                await page.get_by_role("button", name="Send").click()
+                await common.send_with_keyboard(page)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await snapshot_intercepted.wait()
                 assert accepted_response_dropped
                 draft = "Draft kept during run\nsecond line Ω"
                 await page.locator("#prompt").fill(draft)
-                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#send").count() == 0
                 assert await page.locator("#stop-turn").is_visible()
                 before_active_actions = {
                     "submit": len([item for item in requests if item[1].endswith("/submit")]),
                     "stop": len([item for item in requests if item[1].endswith("/stop")]),
                 }
+                await common.send_with_keyboard(page)
+                assert await page.locator("#prompt").input_value() == draft
+                assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
                 await choose_theme(page, "fixture", wait_for_session=False)
                 await page.wait_for_function(
                     "draft => document.querySelector('#prompt')?.value === draft",
@@ -464,7 +536,7 @@ async def run(
                 await page.unroute("**/submit", drop_accepted_response)
                 await common.wait_status(page, "Running")
                 assert await page.locator("#stop-turn").is_visible()
-                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#send").count() == 0
                 assert await page.get_by_text("The first live text is visible", exact=False).count() == 1
                 await choose_theme(page, "fixture")
                 assert await page.locator("#prompt").input_value() == draft
@@ -507,7 +579,7 @@ async def run(
                 await page.route("**/submit", abort_first_send)
                 retry_prompt = "TRIAL-CONTINUE: explicit same-send retry after switch"
                 await page.locator("#prompt").fill(retry_prompt)
-                await page.get_by_role("button", name="Send").click()
+                await common.send_with_keyboard(page)
                 await page.get_by_role("button", name="Retry same send").wait_for(state="visible")
                 before_pending_switch = len(submission_ids)
                 await choose_theme(page, "fixture")
@@ -535,7 +607,7 @@ async def run(
                 await common.wait_status(page, "Failed")
 
                 await page.locator("#prompt").fill("TRIAL-CAP: show a capped run")
-                await page.get_by_role("button", name="Send").click()
+                await common.send_with_keyboard(page)
                 capped = await asyncio.to_thread(
                     common.wait_completed_submission, authority, token, session_fixture, 5
                 )

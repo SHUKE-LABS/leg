@@ -199,11 +199,11 @@ repeat tool side effects. **Retry same send** is separate:
 it appears only when the host proves that a pending submission was not
 accepted, then reuses that send's ID and exact text for reconciliation.
 
-Press Enter for a newline. Press Ctrl+Enter or Cmd+Enter, or select **Send**,
-to submit. Send is disabled while leg is running; a draft can still be edited
-and failed prompts remain available. Markdown formatting uses local DOM
-rendering: raw HTML is shown as text, unsupported or unsafe links remain text,
-and model/tool output cannot load remote images or other resources.
+Press Enter for a newline. Press Ctrl+Enter or Cmd+Enter to submit. Blank
+drafts are ignored, and sends are refused while a turn is running. A draft can
+still be edited, and failed prompts remain available. Markdown formatting uses
+local DOM rendering: raw HTML is shown as text, unsupported or unsafe links
+remain text, and model/tool output cannot load remote images or other resources.
 
 The default theme's tool inspector is opened with its **Show details** button. It shows
 the tool name and ID, literal arguments, result or error, and call/result
