@@ -2833,7 +2833,10 @@ mod tests {
             .unwrap();
         assert_eq!(shared_renderer_response.status(), StatusCode::OK);
         assert_eq!(
-            shared_renderer_response.headers().get(CONTENT_TYPE).unwrap(),
+            shared_renderer_response
+                .headers()
+                .get(CONTENT_TYPE)
+                .unwrap(),
             "text/javascript; charset=utf-8"
         );
 
