@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use leg_ui_client::SessionCatalogConfig;
-use leg_web::{Host, HostConfig};
+use leg_web::{DEFAULT_PORT, Host, HostConfig};
 
 const SAFETY_WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
 
@@ -70,7 +70,7 @@ fn parse_args() -> Result<Args, String> {
             Some("--bind") => {
                 let value = values.next().ok_or("--bind requires an address")?;
                 args.bind = Some(value.to_string_lossy().parse().map_err(
-                    |_| "--bind must be 127.0.0.1:0; leg-web chooses an OS-assigned port",
+                    |_| "--bind must be 127.0.0.1:<port>; use port 0 for any free port",
                 )?);
             }
             Some("--state-dir") => {
@@ -109,9 +109,11 @@ fn parse_args() -> Result<Args, String> {
 fn print_help() {
     println!(
         "leg-web — authenticated loopback host for leg companion sessions\n\n\
-         Usage: leg-web [--no-open] [--bind 127.0.0.1:0] [--state-dir PATH]\n\
+         Usage: leg-web [--no-open] [--bind 127.0.0.1:PORT] [--state-dir PATH]\n\
          [--leg-bin PATH] [--supervisor-bin PATH] [--event-buffer N]\n\
          [--receipt-limit N]\n\n\
+         Listens on 127.0.0.1:{DEFAULT_PORT} by default; --bind 127.0.0.1:0 picks\n\
+         any free port.\n\n\
          The launch token is printed once in a URL fragment, then moved into\n\
          per-tab session storage by the embedded page.\n\n\
          {SAFETY_WARNING}"
