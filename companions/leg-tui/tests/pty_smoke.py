@@ -2645,7 +2645,7 @@ def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
 
             os.write(master_fd, b"\x1bOR")
             read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
-            assert "Alpha  [Busy]" in output.text(), output.text()
+            read_until(master_fd, child, output, "Alpha  [Busy]")
             os.write(master_fd, b"n")
             read_until(master_fd, child, output, "Untitled conversation  |  model:")
             os.write(master_fd, b"\x1bORr")
@@ -2663,7 +2663,7 @@ def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
             assert "status: Running" in output.text(), output.text()
             select_picker_session(master_fd, child, output, "Beta")
             read_until(master_fd, child, output, beta_draft)
-            assert "Background: Alpha (Running)" in output.text(), output.text()
+            read_until(master_fd, child, output, "Background: Alpha (Running)")
 
             release_gate(status_url.removesuffix("/__trial/status"), 1)
             wait_for_status(

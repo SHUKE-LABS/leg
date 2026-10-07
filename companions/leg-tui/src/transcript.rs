@@ -80,6 +80,7 @@ struct TranscriptRound {
 /// One submitted prompt and its streamed assistant/tool history.
 #[derive(Clone, Debug)]
 pub struct TranscriptTurn {
+    render_revision: u64,
     turn_index: Option<u64>,
     prompt: String,
     timestamp_ms: Option<u64>,
@@ -95,6 +96,7 @@ pub struct TranscriptTurn {
 impl TranscriptTurn {
     pub fn new(prompt: &str) -> Self {
         Self {
+            render_revision: 0,
             turn_index: None,
             prompt: terminal_safe_text(prompt),
             timestamp_ms: Some(now_ms()),
@@ -614,7 +616,7 @@ impl TranscriptTurn {
     /// Adds a visible event. `false` means the event did not add renderable
     /// transcript content (for example, an incomplete escape sequence).
     pub fn observe(&mut self, event: &StreamEvent) -> bool {
-        match event {
+        let visible = match event {
             StreamEvent::TextDelta {
                 round_index,
                 block_index,
@@ -655,7 +657,11 @@ impl TranscriptTurn {
                 ..
             } => self.observe_tool_result(*round_index, tool_use_id, tool_name, status, output),
             _ => false,
+        };
+        if visible {
+            self.render_revision = self.render_revision.wrapping_add(1);
         }
+        visible
     }
 
     fn observe_tool_round(&mut self, round_index: u64, content: &Value) -> bool {
@@ -798,7 +804,12 @@ impl TranscriptTurn {
             return;
         };
         let round_index = self.rounds.keys().next_back().copied().unwrap_or(0);
-        self.authoritative_final = Some((round_index, terminal_safe_text(body)));
+        let final_text = terminal_safe_text(body);
+        let authoritative_final = (round_index, final_text);
+        if self.authoritative_final.as_ref() != Some(&authoritative_final) {
+            self.authoritative_final = Some(authoritative_final);
+            self.render_revision = self.render_revision.wrapping_add(1);
+        }
     }
 
     pub fn finish_stream(&mut self) {
@@ -825,14 +836,26 @@ impl TranscriptTurn {
                 }
             }
         }
+        self.render_revision = self.render_revision.wrapping_add(1);
     }
 
     pub fn set_completion_warning(&mut self, warning: &str) {
-        self.completion_warning = Some(terminal_safe_text(warning));
+        let warning = terminal_safe_text(warning);
+        if self.completion_warning.as_deref() != Some(warning.as_str()) {
+            self.completion_warning = Some(warning);
+            self.render_revision = self.render_revision.wrapping_add(1);
+        }
     }
 
     pub fn set_turn_index(&mut self, turn_index: u64) {
-        self.turn_index = Some(turn_index);
+        if self.turn_index != Some(turn_index) {
+            self.turn_index = Some(turn_index);
+            self.render_revision = self.render_revision.wrapping_add(1);
+        }
+    }
+
+    pub fn render_revision(&self) -> u64 {
+        self.render_revision
     }
 
     pub fn turn_index(&self) -> Option<u64> {
