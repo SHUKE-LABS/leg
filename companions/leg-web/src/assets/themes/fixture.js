@@ -75,6 +75,7 @@ function createView(root, elements) {
     save: renderer.save,
     focus: renderer.focus,
     rebindSessionId: renderer.rebindSessionId,
+    dispose: renderer.dispose,
   };
 }
 

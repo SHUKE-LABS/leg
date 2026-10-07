@@ -269,8 +269,10 @@ fails, the page shows a startup error and does not retry it in a loop.
 To add a source-controlled theme, add its module, HTML template, and scoped
 stylesheet under `companions/leg-web/src/assets/themes`, register its ID and
 loader in `registry.js`, and add explicit host routes and allowlist entries in
-`companions/leg-web/src/lib.rs`. Implement `mount`, `bind(actions)`, and
-`render(readOnlyModel, actions)` using the shared action contract; compose
+`companions/leg-web/src/lib.rs`. Implement `mount`, `bind(actions)`,
+`render(readOnlyModel, actions)`, and `dispose()` using the shared view
+contract. `dispose()` releases view-owned global listeners and timers if
+startup fails after binding begins. Compose
 `shared-renderer.js` when its common presentation fits, or provide a theme
 renderer that preserves safe transcript rendering. Keep the production
 registry limited to themes intended for release. The alternate fixture is

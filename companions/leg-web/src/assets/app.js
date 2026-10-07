@@ -64,12 +64,24 @@ async function loadTheme(record) {
   const view = await module.theme.mount(root);
   if (!view || typeof view.bind !== "function" || typeof view.render !== "function" ||
       typeof view.save !== "function" || typeof view.focus !== "function" ||
-      typeof view.rebindSessionId !== "function") {
+      typeof view.rebindSessionId !== "function" || typeof view.dispose !== "function") {
     throw new Error("theme_contract_invalid");
   }
   view.record = record;
   view.features = Object.freeze({ ...(view.features || {}) });
   return view;
+}
+
+async function startTheme(record) {
+  let view = null;
+  try {
+    view = await loadTheme(record);
+    saveThemeViewState = startController(view);
+    return view;
+  } catch (error) {
+    try { view?.dispose(); } catch { /* Preserve the startup error while discarding a partial view. */ }
+    throw error;
+  }
 }
 
 async function initializeTheme() {
@@ -93,7 +105,7 @@ async function initializeTheme() {
   }
   const selector = buildThemeSelector(records, selected.id);
   try {
-    const view = await loadTheme(selected);
+    const view = await startTheme(selected);
     if (selector) selector.disabled = false;
     return view;
   } catch (error) {
@@ -104,7 +116,7 @@ async function initializeTheme() {
       window.sessionStorage.setItem(themeStorageKey, defaultRecord.id);
       if (selector) selector.value = defaultRecord.id;
       try {
-        const view = await loadTheme(defaultRecord);
+        const view = await startTheme(defaultRecord);
         const notice = document.getElementById("theme-startup-error");
         notice.textContent = `${failedName} could not start. The Default theme was opened instead.`;
         notice.hidden = false;
@@ -112,6 +124,7 @@ async function initializeTheme() {
         return view;
       } catch {
         document.getElementById("theme-style")?.remove();
+        document.getElementById("theme-root").replaceChildren();
         setStartupError("The selected theme and the Default theme could not start. Check the embedded Web assets, then refresh.");
         return null;
       }
@@ -121,5 +134,4 @@ async function initializeTheme() {
   }
 }
 
-const initialView = await initializeTheme();
-if (initialView) saveThemeViewState = startController(initialView);
+await initializeTheme();

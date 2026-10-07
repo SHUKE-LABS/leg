@@ -1499,6 +1499,16 @@ export function createSharedRenderer(ui, features) {
     if (name === "rename") targets[name]?.select();
   }
 
+  function dispose() {
+    window.removeEventListener("resize", adjustTextarea);
+    if (actions.saveCurrentSessionView) window.removeEventListener("pagehide", actions.saveCurrentSessionView);
+    if (actions.online) window.removeEventListener("online", actions.online);
+    if (elapsedTimer !== null) {
+      window.clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+  }
+
   function bind(nextActions) {
     actions = nextActions;
     ui["start-form"].addEventListener("submit", (event) => { event.preventDefault(); actions.startConversation(ui["workspace-input"].value); });
@@ -1555,5 +1565,5 @@ export function createSharedRenderer(ui, features) {
     window.addEventListener("online", actions.online);
   }
 
-  return { bind, render, save, focus, rebindSessionId };
+  return { bind, render, save, focus, rebindSessionId, dispose };
 }

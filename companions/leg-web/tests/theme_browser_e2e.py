@@ -49,6 +49,19 @@ async def start_session(page, workspace: Path) -> str:
     return await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
 
 
+async def inject_bind_failure(route, theme_id: str) -> None:
+    response = await route.fetch()
+    source = await response.text()
+    binding = "bind(actions) { renderer.bind(actions); },"
+    assert source.count(binding) == 1, f"could not find one {theme_id} bind method to fault-inject"
+    source = source.replace(
+        binding,
+        f"bind(actions) {{ renderer.bind(actions); throw new Error('injected_{theme_id}_bind_failure'); }},",
+        1,
+    )
+    await route.fulfill(response=response, body=source)
+
+
 async def run(
     web_bin: Path, leg_bin: Path, supervisor_bin: Path, browser_name: str
 ) -> None:
@@ -203,6 +216,83 @@ async def run(
                 assert "Default theme could not start" in await failing_page.locator("#theme-startup-error").inner_text()
                 await asyncio.sleep(0.25)
                 assert len(failed_default_requests) == 1, failed_default_requests
+
+                fixture_bind_context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                extra_contexts.append(fixture_bind_context)
+                fixture_bind_page = await fixture_bind_context.new_page()
+                fixture_bind_page_errors: list[str] = []
+                fixture_module_requests: list[str] = []
+                default_module_requests: list[str] = []
+                fixture_bind_page.on("pageerror", lambda error: fixture_bind_page_errors.append(str(error)))
+                fixture_bind_page.on(
+                    "request",
+                    lambda request: fixture_module_requests.append(request.url)
+                    if request.url.endswith("/themes/fixture.js") else None,
+                )
+                fixture_bind_page.on(
+                    "request",
+                    lambda request: default_module_requests.append(request.url)
+                    if request.url.endswith("/themes/default.js") else None,
+                )
+                await fixture_bind_page.add_init_script(
+                    "sessionStorage.setItem('leg-web-theme', 'fixture')"
+                )
+
+                async def break_fixture_bind(route) -> None:
+                    await inject_bind_failure(route, "fixture")
+
+                await fixture_bind_page.route("**/themes/fixture.js", break_fixture_bind)
+                await fixture_bind_page.goto(launch_url, wait_until="load")
+                await fixture_bind_page.locator("#theme-startup-error").wait_for(state="visible")
+                assert "Fixture could not start" in await fixture_bind_page.locator("#theme-startup-error").inner_text()
+                await wait_theme(fixture_bind_page, "default")
+                assert await fixture_bind_page.evaluate("sessionStorage.getItem('leg-web-theme')") == "default"
+                await asyncio.sleep(0.25)
+                assert len(fixture_module_requests) == 1, fixture_module_requests
+                assert len(default_module_requests) == 1, default_module_requests
+                assert not fixture_bind_page_errors, fixture_bind_page_errors
+
+                default_bind_context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                extra_contexts.append(default_bind_context)
+                default_bind_page = await default_bind_context.new_page()
+                default_bind_page_errors: list[str] = []
+                failed_fixture_bind_requests: list[str] = []
+                default_bind_requests: list[str] = []
+                default_bind_page.on("pageerror", lambda error: default_bind_page_errors.append(str(error)))
+                default_bind_page.on(
+                    "request",
+                    lambda request: failed_fixture_bind_requests.append(request.url)
+                    if request.url.endswith("/themes/fixture.js") else None,
+                )
+                default_bind_page.on(
+                    "request",
+                    lambda request: default_bind_requests.append(request.url)
+                    if request.url.endswith("/themes/default.js") else None,
+                )
+
+                async def break_fixture_before_default_bind(route) -> None:
+                    await inject_bind_failure(route, "fixture")
+
+                async def break_default_bind(route) -> None:
+                    await inject_bind_failure(route, "default")
+
+                await default_bind_page.add_init_script(
+                    "sessionStorage.setItem('leg-web-theme', 'fixture')"
+                )
+                await default_bind_page.route("**/themes/fixture.js", break_fixture_before_default_bind)
+                await default_bind_page.route("**/themes/default.js", break_default_bind)
+                await default_bind_page.goto(launch_url, wait_until="load")
+                await default_bind_page.locator("#theme-startup-error").wait_for(state="visible")
+                assert "selected theme and the Default theme could not start" in await default_bind_page.locator(
+                    "#theme-startup-error"
+                ).inner_text()
+                assert await default_bind_page.locator("#theme-root").evaluate("root => root.children.length") == 0
+                assert await default_bind_page.locator("#theme-style").count() == 0
+                assert await default_bind_page.evaluate("sessionStorage.getItem('leg-web-theme')") == "default"
+                await asyncio.sleep(0.25)
+                assert len(failed_fixture_bind_requests) == 1, failed_fixture_bind_requests
+                assert len(default_bind_requests) == 1, default_bind_requests
+                assert not default_bind_page_errors, default_bind_page_errors
 
                 await choose_theme(page, "fixture")
                 assert await page.locator("#theme-style").get_attribute("href") == "/themes/fixture.css"
