@@ -9,6 +9,9 @@ description = "Authenticated loopback Web host for leg companion sessions"
 [lib]
 name = "leg_web"
 
+[features]
+browser-e2e-themes = []
+
 [[bin]]
 name = "leg-web"
 path = "src/main.rs"

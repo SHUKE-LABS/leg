@@ -61,6 +61,29 @@ textarea:focus-visible,
   display: none !important;
 }
 
+.theme-selector {
+  position: fixed;
+  z-index: 10;
+  top: 0.35rem;
+  right: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid #aab8b2;
+  border-radius: 0.55rem;
+  padding: 0.3rem 0.45rem;
+  background: #fff;
+  font-size: 0.8rem;
+}
+
+.theme-selector select {
+  min-height: 2rem;
+  border: 1px solid #aab8b2;
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.35rem;
+  background: #fff;
+}
+
 .app-shell {
   display: grid;
   grid-template-rows: minmax(0, 1fr);

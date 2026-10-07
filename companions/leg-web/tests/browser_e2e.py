@@ -547,6 +547,7 @@ async def run(
                 assert await page.title() == "Leg Web"
                 assert await page.locator(".topbar").count() == 0
                 assert await page.locator(".brand").count() == 0
+                assert await page.locator("select[aria-label='Interface theme']").count() == 0
                 assert await page.locator("#workspace-warning").count() == 1
                 await page.locator("#workspace-input").fill(str(workspace))
 

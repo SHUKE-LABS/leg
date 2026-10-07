@@ -138,14 +138,22 @@ def smoke_bundle(bundle_dir: Path) -> None:
                     f"unpacked bundle HTML request returned HTTP {status}, content-type={content_type!r}"
                 )
             page_text = page.decode("utf-8")
-            if "workspace-input" not in page_text or parsed.fragment in page_text:
+            if "theme-root" not in page_text or parsed.fragment in page_text:
                 raise AssertionError("unpacked page is incomplete or exposes its launch token")
 
             assets = PageAssets()
             assets.feed(page_text)
-            if not {"/app.css", "/app.js"}.issubset(assets.paths):
-                raise AssertionError("unpacked page does not reference its embedded CSS and JavaScript")
-            for asset_path in assets.paths:
+            if "/app.js" not in assets.paths:
+                raise AssertionError("unpacked page does not reference its embedded entry module")
+            embedded_theme_assets = {
+                "/controller.js",
+                "/themes/registry.js",
+                "/themes/default.js",
+                "/themes/default.html",
+                "/themes/default.css",
+                "/themes/shared-renderer.js",
+            }
+            for asset_path in set(assets.paths) | embedded_theme_assets:
                 asset_status, _asset_headers, asset_body = request(authority, asset_path)
                 if asset_status != 200 or not asset_body:
                     raise AssertionError(f"unpacked page asset failed to load: {asset_path}")

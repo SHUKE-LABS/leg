@@ -1,0 +1,89 @@
+<div class="fixture-layout">
+  <header class="fixture-session-deck" aria-label="Session navigation">
+    <div class="fixture-heading">
+      <div>
+        <p class="fixture-eyebrow">Alternate view fixture</p>
+        <h1>Session deck</h1>
+      </div>
+      <button id="new-conversation" type="button">New conversation</button>
+    </div>
+    <p id="session-list-empty" role="status" hidden>No saved sessions yet. Choose New conversation to begin.</p>
+    <p id="session-list-no-results" role="status" hidden>No sessions match this title.</p>
+    <p id="session-list-error" role="status" hidden></p>
+    <ul id="session-list" aria-label="Saved sessions"></ul>
+    <form id="rename-form" hidden>
+      <label for="rename-input">Session name</label>
+      <input id="rename-input" type="text" maxlength="120" autocomplete="off" />
+      <button type="submit">Save name</button>
+      <button id="cancel-rename" type="button">Cancel rename</button>
+      <p id="rename-error" role="alert" hidden></p>
+    </form>
+  </header>
+
+  <main class="fixture-main">
+    <section id="welcome" aria-labelledby="fixture-welcome-title">
+      <div class="fixture-card">
+        <p class="fixture-eyebrow">Workspace setup</p>
+        <h2 id="fixture-welcome-title">Start a conversation</h2>
+        <p>Leg uses this existing folder when its tools read files or run commands.</p>
+        <form id="start-form">
+          <label for="workspace-input">Workspace folder path</label>
+          <input id="workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace" required />
+          <button type="submit">Start conversation</button>
+          <p id="setup-error" role="alert" hidden></p>
+        </form>
+        <aside class="fixture-warning" aria-label="Workspace and tools warning">
+          <strong>Workspace and tools</strong>
+          <span>Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.</span>
+        </aside>
+      </div>
+    </section>
+
+    <section id="conversation" aria-label="Current conversation" hidden>
+      <header class="fixture-conversation-heading">
+        <div>
+          <p class="fixture-eyebrow">Current session</p>
+          <h2 id="session-title">Conversation</h2>
+        </div>
+        <button id="stop-turn" type="button" hidden>Stop</button>
+      </header>
+      <p id="session-guidance" role="status" hidden></p>
+      <form id="set-workspace-form" hidden>
+        <label for="recovery-workspace-input">Workspace folder path</label>
+        <input id="recovery-workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace" />
+        <button type="submit">Set workspace</button>
+        <button id="cancel-workspace" type="button">Cancel workspace change</button>
+        <p id="recovery-error" role="alert" hidden></p>
+      </form>
+      <aside id="workspace-warning" class="fixture-warning" role="note">
+        <strong>Before you send</strong>
+        <span>Leg can run shell commands and modify files as your OS user. The workspace shown above is its working directory, not a sandbox.</span>
+      </aside>
+      <p id="connection-message" role="status" hidden></p>
+      <aside id="transcript-warnings" role="note" hidden></aside>
+      <div id="transcript" tabindex="0" aria-label="Conversation transcript. Use Home, End, Page Up, and Page Down to browse history.">
+        <div id="messages"></div>
+        <p id="empty-transcript">Your conversation will appear here.</p>
+        <button id="new-content" type="button" hidden>New content · Jump to latest</button>
+      </div>
+      <form id="composer">
+        <label class="visually-hidden" for="prompt">Message</label>
+        <textarea id="prompt" rows="1" aria-label="Message" placeholder="Message — Ctrl+Enter to send" autocomplete="off"></textarea>
+        <div class="fixture-compose-actions">
+          <button id="retry-submission" type="button" hidden>Retry same send</button>
+          <button id="send" type="submit">Send</button>
+        </div>
+        <p id="send-error" role="alert" hidden></p>
+      </form>
+      <div class="fixture-status" role="group" aria-label="Conversation status">
+        <span id="workspace-label">Workspace not set</span>
+        <span id="provider-model" hidden></span>
+        <span id="turn-status">Idle</span>
+        <span id="active-tool" hidden></span>
+        <span id="elapsed-time" hidden></span>
+        <span id="connection-state" role="status">Connecting to local host…</span>
+      </div>
+    </section>
+    <p id="live-status" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+  </main>
+</div>

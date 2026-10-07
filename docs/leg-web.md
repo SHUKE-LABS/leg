@@ -1,9 +1,10 @@
 # Leg Web host
 
 `leg-web` is the local HTTP companion for browser clients. It embeds its
-bootstrap page and JavaScript in the binary; running it needs no Node runtime,
-CDN, or external service. The experimental interface in #84 can use the API
-below without adding HTTP dependencies to core `leg`.
+bootstrap page, controller, registered theme views, templates, and styles in
+the binary; running it needs no Node runtime, CDN, or external service. The
+experimental interface in #84 can use the API below without adding HTTP
+dependencies to core `leg`.
 
 ## Experimental trial bundle
 
@@ -204,7 +205,7 @@ and failed prompts remain available. Markdown formatting uses local DOM
 rendering: raw HTML is shown as text, unsupported or unsafe links remain text,
 and model/tool output cannot load remote images or other resources.
 
-Each turn's tool inspector is opened with its **Show details** button. It shows
+The default theme's tool inspector is opened with its **Show details** button. It shows
 the tool name and ID, literal arguments, result or error, and call/result
 observation times. The local companion records times for new streamed tool
 events; older saved calls without time metadata say **Timestamp unavailable**.
@@ -229,6 +230,60 @@ plus mounted turn/detail counts and the Chromium version.
 Session history browsing and detailed execution inspection are covered by
 #85. The manual keyboard and screen-reader checklist is
 [`companions/leg-web/tests/keyboard-screen-reader-checklist.md`](../companions/leg-web/tests/keyboard-screen-reader-checklist.md).
+
+## Themes
+
+Production registers only the built-in `default` theme, so the selector is
+omitted and the current workbench layout remains the default experience. A
+theme is trusted source embedded in the Web binary. Its registry entry has a
+stable ID, display name, stylesheet path, and module loader. The host serves
+each registered module, template, and stylesheet from an explicit route and
+asset allowlist; it does not serve arbitrary files or load themes from a
+network or plugin.
+
+The controller owns authentication, session and run state, persistence,
+submission IDs, retries, Stop, stream recovery, and transcript safety. A view
+mounts its own DOM, binds the shared actions, and renders a read-only model
+containing sessions, workspace guidance, transcript/live activity, metadata,
+connection and turn state, action availability, and the editable draft. The
+view receives no launch token or authenticated transport. Its feature list
+controls which optional controls and handlers exist. When tool inspection is
+omitted, failed, denied, missing, interrupted, and capped results still have
+readable summaries.
+
+The built-in views compose `themes/shared-renderer.js` for common DOM updates,
+event binding, and safe transcript rendering. A theme owns that rendering
+boundary: it can provide its own template and layout while reusing the shared
+renderer. A replacement renderer works from the same model and actions and
+must preserve the safe transcript rendering behavior.
+
+When more than one theme is registered, every view includes a keyboard
+accessible selector. The selected stable ID is kept in per-tab
+`sessionStorage`; unknown and missing IDs choose `default`. Choosing a theme
+saves the current session, draft, transcript position, tool expansion, and
+pending-send record, then reloads through the existing reconciliation path.
+Selection does not submit, retry, or stop a turn. A non-default load or
+initialization failure falls back once to `default` with an alert. If `default`
+fails, the page shows a startup error and does not retry it in a loop.
+
+To add a source-controlled theme, add its module, HTML template, and scoped
+stylesheet under `companions/leg-web/src/assets/themes`, register its ID and
+loader in `registry.js`, and add explicit host routes and allowlist entries in
+`companions/leg-web/src/lib.rs`. Implement `mount`, `bind(actions)`,
+`render(readOnlyModel, actions)`, and `dispose()` using the shared view
+contract. `dispose()` releases view-owned global listeners and timers if
+startup fails after binding begins. Compose
+`shared-renderer.js` when its common presentation fits, or provide a theme
+renderer that preserves safe transcript rendering. Keep the production
+registry limited to themes intended for release. The alternate fixture is
+registered only by the `browser-e2e-themes` Cargo feature.
+
+Run the executable Chromium and Firefox check for the production default,
+fixture view, and theme selection/recovery with:
+
+```sh
+bash companions/leg-web/tests/theme_browser_e2e.sh
+```
 
 ## Validation
 
