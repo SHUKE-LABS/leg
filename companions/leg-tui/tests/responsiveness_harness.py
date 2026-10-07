@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import codecs
+from contextlib import ExitStack
 import importlib.util
 import json
 import math
@@ -475,6 +476,14 @@ class TerminalProcess:
             while written < len(data):
                 written += os.write(self.master_fd, data[written:])
 
+    def write_control(self, key: str) -> None:
+        if len(key) != 1 or not ("a" <= key.lower() <= "z"):
+            raise ValueError("control key must be one ASCII letter")
+        if os.name == "nt":
+            self.process.sendcontrol(key.lower())
+        else:
+            self.write(chr(ord(key.lower()) - ord("a") + 1))
+
     def wait_for(
         self,
         predicate: Callable[[str], bool],
@@ -754,13 +763,21 @@ def _build_profile(args: argparse.Namespace) -> str:
     return "release" if any("release" in Path(path).parts for path in paths) else "debug"
 
 
-def _wait_fixture_requests(fixture: Any, count: int, timeout: float = 8.0) -> None:
+def _wait_fixture_requests(
+    fixture: Any,
+    count: int,
+    timeout: float = 8.0,
+    terminal: TerminalProcess | None = None,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if fixture.status()["requests"] >= count:
             return
         time.sleep(0.01)
-    raise TimeoutError(f"provider fixture saw fewer than {count} requests: {fixture.status()}")
+    screen = f"\ncurrent TUI screen:\n{terminal.capture.text()[-3000:]}" if terminal else ""
+    raise TimeoutError(
+        f"provider fixture saw fewer than {count} requests: {fixture.status()}{screen}"
+    )
 
 
 def _wait_for_both_streams(fixture: Any, timeout: float = 8.0) -> None:
@@ -862,10 +879,10 @@ def _measure_dimension(
             )
         )
 
-    terminal.write("\x10")  # Ctrl-P
+    terminal.write_control("p")  # Ctrl-P
     terminal.wait_contains(PALETTE_HEADER)
     for index in range(sample_count):
-        terminal.write("\x15")  # Ctrl-U clears the prior query.
+        terminal.write_control("u")  # Ctrl-U clears the prior query.
         query = f"q{index:03d}"
         groups[f"palette_filtering@{suffix}"].append(
             _measure_sample(
@@ -952,13 +969,17 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
     idle_memory: list[int] = []
     catalog_load_ms: float | None = None
     history_open_ms: float | None = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="leg-tui-responsiveness-") as temporary:
+    with ExitStack() as workspace_cleanup:
+        temporary = workspace_cleanup.enter_context(
+            tempfile.TemporaryDirectory(prefix="leg-tui-responsiveness-")
+        )
+        with ExitStack() as process_cleanup:
             temp_root = Path(temporary)
             workspace = temp_root / "workspace"
             state_dir = temp_root / "state"
             dataset = seed_responsiveness_catalog(state_dir, workspace)
             fixture_server = FixtureServer(workspace)
+            process_cleanup.callback(fixture_server.close)
             env = os.environ.copy()
             env.update(fixture_server.environment)
             env.update(
@@ -977,8 +998,10 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             ]
             startup_started_ns = time.perf_counter_ns()
             terminal = TerminalProcess(command, workspace, env, rows=24, columns=80)
+            process_cleanup.callback(terminal.close)
             sampler = ProcessTreeRssSampler(terminal.pid)
             sampler.start()
+            process_cleanup.callback(sampler.stop)
             _, startup_visible_ns = terminal.wait_contains(PICKER_HEADER, timeout=15.0)
             startup_ms = (startup_visible_ns - startup_started_ns) / 1_000_000
 
@@ -996,12 +1019,12 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
 
             _select_session(terminal, "Stream A", target="RESPONSIVENESS-STREAM-A")
             terminal.write("RESPONSIVENESS-STREAM-A")
-            terminal.write("\x13")  # Ctrl-S submits the seeded stream prompt.
-            _wait_fixture_requests(fixture_server.fixture, 1)
+            terminal.write_control("s")  # Ctrl-S submits the seeded stream prompt.
+            _wait_fixture_requests(fixture_server.fixture, 1, terminal=terminal)
             _select_session(terminal, "Stream B", target="RESPONSIVENESS-STREAM-B")
             terminal.write("RESPONSIVENESS-STREAM-B")
-            terminal.write("\x13")
-            _wait_fixture_requests(fixture_server.fixture, 2)
+            terminal.write_control("s")
+            _wait_fixture_requests(fixture_server.fixture, 2, terminal=terminal)
             _wait_for_both_streams(fixture_server.fixture)
             selected_ns, visible_ns = _select_session(
                 terminal,
@@ -1047,7 +1070,7 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             ]
             inspector_open_ms = p95([float(sample["latency_ms"]) for sample in inspector_samples])
 
-            terminal.write("\x03")
+            terminal.write_control("c")
             if not terminal.wait_exit(timeout=5.0):
                 raise RuntimeError("leg-tui did not exit after the harness sent Ctrl-C")
 
@@ -1104,13 +1127,6 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             )
             temporary_output.replace(output_path)
             return report
-    finally:
-        if sampler is not None:
-            sampler.stop()
-        if terminal is not None:
-            terminal.close()
-        if fixture_server is not None:
-            fixture_server.close()
 
 
 def main() -> int:
