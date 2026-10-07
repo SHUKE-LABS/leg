@@ -33,9 +33,15 @@ SCENARIOS = (
     "stalled-bash",
     "reopen-after-failure",
     "reopen-after-interruption",
+    "responsiveness",
 )
 PAUSE_MS = 1200
 BROWSER_PAUSE_MS = 12000
+RESPONSIVENESS_CHUNKS_PER_SECOND = 200
+RESPONSIVENESS_CHUNK_BYTES = 32
+RESPONSIVENESS_DURATION_SECONDS = 30
+RESPONSIVENESS_CHUNK_COUNT = RESPONSIVENESS_CHUNKS_PER_SECOND * RESPONSIVENESS_DURATION_SECONDS
+RESPONSIVENESS_CHUNK_INTERVAL_MS = 1000 // RESPONSIVENESS_CHUNKS_PER_SECOND
 TRIAL_LINES = "Line one: keep this first.\n第二行：保留中文。\nLine three: keep this third."
 UNTRUSTED_MARKDOWN = (
     "<script>window.__legXss = true</script>\n"
@@ -80,6 +86,8 @@ class Fixture:
         self.pause_gates: dict[int, threading.Event] = {}
         self.pause_gate_states: dict[int, str] = {}
         self.provider_waits: list[dict[str, Any]] = []
+        self.stream_emissions: dict[str, list[dict[str, int]]] = {}
+        self.stream_timings: dict[str, dict[str, int]] = {}
         self.input_checks: dict[str, bool] = {}
         self.expected_files: dict[str, tuple[str, str | None]] = {}
         self.denial_hook: Path | None = None
@@ -154,6 +162,8 @@ class Fixture:
             "TRIAL-TUI-MAX-TOKENS",
             "TRIAL-UNTRUSTED-MARKDOWN",
             "TRIAL-CONTINUE",
+            "RESPONSIVENESS-STREAM-A",
+            "RESPONSIVENESS-STREAM-B",
         )
         for message in reversed(messages if isinstance(messages, list) else []):
             if not isinstance(message, dict):
@@ -181,6 +191,27 @@ class Fixture:
             self.active_requests.discard(request)
             if self.request_outcomes.get(request) == "active":
                 self.request_outcomes[request] = outcome
+
+    def record_stream_emit(
+        self, stream_id: str, request: int, chunk_index: int, emitted_ns: int
+    ) -> None:
+        with self.lock:
+            events = self.stream_emissions.setdefault(stream_id, [])
+            if not events:
+                self.stream_timings[stream_id] = {
+                    "request": request,
+                    "started_ns": emitted_ns,
+                    "ended_ns": emitted_ns,
+                    "chunk_interval_ms": RESPONSIVENESS_CHUNK_INTERVAL_MS,
+                }
+            events.append({"chunk_index": chunk_index, "emitted_ns": emitted_ns})
+            self.stream_timings[stream_id]["ended_ns"] = emitted_ns
+
+    def finish_stream(self, stream_id: str, ended_ns: int) -> None:
+        with self.lock:
+            timing = self.stream_timings.get(stream_id)
+            if timing is not None:
+                timing["ended_ns"] = ended_ns
 
     def set_pause_gate_state(self, request: int, state: str) -> None:
         with self.lock:
@@ -254,6 +285,8 @@ class Fixture:
         pause_ms: int = 0,
         marker: str = "",
         gate_after_first_chunk: bool = False,
+        chunk_interval_ms: int = 0,
+        stream_id: str = "",
     ) -> bool:
         request_number = getattr(handler, "fixture_request_number", self.request_count)
         if not getattr(handler, "fixture_streaming", False):
@@ -329,8 +362,21 @@ class Fixture:
                 if not isinstance(chunks, list):
                     midpoint = max(1, len(value) // 2)
                     chunks = [value[:midpoint], value[midpoint:]]
+                chunk_clock_started_ns = time.perf_counter_ns()
                 for chunk_index, chunk in enumerate(chunks):
+                    if chunk_interval_ms:
+                        due_ns = chunk_clock_started_ns + chunk_index * chunk_interval_ms * 1_000_000
+                        wait_ns = due_ns - time.perf_counter_ns()
+                        if wait_ns > 0:
+                            time.sleep(wait_ns / 1_000_000_000)
                     if chunk:
+                        if stream_id:
+                            self.record_stream_emit(
+                                stream_id,
+                                request_number,
+                                chunk_index,
+                                time.perf_counter_ns(),
+                            )
                         write(
                             sse(
                                 "content_block_delta",
@@ -377,6 +423,8 @@ class Fixture:
             )
         )
         write(sse("message_stop", {"type": "message_stop"}))
+        if stream_id:
+            self.finish_stream(stream_id, time.perf_counter_ns())
         return True
 
     def send_partial_then_close(self, handler: http.server.BaseHTTPRequestHandler) -> None:
@@ -409,9 +457,30 @@ class Fixture:
         handler.close_connection = True
 
     def handle_messages(self, handler: http.server.BaseHTTPRequestHandler, payload: dict[str, Any]) -> None:
-        marker = self.marker_for(payload) if self.scenario in ("trial", "browser") else self.scenario
+        marker = (
+            self.marker_for(payload)
+            if self.scenario in ("trial", "browser", "responsiveness")
+            else self.scenario
+        )
         request, occurrence = self.advance(marker)
         handler.fixture_request_number = request
+
+        if self.scenario == "responsiveness" and marker in (
+            "RESPONSIVENESS-STREAM-A",
+            "RESPONSIVENESS-STREAM-B",
+        ):
+            chunk = "0123456789abcdefghijklmnopqrstuv"
+            assert len(chunk.encode("utf-8")) == RESPONSIVENESS_CHUNK_BYTES
+            chunks = [chunk] * RESPONSIVENESS_CHUNK_COUNT
+            completed = self.send_stream(
+                handler,
+                [{"type": "text", "text": chunk * RESPONSIVENESS_CHUNK_COUNT, "chunks": chunks}],
+                chunk_interval_ms=RESPONSIVENESS_CHUNK_INTERVAL_MS,
+                stream_id=marker,
+            )
+            if completed:
+                self.check(f"{marker.lower().replace('-', '_')}_stream_completed")
+            return
 
         if marker == "TRIAL-PROVIDER-RETRY" and occurrence == 1:
             self.check("provider_retry_first_attempt_failed")
@@ -768,6 +837,11 @@ class Fixture:
             active_requests = sorted(self.active_requests)
             request_outcomes = dict(self.request_outcomes)
             pause_gate_states = dict(self.pause_gate_states)
+            stream_timings = {
+                stream_id: dict(timing)
+                | {"chunks_emitted": len(self.stream_emissions.get(stream_id, []))}
+                for stream_id, timing in self.stream_timings.items()
+            }
         checks: list[dict[str, Any]] = []
         for relative, (kind, expected) in sorted(expected_files.items()):
             if self.workspace is None:
@@ -815,6 +889,7 @@ class Fixture:
                 str(request): state for request, state in pause_gate_states.items()
             },
             "simulated_provider_waits": waits,
+            "responsiveness_streams": stream_timings,
             "input_checks": input_checks,
             "workspace_checks": checks,
             "note": "No prompts, provider headers, credentials, or transcript content are retained.",

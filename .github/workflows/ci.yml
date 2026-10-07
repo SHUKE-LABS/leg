@@ -147,6 +147,13 @@ jobs:
             --requirement companions/leg-tui/tests/requirements.txt
           echo "TUI_TRIAL_PYTHON=${RUNNER_TEMP}/leg-tui-trial-venv/bin/python" >>"${GITHUB_ENV}"
 
+      - name: Test responsiveness harness fixtures (Linux)
+        if: ${{ matrix.platform == 'linux-x86_64' }}
+        run: |
+          "${TUI_TRIAL_PYTHON}" -m unittest discover \
+            -s companions/leg-tui/tests \
+            -p 'test_responsiveness_harness.py'
+
       - name: Build experimental TUI trial bundle
         run: bash scripts/build-tui-trial.sh --output "${RUNNER_TEMP}/tui-trial"
 
@@ -185,6 +192,25 @@ jobs:
             --leg-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg" \
             --supervisor-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg-ui-supervisor" \
             --output "${RUNNER_TEMP}/tui-trial/resource-measurements.json"
+
+      - name: Run native Linux TUI responsiveness harness
+        if: ${{ matrix.platform == 'linux-x86_64' }}
+        run: |
+          "${TUI_TRIAL_PYTHON}" companions/leg-tui/tests/responsiveness_harness.py \
+            --tui-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg-tui" \
+            --leg-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg" \
+            --supervisor-bin "${TUI_TRIAL_BUNDLE_DIR}/bin/leg-ui-supervisor" \
+            --build-profile release \
+            --output "${RUNNER_TEMP}/leg-tui-responsiveness-linux.json"
+
+      - name: Upload native Linux responsiveness report
+        if: ${{ matrix.platform == 'linux-x86_64' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: leg-tui-responsiveness-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/leg-tui-responsiveness-linux.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Write TUI trial report
         if: ${{ matrix.platform == 'linux-x86_64' }}
@@ -272,6 +298,42 @@ jobs:
         if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
         shell: bash
         run: cargo build --locked --manifest-path companions/Cargo.toml -p leg-web --bin leg-web
+
+      - uses: actions/setup-python@v5
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        with:
+          python-version: "3.12"
+
+      - name: Run native Windows TUI responsiveness harness
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_temp="$(cygpath -u "${RUNNER_TEMP}")"
+          venv="${runner_temp}/leg-tui-responsiveness-venv"
+          python -m venv "${venv}"
+          "${venv}/Scripts/python.exe" -m pip install \
+            --requirement companions/leg-tui/tests/requirements.txt
+          cargo build --locked --release --bin leg
+          cargo build --locked --manifest-path companions/Cargo.toml --release \
+            -p leg-ui-client --bin leg-ui-supervisor
+          cargo build --locked --manifest-path companions/Cargo.toml --release -p leg-tui
+          "${venv}/Scripts/python.exe" \
+            companions/leg-tui/tests/responsiveness_harness.py \
+            --tui-bin companions/target/release/leg-tui.exe \
+            --leg-bin target/release/leg.exe \
+            --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
+            --build-profile release \
+            --output "${runner_temp}/leg-tui-responsiveness-windows.json"
+
+      - name: Upload native Windows responsiveness report
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: leg-tui-responsiveness-windows-${{ github.sha }}
+          path: ${{ runner.temp }}/leg-tui-responsiveness-windows.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Build Web lifecycle binaries (locked)
         if: ${{ matrix.target != 'x86_64-pc-windows-msvc' }}
