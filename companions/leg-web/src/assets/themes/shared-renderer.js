@@ -744,7 +744,12 @@ export function createSharedRenderer(ui, features) {
       if (!turn) return;
       const target = match.toolIndex === null
         ? turn
-        : turn.querySelector(`.tool-inspector[data-tool-index="${match.toolIndex}"]`) || turn;
+        : turn.querySelector(`.tool-inspector[data-tool-index="${match.toolIndex}"], .tool-summary[data-tool-index="${match.toolIndex}"]`) || turn;
+      const group = target.closest(".tool-call-group");
+      const groupDisclosure = group?.querySelector(".tool-group-disclosure");
+      if (groupDisclosure?.getAttribute("aria-expanded") !== "true") groupDisclosure?.click();
+      const toolDisclosure = target.querySelector(".tool-disclosure");
+      if (toolDisclosure?.getAttribute("aria-expanded") !== "true") toolDisclosure?.click();
       const scrollerBounds = ui.transcript.getBoundingClientRect();
       const targetBounds = target.getBoundingClientRect();
       ui.transcript.scrollTop += targetBounds.top - scrollerBounds.top - (ui.transcript.clientHeight - targetBounds.height) / 2;
@@ -1006,7 +1011,7 @@ export function createSharedRenderer(ui, features) {
     const rendered = messageRenderState.get(article);
     if (rendered.details !== signature) {
       rendered.details = signature;
-      for (const detail of article.querySelectorAll(".tool-round-text, .tool-summary, .tool-inspector, .turn-outcome, .turn-warning, .retry-turn-control")) {
+      for (const detail of article.querySelectorAll(".tool-round-text, .tool-summary, .tool-inspector, .tool-call-group, .turn-outcome, .turn-warning, .retry-turn-control")) {
         detail.remove();
       }
       for (const round of item.toolRounds || []) {
@@ -1024,6 +1029,7 @@ export function createSharedRenderer(ui, features) {
         if (features.toolInspection) appendToolInspector(article, tool, toolIndex);
         else appendToolSummary(article, tool, toolIndex);
       }
+      groupFinishedToolRows(article, item);
       appendOutcome(article, status);
       if (item.capped) {
         const warning = document.createElement("p");
@@ -1052,10 +1058,11 @@ export function createSharedRenderer(ui, features) {
     if (!heading || !body) return;
 
     const toolNodes = [...article.querySelectorAll(".tool-inspector, .tool-summary")];
+    const toolContainer = (node) => node.closest(".tool-call-group") || node;
     const toolById = new Map(toolNodes
       .filter((node) => node.dataset.toolUseId)
-      .map((node) => [node.dataset.toolUseId, node]));
-    const toolByIndex = new Map(toolNodes.map((node) => [Number(node.dataset.toolIndex), node]));
+      .map((node) => [node.dataset.toolUseId, toolContainer(node)]));
+    const toolByIndex = new Map(toolNodes.map((node) => [Number(node.dataset.toolIndex), toolContainer(node)]));
     const textByKey = new Map([...article.querySelectorAll(".tool-round-text")]
       .map((node) => [`${node.dataset.roundIndex}:${node.dataset.blockIndex}`, node]));
     const ordered = [heading];
@@ -1075,8 +1082,6 @@ export function createSharedRenderer(ui, features) {
       for (const round of item.toolRounds) {
         for (const [blockIndex, block] of (round.content || []).entries()) {
           if (block?.type === "text") add(textByKey.get(`${round.roundIndex}:${blockIndex}`));
-        }
-        for (const block of round.content || []) {
           if (block?.type === "tool_use") addTool(block.id);
         }
       }
@@ -1099,7 +1104,7 @@ export function createSharedRenderer(ui, features) {
 
   function appendOutcome(article, text) {
     const status = document.createElement("p");
-    status.className = "turn-outcome";
+    status.className = `turn-outcome turn-outcome-${text.toLowerCase()}`;
     status.textContent = text;
     article.append(status);
   }
@@ -1134,9 +1139,128 @@ export function createSharedRenderer(ui, features) {
     return "Outcome unavailable";
   }
 
+  function toolInputRecord(tool) {
+    let input = tool.input;
+    if (typeof input === "string") {
+      try { input = JSON.parse(input); } catch { return {}; }
+    }
+    return input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  }
+
+  function bashResultEnvelope(tool, value = tool.error ?? tool.output) {
+    if (tool.name !== "bash" || value === undefined) return null;
+    let envelope = value;
+    if (typeof envelope === "string") {
+      try { envelope = JSON.parse(envelope); } catch { return null; }
+    }
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) return null;
+    return ["stdout", "stderr", "exit_code", "stdout_omitted_bytes", "stderr_omitted_bytes"]
+      .some((key) => Object.hasOwn(envelope, key)) ? envelope : null;
+  }
+
+  function toolOutputPresentation(tool, value = tool.error ?? tool.output) {
+    const envelope = bashResultEnvelope(tool, value);
+    if (!envelope) return { text: toolLiteralText(value), envelope: null, exitCode: null };
+    const stdout = envelope.stdout === undefined ? "" : String(envelope.stdout);
+    const stderr = envelope.stderr === undefined ? "" : String(envelope.stderr);
+    const text = stdout && stderr && !stdout.endsWith("\n")
+      ? `${stdout}\n${stderr}`
+      : `${stdout}${stderr}`;
+    const exitCode = envelope.exit_code === null || envelope.exit_code === undefined || envelope.exit_code === ""
+      ? null
+      : Number(envelope.exit_code);
+    return {
+      text,
+      envelope,
+      exitCode: Number.isFinite(exitCode) ? exitCode : null,
+    };
+  }
+
+  function toolDisplayStatus(tool, output = toolOutputPresentation(tool)) {
+    return output.exitCode !== null && output.exitCode !== 0 ? "failed" : tool.status;
+  }
+
+  function toolInputSummary(tool) {
+    const input = toolInputRecord(tool);
+    if (tool.name === "bash") {
+      const summary = typeof input.description === "string" && input.description.trim()
+        ? input.description
+        : input.command;
+      return oneLineToolSummary(summary);
+    }
+    if (tool.name === "read") {
+      const parts = [typeof input.path === "string" ? input.path : "Path unavailable"];
+      if (input.offset !== undefined) parts.push(`offset ${input.offset}`);
+      if (input.limit !== undefined) parts.push(`limit ${input.limit}`);
+      return parts.join(" · ");
+    }
+    const firstString = typeof tool.input === "string"
+      ? tool.input
+      : Object.values(input).find((value) => typeof value === "string");
+    return oneLineToolSummary(firstString ?? tool.input);
+  }
+
+  function oneLineToolSummary(value) {
+    const summary = typeof value === "string" ? value : value === undefined ? "Input unavailable" : toolLiteralText(value);
+    return summary.replace(/\s+/g, " ").trim() || "Input unavailable";
+  }
+
+  function toolStatusGlyph(status) {
+    if (status === "pending") return "⟳";
+    if (status === "completed") return "✓";
+    if (status === "failed" || status === "denied") return "✗";
+    if (status === "interrupted") return "Ⅱ";
+    if (status === "missing" || status === "unavailable") return "?";
+    return "·";
+  }
+
+  function setToolDisclosureLabel(button, tool, expanded) {
+    const output = toolOutputPresentation(tool);
+    const status = toolDisplayStatus(tool, output);
+    const statusLabel = toolStatusLabel(status);
+    const summary = toolInputSummary(tool);
+    const exitCode = output.exitCode;
+    const glyph = document.createElement("span");
+    glyph.className = `tool-status-glyph tool-status-glyph-${status}`;
+    glyph.setAttribute("aria-hidden", "true");
+    glyph.textContent = toolStatusGlyph(status);
+    const name = document.createElement("span");
+    name.className = "tool-row-name";
+    name.textContent = tool.name || "tool";
+    const input = document.createElement("span");
+    input.className = "tool-row-summary";
+    input.textContent = summary;
+    button.replaceChildren(glyph, name, input);
+    if (exitCode !== null && exitCode !== 0) {
+      const exit = document.createElement("span");
+      exit.className = "tool-exit-code";
+      exit.textContent = `exit ${exitCode}`;
+      button.append(exit);
+    }
+    const action = expanded ? "Hide details" : "Show details";
+    button.setAttribute("aria-label", `${statusLabel} ${tool.name || "tool"}: ${summary}${exitCode !== null && exitCode !== 0 ? `, exit ${exitCode}` : ""}. ${action}`);
+  }
+
+  function renderToolDetails(parent, tool) {
+    parent.replaceChildren();
+    appendToolDetails(parent, tool);
+    const copyActions = document.createElement("div");
+    copyActions.className = "tool-copy-actions";
+    if (features.copy && tool.input !== undefined) {
+      copyActions.append(makeCopyButton("Copy tool input", toolLiteralText(tool.input), parent, "tool-copy-button"));
+    }
+    if (features.copy && tool.output !== undefined) {
+      copyActions.append(makeCopyButton("Copy tool result", toolOutputPresentation(tool, tool.output).text, parent, "tool-copy-button"));
+    }
+    if (features.copy && tool.error !== undefined) {
+      copyActions.append(makeCopyButton("Copy tool error", toolOutputPresentation(tool, tool.error).text, parent, "tool-copy-button"));
+    }
+    if (copyActions.childElementCount) parent.append(copyActions);
+  }
+
   function appendToolInspector(article, tool, toolIndex) {
     const card = document.createElement("section");
-    card.className = `tool-inspector tool-inspector-${tool.status}`;
+    card.className = `tool-inspector tool-inspector-${toolDisplayStatus(tool)}`;
     card.dataset.toolIndex = String(toolIndex);
     card.dataset.toolUseId = String(tool.id || "");
     const disclosureId = `tool-details-${Math.random().toString(36).slice(2)}`;
@@ -1147,58 +1271,23 @@ export function createSharedRenderer(ui, features) {
     button.dataset.focusKey = tool.identity;
     button.setAttribute("aria-expanded", String(expanded));
     button.setAttribute("aria-controls", disclosureId);
-    button.textContent = `Tool ${tool.name} · ${tool.id || "ID unavailable"} · ${toolStatusLabel(tool.status)} · ${expanded ? "Hide details" : "Show details"}`;
-
-    const preview = document.createElement("p");
-    preview.className = "tool-preview";
-    if (tool.output !== undefined || tool.error !== undefined) {
-      const raw = tool.error ?? tool.output;
-      const output = toolLiteralText(raw);
-      const prefix = tool.error !== undefined || ["failed", "denied"].includes(tool.status)
-        ? "Error preview"
-        : "Output preview";
-      if (output.length > 180) preview.dataset.outputChars = String(output.length);
-      preview.textContent = output.length > 180
-        ? `${prefix} (${output.length.toLocaleString()} characters; full text in details): ${output.slice(0, 150)}…`
-        : `${tool.error !== undefined || ["failed", "denied"].includes(tool.status) ? "Error" : "Output"}: ${output}`;
-    } else if (tool.status !== "pending") {
-      preview.textContent = "No tool result was recorded.";
-    } else {
-      preview.textContent = "Tool result is pending.";
-    }
-    const omission = toolOmissionSummary(tool.output ?? tool.error);
-    if (omission) preview.textContent = `${preview.textContent} · ${omission}`;
-
-    const copyActions = document.createElement("div");
-    copyActions.className = "tool-copy-actions";
-    if (features.copy && tool.input !== undefined) {
-      copyActions.append(makeCopyButton("Copy tool input", toolLiteralText(tool.input), card, "tool-copy-button"));
-    }
-    if (features.copy && tool.output !== undefined) {
-      copyActions.append(makeCopyButton("Copy tool result", toolLiteralText(tool.output), card, "tool-copy-button"));
-    }
-    if (features.copy && tool.error !== undefined) {
-      copyActions.append(makeCopyButton("Copy tool error", toolLiteralText(tool.error), card, "tool-copy-button"));
-    }
+    setToolDisclosureLabel(button, tool, expanded);
     const details = document.createElement("div");
     details.className = "tool-detail-body";
     details.id = disclosureId;
     details.hidden = !expanded;
-    card.append(button, preview);
-    if (copyActions.childElementCount) card.append(copyActions);
-    card.append(details);
-    if (expanded) appendToolDetails(details, tool);
+    card.append(button, details);
+    if (expanded) renderToolDetails(details, tool);
     button.addEventListener("click", () => {
       const anchor = findScrollAnchor(ui.transcript);
       const previousTop = ui.transcript.scrollTop;
       const open = button.getAttribute("aria-expanded") !== "true";
       button.setAttribute("aria-expanded", String(open));
-      button.textContent = `Tool ${tool.name} · ${tool.id || "ID unavailable"} · ${toolStatusLabel(tool.status)} · ${open ? "Hide details" : "Show details"}`;
+      setToolDisclosureLabel(button, tool, open);
       details.hidden = !open;
       if (open) {
         state.expandedTools.add(tool.identity);
-        details.replaceChildren();
-        appendToolDetails(details, tool);
+        renderToolDetails(details, tool);
       } else {
         state.expandedTools.delete(tool.identity);
       }
@@ -1210,25 +1299,95 @@ export function createSharedRenderer(ui, features) {
     article.append(card);
   }
 
+  function groupFinishedToolRows(article, item) {
+    if (!features.toolInspection || item.active) return;
+    const rows = [...article.querySelectorAll(":scope > .tool-inspector")];
+    if (rows.length < 2) return;
+    const rowById = new Map(rows.map((row) => [row.dataset.toolUseId, row]));
+    const rowByIndex = new Map(rows.map((row) => [Number(row.dataset.toolIndex), row]));
+    const included = new Set();
+    const groups = [];
+    let run = [];
+    const flush = () => {
+      if (run.length > 1) groups.push(run);
+      run = [];
+    };
+    const addRow = (row) => {
+      if (!row || included.has(row)) return;
+      included.add(row);
+      run.push(row);
+    };
+    for (const round of item.toolRounds || []) {
+      for (const block of round.content || []) {
+        if (block?.type === "text" && typeof block.text === "string" && block.text.trim()) flush();
+        if (block?.type === "tool_use") addRow(rowById.get(String(block.id ?? "")));
+      }
+    }
+    for (const [toolIndex, tool] of (item.tools || []).entries()) addRow(rowById.get(String(tool.id || "")) || rowByIndex.get(toolIndex));
+    flush();
+
+    for (const runRows of groups) {
+      const toolIdentities = runRows.map((row) => item.tools?.[Number(row.dataset.toolIndex)]?.identity || row.dataset.toolUseId);
+      const identity = JSON.stringify([state.sessionId, item.turnIndex ?? item.key, "tool-group", ...toolIdentities]);
+      const expanded = state.expandedTools.has(identity);
+      const disclosureId = `tool-group-details-${Math.random().toString(36).slice(2)}`;
+      const group = document.createElement("section");
+      group.className = "tool-call-group";
+      group.dataset.groupKey = identity;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "tool-group-disclosure";
+      button.dataset.focusKey = identity;
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute("aria-controls", disclosureId);
+      button.textContent = `${runRows.length} tool calls`;
+      button.setAttribute("aria-label", `${runRows.length} tool calls. ${expanded ? "Hide calls" : "Show calls"}`);
+      const contents = document.createElement("div");
+      contents.className = "tool-call-group-rows";
+      contents.id = disclosureId;
+      contents.hidden = !expanded;
+      for (const row of runRows) contents.append(row);
+      group.append(button, contents);
+      article.append(group);
+      button.addEventListener("click", () => {
+        const anchor = findScrollAnchor(ui.transcript);
+        const previousTop = ui.transcript.scrollTop;
+        const open = button.getAttribute("aria-expanded") !== "true";
+        button.setAttribute("aria-expanded", String(open));
+        button.setAttribute("aria-label", `${runRows.length} tool calls. ${open ? "Hide calls" : "Show calls"}`);
+        contents.hidden = !open;
+        if (open) state.expandedTools.add(identity);
+        else state.expandedTools.delete(identity);
+        saveExpandedTools();
+        measureTranscriptTurns();
+        refreshTranscriptSpacers();
+        restoreScrollAnchor(ui.transcript, anchor, previousTop);
+      });
+    }
+  }
+
   function appendToolSummary(article, tool, toolIndex) {
     const summary = document.createElement("p");
-    summary.className = `tool-summary tool-summary-${tool.status}`;
+    const output = toolOutputPresentation(tool);
+    const status = toolDisplayStatus(tool, output);
+    summary.className = `tool-summary tool-summary-${status}`;
     summary.dataset.toolIndex = String(toolIndex);
     summary.dataset.toolUseId = String(tool.id || "");
     summary.setAttribute("role", "status");
-    let outcome = `Tool ${tool.name || "tool"}: ${toolStatusLabel(tool.status)}.`;
-    if (["failed", "denied"].includes(tool.status)) {
+    let outcome = `Tool ${tool.name || "tool"}: ${toolStatusLabel(status)}.`;
+    if (output.exitCode !== null && output.exitCode !== 0) outcome += ` exit ${output.exitCode}.`;
+    if (["failed", "denied"].includes(status)) {
       const error = tool.error ?? tool.output;
-      outcome += error === undefined ? " No error detail was recorded." : ` ${toolLiteralText(error).slice(0, 240)}`;
-    } else if (["missing", "interrupted", "unavailable"].includes(tool.status)) {
+      const errorText = error === undefined ? "" : toolOutputPresentation(tool, error).text;
+      outcome += error === undefined ? " No error detail was recorded." : ` ${errorText.slice(0, 240)}`;
+    } else if (["missing", "interrupted", "unavailable"].includes(status)) {
       outcome += " No tool result was recorded.";
-    } else if (tool.status === "pending") {
+    } else if (status === "pending") {
       outcome += " Tool result is pending.";
     } else if (tool.output !== undefined) {
-      const output = toolLiteralText(tool.output);
-      outcome += output.length > 180
-        ? ` Result preview (${output.length.toLocaleString()} characters): ${output.slice(0, 150)}…`
-        : ` Result: ${output}`;
+      outcome += output.text.length > 180
+        ? ` Result preview (${output.text.length.toLocaleString()} characters): ${output.text.slice(0, 150)}…`
+        : ` Result: ${output.text}`;
     }
     const omission = toolOmissionSummary(tool.output ?? tool.error);
     if (omission) outcome += ` ${omission}`;
@@ -1288,11 +1447,22 @@ export function createSharedRenderer(ui, features) {
   }
 
   function appendToolDetails(parent, tool) {
-    appendToolField(parent, "Arguments", toolLiteralText(tool.input));
-    if (tool.error !== undefined || (["failed", "denied"].includes(tool.status) && tool.output !== undefined)) {
-      appendToolField(parent, "Error", toolLiteralText(tool.error ?? tool.output));
+    if (tool.name === "bash") {
+      const input = toolInputRecord(tool);
+      appendToolField(parent, "Arguments", typeof input.command === "string" ? input.command : toolLiteralText(tool.input), true);
+    } else {
+      appendToolField(parent, "Arguments", toolLiteralText(tool.input));
     }
-    else if (tool.output !== undefined) appendToolField(parent, "Result", toolLiteralText(tool.output));
+    const value = tool.error ?? tool.output;
+    const envelope = bashResultEnvelope(tool, value);
+    if (envelope) {
+      appendToolField(parent, "stdout", envelope.stdout === undefined ? "" : String(envelope.stdout));
+      if (envelope.stderr !== undefined && String(envelope.stderr)) {
+        appendToolField(parent, "stderr", String(envelope.stderr));
+      }
+    } else if (tool.error !== undefined || (["failed", "denied"].includes(tool.status) && tool.output !== undefined)) {
+      appendToolField(parent, "Error", toolLiteralText(value));
+    } else if (tool.output !== undefined) appendToolField(parent, "Result", toolLiteralText(tool.output));
     else appendToolField(parent, "Result", "No result was recorded.");
     const omission = toolOmissionSummary(tool.output ?? tool.error);
     if (omission) appendToolField(parent, "Output omission", omission);
@@ -1324,13 +1494,17 @@ export function createSharedRenderer(ui, features) {
     return omissions.join(" · ");
   }
 
-  function appendToolField(parent, label, value) {
+  function appendToolField(parent, label, value, code = false) {
     const field = document.createElement("div");
     field.className = "tool-detail-field";
     const heading = document.createElement("strong");
     heading.textContent = label;
     const literal = document.createElement("pre");
-    literal.textContent = value;
+    if (code) {
+      const codeElement = document.createElement("code");
+      codeElement.textContent = value;
+      literal.append(codeElement);
+    } else literal.textContent = value;
     field.append(heading, literal);
     parent.append(field);
   }

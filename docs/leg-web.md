@@ -169,8 +169,16 @@ and Shift+Enter move through matches. Clear removes the query, and a no-match
 message appears when nothing matches. Escape closes and clears the bar, then
 returns focus to the search button. Search includes the full transcript text
 even when a large tool result is shown as a summary. It does not submit a
-request or load tool details. Searching and switching sessions leave the
-composer draft intact.
+request; navigating to a tool match opens its group and details. Searching and
+switching sessions leave the composer draft intact.
+
+Tool activity uses compact, keyboard-operable rows. Running calls stay as
+individual rows; consecutive calls in a finished turn collapse under a
+`N tool calls` row. A call row summarizes its command description or command,
+read path and range, or first string input, without exposing the call ID.
+Expand a row to inspect its input and output. Bash commands appear as code;
+results show stdout followed by non-empty stderr, with omitted bytes noted.
+Copy controls are inside the expanded details.
 
 Copy is always an explicit action on a prompt, reply, code block, or tool input,
 result, or error. Reply and tool text retain their newlines and Unicode. The UI
