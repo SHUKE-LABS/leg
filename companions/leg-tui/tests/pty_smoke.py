@@ -1708,9 +1708,8 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Tool bash · id")
             os.write(master_fd, b"\x1b[B\x1b[B")
             read_until(master_fd, child, output, "Tool bash · stdout")
-            large_output_screen = output.text()
-            assert "BEGIN_TOOL_OUTPUT" in large_output_screen, large_output_screen
-            assert "bytes below; Shift-PageDown to continue" in large_output_screen, large_output_screen
+            read_until(master_fd, child, output, "BEGIN_TOOL_OUTPUT")
+            read_until(master_fd, child, output, "bytes below; Shift-PageDown to continue")
             for _ in range(20):
                 if "END_TOOL_OUTPUT" in output.text():
                     break
