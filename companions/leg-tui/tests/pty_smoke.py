@@ -715,7 +715,7 @@ def start_prompt(
         for hint in (
             "Ctrl-S send",
             "F1 help",
-            "F2 actions",
+            "F2/Ctrl-P actions",
             "F3 sessions",
             "Ctrl-F search",
             "F4 inspect",
@@ -760,27 +760,45 @@ def start_prompt(
         os.write(master_fd, b"ignored-help")
         os.write(master_fd, b"\x1b")
         drain_for(master_fd, capture, 0.15, child)
+        os.write(master_fd, b"a\x1b[D")
+        read_until(master_fd, child, capture, "Composer (Ctrl-S send)")
         os.write(master_fd, b"\x1bOQ")
-        read_until(master_fd, child, capture, "Keyboard actions")
-        action_menu = capture.text()
-        for action in (
-            "F3  Browse/create/rename/reopen sessions",
-            "Ctrl-F  Search titles and complete sanitized transcript source.",
-            "Ctrl-Up/Down  Focus the previous/next tool row without editing the composer.",
-            "F4  Inspect the focused tool call; without a focused row, toggle the latest turn.",
-            "F5  Send selected field with terminal OSC 52 clipboard.",
-            "F7  Save the copied field to a file",
-            "F6  Export transcript only",
-            "Ctrl-R in inspector  Retry latest failed turn",
-            "Esc closes this menu.",
-        ):
-            assert action in action_menu, f"keyboard action menu omitted {action!r}"
-        os.write(master_fd, b"ignored-menu")
-        os.write(master_fd, b"\x1b[200~ignored-paste\x1b[201~")
+        read_until(master_fd, child, capture, "Command palette")
+        assert "Browse/switch sessions" in capture.text(), capture.text()
+        assert "New conversation" in capture.text(), capture.text()
+        os.write(master_fd, b"iNsPeCt")
+        read_until(master_fd, child, capture, "Filter: iNsPeCt")
+        assert "New conversation" not in capture.text(), capture.text()
+        assert "No transcript fields to inspect" in capture.text(), capture.text()
+        os.write(master_fd, b"\r")
+        drain_for(master_fd, capture, 0.1, child)
+        assert "No transcript fields to inspect" in capture.text(), capture.text()
+        assert "Explicit retry confirmation" not in capture.text(), capture.text()
+        os.write(master_fd, b"\x15no-such-action")
+        read_until(master_fd, child, capture, "No actions match")
+        os.write(master_fd, b"\r")
+        drain_for(master_fd, capture, 0.1, child)
+        assert "No actions match" in capture.text(), capture.text()
+        os.write(master_fd, b"\x1b[200~paste-filter\x1b[201~")
+        read_until(master_fd, child, capture, "paste-filter")
         os.write(master_fd, b"\x1b")
+        read_until(master_fd, child, capture, "Composer (Ctrl-S send)")
+        os.write(master_fd, b"x")
+        read_until(master_fd, child, capture, "xa")
+        os.write(master_fd, b"\x1a\x1a")
+        drain_for(master_fd, capture, 0.1, child)
+        os.write(master_fd, b"\x10")
+        read_until(master_fd, child, capture, "Command palette")
+        os.write(master_fd, b"search")
+        read_until(master_fd, child, capture, "Filter: search")
+        os.write(master_fd, b"\r")
+        read_until(master_fd, child, capture, "Search history")
+        assert request_status(status_url)["requests"] == expected_requests
+        os.write(master_fd, b"\x1b")
+        read_until(master_fd, child, capture, "Composer (Ctrl-S send)")
         drain_for(master_fd, capture, 0.15, child)
         assert request_status(status_url)["requests"] == expected_requests, (
-            "opening help or the action menu started a provider request"
+            "opening or filtering the command palette started a provider request"
         )
 
         os.write(master_fd, b"?typed line\r")
@@ -950,7 +968,9 @@ def run_smoke(args: argparse.Namespace) -> None:
                 assert delayed["pause_gates"].get("2") == "held", delayed
                 assert capture.contains(STOP_LIVE_TEXT), capture.text()
 
-                os.write(master_fd, b"\x03")
+                os.write(master_fd, b"\x1bOQstop")
+                read_until(master_fd, child, capture, "Stop Untitled conversation")
+                os.write(master_fd, b"\r")
                 read_until(master_fd, child, capture, "Interrupted")
                 assert capture.contains("Interrupted"), capture.text()
                 os.write(master_fd, b"\x03")
@@ -2025,6 +2045,22 @@ def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
             drain_for(master_fd, output, 0.1)
 
             warning = "Retry sends this prompt again and may repeat tool side effects."
+            os.write(master_fd, b"\x1bOQReTrY")
+            read_until(master_fd, child, output, "Retry latest failed turn")
+            drain_for(master_fd, output, 0.1, child)
+            assert "No eligible failed or incomplete latest turn" not in output.text()
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, warning)
+            assert request_status(status_url)["requests"] == 1
+            os.write(master_fd, b"\r")
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "Enter confirmed a palette retry"
+            assert warning in output.text()
+            os.write(master_fd, b"n")
+            drain_for(master_fd, output, 0.1)
+            assert request_status(status_url)["requests"] == 1
+            assert "Explicit retry confirmation" not in output.text()
+
             os.write(master_fd, b"\x13")
             read_until(master_fd, child, output, warning)
             assert request_status(status_url)["requests"] == 1
@@ -2091,13 +2127,7 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
                 args, env, workspace
             )
 
-            os.write(master_fd, b"\x1bOR")
-            read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
-            read_until(master_fd, child, output, str(workspace.resolve()))
-            read_until(master_fd, child, output, "Ready")
-            picker = output.text()
-            assert str(workspace.resolve()) in picker and "Ready" in picker, picker
-            os.write(master_fd, b"r")
+            os.write(master_fd, b"\x1bOQrename\r")
             read_until(master_fd, child, output, "Rename session")
             os.write(master_fd, b"Alpha\r")
             read_until(master_fd, child, output, "Alpha")
@@ -2115,7 +2145,7 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             alpha_draft = "Alpha draft before restart"
             os.write(master_fd, alpha_draft.encode())
             read_until(master_fd, child, output, alpha_draft)
-            os.write(master_fd, b"\x1bORn")
+            os.write(master_fd, b"\x1bOQNew conversation\r")
             read_until(master_fd, child, output, "Untitled conversation  |  model:")
             os.write(master_fd, b"\x1bORr")
             read_until(master_fd, child, output, "Rename session")
@@ -2769,7 +2799,16 @@ def run_background_stop_chooser_smoke(args: argparse.Namespace) -> None:
                 "switching sessions replayed a background prompt"
             )
 
-            os.write(master_fd, b"\x03")
+            os.write(master_fd, b"\x1bOQexit")
+            read_until(master_fd, child, output, "Active turn in ")
+            os.write(master_fd, b"\r")
+            drain_for(master_fd, output, 0.1, child)
+            assert child.poll() is None, "disabled palette Exit exited during background work"
+            assert request_status(status_url)["active_requests"] == [1, 2]
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
+
+            os.write(master_fd, b"\x1bOQstop\r")
             read_until(master_fd, child, output, "Choose a background session to stop")
             read_until(master_fd, child, output, "Alpha")
             read_until(master_fd, child, output, "Beta")
@@ -2823,6 +2862,43 @@ def run_background_stop_chooser_smoke(args: argparse.Namespace) -> None:
                 "1": "completed",
                 "2": "interrupted",
             }
+
+            # The palette's Stop entry is available while Gamma is running.
+            # Complete the turn through the real stream/event path before Enter;
+            # the stale entry must then refuse to stop anything.
+            os.write(master_fd, b"\x7f" * len(gamma_draft))
+            palette_race_prompt = "Gamma run held for palette race"
+            os.write(master_fd, palette_race_prompt.encode() + b"\x13")
+            read_until(master_fd, child, output, "Request 3:")
+            wait_for_status(
+                status_url,
+                lambda value: value["requests"] == 3
+                and value["active_requests"] == [3]
+                and value["pause_gates"].get("3") == "held",
+                "Gamma's request to be active and held for the palette race",
+            )
+            os.write(master_fd, b"\x1bOQstop")
+            read_until(master_fd, child, output, "Stop Gamma")
+            release_gate(status_url.removesuffix("/__trial/status"), 3)
+            completed = wait_for_status(
+                status_url,
+                lambda value: value["request_outcomes"].get("3") == "completed",
+                "Gamma to finish while the palette is open",
+            )
+            assert completed["active_requests"] == [], completed
+            read_until(master_fd, child, output, "status: Succeeded")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "No active TUI session to stop")
+            assert "Stop background run" not in output.text(), output.text()
+            assert request_status(status_url)["request_outcomes"] == {
+                "1": "completed",
+                "2": "interrupted",
+                "3": "completed",
+            }
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
+            os.write(master_fd, gamma_draft.encode())
+            read_until(master_fd, child, output, gamma_draft)
 
             os.write(master_fd, b"\x03")
             status = drain_until_exit(master_fd, child, output)
@@ -3197,6 +3273,48 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
             os.write(master_fd, b"/Tool summary fixture\r\r")
             read_until(master_fd, child, output, "lookup · completed · HIDDEN_UNKNOWN_INPUT")
+            os.write(master_fd, b"q")
+            read_until(master_fd, child, output, "q")
+            screen_120 = terminal_screen_text(bytes(output.raw), 40, 120)
+            footer_120 = screen_120.rstrip().splitlines()[-1]
+            assert "F2/Ctrl-P actions" in footer_120, footer_120
+            assert "Ctrl-S send" in footer_120, footer_120
+            assert "F8 rail" in footer_120, footer_120
+            os.write(master_fd, b"\x1bOQ")
+            read_until(master_fd, child, output, "Command palette")
+            drain_for(master_fd, output, 0.1, child)
+            os.write(master_fd, b"\x1b[B")
+            drain_for(master_fd, output, 0.1, child)
+            selected_120 = terminal_screen_text(bytes(output.raw), 40, 120)
+            assert "> New conversation" in selected_120, selected_120
+            os.write(master_fd, b"\x1b[A")
+            drain_for(master_fd, output, 0.1, child)
+            palette_120 = terminal_screen_text(bytes(output.raw), 40, 120)
+            assert "Browse/switch sessions" in palette_120, palette_120
+            assert "Choose/replace workspace" in palette_120, palette_120
+            assert "Retry latest failed turn" in palette_120, palette_120
+            assert "stop" in palette_120.lower(), palette_120
+            compare_workbench_capture(
+                "command-palette-120x40.txt",
+                palette_120,
+                getattr(args, "update_workbench_captures", False),
+            )
+            os.write(master_fd, b"retry")
+            read_until(master_fd, child, output, "No eligible failed or incomplete latest turn")
+            os.write(master_fd, b"\x15")
+            drain_for(master_fd, output, 0.1, child)
+            reset_palette = terminal_screen_text(bytes(output.raw), 40, 120)
+            assert "Filter: ▏" in reset_palette, reset_palette
+            assert "> Browse/switch sessions" in reset_palette, reset_palette
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
+            os.write(master_fd, b"\x10")
+            read_until(master_fd, child, output, "Command palette")
+            assert "Browse/switch sessions" in output.text(), output.text()
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
+            os.write(master_fd, b"\x7f")
+            drain_for(master_fd, output, 0.1, child)
             os.write(master_fd, b"\x1bOS")
             read_until(master_fd, child, output, "Inspector · Up/Down field")
             os.write(master_fd, b"\x1bOS")
@@ -3205,6 +3323,10 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
             resize_pty(slave_fd, 24, 80)
             drain_for(master_fd, output, 0.2, child)
             screen_80 = terminal_screen_text(bytes(output.raw), 24, 80)
+            footer_80 = screen_80.rstrip().splitlines()[-1]
+            assert "F2/Ctrl-P actions" in footer_80, footer_80
+            assert "Ctrl-S send" in footer_80, footer_80
+            assert "F8 rail" not in footer_80, footer_80
             for summary in (
                 "bash · exit 7 · check nonzero status",
                 "read · completed · history.txt · offset 2 · limit 3",
@@ -3219,6 +3341,27 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
                 screen_80,
                 getattr(args, "update_workbench_captures", False),
             )
+            os.write(master_fd, b"\x1bOQ")
+            read_until(master_fd, child, output, "Command palette")
+            drain_for(master_fd, output, 0.1, child)
+            palette_80 = terminal_screen_text(bytes(output.raw), 24, 80)
+            assert "Browse/switch sessions" in palette_80, palette_80
+            assert "Show/hide session rail" in palette_80, palette_80
+            assert "disabled" in palette_80, palette_80
+            compare_workbench_capture(
+                "command-palette-80x24.txt",
+                palette_80,
+                getattr(args, "update_workbench_captures", False),
+            )
+            os.write(master_fd, b"rAiL")
+            read_until(master_fd, child, output, "Available at 105 columns and wider")
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
+            os.write(master_fd, b"\x10")
+            read_until(master_fd, child, output, "Command palette")
+            assert "Browse/switch sessions" in output.text(), output.text()
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
             resize_pty(slave_fd, 40, 120)
             drain_for(master_fd, output, 0.2, child)
             screen_120 = terminal_screen_text(bytes(output.raw), 40, 120)
@@ -3426,10 +3569,18 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             resize_pty(slave_fd, 24, 80)
             drain_for(master_fd, output, 0.2)
             conversation_screen = terminal_screen_text(bytes(output), 24, 80)
-            for hint in ("Composer", "status: Idle", "Ctrl-S send", "Ctrl-C stop/exit", "F1 help"):
+            for hint in (
+                "Composer",
+                "status: Idle",
+                "F2/Ctrl-P actions",
+                "Ctrl-C exit",
+                "F1 help",
+            ):
                 assert hint in conversation_screen, (
                     f"conversation omitted {hint!r} at 80x24: {conversation_screen!r}"
                 )
+            footer_line = conversation_screen.rstrip().splitlines()[-1]
+            assert "Ctrl-S send" not in footer_line, footer_line
             assert "Sessions" not in conversation_screen, (
                 f"session rail should be hidden at 80x24: {conversation_screen!r}"
             )

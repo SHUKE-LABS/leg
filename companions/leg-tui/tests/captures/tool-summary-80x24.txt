@@ -21,4 +21,4 @@ workspace: <workspace> · catalog: Ready · <elapsed>
 ┌Composer (Ctrl-S send)────────────────────────────────────────────────────────┐
 │Alpha draft survives session changes                                          │
 └──────────────────────────────────────────────────────────────────────────────┘
-Session reopened. History browsing did not start an exchange.
+F2/Ctrl-P actions · Ctrl-S send · F1 help · Ctrl-C exit · F3 sessions

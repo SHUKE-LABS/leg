@@ -265,15 +265,19 @@ Enter inserts a newline; Ctrl-S sends a nonblank prompt. Left/Right move by
 grapheme, Home/End move within the current line, and Backspace/Delete remove a
 grapheme. Ctrl-Z undoes and Ctrl-Y redoes; a bracketed paste is one edit,
 preserves Unicode and line breaks, normalizes CRLF/CR to LF, and discards other
-control characters. A literal `?` is prompt text. F1 opens help, F2 opens the
-keyboard action menu, and Esc closes either overlay. Ctrl-C first stops the
-viewed active turn. If the viewed session is idle while background turns are
-active, Ctrl-C opens a named Stop chooser; Escape cancels, and Enter stops only
-the selected run after its session and turn are rechecked. If no TUI turns are
-active, Ctrl-C saves drafts and exits. External SIGINT and SIGTERM use the
-shared turn controller to stop an active turn, wait for process cleanup, save
-the draft, and restore the terminal. Editing stays available during a turn,
-but another Ctrl-S is rejected while busy.
+control characters. A literal `?` is prompt text. F1 opens the full keyboard
+guide. F2 and Ctrl-P open the same searchable command palette; type to filter
+action labels case-insensitively, use Up/Down to select, Enter to invoke an
+enabled action, and Esc to return to the unchanged composer draft and cursor.
+Palette typing and paste stay out of the prompt. Ctrl-C first stops the viewed
+active turn. If the viewed session is idle while background turns are active,
+Ctrl-C opens a named Stop chooser; Escape cancels, and Enter stops only the
+selected run after its session and turn are rechecked. If no TUI turns are
+active, Ctrl-C saves drafts and exits. An active turn owned by another interface
+disables Exit so it cannot be abandoned silently. External SIGINT and SIGTERM
+use the shared turn controller to stop an active turn, wait for process
+cleanup, save the draft, and restore the terminal. Editing stays available
+during a turn, but another Ctrl-S is rejected while busy.
 
 F3 opens the session picker. It shows each title, workspace, recent activity,
 turn count, and state. Use `/` to filter titles, Up/Down to select, Enter to
@@ -321,8 +325,14 @@ readable bash output fields or the full literal input/result; copying is explici
 and never executes the text. If the terminal blocks clipboard access, F7 saves
 the selected field to a file. F6 exports transcript data only, without catalog
 metadata or inherited keys, and asks before replacing an existing file.
-F1 lists every keyboard action and the retry warning; F2 opens the shorter
-action menu. In the inspector, Ctrl-R offers an explicit retry only for the
+The command palette lists session browsing/switching, new conversation, rename,
+workspace selection/replacement, search, inspect, copy/save, export, retry,
+rail visibility, Stop, help, and Exit. Unavailable actions remain visible with
+their reason. State is refreshed when an action is invoked, so a completed run
+or a new owner cannot make a stale Stop or retry act on a different operation.
+The footer hints at actions enabled for the viewed session; status and named
+background activity keep priority. F1 remains the complete keyboard guide.
+Ctrl-R in the inspector and palette retry offer an explicit retry only for the
 latest failed, interrupted, or incomplete turn. Confirm with Y after reading
 `Retry sends this prompt again and may repeat tool side effects.` Press N or Esc
 to cancel; Enter does not retry.
@@ -365,7 +375,9 @@ with a long unbroken Chinese and emoji line. The native Linux/macOS PTY smoke
 test uses the local fake provider and explicit binary paths. It covers 80x24 and
 120x40 layouts, responsive rail and inspector, resize recovery, signal cleanup,
 non-TTY startup, color-disabled output, session creation/rename/reopen after
-restart, history search and inspection, cross-interface busy rejection, named
+restart, palette filtering/cancellation/availability and stale-action races,
+enabled-action footer hints, command-palette captures at 80x24 and 120x40,
+history search and inspection, cross-interface busy rejection, named
 background Stop selection, draft and scroll retention, copy/export
 confirmation, a 1,000-turn history, composer and active-turn workflows, and the
 delayed Stop regression. The history test records open and inspector response
@@ -380,6 +392,10 @@ denial, missing results, unknown tools, search, copy/save, and the Escape return
 to a focused row. Its 80x24 and 120x40 views are recorded in
 `companions/leg-tui/tests/captures/tool-summary-80x24.txt` and
 `companions/leg-tui/tests/captures/tool-summary-120x40.txt`.
+
+Command-palette captures are checked in at
+[80x24](../companions/leg-tui/tests/captures/command-palette-80x24.txt) and
+[120x40](../companions/leg-tui/tests/captures/command-palette-120x40.txt).
 
 Representative fixture captures are checked in at
 [80x24](../companions/leg-tui/tests/captures/workbench-80x24.txt) and

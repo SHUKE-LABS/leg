@@ -37,4 +37,4 @@ workspace: <workspace> · catalog: Ready · <elapsed>
 ┌Composer (Ctrl-S send)────────────────────────────────────────────────────────────────────────────────────────────────┐
 │Alpha draft survives session changes                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Session reopened. History browsing did not start an exchange.
+Composer focused

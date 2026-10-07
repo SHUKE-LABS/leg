@@ -49,9 +49,6 @@ use unicode_width::UnicodeWidthStr;
 
 const WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
 const WARNING_ACK_KEY: &str = "tui_first_run_warning_acknowledged";
-const HELP: &str =
-    "Ctrl-S send · Ctrl-↑/↓ tool rows · F4 inspect · F3 sessions · F1 help · Ctrl-C stop/exit";
-const NARROW_HELP: &str = "Ctrl-↑/↓ tools · F4 inspect · Ctrl-S send · F1 help · Ctrl-C stop/exit";
 const MIN_TERMINAL_COLUMNS: u16 = 80;
 const MIN_TERMINAL_ROWS: u16 = 24;
 const SESSION_RAIL_WIDTH: u16 = 25;
@@ -294,6 +291,39 @@ enum TurnMessage {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteAction {
+    Sessions,
+    NewConversation,
+    Rename,
+    Workspace,
+    Search,
+    Inspect,
+    CopyField,
+    SaveField,
+    Export,
+    Retry,
+    ToggleRail,
+    Stop,
+    Help,
+    Exit,
+    Send,
+    FocusTools,
+}
+
+struct PaletteEntry {
+    action: PaletteAction,
+    label: String,
+    shortcut: &'static str,
+    disabled_reason: Option<String>,
+}
+
+struct PaletteState {
+    query: String,
+    selected: usize,
+    notice: Option<String>,
+}
+
 struct App {
     catalog: SessionCatalog,
     screen: Screen,
@@ -326,7 +356,7 @@ struct App {
     rail_requested_visible: bool,
     use_color: bool,
     show_help: bool,
-    show_menu: bool,
+    palette: Option<PaletteState>,
     stop_chooser_open: bool,
     stop_targets: Vec<StopTarget>,
     stop_picker_index: usize,
@@ -403,6 +433,16 @@ struct StopTarget {
     title: String,
     status: String,
     turn_index: Option<u64>,
+}
+
+struct ActionDisabledInputs {
+    current_busy: bool,
+    current_owner_unverified: bool,
+    current_read_only: bool,
+    workspace_available: bool,
+    has_any_active_session: bool,
+    has_unverified_session_owner: bool,
+    background_stop_targets: Vec<StopTarget>,
 }
 
 impl ConversationState {
@@ -582,7 +622,7 @@ impl App {
             rail_requested_visible: true,
             use_color: terminal_color_enabled(),
             show_help: false,
-            show_menu: false,
+            palette: None,
             stop_chooser_open: false,
             stop_targets: Vec::new(),
             stop_picker_index: 0,
@@ -838,7 +878,7 @@ impl App {
         self.views.insert(outgoing.state_key.clone(), outgoing);
         self.screen = Screen::Conversation;
         self.show_help = false;
-        self.show_menu = false;
+        self.palette = None;
         self.inspector_open = turn_index.is_some();
         if let Some(index) = turn_index {
             let turn_index = index.min(self.transcript.len().saturating_sub(1));
@@ -1088,6 +1128,519 @@ impl App {
         self.dialog_input = "leg-transcript.json".to_string();
         self.overwrite_export = None;
         self.screen = Screen::Export;
+    }
+
+    fn current_record_id(&self) -> Option<&str> {
+        self.session_id.as_deref().or(self.draft_id.as_deref())
+    }
+
+    fn current_catalog_session(&self) -> Option<&CatalogSession> {
+        let id = self.current_record_id()?;
+        self.sessions.iter().find(|session| session.id == id)
+    }
+
+    fn current_session_title(&self) -> String {
+        self.current_catalog_session()
+            .and_then(|session| session.name.as_deref())
+            .filter(|name| !name.trim().is_empty())
+            .map(sanitize::terminal_safe_text)
+            .unwrap_or_else(|| "Untitled conversation".to_string())
+    }
+
+    fn has_any_active_session(&self) -> bool {
+        self.turn_status.is_active()
+            || self.views.values().any(|view| view.turn_status.is_active())
+            || self
+                .sessions
+                .iter()
+                .any(|session| session.run_state == CatalogRunState::Active)
+    }
+
+    fn has_unverified_session_owner(&self) -> bool {
+        self.sessions
+            .iter()
+            .any(|session| session.run_state == CatalogRunState::Unknown)
+    }
+
+    fn has_tool_rows(&self) -> bool {
+        self.transcript.iter().any(TranscriptTurn::has_tool_rows)
+    }
+
+    fn action_disabled_inputs(&self) -> ActionDisabledInputs {
+        let current_session = self.current_catalog_session();
+        ActionDisabledInputs {
+            current_busy: self.turn_status.is_active()
+                || current_session
+                    .is_some_and(|session| session.run_state == CatalogRunState::Active),
+            current_owner_unverified: current_session
+                .is_some_and(|session| session.run_state == CatalogRunState::Unknown),
+            current_read_only: self.read_only
+                || current_session.is_some_and(|session| session.read_only),
+            workspace_available: self.workspace.as_ref().is_some_and(|path| path.is_dir()),
+            has_any_active_session: self.has_any_active_session(),
+            has_unverified_session_owner: self.has_unverified_session_owner(),
+            background_stop_targets: self.background_stop_targets(),
+        }
+    }
+
+    fn action_disabled_reason(&self, action: PaletteAction) -> Option<String> {
+        let inputs = self.action_disabled_inputs();
+        self.action_disabled_reason_with_inputs(action, &inputs)
+    }
+
+    fn action_disabled_reason_with_inputs(
+        &self,
+        action: PaletteAction,
+        inputs: &ActionDisabledInputs,
+    ) -> Option<String> {
+        match action {
+            PaletteAction::Sessions if self.sessions.is_empty() => {
+                Some("No sessions to browse.".to_string())
+            }
+            PaletteAction::Rename if self.current_record_id().is_none() => {
+                Some("No session is open.".to_string())
+            }
+            PaletteAction::Rename if inputs.current_busy => {
+                Some("Session has an active turn.".to_string())
+            }
+            PaletteAction::Rename if inputs.current_owner_unverified => {
+                Some("Session ownership could not be verified.".to_string())
+            }
+            PaletteAction::Workspace if inputs.current_busy => {
+                Some("Session has an active turn.".to_string())
+            }
+            PaletteAction::Workspace if inputs.current_owner_unverified => {
+                Some("Session ownership could not be verified.".to_string())
+            }
+            PaletteAction::Search if self.sessions.is_empty() => {
+                Some("No saved session data to search.".to_string())
+            }
+            PaletteAction::Inspect if self.transcript.is_empty() => {
+                Some("No transcript fields to inspect.".to_string())
+            }
+            PaletteAction::CopyField
+                if !self.inspector_open || self.selected_detail_field().is_none() =>
+            {
+                Some("Open the inspector and select a field.".to_string())
+            }
+            PaletteAction::SaveField
+                if (!self.inspector_open || self.selected_detail_field().is_none())
+                    && self.copy_text.is_none() =>
+            {
+                Some("Open the inspector or copy a field first.".to_string())
+            }
+            PaletteAction::Export if self.transcript.is_empty() => {
+                Some("No transcript to export.".to_string())
+            }
+            PaletteAction::Retry if self.session_id.is_none() => {
+                Some("No saved session to retry.".to_string())
+            }
+            PaletteAction::Retry if inputs.current_busy => {
+                Some("Session has an active turn.".to_string())
+            }
+            PaletteAction::Retry if inputs.current_owner_unverified => {
+                Some("Session ownership could not be verified.".to_string())
+            }
+            PaletteAction::Retry if inputs.current_read_only => {
+                Some("Session is read-only.".to_string())
+            }
+            PaletteAction::Retry if !inputs.workspace_available => {
+                Some("Recorded workspace is missing.".to_string())
+            }
+            PaletteAction::Retry
+                if !self
+                    .transcript
+                    .last()
+                    .is_some_and(TranscriptTurn::retryable) =>
+            {
+                Some("No eligible failed or incomplete latest turn.".to_string())
+            }
+            PaletteAction::ToggleRail if self.terminal_columns < SESSION_RAIL_MIN_COLUMNS => Some(
+                format!("Available at {SESSION_RAIL_MIN_COLUMNS} columns and wider."),
+            ),
+            PaletteAction::Stop if inputs.current_owner_unverified => {
+                Some("Session ownership could not be verified.".to_string())
+            }
+            PaletteAction::Stop if self.turn_status.is_stopping() => {
+                Some("Current session is already stopping.".to_string())
+            }
+            PaletteAction::Stop if self.turn_status.is_active() && self.stop_handle.is_none() => {
+                Some("Current session has no Stop control.".to_string())
+            }
+            PaletteAction::Stop
+                if !self.turn_status.is_active()
+                    && inputs.background_stop_targets.is_empty()
+                    && self
+                        .sessions
+                        .iter()
+                        .any(|session| session.run_state == CatalogRunState::Active) =>
+            {
+                Some("Active turn is owned by another interface.".to_string())
+            }
+            PaletteAction::Stop
+                if !self.turn_status.is_active() && inputs.background_stop_targets.is_empty() =>
+            {
+                Some("No active TUI session to stop.".to_string())
+            }
+            PaletteAction::Exit if inputs.has_any_active_session => {
+                let catalog_title = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.run_state == CatalogRunState::Active)
+                    .and_then(|session| session.name.as_deref())
+                    .filter(|name| !name.trim().is_empty())
+                    .map(sanitize::terminal_safe_text);
+                let active_title = catalog_title.unwrap_or_else(|| {
+                    if self.turn_status.is_active() {
+                        self.current_session_title()
+                    } else {
+                        inputs
+                            .background_stop_targets
+                            .first()
+                            .map(|target| target.title.clone())
+                            .unwrap_or_else(|| "session".to_string())
+                    }
+                });
+                Some(format!("Active turn in {active_title}."))
+            }
+            PaletteAction::Exit if inputs.has_unverified_session_owner => {
+                Some("Session ownership could not be verified.".to_string())
+            }
+            PaletteAction::Send if self.terminal_too_small() => {
+                Some("Terminal must be at least 80x24.".to_string())
+            }
+            PaletteAction::Send if inputs.current_busy => {
+                Some("Session has an active turn.".to_string())
+            }
+            PaletteAction::Send if inputs.current_owner_unverified => {
+                Some("Session ownership could not be verified.".to_string())
+            }
+            PaletteAction::Send if inputs.current_read_only => {
+                Some("Session is read-only.".to_string())
+            }
+            PaletteAction::Send if !inputs.workspace_available => {
+                Some("Choose an existing workspace.".to_string())
+            }
+            PaletteAction::Send if self.composer.text().trim().is_empty() => {
+                Some("Prompt is empty.".to_string())
+            }
+            PaletteAction::FocusTools if !self.has_tool_rows() => {
+                Some("No tool rows in this conversation.".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn palette_entries(&self) -> Vec<PaletteEntry> {
+        let inputs = self.action_disabled_inputs();
+        let mut entries = vec![
+            (
+                PaletteAction::Sessions,
+                "Browse/switch sessions".to_string(),
+                "F3",
+            ),
+            (
+                PaletteAction::NewConversation,
+                "New conversation".to_string(),
+                "F3 → N",
+            ),
+            (
+                PaletteAction::Rename,
+                "Rename current session".to_string(),
+                "F3 → R",
+            ),
+            (
+                PaletteAction::Workspace,
+                "Choose/replace workspace".to_string(),
+                "F3 → W",
+            ),
+            (
+                PaletteAction::Search,
+                "Search sessions and transcript".to_string(),
+                "Ctrl-F",
+            ),
+            (
+                PaletteAction::Inspect,
+                "Inspect transcript".to_string(),
+                "F4",
+            ),
+            (
+                PaletteAction::CopyField,
+                "Copy selected field".to_string(),
+                "F5",
+            ),
+            (
+                PaletteAction::SaveField,
+                "Save selected field".to_string(),
+                "F7",
+            ),
+            (PaletteAction::Export, "Export transcript".to_string(), "F6"),
+            (
+                PaletteAction::Retry,
+                "Retry latest failed turn".to_string(),
+                "Ctrl-R",
+            ),
+            (
+                PaletteAction::ToggleRail,
+                "Show/hide session rail".to_string(),
+                "F8",
+            ),
+            (
+                PaletteAction::Stop,
+                if self.turn_status.is_active() {
+                    format!("Stop {}", self.current_session_title())
+                } else {
+                    "Choose background session to stop".to_string()
+                },
+                "Ctrl-C",
+            ),
+            (PaletteAction::Help, "Keyboard help".to_string(), "F1"),
+            (
+                PaletteAction::Exit,
+                "Exit and save drafts".to_string(),
+                "Ctrl-C",
+            ),
+        ]
+        .into_iter()
+        .map(|(action, label, shortcut)| PaletteEntry {
+            action,
+            label,
+            shortcut,
+            disabled_reason: self.action_disabled_reason_with_inputs(action, &inputs),
+        })
+        .collect::<Vec<_>>();
+        for entry in &mut entries {
+            entry.label = sanitize::terminal_safe_text(&entry.label);
+        }
+        entries
+    }
+
+    fn filtered_palette_entries(&self) -> Vec<PaletteEntry> {
+        let query = self
+            .palette
+            .as_ref()
+            .map(|palette| palette.query.trim().to_lowercase())
+            .unwrap_or_default();
+        self.palette_entries()
+            .into_iter()
+            .filter(|entry| query.is_empty() || entry.label.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    fn begin_palette(&mut self) {
+        self.refresh_sessions();
+        self.palette = Some(PaletteState {
+            query: String::new(),
+            selected: 0,
+            notice: None,
+        });
+        self.status = "Command palette open".to_string();
+    }
+
+    fn idle_footer_text(&self, width: usize) -> String {
+        let inputs = self.action_disabled_inputs();
+        let enabled = |action| {
+            self.action_disabled_reason_with_inputs(action, &inputs)
+                .is_none()
+        };
+        let mut hints = vec!["F2/Ctrl-P actions".to_string()];
+        if enabled(PaletteAction::Send) {
+            hints.push("Ctrl-S send".to_string());
+        }
+        hints.push("F1 help".to_string());
+        if enabled(PaletteAction::Stop) {
+            hints.push("Ctrl-C stop".to_string());
+        } else if enabled(PaletteAction::Exit) {
+            hints.push("Ctrl-C exit".to_string());
+        } else if !inputs.background_stop_targets.is_empty() {
+            hints.push("Ctrl-C choose Stop".to_string());
+        }
+        let mut optional = Vec::new();
+        if enabled(PaletteAction::Sessions) {
+            optional.push("F3 sessions".to_string());
+        }
+        if enabled(PaletteAction::Inspect) {
+            optional.push("F4 inspect".to_string());
+        }
+        if enabled(PaletteAction::ToggleRail) {
+            optional.push("F8 rail".to_string());
+        }
+        if enabled(PaletteAction::FocusTools) {
+            optional.push("Ctrl-↑/↓ tools".to_string());
+        }
+        if enabled(PaletteAction::CopyField) {
+            optional.push("F5 copy".to_string());
+        }
+        if enabled(PaletteAction::SaveField) {
+            optional.push("F7 save".to_string());
+        }
+        if enabled(PaletteAction::Export) {
+            optional.push("F6 export".to_string());
+        }
+        if enabled(PaletteAction::Retry) {
+            optional.push("Ctrl-R retry".to_string());
+        }
+        for hint in optional {
+            let candidate = format!("{} · {hint}", hints.join(" · "));
+            if UnicodeWidthStr::width(candidate.as_str()) <= width {
+                hints.push(hint);
+            }
+        }
+        hints.join(" · ")
+    }
+
+    fn move_palette_selection(&mut self, direction: isize) {
+        let count = self.filtered_palette_entries().len();
+        let Some(palette) = self.palette.as_mut() else {
+            return;
+        };
+        if count == 0 {
+            palette.selected = 0;
+        } else if direction < 0 {
+            palette.selected = palette.selected.saturating_sub(1);
+        } else {
+            palette.selected = (palette.selected + 1).min(count - 1);
+        }
+        palette.notice = None;
+    }
+
+    fn normalize_palette_selection(&mut self) {
+        let count = self.filtered_palette_entries().len();
+        if let Some(palette) = self.palette.as_mut() {
+            palette.selected = palette.selected.min(count.saturating_sub(1));
+            if count == 0 {
+                palette.selected = 0;
+            }
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            if let Some(palette) = self.palette.as_mut() {
+                palette.query.clear();
+                palette.selected = 0;
+                palette.notice = None;
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.palette = None;
+                self.status = "Composer focused".to_string();
+            }
+            KeyCode::Up => self.move_palette_selection(-1),
+            KeyCode::Down => self.move_palette_selection(1),
+            KeyCode::Enter => {
+                let Some(action) = self
+                    .filtered_palette_entries()
+                    .get(self.palette.as_ref().map_or(0, |palette| palette.selected))
+                    .map(|entry| entry.action)
+                else {
+                    return;
+                };
+
+                // Drain turn completion messages and refresh process ownership before
+                // dispatch so an entry that went stale while the palette was open
+                // cannot act on the old state.
+                self.receive_turn_messages();
+                self.refresh_sessions();
+                if let Some(reason) = self.action_disabled_reason(action) {
+                    self.status = reason.clone();
+                    if let Some(palette) = self.palette.as_mut() {
+                        palette.notice = Some(reason);
+                    }
+                    self.normalize_palette_selection();
+                    return;
+                }
+                self.palette = None;
+                self.invoke_palette_action(action);
+            }
+            KeyCode::Backspace => {
+                if let Some(palette) = self.palette.as_mut()
+                    && let Some((start, _)) = palette.query.grapheme_indices(true).next_back()
+                {
+                    palette.query.truncate(start);
+                    palette.selected = 0;
+                    palette.notice = None;
+                }
+                self.normalize_palette_selection();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && !character.is_control() =>
+            {
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.query.push(character);
+                    palette.selected = 0;
+                    palette.notice = None;
+                }
+                self.normalize_palette_selection();
+            }
+            _ => {}
+        }
+    }
+
+    fn invoke_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::Sessions => self.begin_session_picker(),
+            PaletteAction::NewConversation => self.create_session(),
+            PaletteAction::Rename => {
+                self.begin_session_picker();
+                self.begin_rename_selected();
+            }
+            PaletteAction::Workspace => {
+                if let Some(session_id) = self.current_record_id().map(str::to_owned) {
+                    self.begin_workspace_replacement(&session_id);
+                } else {
+                    self.workspace_flow = WorkspaceFlow::Initial;
+                    self.workspace_input.clear();
+                    self.screen = Screen::Workspace;
+                    self.status = "Choose an existing workspace directory".to_string();
+                }
+            }
+            PaletteAction::Search => self.begin_search(),
+            PaletteAction::Inspect => self.toggle_inspector(),
+            PaletteAction::CopyField => self.copy_selected_detail(),
+            PaletteAction::SaveField => self.save_selected_field(),
+            PaletteAction::Export => self.begin_export(),
+            PaletteAction::Retry => {
+                self.inspector_turn = self.transcript.len().saturating_sub(1);
+                self.retry_selected_turn();
+            }
+            PaletteAction::ToggleRail => self.toggle_session_rail(),
+            PaletteAction::Stop => self.stop_from_palette(),
+            PaletteAction::Help => self.show_help = true,
+            PaletteAction::Exit => self.quit = true,
+            PaletteAction::Send | PaletteAction::FocusTools => {}
+        }
+    }
+
+    fn toggle_inspector(&mut self) {
+        if self.inspector_open {
+            self.inspector_open = false;
+        } else if let Some(anchor) = self.focused_tool.clone() {
+            self.open_inspector_at_anchor(anchor.turn_index, anchor);
+        } else {
+            self.inspector_open = true;
+            self.inspector_turn = self.transcript.len().saturating_sub(1);
+            self.inspector_field = 0;
+            self.inspector_scroll = 0;
+            self.inspector_scroll_step = 1;
+        }
+    }
+
+    fn save_selected_field(&mut self) {
+        if let Some((label, text)) = self.selected_detail_field() {
+            self.copy_text = Some(text);
+            self.begin_copy_fallback(&label);
+        } else if self.copy_text.is_some() {
+            self.begin_copy_fallback("selected transcript text");
+        } else {
+            self.status = "Open the inspector and select a transcript field first".to_string();
+        }
     }
 
     fn selected_detail_field(&self) -> Option<(String, String)> {
@@ -1420,7 +1973,7 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.show_help = false;
-            self.show_menu = false;
+            self.palette = None;
             self.handle_ctrl_c();
             return;
         }
@@ -1585,11 +2138,8 @@ impl App {
             }
             return;
         }
-        if self.show_menu {
-            if key.code == KeyCode::Esc {
-                self.show_menu = false;
-                self.status = "Composer focused".to_string();
-            }
+        if self.palette.is_some() {
+            self.handle_palette_key(key);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -1598,6 +2148,10 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
             self.begin_search();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.begin_palette();
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
@@ -1628,30 +2182,12 @@ impl App {
             KeyCode::Esc if self.inspector_open => self.inspector_open = false,
             KeyCode::Esc => self.status = "Composer focused".to_string(),
             KeyCode::F(1) => self.show_help = true,
-            KeyCode::F(2) => self.show_menu = true,
+            KeyCode::F(2) => self.begin_palette(),
             KeyCode::F(3) => self.begin_session_picker(),
-            KeyCode::F(4) => {
-                if self.inspector_open {
-                    self.inspector_open = false;
-                } else if let Some(anchor) = self.focused_tool.clone() {
-                    self.open_inspector_at_anchor(anchor.turn_index, anchor);
-                } else {
-                    self.inspector_open = true;
-                    self.inspector_turn = self.transcript.len().saturating_sub(1);
-                    self.inspector_field = 0;
-                    self.inspector_scroll = 0;
-                    self.inspector_scroll_step = 1;
-                }
-            }
+            KeyCode::F(4) => self.toggle_inspector(),
             KeyCode::F(5) => self.copy_selected_detail(),
             KeyCode::F(6) => self.begin_export(),
-            KeyCode::F(7) => {
-                if self.copy_text.is_some() {
-                    self.begin_copy_fallback("selected transcript text");
-                } else {
-                    self.status = "Copy a selected inspector field with F5 first".to_string();
-                }
-            }
+            KeyCode::F(7) => self.save_selected_field(),
             KeyCode::F(8) => self.toggle_session_rail(),
             KeyCode::Up if self.inspector_open => {
                 self.inspector_field = self.inspector_field.saturating_sub(1);
@@ -1752,6 +2288,13 @@ impl App {
     }
 
     fn handle_paste(&mut self, pasted: &str) {
+        if let Some(palette) = self.palette.as_mut() {
+            palette.query.push_str(&normalize_paste(pasted));
+            palette.selected = 0;
+            palette.notice = None;
+            self.normalize_palette_selection();
+            return;
+        }
         if self.screen == Screen::Search {
             self.search_query.push_str(&normalize_paste(pasted));
             self.update_search();
@@ -1771,7 +2314,6 @@ impl App {
         }
         if self.screen != Screen::Conversation
             || self.show_help
-            || self.show_menu
             || self.retry_confirmation.is_some()
         {
             return;
@@ -1791,31 +2333,89 @@ impl App {
     }
 
     fn handle_ctrl_c(&mut self) {
+        self.receive_turn_messages();
         if self.turn_status.is_active() {
             if self.turn_status.is_stopping() {
                 return;
             }
-            match &self.stop_handle {
-                Some(handle) => match handle.stop() {
-                    Ok(()) => {
-                        self.turn_status = TurnStatus::Stopping;
-                        self.status.clear();
-                    }
-                    Err(error) => self.status = format!("Stop failed: {error}"),
-                },
-                None => self.status = "Active turn has no Stop control".to_string(),
-            }
+            self.stop_current_session();
             return;
         }
         self.refresh_sessions();
-        self.stop_targets = self.background_stop_targets();
-        if !self.stop_targets.is_empty() {
-            self.stop_picker_index = 0;
-            self.stop_chooser_open = true;
-            self.status = "Choose a background session to stop".to_string();
+        if self.open_background_stop_chooser() {
+            return;
+        }
+        if self.has_any_active_session() {
+            self.status = "Cannot exit while another interface owns an active session".to_string();
+            return;
+        }
+        if self.has_unverified_session_owner() {
+            self.status = "Cannot exit while session ownership is unverified".to_string();
             return;
         }
         self.quit = true;
+    }
+
+    fn stop_from_palette(&mut self) {
+        self.receive_turn_messages();
+        if self.turn_status.is_active() {
+            self.stop_current_session();
+            return;
+        }
+        self.refresh_sessions();
+        if !self.open_background_stop_chooser() {
+            self.status = "No active TUI session to stop".to_string();
+        }
+    }
+
+    fn open_background_stop_chooser(&mut self) -> bool {
+        self.stop_targets = self.background_stop_targets();
+        if self.stop_targets.is_empty() {
+            return false;
+        }
+        self.stop_picker_index = 0;
+        self.stop_chooser_open = true;
+        self.status = "Choose a background session to stop".to_string();
+        true
+    }
+
+    fn stop_current_session(&mut self) {
+        if self.turn_status.is_stopping() {
+            return;
+        }
+        let Some(handle) = self.stop_handle.clone() else {
+            self.status = "Active turn has no Stop control".to_string();
+            return;
+        };
+        let Some(record_id) = self.current_record_id().map(str::to_owned) else {
+            self.status = "Could not identify the active session; nothing was stopped".to_string();
+            return;
+        };
+        let current_turn_index = self.transcript.last().and_then(TranscriptTurn::turn_index);
+        let session = match self.catalog.get(&record_id) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status =
+                    format!("Could not verify the active session ({error}); nothing was stopped");
+                return;
+            }
+        };
+        if session.run_state != CatalogRunState::Active
+            || current_turn_index.is_some_and(|turn_index| {
+                session.turns.last().map(|turn| turn.turn_index) != Some(turn_index)
+            })
+        {
+            self.refresh_sessions();
+            self.status = "Active session changed state; nothing was stopped".to_string();
+            return;
+        }
+        match handle.stop() {
+            Ok(()) => {
+                self.turn_status = TurnStatus::Stopping;
+                self.status.clear();
+            }
+            Err(error) => self.status = format!("Stop failed: {error}"),
+        }
     }
 
     fn handle_stop_chooser_key(&mut self, key: KeyEvent) {
@@ -3162,7 +3762,7 @@ fn draw_warning(frame: &mut Frame<'_>, use_color: bool) {
         ),
         Line::from("Ctrl-Z undo; Ctrl-Y redo. Ctrl-C stops a turn or exits when idle."),
         Line::from(
-            "F1 help; F2 actions; F3 sessions; Ctrl-F search; F4 inspect; F5 copy; F6 export.",
+            "F1 help; F2/Ctrl-P actions; F3 sessions; Ctrl-F search; F4 inspect; F5 copy; F6 export.",
         ),
         Line::from("PageUp/PageDown move by transcript rows; Ctrl-End follows new text."),
         Line::from(
@@ -3656,10 +4256,8 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             format!("Background: {background} · Ctrl-C choose Stop · F3 sessions")
         } else if !detail.is_empty() && detail != "Ready" {
             detail.to_string()
-        } else if app.terminal_columns < 120 {
-            NARROW_HELP.to_string()
         } else {
-            HELP.to_string()
+            app.idle_footer_text(chunks[3].width as usize)
         }
     };
     frame.render_widget(
@@ -3702,7 +4300,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("Left/Right move · Home/End line · Backspace/Delete remove · paste keeps Unicode/newlines."),
                 Line::from("PageUp/Down browse transcript rows · Ctrl-End follows the tail · Esc closes the current overlay."),
                 Line::from("Ctrl-Up/Down focuses the previous/next tool row without editing the composer."),
-                Line::from("F1 help · F2 actions · F3 sessions: / filter · N new · R rename · W workspace · Enter reopen."),
+                Line::from("F1 help · F2/Ctrl-P actions · F3 sessions: / filter · N new · R rename · W workspace · Enter reopen."),
                 Line::from("F8 shows or hides the session rail at 105 columns and wider."),
                 Line::from("F3 picker: S search · Ctrl-F searches titles and complete transcript source · Up/Down move through results."),
                 Line::from("Search: Enter opens the match and matching tool details · Ctrl-U clears · Esc closes."),
@@ -3719,39 +4317,8 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             .wrap(Wrap { trim: false }),
             area,
         );
-    } else if app.show_menu {
-        let area = centered_rect(82, 74, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from("Keyboard actions"),
-                Line::from("F3  Browse/create/rename/reopen sessions; slash filters titles."),
-                Line::from("Ctrl-F  Search titles and complete sanitized transcript source."),
-                Line::from("Ctrl-Up/Down  Focus the previous/next tool row without editing the composer."),
-                Line::from("F4  Inspect the focused tool call; without a focused row, toggle the latest turn."),
-                Line::from("Up/Down  Choose inspector field; [/]  Select previous/next turn."),
-                Line::from("F5  Send selected field with terminal OSC 52 clipboard."),
-                Line::from("F7  Save the copied field to a file if clipboard is unavailable."),
-                Line::from("F6  Export transcript only; Y explicitly confirms overwrite."),
-                Line::from(
-                    "Ctrl-R in inspector  Retry latest failed turn after the side-effect warning.",
-                ),
-                Line::from(
-                    "PageUp/Down  Browse transcript rows; Shift-PageUp/Down  Scroll inspector text.",
-                ),
-                Line::from("F8  Show or hide the session rail at 105 columns and wider."),
-                Line::from(
-                    "Ctrl-C  Stop viewed active run; otherwise choose a background run; idle saves drafts and exits.",
-                ),
-                Line::from(
-                    "Enter newline · Ctrl-S send · F1 help · F2 actions.",
-                ),
-                Line::from("Esc closes this menu."),
-            ])
-            .block(Block::default().borders(Borders::ALL).title("Actions"))
-            .wrap(Wrap { trim: false }),
-            area,
-        );
+    } else if app.palette.is_some() {
+        draw_command_palette(frame, app);
     } else {
         let visible_row = cursor_row.saturating_sub(composer_scroll);
         let x = chunks[2]
@@ -3764,6 +4331,94 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             .min(chunks[2].bottom().saturating_sub(2));
         frame.set_cursor_position((x, y));
     }
+}
+
+fn draw_command_palette(frame: &mut Frame<'_>, app: &App) {
+    let Some(palette) = app.palette.as_ref() else {
+        return;
+    };
+    let area = centered_rect(98, 96, frame.area());
+    let entries = app.filtered_palette_entries();
+    let page_rows = area.height.saturating_sub(5).max(1) as usize;
+    let start = palette
+        .selected
+        .saturating_sub(page_rows.saturating_sub(1))
+        .min(entries.len().saturating_sub(page_rows));
+    let end = (start + page_rows).min(entries.len());
+    let width = area.width.saturating_sub(4) as usize;
+    let mut lines = vec![Line::from(format!(
+        "Filter: {}▏",
+        sanitize::terminal_safe_text(&palette.query)
+    ))];
+    if entries.is_empty() {
+        lines.push(Line::from(
+            "No actions match. Type more or press Ctrl-U to clear.",
+        ));
+    } else {
+        for (index, entry) in entries.iter().enumerate().take(end).skip(start) {
+            let marker = if index == palette.selected {
+                ">"
+            } else if entry.disabled_reason.is_some() {
+                "×"
+            } else {
+                " "
+            };
+            let disabled = if entry.disabled_reason.is_some() {
+                " · disabled"
+            } else {
+                ""
+            };
+            let line = Line::from(truncate_to_width(
+                &sanitize::terminal_safe_text(&format!(
+                    "{marker} {}  [{}]{disabled}",
+                    entry.label, entry.shortcut
+                )),
+                width,
+            ));
+            if index == palette.selected && app.use_color {
+                lines.push(
+                    line.style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                );
+            } else if entry.disabled_reason.is_some() && app.use_color {
+                lines.push(line.style(Style::default().fg(Color::DarkGray)));
+            } else {
+                lines.push(line);
+            }
+        }
+    }
+    let selected_reason = entries
+        .get(palette.selected)
+        .and_then(|entry| entry.disabled_reason.as_deref());
+    let notice = palette.notice.as_deref().or(selected_reason);
+    lines.push(Line::from(truncate_to_width(
+        &sanitize::terminal_safe_text(
+            notice.unwrap_or("Enter invokes enabled · ↑/↓ select · Ctrl-U clear · Esc close"),
+        ),
+        width,
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Command palette · F2/Ctrl-P"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    let cursor_x = area
+        .x
+        .saturating_add(
+            1 + UnicodeWidthStr::width("Filter: ") as u16
+                + UnicodeWidthStr::width(palette.query.as_str()) as u16,
+        )
+        .min(area.right().saturating_sub(2));
+    frame.set_cursor_position((cursor_x, area.y.saturating_add(1)));
 }
 
 fn draw_stop_chooser(frame: &mut Frame<'_>, app: &App) {
@@ -4187,17 +4842,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::transcript::{TranscriptSourceId, TranscriptTurn};
     use leg_ui_client::StreamEvent;
     use serde_json::json;
 
     use super::{
-        TranscriptAnchor, TurnStatus, build_transcript_rows, build_transcript_rows_with_focus,
-        find_case_insensitive, find_transcript_anchor_row, response_stop_reason, restored_draft,
-        same_tool_anchor, should_use_color, successful_status, transcript_page_down_start,
-        transcript_page_up_start, truncate_to_width,
+        App, PaletteAction, SessionCatalog, SessionCatalogConfig, TranscriptAnchor, TurnStatus,
+        build_transcript_rows, build_transcript_rows_with_focus, find_case_insensitive,
+        find_transcript_anchor_row, response_stop_reason, restored_draft, same_tool_anchor,
+        should_use_color, successful_status, transcript_page_down_start, transcript_page_up_start,
+        truncate_to_width,
     };
     use unicode_width::UnicodeWidthStr;
 
@@ -4232,6 +4888,32 @@ mod tests {
         status = TurnStatus::Starting;
         status.mark_running_unless_stopping();
         assert_eq!(status, TurnStatus::Running);
+    }
+
+    #[test]
+    fn palette_stop_with_no_active_tui_run_never_exits() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!(
+            "leg-tui-palette-stop-{}-{unique}",
+            std::process::id()
+        ));
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state_dir.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("temporary test catalog opens");
+        let mut app = App::new(catalog);
+
+        app.invoke_palette_action(PaletteAction::Stop);
+
+        assert!(!app.quit);
+        assert!(!app.stop_chooser_open);
+        assert_eq!(app.status, "No active TUI session to stop");
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
     }
 
     #[test]

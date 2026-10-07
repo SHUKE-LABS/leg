@@ -1,0 +1,24 @@
+s┌Command palette · F2/Ctrl-P─────────────────────────────────────────────────┐
+w│Filter: ▏                                                                   │
+┌│> Browse/switch sessions  [F3]                                              │┐
+││  New conversation  [F3 → N]                                                ││
+││  Rename current session  [F3 → R]                                          ││
+││  Choose/replace workspace  [F3 → W]                                        ││
+││  Search sessions and transcript  [Ctrl-F]                                  ││
+││  Inspect transcript  [F4]                                                  ││
+││× Copy selected field  [F5] · disabled                                      ││
+││× Save selected field  [F7] · disabled                                      ││
+││  Export transcript  [F6]                                                   ││
+││× Retry latest failed turn  [Ctrl-R] · disabled                             ││
+││× Show/hide session rail  [F8] · disabled                                   ││
+││× Choose background session to stop  [Ctrl-C] · disabled                    ││
+││  Keyboard help  [F1]                                                       ││
+││  Exit and save drafts  [Ctrl-C]                                            ││
+││Enter invokes enabled · ↑/↓ select · Ctrl-U clear · Esc close               ││
+││                                                                            ││
+││                                                                            ││
+└│                                                                            │┘
+┌│                                                                            │┐
+││                                                                            ││
+└│                                                                            │┘
+C└────────────────────────────────────────────────────────────────────────────┘
