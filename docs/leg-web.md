@@ -251,6 +251,12 @@ controls which optional controls and handlers exist. When tool inspection is
 omitted, failed, denied, missing, interrupted, and capped results still have
 readable summaries.
 
+The built-in views compose `themes/shared-renderer.js` for common DOM updates,
+event binding, and safe transcript rendering. A theme owns that rendering
+boundary: it can provide its own template and layout while reusing the shared
+renderer. A replacement renderer works from the same model and actions and
+must preserve the safe transcript rendering behavior.
+
 When more than one theme is registered, every view includes a keyboard
 accessible selector. The selected stable ID is kept in per-tab
 `sessionStorage`; unknown and missing IDs choose `default`. Choosing a theme
@@ -264,9 +270,11 @@ To add a source-controlled theme, add its module, HTML template, and scoped
 stylesheet under `companions/leg-web/src/assets/themes`, register its ID and
 loader in `registry.js`, and add explicit host routes and allowlist entries in
 `companions/leg-web/src/lib.rs`. Implement `mount`, `bind(actions)`, and
-`render(readOnlyModel, actions)` using the same shared action contract. Keep
-the production registry limited to themes intended for release. The alternate
-fixture is registered only by the `browser-e2e-themes` Cargo feature.
+`render(readOnlyModel, actions)` using the shared action contract; compose
+`shared-renderer.js` when its common presentation fits, or provide a theme
+renderer that preserves safe transcript rendering. Keep the production
+registry limited to themes intended for release. The alternate fixture is
+registered only by the `browser-e2e-themes` Cargo feature.
 
 Run the executable Chromium and Firefox check for the production default,
 fixture view, and theme selection/recovery with:

@@ -27,9 +27,19 @@ async def wait_theme(page, theme_id: str) -> None:
     )
 
 
-async def choose_theme(page, theme_id: str) -> None:
+async def choose_theme(page, theme_id: str, *, wait_for_session: bool = True) -> None:
+    session_id = None
+    if wait_for_session:
+        session_id = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
     await page.locator("select[aria-label='Interface theme']").select_option(theme_id)
     await wait_theme(page, theme_id)
+    if session_id:
+        await page.wait_for_function(
+            "id => document.querySelector('#session-title')?.dataset.sessionId === id && "
+            "document.querySelector('#connection-state')?.textContent === ''",
+            arg=session_id,
+            timeout=15000,
+        )
 
 
 async def start_session(page, workspace: Path) -> str:
@@ -245,9 +255,9 @@ async def run(
                 await page.keyboard.press("Control+Shift+F")
                 assert await page.locator("#transcript-search, #transcript-find-bar").count() == 0
                 await choose_theme(page, "default")
-                assert await page.locator(
-                    "#messages .transcript-turn[data-turn-index='0'] .tool-disclosure[aria-expanded='true']"
-                ).count() == 1
+                expanded_tool = "#messages .transcript-turn[data-turn-index='0'] .tool-disclosure[aria-expanded='true']"
+                await page.locator(expanded_tool).wait_for(state="visible")
+                assert await page.locator(expanded_tool).count() == 1
 
                 # A malformed saved trail is read-only in either view.
                 await page.locator("#session-list button.session-select[data-session-id='" + readonly_id + "']").click()
@@ -305,7 +315,18 @@ async def run(
                 assert session_default == session_fixture
                 assert await page.locator("#workspace-warning").is_hidden()
 
+                # The host accepts this request, then the browser loses its receipt.
+                # Hold snapshots so both theme directions preserve an unresolved send.
                 accepted_response_dropped = False
+                snapshot_gate = asyncio.Event()
+                snapshot_intercepted = asyncio.Event()
+
+                async def hold_snapshot(route) -> None:
+                    snapshot_intercepted.set()
+                    await snapshot_gate.wait()
+                    await route.continue_()
+
+                await page.route("**/snapshot", hold_snapshot)
 
                 async def drop_accepted_response(route) -> None:
                     nonlocal accepted_response_dropped
@@ -320,18 +341,50 @@ async def run(
                 await page.locator("#prompt").fill("TRIAL-PAUSE: live turn across theme reload")
                 await page.get_by_role("button", name="Send").click()
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
-                await page.unroute("**/submit", drop_accepted_response)
+                await snapshot_intercepted.wait()
                 assert accepted_response_dropped
                 draft = "Draft kept during run\nsecond line Ω"
                 await page.locator("#prompt").fill(draft)
                 assert await page.get_by_role("button", name="Send").is_disabled()
                 assert await page.locator("#stop-turn").is_visible()
-                before_active_switch = len([item for item in requests if item[1].endswith("/submit")])
+                before_active_actions = {
+                    "submit": len([item for item in requests if item[1].endswith("/submit")]),
+                    "stop": len([item for item in requests if item[1].endswith("/stop")]),
+                }
+                await choose_theme(page, "fixture", wait_for_session=False)
+                await page.wait_for_function(
+                    "draft => document.querySelector('#prompt')?.value === draft",
+                    arg=draft,
+                )
+                assert await page.locator("#prompt").input_value() == draft
+                assert await page.evaluate("sessionStorage.getItem('leg-web-current-session')") == session_fixture
+                assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
+                assert len([item for item in requests if item[1].endswith("/stop")]) == before_active_actions["stop"]
+                await choose_theme(page, "default", wait_for_session=False)
+                await page.wait_for_function(
+                    "draft => document.querySelector('#prompt')?.value === draft",
+                    arg=draft,
+                )
+                assert await page.locator("#prompt").input_value() == draft
+                assert await page.evaluate("sessionStorage.getItem('leg-web-current-session')") == session_fixture
+                assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
+                assert len([item for item in requests if item[1].endswith("/stop")]) == before_active_actions["stop"]
+                snapshot_gate.set()
+                await page.unroute("**/snapshot", hold_snapshot)
+                await page.unroute("**/submit", drop_accepted_response)
+                await common.wait_status(page, "Running")
+                assert await page.locator("#stop-turn").is_visible()
+                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.get_by_text("The first live text is visible", exact=False).count() == 1
                 await choose_theme(page, "fixture")
                 assert await page.locator("#prompt").input_value() == draft
+                assert await page.evaluate("sessionStorage.getItem('leg-web-current-session')") == session_fixture
                 assert await page.locator("#stop-turn").is_visible()
+                assert await page.locator("#stop-turn").is_enabled()
+                assert await page.get_by_role("button", name="Send").is_disabled()
                 assert await page.get_by_text("The first live text is visible", exact=False).count() == 1
-                assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_switch
+                assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
+                assert len([item for item in requests if item[1].endswith("/stop")]) == before_active_actions["stop"]
                 assert await page.locator("#stop-turn").is_enabled()
                 before_stop = len([item for item in requests if item[1].endswith("/stop")])
                 await page.get_by_role("button", name="Stop").click()
@@ -344,7 +397,7 @@ async def run(
                 await choose_theme(page, "default")
                 await common.wait_status(page, "Interrupted")
 
-                # A request whose response is unknown can be retried only by the explicit same-ID action.
+                # A snapshot proves this send was not accepted; retry stays explicit and uses the same ID.
                 submission_ids: list[int] = []
                 page.on(
                     "request",

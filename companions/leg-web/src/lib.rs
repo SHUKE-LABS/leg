@@ -40,6 +40,7 @@ const THEME_REGISTRY_JS: &str = include_str!("assets/themes/registry.js");
 const DEFAULT_THEME_JS: &str = include_str!("assets/themes/default.js");
 const DEFAULT_THEME_HTML: &str = include_str!("assets/themes/default.html");
 const DEFAULT_THEME_CSS: &str = include_str!("assets/themes/default.css");
+const SHARED_RENDERER_JS: &str = include_str!("assets/themes/shared-renderer.js");
 #[cfg(feature = "browser-e2e-themes")]
 const FIXTURE_THEME_JS: &str = include_str!("assets/themes/fixture.js");
 #[cfg(feature = "browser-e2e-themes")]
@@ -596,6 +597,7 @@ fn build_router(state: HostState) -> Router {
         .route("/themes/default.js", get(default_theme_js))
         .route("/themes/default.html", get(default_theme_html))
         .route("/themes/default.css", get(default_theme_css))
+        .route("/themes/shared-renderer.js", get(shared_renderer_js))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/select", post(select_session))
         .route("/api/sessions/{id}", get(get_session).patch(rename_session))
@@ -738,6 +740,10 @@ async fn default_theme_css() -> Response {
     static_response("text/css; charset=utf-8", DEFAULT_THEME_CSS)
 }
 
+async fn shared_renderer_js() -> Response {
+    static_response("text/javascript; charset=utf-8", SHARED_RENDERER_JS)
+}
+
 #[cfg(feature = "browser-e2e-themes")]
 async fn fixture_theme_js() -> Response {
     static_response("text/javascript; charset=utf-8", FIXTURE_THEME_JS)
@@ -762,6 +768,7 @@ fn is_embedded_asset(path: &str) -> bool {
             | "/themes/default.js"
             | "/themes/default.html"
             | "/themes/default.css"
+            | "/themes/shared-renderer.js"
     ) || (cfg!(feature = "browser-e2e-themes")
         && matches!(
             path,
@@ -2788,6 +2795,7 @@ mod tests {
         );
         assert!(THEME_REGISTRY_JS.contains("/themes/default.js"));
         assert!(DEFAULT_THEME_CSS.contains(".composer"));
+        assert!(SHARED_RENDERER_JS.contains("createSharedRenderer"));
         let css_response = build_router(host.state.clone())
             .oneshot(
                 HttpRequest::builder()
@@ -2811,6 +2819,22 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("style-src 'self'")
+        );
+
+        let shared_renderer_response = build_router(host.state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/themes/shared-renderer.js")
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shared_renderer_response.status(), StatusCode::OK);
+        assert_eq!(
+            shared_renderer_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
         );
 
         let unknown = build_router(host.state.clone())

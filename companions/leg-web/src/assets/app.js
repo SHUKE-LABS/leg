@@ -62,37 +62,13 @@ async function loadTheme(record) {
     throw new Error("theme_contract_invalid");
   }
   const view = await module.theme.mount(root);
-  if (!view || typeof view.bind !== "function" || typeof view.render !== "function" || !view.elements) {
+  if (!view || typeof view.bind !== "function" || typeof view.render !== "function" ||
+      typeof view.save !== "function" || typeof view.focus !== "function" ||
+      typeof view.rebindSessionId !== "function") {
     throw new Error("theme_contract_invalid");
   }
   view.record = record;
   view.features = Object.freeze({ ...(view.features || {}) });
-  const requiredElements = [
-    "connection-state", "new-conversation", "session-list", "session-list-empty",
-    "session-list-no-results", "session-list-error", "rename-form", "rename-input",
-    "rename-error", "cancel-rename", "welcome", "start-form", "workspace-input",
-    "setup-error", "conversation", "session-title", "workspace-label", "session-guidance",
-    "set-workspace-form", "recovery-workspace-input", "recovery-error", "cancel-workspace",
-    "provider-model", "elapsed-time", "turn-status", "active-tool", "stop-turn",
-    "workspace-warning", "connection-message", "transcript-warnings", "transcript",
-    "messages", "empty-transcript", "new-content", "composer", "prompt",
-    "retry-submission", "send", "send-error", "live-status",
-  ];
-  const missingElements = requiredElements.filter((key) => !view.elements[key]);
-  const featureElements = {
-    titleFilter: ["session-filter"],
-    transcriptSearch: [
-      "open-transcript-search", "close-transcript-search", "transcript-find-bar",
-      "transcript-search", "transcript-search-prev", "transcript-search-next",
-      "transcript-search-clear", "transcript-search-status",
-    ],
-    copy: ["copy-status"],
-    download: ["download-transcript", "download-status"],
-  };
-  for (const [feature, keys] of Object.entries(featureElements)) {
-    if (view.features[feature]) missingElements.push(...keys.filter((key) => !view.elements[key]));
-  }
-  if (missingElements.length) throw new Error(`theme_contract_missing:${missingElements.join(",")}`);
   return view;
 }
 

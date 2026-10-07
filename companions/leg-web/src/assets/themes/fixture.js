@@ -1,3 +1,5 @@
+import { createSharedRenderer } from "/themes/shared-renderer.js";
+
 const elementIds = [
   "connection-state",
   "new-conversation",
@@ -52,48 +54,27 @@ async function mount(root) {
 }
 
 function createView(root, elements) {
+  const features = Object.freeze({
+    titleFilter: false,
+    transcriptSearch: false,
+    copy: false,
+    download: false,
+    toolInspection: false,
+  });
+  const renderer = createSharedRenderer(elements, features);
   return {
-    elements,
-    features: Object.freeze({
-      titleFilter: false,
-      transcriptSearch: false,
-      copy: false,
-      download: false,
-      toolInspection: false,
-    }),
-    bind(actions) {
-      const ui = elements;
-      ui["start-form"].addEventListener("submit", actions.startConversation);
-      ui["new-conversation"].addEventListener("click", actions.openNewConversation);
-      ui["session-list"].addEventListener("click", actions.sessionListClick);
-      ui["rename-form"].addEventListener("submit", actions.renameSession);
-      ui["cancel-rename"].addEventListener("click", actions.cancelRename);
-      ui["set-workspace-form"].addEventListener("submit", actions.setSessionWorkspace);
-      ui["cancel-workspace"].addEventListener("click", actions.cancelWorkspace);
-      ui.conversation.addEventListener("click", actions.conversationClick);
-      ui.composer.addEventListener("submit", actions.submitForm);
-      ui.prompt.addEventListener("input", actions.updateDraft);
-      ui.prompt.addEventListener("compositionstart", actions.compositionStart);
-      ui.prompt.addEventListener("compositionend", actions.compositionEnd);
-      ui.prompt.addEventListener("keydown", actions.promptKeydown);
-      window.addEventListener("resize", actions.resize);
-      ui["retry-submission"].addEventListener("click", actions.retrySubmission);
-      ui["stop-turn"].addEventListener("click", actions.stopTurn);
-      ui["new-content"].addEventListener("click", actions.showNewContent);
-      ui.transcript.addEventListener("pointerdown", actions.transcriptPointerDown);
-      ui.transcript.addEventListener("wheel", actions.transcriptPointerDown, { passive: true });
-      ui.transcript.addEventListener("touchstart", actions.transcriptPointerDown, { passive: true });
-      ui.transcript.addEventListener("keydown", actions.transcriptKeydown);
-      ui.transcript.addEventListener("scroll", actions.transcriptScroll);
-      window.addEventListener("pagehide", actions.saveCurrentSessionView);
-      window.addEventListener("online", actions.online);
-    },
-    render(model) {
+    features,
+    bind(actions) { renderer.bind(actions); },
+    render(model, actions) {
       root.dataset.themeId = "fixture";
       root.dataset.turnState = model.status.text.toLowerCase();
       const state = elements["turn-status"];
       state.dataset.busy = String(model.status.busy);
+      renderer.render(model, actions);
     },
+    save: renderer.save,
+    focus: renderer.focus,
+    rebindSessionId: renderer.rebindSessionId,
   };
 }
 

@@ -151,6 +151,7 @@ def smoke_bundle(bundle_dir: Path) -> None:
                 "/themes/default.js",
                 "/themes/default.html",
                 "/themes/default.css",
+                "/themes/shared-renderer.js",
             }
             for asset_path in set(assets.paths) | embedded_theme_assets:
                 asset_status, _asset_headers, asset_body = request(authority, asset_path)
