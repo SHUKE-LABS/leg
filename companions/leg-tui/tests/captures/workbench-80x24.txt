@@ -1,10 +1,13 @@
-status: Idle  |  Untitled conv…  |  model: trial-fixture
+status: Succeeded  |  Untitled conv…  |  model: anthropic/trial-f…
 workspace: <workspace> · catalog: Ready · <elapsed>
-┌Conversation──────────────────────────────────────────────────────────────────┐
-│Choose a workspace, acknowledge the warning, then send a prompt with Ctrl-S.  │
+┌Rows 1-8 of 8─────────────────────────────────────────────────────────────────┐
+│Turn 1                                                                        │
+│You: terminal size recovery draft                                             │
 │                                                                              │
+│Assistant                                                                     │
+│Fixture ready. This answer came from a local fake provider.                   │
 │                                                                              │
-│                                                                              │
+│Outcome: succeeded                                                            │
 │                                                                              │
 │                                                                              │
 │                                                                              │
@@ -16,9 +19,6 @@ workspace: <workspace> · catalog: Ready · <elapsed>
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌Composer (Ctrl-S send)────────────────────────────────────────────────────────┐
-│one                                                                           │
-│two                                                                           │
-│three                                                                         │
-│four                                                                          │
+│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 Ctrl-S send · F3 sessions · F1 help · F2 actions · Ctrl-C stop/exit

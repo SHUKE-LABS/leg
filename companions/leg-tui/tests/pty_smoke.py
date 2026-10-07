@@ -3034,11 +3034,6 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
                 master_fd, child, output, "four", rows=24, columns=80
             )
             layout_screen = terminal_screen_text(bytes(output), 24, 80)
-            compare_workbench_capture(
-                "workbench-80x24.txt",
-                layout_screen,
-                getattr(args, "update_workbench_captures", False),
-            )
             layout_lines = layout_screen.splitlines()
             conversation_row = next(
                 index for index, line in enumerate(layout_lines) if "Conversation" in line
@@ -3105,6 +3100,15 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
                 master_fd, child, output, "Succeeded", rows=24, columns=80
             )
             assert request_status(status_url)["requests"] == 1
+            final_80_screen = terminal_screen_text(bytes(output), 24, 80)
+            assert "You: terminal size recovery draft" in final_80_screen, final_80_screen
+            assert "Assistant" in final_80_screen, final_80_screen
+            assert "Outcome: succeeded" in final_80_screen, final_80_screen
+            compare_workbench_capture(
+                "workbench-80x24.txt",
+                final_80_screen,
+                getattr(args, "update_workbench_captures", False),
+            )
             requests = [
                 json.loads(line)
                 for line in event_log.read_text(encoding="utf-8").splitlines()

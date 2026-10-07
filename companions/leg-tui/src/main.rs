@@ -2840,14 +2840,22 @@ fn inline_markdown_runs(
 }
 
 fn find_transcript_anchor_row(rows: &[TranscriptRow], anchor: &TranscriptAnchor) -> Option<usize> {
+    let matches_exact_source = |row: &&TranscriptRow| {
+        row.anchor.turn_index == anchor.turn_index
+            && row.anchor.source_id == anchor.source_id
+            && row.anchor.source_order == anchor.source_order
+    };
     rows.iter()
         .enumerate()
-        .filter(|(_, row)| {
-            row.anchor.turn_index == anchor.turn_index
-                && row.anchor.source_id == anchor.source_id
-                && row.anchor.source_order == anchor.source_order
+        .filter(|(_, row)| matches_exact_source(row))
+        .filter(|(_, row)| row.anchor.byte_offset <= anchor.byte_offset)
+        .last()
+        .or_else(|| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| matches_exact_source(row))
+                .min_by_key(|(_, row)| row.anchor.byte_offset.abs_diff(anchor.byte_offset))
         })
-        .min_by_key(|(_, row)| row.anchor.byte_offset.abs_diff(anchor.byte_offset))
         .or_else(|| {
             rows.iter()
                 .enumerate()
@@ -4194,6 +4202,52 @@ mod tests {
         let previous_page = transcript_page_up_start(start, max_scroll, page_rows, true);
         assert!(previous_page < start);
         assert_eq!(transcript_page_up_start(0, max_scroll, page_rows, false), 0);
+    }
+
+    #[test]
+    fn transcript_anchor_selects_the_row_containing_search_and_resize_offsets() {
+        let source = (0..40)
+            .map(|word| format!("w{word:02}xx"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut turn = TranscriptTurn::new("anchor test");
+        turn.observe(&StreamEvent::TextDelta {
+            seq: 1,
+            round_index: 0,
+            block_index: 0,
+            text: source.clone(),
+        });
+        let source_id = TranscriptSourceId::Assistant {
+            round_index: 0,
+            block_index: 0,
+        };
+
+        let search_offset = source.find("w02xx").unwrap();
+        let search_anchor = TranscriptAnchor {
+            turn_index: 0,
+            source_id: source_id.clone(),
+            source_order: 1,
+            byte_offset: search_offset,
+        };
+        let search_rows = build_transcript_rows(&[turn.clone()], 20, false);
+        let search_row = find_transcript_anchor_row(&search_rows, &search_anchor).unwrap();
+        assert!(search_rows[search_row].line.to_string().contains("w02xx"));
+
+        let old_width_rows = build_transcript_rows(&[turn.clone()], 16, false);
+        let old_row_anchor = old_width_rows
+            .iter()
+            .map(|row| &row.anchor)
+            .find(|row| {
+                row.turn_index == 0
+                    && row.source_id == source_id
+                    && row.source_order == 1
+                    && row.byte_offset == 16
+            })
+            .unwrap()
+            .clone();
+        let resized_rows = build_transcript_rows(&[turn], 26, false);
+        let resized_row = find_transcript_anchor_row(&resized_rows, &old_row_anchor).unwrap();
+        assert!(resized_rows[resized_row].line.to_string().contains("w03xx"));
     }
 
     #[test]
