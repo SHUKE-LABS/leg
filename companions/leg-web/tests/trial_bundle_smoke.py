@@ -111,7 +111,7 @@ def smoke_bundle(bundle_dir: Path) -> None:
         env = os.environ.copy()
         env["PATH"] = runtime_path
         process = subprocess.Popen(
-            [str(launcher), "--no-open", "--state-dir", str(state_dir)],
+            [str(launcher), "--no-open", "--bind", "127.0.0.1:0", "--state-dir", str(state_dir)],
             cwd=bundle_dir,
             env=env,
             stdout=subprocess.PIPE,
