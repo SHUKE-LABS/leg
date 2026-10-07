@@ -1,0 +1,40 @@
+status: Succeeded  |  Untitled conversation  |  model: anthropic/trial-fixture
+workspace: <workspace> · catalog: Ready · <elapsed>
+┌Sessions───────────────┐┌Turns 1-1 of 1───────────────────────────────────────────────────────────────────────────────┐
+│F3 picker · F8 hide    ││Turn 1                                                                                       │
+│Untitled conversation  ││You: terminal size recovery draft                                                            │
+│Status: Ready          ││Assistant: Fixture ready. This answer came from a local fake provider.                       │
+│                       ││Turn succeeded                                                                               │
+│▶ Untitled             ││                                                                                             │
+│  Ready                ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+│                       ││                                                                                             │
+└───────────────────────┘└─────────────────────────────────────────────────────────────────────────────────────────────┘
+┌Composer (Ctrl-S send)────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+Ctrl-S send · F3 sessions · F4 inspect · F8 rail · F1 help · F2 actions · Ctrl-C stop/exit
