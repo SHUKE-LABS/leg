@@ -766,7 +766,8 @@ def start_prompt(
         for action in (
             "F3  Browse/create/rename/reopen sessions",
             "Ctrl-F  Search titles and complete sanitized transcript source.",
-            "F4  Expand the selected turn's tool inspector.",
+            "Ctrl-Up/Down  Focus the previous/next tool row without editing the composer.",
+            "F4  Inspect the focused tool call; without a focused row, toggle the latest turn.",
             "F5  Send selected field with terminal OSC 52 clipboard.",
             "F7  Save the copied field to a file",
             "F6  Export transcript only",
@@ -1201,7 +1202,12 @@ def launch_conversation(
         raise
 
 
-def seed_windowed_catalog(state_dir: Path, workspace: Path, turn_count: int = 1000) -> str:
+def seed_windowed_catalog(
+    state_dir: Path,
+    workspace: Path,
+    turn_count: int = 1000,
+    session_title: str = "History fixture",
+) -> str:
     session_id = "session-windowed-1000"
     now_ms = int(time.time() * 1000)
     sessions_dir = state_dir / "sessions"
@@ -1238,8 +1244,115 @@ def seed_windowed_catalog(state_dir: Path, workspace: Path, turn_count: int = 10
         )
         status = tool_statuses.get(index)
         if status:
-            tool_id = "reused-tool-id"
-            tool_input = {"command": f"echo output from turn {index:04d}"}
+            tool_specs: list[dict[str, Any]] = [
+                {
+                    "id": "reused-tool-id",
+                    "name": "bash",
+                    "input": {"command": f"echo output from turn {index:04d}"},
+                    "status": status,
+                    "result": f"literal Ω output from turn {index:04d}",
+                }
+            ]
+            if index == turn_count - 1:
+                bash_envelope = lambda code, stdout, stderr="", stdout_omitted=0, stderr_omitted=0: json.dumps(
+                    {
+                        "wall_time_seconds": 0.01,
+                        "status": "exited",
+                        "exit_code": code,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "stdout_omitted_bytes": stdout_omitted,
+                        "stderr_omitted_bytes": stderr_omitted,
+                    },
+                    ensure_ascii=False,
+                )
+                tool_specs = [
+                    tool_specs[0]
+                    | {"result": bash_envelope(0, f"literal Ω output from turn {index:04d}")},
+                    {
+                        "id": "bash-exit-7",
+                        "name": "bash",
+                        "input": {"command": "false", "description": "check nonzero status"},
+                        "status": "completed",
+                        "result": bash_envelope(
+                            7,
+                            "HIDDEN_BASH_STDOUT_Ω",
+                            "HIDDEN_BASH_STDERR_Ω",
+                            stdout_omitted=12,
+                            stderr_omitted=2,
+                        ),
+                    },
+                    {
+                        "id": "bash-truncated",
+                        "name": "bash",
+                        "input": {"command": "large", "description": "truncated output"},
+                        "status": "completed",
+                        "result": bash_envelope(
+                            0,
+                            "prefix … [120 bytes omitted]",
+                            stdout_omitted=120,
+                        ),
+                    },
+                    {
+                        "id": "bash-malformed",
+                        "name": "bash",
+                        "input": {"command": "malformed", "description": "malformed envelope"},
+                        "status": "completed",
+                        "result": '{"status":"exited","exit_code":0,"stdout":',
+                    },
+                    {
+                        "id": "bash-unknown-envelope",
+                        "name": "bash",
+                        "input": {"command": "future", "description": "unknown envelope"},
+                        "status": "completed",
+                        "result": json.dumps(
+                            {
+                                "status": "future",
+                                "exit_code": 0,
+                                "stdout": "unknown-envelope-output",
+                                "stderr": "",
+                            }
+                        ),
+                    },
+                    {
+                        "id": "read-output",
+                        "name": "read",
+                        "input": {"path": "history.txt", "offset": 2, "limit": 3},
+                        "status": "completed",
+                        "result": "READ_OUTPUT_SENTINEL",
+                    },
+                    {
+                        "id": "edit-diff",
+                        "name": "edit",
+                        "input": {"path": "edit.txt"},
+                        "status": "completed",
+                        "result": (
+                            "Successfully replaced 1 occurrence in edit.txt.\n"
+                            "--- a/edit.txt\n+++ b/edit.txt\n@@ -1 +1 @@\n-old\n+new\n"
+                            "... [diff truncated: 2 more lines]"
+                        ),
+                    },
+                    {
+                        "id": "denied-call",
+                        "name": "bash",
+                        "input": {"command": "blocked command"},
+                        "status": "denied",
+                        "error": "hook denied",
+                    },
+                    {
+                        "id": "missing-result",
+                        "name": "write",
+                        "input": {"path": "missing-result.txt"},
+                        "status": None,
+                    },
+                    {
+                        "id": "unknown-tool",
+                        "name": "lookup",
+                        "input": {"query": "HIDDEN_UNKNOWN_INPUT"},
+                        "status": "completed",
+                        "result": "unknown tool literal result",
+                    },
+                ]
             events.append(
                 {
                     "schema": EXCHANGE_SCHEMA,
@@ -1248,42 +1361,46 @@ def seed_windowed_catalog(state_dir: Path, workspace: Path, turn_count: int = 10
                     "content": [
                         {
                             "type": "tool_use",
-                            "id": tool_id,
-                            "name": "bash",
-                            "input": tool_input,
+                            "id": tool["id"],
+                            "name": tool["name"],
+                            "input": tool["input"],
                         }
+                        for tool in tool_specs
                     ],
                     "session_id": session_id,
                     "turn_index": index,
                 }
             )
-            events.append(
-                {
-                    "schema": EXCHANGE_SCHEMA,
-                    "event": "tool_call",
-                    "ts_ms": event_ms + 2,
-                    "tool_use_id": tool_id,
-                    "tool_name": "bash",
-                    "input": tool_input,
-                    "session_id": session_id,
-                    "turn_index": index,
-                }
-            )
-            if status not in ("pending", "interrupted"):
+            for tool in tool_specs:
+                events.append(
+                    {
+                        "schema": EXCHANGE_SCHEMA,
+                        "event": "tool_call",
+                        "ts_ms": event_ms + 2,
+                        "tool_use_id": tool["id"],
+                        "tool_name": tool["name"],
+                        "input": tool["input"],
+                        "session_id": session_id,
+                        "turn_index": index,
+                    }
+                )
+                tool_status = tool["status"]
+                if tool_status is None or tool_status in ("pending", "interrupted"):
+                    continue
                 result: dict[str, Any] = {
                     "schema": EXCHANGE_SCHEMA,
                     "event": "tool_result",
                     "ts_ms": event_ms + 3,
-                    "tool_use_id": tool_id,
-                    "tool_name": "bash",
-                    "status": status,
+                    "tool_use_id": tool["id"],
+                    "tool_name": tool["name"],
+                    "status": tool_status,
                     "session_id": session_id,
                     "turn_index": index,
                 }
-                if status == "completed":
-                    result["result"] = f"literal Ω output from turn {index:04d}"
+                if tool_status in ("failed", "denied"):
+                    result["error"] = tool.get("error", f"fixture tool {tool_status} from turn {index:04d}")
                 else:
-                    result["error"] = f"fixture tool {status} from turn {index:04d}"
+                    result["result"] = tool.get("result", f"literal Ω output from turn {index:04d}")
                 events.append(result)
             if status == "interrupted":
                 events.append(
@@ -1320,7 +1437,7 @@ def seed_windowed_catalog(state_dir: Path, workspace: Path, turn_count: int = 10
     trail_path.chmod(0o600)
     metadata = {
         session_id: {
-            "name": "History fixture",
+            "name": session_title,
             "cwd": str(workspace.resolve()),
             "created_at_ms": now_ms,
             "updated_at_ms": now_ms,
@@ -1546,7 +1663,7 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             screen = output.text()
             assert screen.count("First the text, then a verified fixture write.") == 1, screen
             assert screen.count("The write result returned; this is the final text.") == 1, screen
-            assert "Tool completed: write" in screen, screen
+            assert "write · completed · fixture-write.txt" in screen, screen
             status = request_status(status_url)
             assert status["requests"] == 2, status
 
@@ -1583,10 +1700,29 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "The large tool result was returned.")
             drain_for(master_fd, output, 0.25)
             large_tool_screen = output.text()
-            assert "more ch" in large_tool_screen and "aracters]" in large_tool_screen, large_tool_screen
+            assert "bash · completed" in large_tool_screen, large_tool_screen
+            assert "characters]" not in large_tool_screen, large_tool_screen
             assert request_status(status_url)["requests"] == 12
 
-            os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE\x13")
+            os.write(master_fd, b"\x06" + b"12000\r")
+            read_until(master_fd, child, output, "Tool bash · id")
+            os.write(master_fd, b"\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Tool bash · stdout")
+            read_until(master_fd, child, output, "BEGIN_TOOL_OUTPUT")
+            read_until(master_fd, child, output, "bytes below; Shift-PageDown to continue")
+            for _ in range(20):
+                if "END_TOOL_OUTPUT" in output.text():
+                    break
+                os.write(master_fd, b"\x1b[6;2~")
+                drain_for(master_fd, output, 0.1, child)
+            assert "END_TOOL_OUTPUT" in output.text(), output.text()
+            os.write(master_fd, b"\x1b")
+            read_until_not_contains(master_fd, child, output, "Inspector · Up/Down field")
+            os.write(master_fd, b"\x1b[1;5F")
+
+            os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE")
+            read_until(master_fd, child, output, "TRIAL-TUI-LONG-PAUSE")
+            os.write(master_fd, b"\x13")
             read_until(master_fd, child, output, "Long fixture line 090")
             for _ in range(6):
                 screen = output.text()
@@ -1749,16 +1885,18 @@ def run_issue82_trial_coverage_smoke(args: argparse.Namespace) -> None:
 
             os.write(master_fd, b"TRIAL-TOOL-TEXT: inspect this write\x13")
             read_until(master_fd, child, output, "The write result returned; this is the final text.")
-            read_until(master_fd, child, output, "Tool completed: write")
+            read_until(master_fd, child, output, "write · completed · fixture-write.txt")
             read_until(master_fd, child, output, "Succeeded")
             assert (workspace / "fixture-write.txt").read_text(encoding="utf-8") == "fixture-write-ok\n"
-            os.write(master_fd, b"\x1bOS")
+            os.write(master_fd, b"\x1b[1;5A\x1bOS")
+            read_until(master_fd, child, output, "Tool write · id")
+            os.write(master_fd, b"\x1b[B\x1b[B")
             read_until(master_fd, child, output, "Inspector · Up/Down field")
-            os.write(master_fd, b"\x1b[B" * 6)
             read_until(master_fd, child, output, "Tool write · result")
             read_until(master_fd, child, output, "Successfully wrote to")
             os.write(master_fd, b"\x1b")
-            drain_for(master_fd, output, 0.1, child)
+            read_until(master_fd, child, output, "› write · completed · fixture-write.txt")
+            os.write(master_fd, b"\x1b[1;5F")
 
             os.write(master_fd, b"TRIAL-CONTINUE: continue after inspecting the tool\x13")
             read_until(
@@ -2050,13 +2188,13 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Match 1 of 2")
             os.write(master_fd, b"\x15")
             read_until(master_fd, child, output, "Search titles and complete sanitized transcript source.")
-            os.write(master_fd, b"TRIAL-NAV-SEED")
+            os.write(master_fd, b"session-rail-tool-history")
             read_until(master_fd, child, output, "Match 1 of 1")
             os.write(master_fd, b"\r")
             read_until(master_fd, child, output, "Inspector · Up/Down field")
-            assert "TRIAL-NAV-SEED" in output.text(), output.text()
-            os.write(master_fd, b"\x1b[B" * 6)
-            read_until(master_fd, child, output, "Tool bash · result")
+            read_until(master_fd, child, output, "Tool bash · id")
+            os.write(master_fd, b"\x1b[B" * 2)
+            read_until(master_fd, child, output, "Tool bash · stdout")
             read_until(master_fd, child, output, "tool-history")
             before_copy = bytes(output.raw)
             os.write(master_fd, b"\x1b[15~")
@@ -2745,14 +2883,13 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             read_until_fast(master_fd, child, output, "Rows ", timeout=0.2)
             open_elapsed = time.perf_counter() - open_started
             assert open_elapsed <= 0.2, f"opening known 1,000-turn session took {open_elapsed * 1000:.1f} ms"
-            read_until(master_fd, child, output, "history fixture prompt 0999")
-            read_until(master_fd, child, output, "literal Ω output from turn 0999")
+            read_until(master_fd, child, output, "lookup · completed · HIDDEN_UNKNOWN_INPUT")
             statuses = (
-                "Tool completed",
-                "Tool interrupted",
-                "Tool pending",
-                "Tool denied",
-                "Tool failed",
+                "bash · completed",
+                "bash · interrupted",
+                "bash · running",
+                "bash · denied",
+                "bash · failed",
             )
             for status in statuses:
                 for _ in range(6):
@@ -2770,11 +2907,11 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
                     f"history browsing did not reveal {status!r}: {output.text()!r}"
                 )
             os.write(master_fd, b"\x1b[1;5F")
-            read_until(master_fd, child, output, "literal Ω output from turn 0999")
+            read_until(master_fd, child, output, "lookup · completed · HIDDEN_UNKNOWN_INPUT")
             os.write(master_fd, b"\x1b[5~")
-            read_until(master_fd, child, output, "Tool failed")
+            read_until(master_fd, child, output, "bash · failed")
             os.write(master_fd, b"\x1b[1;5F")
-            read_until(master_fd, child, output, "literal Ω output from turn 0999")
+            read_until(master_fd, child, output, "lookup · completed · HIDDEN_UNKNOWN_INPUT")
             row_window = re.search(r"Rows (\d+-\d+ of \d+)", output.text())
             assert row_window, output.text()
 
@@ -2787,6 +2924,7 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             assert time.perf_counter() - inspector_started <= 0.2, "inspector feedback exceeded 200 ms"
 
             os.write(master_fd, b"\x1b[B" * 6)
+            read_until(master_fd, child, output, "Tool bash · stdout")
             read_until(master_fd, child, output, "literal Ω output from turn 0999")
             before_page = output.text()
             previous_window = re.search(r"Rows (\d+-\d+ of \d+)", before_page)
@@ -2822,6 +2960,7 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Match 1 of 1")
             os.write(master_fd, b"\r")
             read_until(master_fd, child, output, "Inspector · Up/Down field")
+            assert "Tool bash · id reused-tool-id · status" in output.text(), output.text()
             assert session_id in json.loads((state_dir / "catalog.json").read_text())["sessions"]
 
             status = drain_until_exit_after_close(
@@ -3022,6 +3161,193 @@ def has_color_styling(output: bytes) -> bool:
         if any(code in color_codes for code in codes):
             return True
     return False
+
+def run_tool_summary_smoke(args: argparse.Namespace) -> None:
+    with tempfile.TemporaryDirectory(prefix="leg-tui-tool-summary-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        state_dir = root / "state"
+        seed_windowed_catalog(
+            state_dir,
+            workspace,
+            turn_count=1,
+            session_title="Tool summary fixture",
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "TERM": "xterm-256color",
+                "LEG_UI_STATE_DIR": str(state_dir),
+                "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+            }
+        )
+        command = [
+            str(Path(args.tui_bin).resolve()),
+            "--leg-bin",
+            str(Path(args.leg_bin).resolve()),
+            "--supervisor-bin",
+            str(Path(args.supervisor_bin).resolve()),
+        ]
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+            read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
+            os.write(master_fd, b"/Tool summary fixture\r\r")
+            read_until(master_fd, child, output, "lookup · completed · HIDDEN_UNKNOWN_INPUT")
+            os.write(master_fd, b"\x1bOS")
+            read_until(master_fd, child, output, "Inspector · Up/Down field")
+            os.write(master_fd, b"\x1bOS")
+            read_until_not_contains(master_fd, child, output, "Inspector · Up/Down field")
+
+            resize_pty(slave_fd, 24, 80)
+            drain_for(master_fd, output, 0.2, child)
+            screen_80 = terminal_screen_text(bytes(output.raw), 24, 80)
+            for summary in (
+                "bash · exit 7 · check nonzero status",
+                "read · completed · history.txt · offset 2 · limit 3",
+                "edit · completed · edit.txt",
+                "lookup · completed · HIDDEN_UNKNOWN_INPUT",
+            ):
+                assert any(summary in line for line in screen_80.splitlines()), (
+                    f"80-column tool row wrapped or disappeared: {summary!r}: {screen_80!r}"
+                )
+            compare_workbench_capture(
+                "tool-summary-80x24.txt",
+                screen_80,
+                getattr(args, "update_workbench_captures", False),
+            )
+            resize_pty(slave_fd, 40, 120)
+            drain_for(master_fd, output, 0.2, child)
+            screen_120 = terminal_screen_text(bytes(output.raw), 40, 120)
+            for summary in (
+                "bash · exit 7 · check nonzero status",
+                "bash · completed · malformed envelope",
+                "bash · completed · unknown envelope",
+                "read · completed · history.txt · offset 2 · limit 3",
+                "edit · completed · edit.txt",
+                "bash · denied · blocked command",
+                "write · missing result · missing-result.txt",
+                "lookup · completed · HIDDEN_UNKNOWN_INPUT",
+            ):
+                assert summary in screen_120, f"tool summary omitted {summary!r}: {screen_120!r}"
+            assert "bash-exit-7" not in screen_120, screen_120
+            compare_workbench_capture(
+                "tool-summary-120x40.txt",
+                screen_120,
+                getattr(args, "update_workbench_captures", False),
+            )
+
+            os.write(master_fd, b"\x1b[1;5A")
+            read_until(master_fd, child, output, "› lookup · completed · HIDDEN_UNKNOWN_INPUT")
+            os.write(master_fd, b"\x1bOS")
+            read_until(master_fd, child, output, "Tool lookup · id unknown-tool · status")
+            os.write(master_fd, b"\x1b")
+            read_until(master_fd, child, output, "› lookup · completed · HIDDEN_UNKNOWN_INPUT")
+            os.write(master_fd, b"\x1b[1;5A")
+            read_until(master_fd, child, output, "› write · missing result · missing-result.txt")
+            os.write(master_fd, b"\x1bOS")
+            read_until(master_fd, child, output, "Tool write · id missing-result · status")
+            assert "missing result" in output.text(), output.text()
+            os.write(master_fd, b"\x1b")
+            read_until(master_fd, child, output, "› write · missing result · missing-result.txt")
+            os.write(master_fd, b"\x1b[1;5B")
+            read_until(master_fd, child, output, "› lookup · completed · HIDDEN_UNKNOWN_INPUT")
+            assert "Alpha draft survives session changes" in output.text(), output.text()
+
+            os.write(master_fd, b"\x06" + "HIDDEN_BASH_STDOUT_Ω\r".encode())
+            read_until(master_fd, child, output, "Tool bash · id bash-exit-7 · status")
+            os.write(master_fd, b"\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Tool bash · stdout")
+            assert "HIDDEN_BASH_STDOUT_Ω" in output.text(), output.text()
+            before_copy = bytes(output.raw)
+            os.write(master_fd, b"\x1b[15~")
+            drain_for(master_fd, output, 0.1, child)
+            assert b"\x1b]52;c;" in bytes(output.raw[len(before_copy) :]), (
+                "F5 did not copy the readable bash stdout field"
+            )
+            os.write(master_fd, b"\x1b[18~")
+            read_until(master_fd, child, output, "Save copied text to:")
+            os.write(master_fd, b"\r")
+            readable_copy = workspace / "leg-copy.txt"
+            read_until(master_fd, child, output, "Saved ")
+            assert readable_copy.read_text(encoding="utf-8") == "HIDDEN_BASH_STDOUT_Ω"
+
+            os.write(master_fd, b"\x1b[B" * 6)
+            read_until(master_fd, child, output, "Tool bash · result (literal)")
+            assert '"exit_code": 7' in output.text(), output.text()
+            os.write(master_fd, b"\x1b[15~")
+            read_until(master_fd, child, output, "Clipboard request sent")
+            os.write(master_fd, b"\x1b[18~")
+            read_until(master_fd, child, output, "Save copied text to:")
+            os.write(master_fd, b"\x15leg-result.txt\r")
+            raw_copy = workspace / "leg-result.txt"
+            read_until(master_fd, child, output, "Saved ")
+            raw_value = raw_copy.read_text(encoding="utf-8")
+            assert '"exit_code": 7' in raw_value and "HIDDEN_BASH_STDOUT_Ω" in raw_value
+
+            os.write(master_fd, b"\x06HIDDEN_UNKNOWN_INPUT\r")
+            read_until(master_fd, child, output, "Tool lookup · id unknown-tool · status")
+            os.write(master_fd, b"\x1b[B")
+            read_until(master_fd, child, output, "Tool lookup · input")
+            assert "HIDDEN_UNKNOWN_INPUT" in output.text(), output.text()
+
+            os.write(master_fd, b"\x06READ_OUTPUT_SENTINEL\r")
+            read_until(master_fd, child, output, "Tool read · id read-output · status")
+            os.write(master_fd, b"\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Tool read · result")
+            assert "READ_OUTPUT_SENTINEL" in output.text(), output.text()
+            assert "stdout" not in output.text(), output.text()
+
+            os.write(master_fd, b"\x06malformed envelope\r")
+            read_until(master_fd, child, output, "Tool bash · id bash-malformed · status")
+            os.write(master_fd, b"\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Tool bash · result")
+            assert '{"status":"exited","exit_code":0,"stdout":' in output.text()
+            assert "Tool bash · stdout" not in output.text()
+
+            os.write(master_fd, b"\x06unknown envelope\r")
+            read_until(master_fd, child, output, "Tool bash · id bash-unknown-envelope · status")
+            os.write(master_fd, b"\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Tool bash · result")
+            assert '"status": "future"' in output.text(), output.text()
+            assert "Tool bash · stdout" not in output.text()
+
+            os.write(master_fd, b"\x06truncated output\r")
+            read_until(master_fd, child, output, "Tool bash · id bash-truncated · status")
+            os.write(master_fd, b"\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Tool bash · stdout")
+            assert "120 bytes omitted" in output.text(), output.text()
+            os.write(master_fd, b"\x1b[B" * 4)
+            read_until(master_fd, child, output, "Tool bash · stdout_omitted_bytes")
+            assert "120" in output.text(), output.text()
+
+            os.write(master_fd, b"\x06hook denied\r")
+            read_until(master_fd, child, output, "Tool bash · id denied-call · status")
+            assert "denied" in output.text(), output.text()
+
+            os.write(master_fd, b"\x06edit.txt\r")
+            read_until(master_fd, child, output, "Tool edit · id edit-diff · status")
+            os.write(master_fd, b"\x1b[B\x1b[B")
+            read_until(master_fd, child, output, "Tool edit · diff")
+            assert "... [diff truncated: 2 more lines]" in output.text(), output.text()
+
+            os.write(master_fd, b"\x03")
+            status = drain_until_exit(master_fd, child, output)
+            assert status == 0, f"TUI exit status was {status}"
+            assert_terminal_restored(bytes(output.raw), master_fd, initial_termios, child)
+            master_fd = slave_fd = None
+            child = None
+        finally:
+            if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+
 
 def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
     repository = Path(__file__).resolve().parents[2]
@@ -3527,15 +3853,25 @@ def main() -> None:
         help="run the adaptive layout and background Stop PTY checks",
     )
     parser.add_argument(
+        "--tool-summary-only",
+        action="store_true",
+        help="run focused tool summary/detail PTY checks and captures",
+    )
+    parser.add_argument(
         "--update-workbench-captures",
         action="store_true",
         help="rewrite the checked-in 80x24 and 120x40 screen captures",
     )
     args = parser.parse_args()
+    if args.tool_summary_only:
+        run_tool_summary_smoke(args)
+        print("leg-tui compact tool summary PTY checks passed")
+        return
     if args.workbench_only:
         test_terminal_screen_redraw()
         if sys.platform == "linux":
             run_smoke(args)
+        run_tool_summary_smoke(args)
         run_resize_and_non_tty_smoke(args)
         run_session_navigation_smoke(args)
         if args.web_bin:
@@ -3564,6 +3900,7 @@ def main() -> None:
     run_background_session_busy_smoke(args)
     run_background_stop_chooser_smoke(args)
     run_windowed_history_smoke(args)
+    run_tool_summary_smoke(args)
     run_resize_and_non_tty_smoke(args)
     run_signal_smoke(args)
     run_color_policy_smoke(args)

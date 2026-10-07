@@ -169,8 +169,13 @@ impl TranscriptTurn {
                     .map(|text| Value::String(text.clone()));
                 activity.error = result.error.as_deref().map(terminal_safe_text);
                 activity.result_timestamp_ms = result.timestamp_ms;
-            } else if turn.outcome == TrailOutcome::Interrupted {
-                activity.status = "interrupted".to_string();
+            } else {
+                activity.status = match turn.outcome {
+                    TrailOutcome::Interrupted => "interrupted",
+                    TrailOutcome::Incomplete => "running",
+                    _ => "missing_result",
+                }
+                .to_string();
             }
             ensure_tool_part(round, &tool.tool_use_id);
         }
@@ -473,27 +478,74 @@ impl TranscriptTurn {
                 if let Some(tool) = round.tools.get(id) {
                     let name = terminal_safe_text(&tool.name);
                     fields.push((
-                        format!("Tool {name} · id {id} · status"),
-                        terminal_safe_text(&tool.status),
+                        terminal_safe_text(&format!("Tool {name} · id {id} · status")),
+                        terminal_safe_text(&tool.display_status()),
                     ));
                     let argument_label = tool.timestamp_ms.map_or_else(
-                        || format!("Tool {name} · arguments"),
-                        |timestamp| format!("Tool {name} · arguments (Unix ms {timestamp})"),
+                        || format!("Tool {name} · input"),
+                        |timestamp| format!("Tool {name} · input (Unix ms {timestamp})"),
                     );
                     fields.push((argument_label, terminal_safe_text(&value_text(&tool.input))));
-                    if let Some(result) = &tool.result {
+                    if let Some(error) = &tool.error {
+                        fields.push((format!("Tool {name} · error"), terminal_safe_text(error)));
+                    } else if let Some(result) = &tool.result {
                         let result_label = tool.result_timestamp_ms.map_or_else(
                             || format!("Tool {name} · result"),
                             |timestamp| format!("Tool {name} · result (Unix ms {timestamp})"),
                         );
-                        fields.push((result_label, terminal_safe_text(&value_text(result))));
-                    }
-                    if let Some(error) = &tool.error {
-                        fields.push((format!("Tool {name} · error"), terminal_safe_text(error)));
-                    } else if tool.result.is_none() {
+                        let result_text = value_text(result);
+                        if tool.name == "bash"
+                            && let Some(decoded) = decoded_bash_result(result)
+                        {
+                            fields.push((
+                                format!("Tool {name} · stdout"),
+                                terminal_safe_text(&decoded.stdout),
+                            ));
+                            fields.push((
+                                format!("Tool {name} · stderr"),
+                                terminal_safe_text(&decoded.stderr),
+                            ));
+                            fields.push((
+                                format!("Tool {name} · exit_code"),
+                                decoded.exit_code.to_string(),
+                            ));
+                            fields.push((
+                                format!("Tool {name} · status"),
+                                terminal_safe_text(&decoded.status),
+                            ));
+                            if let Some(bytes) = decoded.stdout_omitted_bytes {
+                                fields.push((
+                                    format!("Tool {name} · stdout_omitted_bytes"),
+                                    bytes.to_string(),
+                                ));
+                            }
+                            if let Some(bytes) = decoded.stderr_omitted_bytes {
+                                fields.push((
+                                    format!("Tool {name} · stderr_omitted_bytes"),
+                                    bytes.to_string(),
+                                ));
+                            }
+                            fields.push((
+                                format!("Tool {name} · result (literal)"),
+                                terminal_safe_text(&result_text),
+                            ));
+                        } else {
+                            let label =
+                                if tool.name == "edit" && contains_unified_diff(&result_text) {
+                                    format!("Tool {name} · diff")
+                                } else {
+                                    result_label
+                                };
+                            fields.push((label, terminal_safe_text(&result_text)));
+                        }
+                    } else {
                         fields.push((
                             format!("Tool {name} · outcome"),
-                            "No result record was written for this call.".to_string(),
+                            if tool.status == "interrupted" {
+                                "Call was interrupted before a result was recorded.".to_string()
+                            } else {
+                                "No result record was written for this call.".to_string()
+                            },
                         ));
                     }
                 }
@@ -506,6 +558,15 @@ impl TranscriptTurn {
             ));
         }
         fields
+    }
+
+    pub fn tool_detail_field_index(&self, round_index: u64, tool_use_id: &str) -> Option<usize> {
+        let tool = self.rounds.get(&round_index)?.tools.get(tool_use_id)?;
+        let status_label =
+            terminal_safe_text(&format!("Tool {} · id {tool_use_id} · status", tool.name));
+        self.detail_fields()
+            .iter()
+            .position(|(label, _)| label == &status_label)
     }
 
     pub fn export_value(&self, fallback_index: u64) -> Value {
@@ -670,6 +731,9 @@ impl TranscriptTurn {
         activity.name = terminal_safe_text(tool_name);
         activity.input = input.clone();
         activity.timestamp_ms = Some(now_ms());
+        if activity.result.is_none() && activity.error.is_none() {
+            activity.status = "running".to_string();
+        }
         ensure_tool_part(round, tool_use_id);
         true
     }
@@ -743,6 +807,20 @@ impl TranscriptTurn {
         self.outcome = Some(terminal_safe_text(outcome));
         self.failure = failure.map(terminal_safe_text);
         self.outcome_timestamp_ms = Some(now_ms());
+        for round in self.rounds.values_mut() {
+            for tool in round.tools.values_mut() {
+                if tool.result.is_none()
+                    && tool.error.is_none()
+                    && matches!(tool.status.as_str(), "pending" | "running")
+                {
+                    tool.status = if outcome == "interrupted" {
+                        "interrupted".to_string()
+                    } else {
+                        "missing_result".to_string()
+                    };
+                }
+            }
+        }
     }
 
     pub fn set_completion_warning(&mut self, warning: &str) {
@@ -807,31 +885,140 @@ impl TextBlock {
 
 impl ToolActivity {
     fn render(&self) -> String {
-        if let Some(error) = &self.error {
-            format!(
-                "Tool {}: {} — {}",
-                self.status,
-                self.name,
-                compact_summary(&Value::String(error.clone()))
-            )
-        } else if let Some(result) = &self.result {
-            format!(
-                "Tool {}: {} — {}",
-                self.status,
-                self.name,
-                compact_summary(result)
-            )
-        } else if self.input.is_null() {
-            format!("Tool {}: {} (no result recorded)", self.status, self.name)
-        } else {
-            format!(
-                "Tool {}: {} — {}",
-                self.status,
-                self.name,
-                compact_summary(&self.input)
-            )
+        let state = self.display_status();
+        let summary = match self.name.as_str() {
+            "read" => self
+                .input_string("path")
+                .map(|path| {
+                    let offset = self.input.get("offset").and_then(Value::as_u64);
+                    let limit = self.input.get("limit").and_then(Value::as_u64);
+                    match (offset, limit) {
+                        (Some(offset), Some(limit)) => {
+                            format!("{path} · offset {offset} · limit {limit}")
+                        }
+                        (Some(offset), None) => format!("{path} · offset {offset}"),
+                        (None, Some(limit)) => format!("{path} · limit {limit}"),
+                        (None, None) => path.to_string(),
+                    }
+                })
+                .unwrap_or_else(|| self.generic_input_summary()),
+            "write" | "edit" => self
+                .input_string("path")
+                .map(str::to_string)
+                .unwrap_or_else(|| self.generic_input_summary()),
+            "bash" => self
+                .input_string("description")
+                .filter(|description| !description.trim().is_empty())
+                .or_else(|| self.input_string("command"))
+                .map(str::to_string)
+                .unwrap_or_else(|| self.generic_input_summary()),
+            _ => self
+                .first_string_input()
+                .map(str::to_string)
+                .unwrap_or_else(|| "tool call".to_string()),
+        };
+        format!(
+            "{} · {} · {}",
+            one_line(&terminal_safe_text(&self.name)),
+            one_line(&state),
+            one_line(&terminal_safe_text(&summary)),
+        )
+    }
+
+    fn display_status(&self) -> String {
+        if self.status == "completed"
+            && self.name == "bash"
+            && let Some(result) = self.result.as_ref().and_then(decoded_bash_result)
+        {
+            if result.status == "timed_out" {
+                return format!("timed out (exit {})", result.exit_code);
+            }
+            if result.exit_code != 0 {
+                return format!("exit {}", result.exit_code);
+            }
+        }
+        match self.status.as_str() {
+            "missing_result" => "missing result".to_string(),
+            status => status.replace('_', " "),
         }
     }
+
+    fn input_string(&self, key: &str) -> Option<&str> {
+        self.input.get(key).and_then(Value::as_str)
+    }
+
+    fn first_string_input(&self) -> Option<&str> {
+        self.input
+            .as_str()
+            .or_else(|| self.input.as_object()?.values().find_map(Value::as_str))
+    }
+
+    fn generic_input_summary(&self) -> String {
+        if self.input.is_null() {
+            "tool call".to_string()
+        } else {
+            compact_summary(&self.input)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BashResultEnvelope {
+    status: String,
+    exit_code: i64,
+    stdout: String,
+    stderr: String,
+    stdout_omitted_bytes: Option<u64>,
+    stderr_omitted_bytes: Option<u64>,
+}
+
+fn decoded_bash_result(value: &Value) -> Option<BashResultEnvelope> {
+    let parsed = match value {
+        Value::Object(_) => None,
+        Value::String(text) => Some(serde_json::from_str::<Value>(text).ok()?),
+        _ => return None,
+    };
+    let envelope = parsed.as_ref().unwrap_or(value);
+    let object = envelope.as_object()?;
+    let status = object.get("status")?.as_str()?;
+    if !matches!(status, "exited" | "timed_out") {
+        return None;
+    }
+    let omitted_bytes = |key: &str| -> Option<Option<u64>> {
+        match object.get(key) {
+            None => Some(None),
+            Some(value) => value.as_u64().map(Some),
+        }
+    };
+    let stdout_omitted_bytes = omitted_bytes("stdout_omitted_bytes")?;
+    let stderr_omitted_bytes = omitted_bytes("stderr_omitted_bytes")?;
+    Some(BashResultEnvelope {
+        status: status.to_string(),
+        exit_code: object.get("exit_code")?.as_i64()?,
+        stdout: object.get("stdout")?.as_str()?.to_string(),
+        stderr: object.get("stderr")?.as_str()?.to_string(),
+        stdout_omitted_bytes,
+        stderr_omitted_bytes,
+    })
+}
+
+fn contains_unified_diff(text: &str) -> bool {
+    let mut found_old_header = false;
+    let mut found_new_header = false;
+    for line in text.lines() {
+        if line.starts_with("--- ") {
+            found_old_header = true;
+        } else if found_old_header && line.starts_with("+++ ") {
+            found_new_header = true;
+        } else if found_old_header && found_new_header && line.starts_with("@@") {
+            return true;
+        }
+    }
+    false
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn ensure_tool_part(round: &mut TranscriptRound, id: &str) {
@@ -929,9 +1116,9 @@ mod tests {
         assert_eq!(rendered.matches("Second round text.").count(), 1);
         assert_eq!(rendered.matches("Authoritative final.").count(), 1);
         assert!(!rendered.contains("provisional final"));
-        let first_tool = rendered.find("Tool completed: read").unwrap();
+        let first_tool = rendered.find("read · completed · one").unwrap();
         let second_text = rendered.find("Second round text.").unwrap();
-        let second_tool = rendered.find("Tool completed: lookup").unwrap();
+        let second_tool = rendered.find("lookup · completed · two").unwrap();
         let final_text = rendered.find("Authoritative final.").unwrap();
         assert!(rendered.find("First round text.").unwrap() < first_tool);
         assert!(first_tool < second_text && second_text < second_tool && second_tool < final_text);
@@ -957,10 +1144,10 @@ mod tests {
         let rendered = transcript.lines().join("\n");
 
         assert!(rendered.contains("Assistant: before tool"));
-        assert!(rendered.contains("Tool completed: read"));
+        assert!(rendered.contains("read · completed · x"));
         assert!(!rendered.contains('\u{1b}'));
         assert!(!rendered.contains("secret title"));
-        assert!(rendered.contains("more characters"));
+        assert!(!rendered.contains(&"x".repeat(1_000)));
         assert!(rendered.len() < 600);
     }
 
@@ -1010,7 +1197,7 @@ mod tests {
         assert!(rendered.contains("Unix ms 120"));
         assert!(rendered.contains("completed"));
         assert!(rendered.contains("denied"));
-        assert!(rendered.contains("pending"));
+        assert!(rendered.contains("missing result"));
         assert!(rendered.contains("No result record was written"));
         assert!(!rendered.contains('\u{1b}'));
         assert!(transcript.searchable_text().contains("literal output"));
@@ -1067,8 +1254,237 @@ mod tests {
             .map(|(_, value)| value)
             .expect("result field");
         assert_eq!(detail, output);
-        assert!(transcript.lines().join("\n").contains("more characters"));
+        assert!(
+            transcript
+                .lines()
+                .join("\n")
+                .contains("bash · completed · large")
+        );
         assert!(transcript.searchable_text().contains(&output));
+    }
+
+    #[test]
+    fn tool_rows_prioritize_readable_inputs_and_hide_call_ids() {
+        let mut transcript = TranscriptTurn::new("run calls");
+        transcript.observe(&tool_round(
+            0,
+            json!([
+                {"type":"tool_use","id":"same-a","name":"read","input":{"path":"src/main.rs","offset":12,"limit":8}},
+                {"type":"tool_use","id":"same-b","name":"write","input":{"path":"out.txt","content":"written"}},
+                {"type":"tool_use","id":"same-c","name":"edit","input":{"path":"edit.txt","oldString":"old","newString":"new"}},
+                {"type":"tool_use","id":"same-d","name":"bash","input":{"description":"  inspect files  ","command":"find ."}},
+                {"type":"tool_use","id":"same-e","name":"lookup","input":{"query":"find this"}}
+            ]),
+        ));
+        let rows = transcript
+            .source_blocks()
+            .into_iter()
+            .filter(|block| matches!(&block.source_id, TranscriptSourceId::Tool { .. }))
+            .map(|block| block.text)
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("read · pending · src/main.rs · offset 12 · limit 8"));
+        assert!(rows[1].contains("write · pending · out.txt"));
+        assert!(rows[2].contains("edit · pending · edit.txt"));
+        assert!(rows[3].contains("bash · pending · inspect files"));
+        assert!(rows[4].contains("lookup · pending · find this"));
+        assert!(!rows.iter().any(|row| row.contains("same-")));
+    }
+
+    #[test]
+    fn bash_envelopes_decode_outputs_and_keep_the_literal_result() {
+        let envelope = json!({
+            "wall_time_seconds": 0.25,
+            "status": "exited",
+            "exit_code": 7,
+            "stdout": "out\n... [3 bytes omitted]",
+            "stderr": "err",
+            "stdout_omitted_bytes": 3,
+            "stderr_omitted_bytes": 0
+        });
+        let serialized = envelope.to_string();
+        let decoded = super::decoded_bash_result(&Value::String(serialized.clone()))
+            .expect("core returns a JSON string envelope");
+        assert_eq!(decoded.status, "exited");
+        assert_eq!(decoded.exit_code, 7);
+        assert_eq!(decoded.stdout_omitted_bytes, Some(3));
+
+        let mut transcript = TranscriptTurn::new("run bash");
+        transcript.observe(&tool_call(
+            0,
+            "bash-id",
+            "bash",
+            json!({"command":"false","description":"check exit status"}),
+        ));
+        transcript.observe(&tool_result(
+            0,
+            "bash-id",
+            "bash",
+            Value::String(serialized.clone()),
+        ));
+        let block = transcript
+            .source_blocks()
+            .into_iter()
+            .find(|block| matches!(&block.source_id, TranscriptSourceId::Tool { .. }))
+            .expect("tool row");
+        assert!(block.text.contains("bash · exit 7 · check exit status"));
+        let fields = transcript.detail_fields();
+        assert!(fields.iter().any(|(label, value)| {
+            label.ends_with("stdout") && value == "out\n... [3 bytes omitted]"
+        }));
+        assert!(
+            fields
+                .iter()
+                .any(|(label, value)| { label.ends_with("stderr") && value == "err" })
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|(label, value)| { label.ends_with("stdout_omitted_bytes") && value == "3" })
+        );
+        assert!(
+            fields.iter().any(|(label, value)| {
+                label.ends_with("result (literal)") && value == &serialized
+            })
+        );
+        assert_eq!(transcript.tool_detail_field_index(0, "bash-id"), Some(2));
+
+        let object_envelope = super::decoded_bash_result(&envelope)
+            .expect("JSON-object fixture envelope also decodes");
+        assert_eq!(object_envelope.exit_code, 7);
+    }
+
+    #[test]
+    fn bash_timeouts_and_unknown_envelopes_are_not_rendered_as_success() {
+        let timeout = json!({
+            "wall_time_seconds": 1.0,
+            "status": "timed_out",
+            "exit_code": 124,
+            "stdout": "partial",
+            "stderr": "",
+            "stdout_omitted_bytes": 0,
+            "stderr_omitted_bytes": 0,
+        });
+        let mut timed_out = TranscriptTurn::new("timeout");
+        timed_out.observe(&tool_call(0, "timeout", "bash", json!({"command":"sleep"})));
+        timed_out.observe(&tool_result(
+            0,
+            "timeout",
+            "bash",
+            Value::String(timeout.to_string()),
+        ));
+        assert!(
+            timed_out
+                .lines()
+                .join("\n")
+                .contains("bash · timed out (exit 124) · sleep")
+        );
+
+        let signal = json!({
+            "wall_time_seconds": 0.01,
+            "status": "exited",
+            "exit_code": 143,
+            "stdout": "",
+            "stderr": "",
+            "stdout_omitted_bytes": 0,
+            "stderr_omitted_bytes": 0,
+        });
+        let mut signaled = TranscriptTurn::new("signal");
+        signaled.observe(&tool_call(
+            0,
+            "signal",
+            "bash",
+            json!({"command":"kill -TERM $$"}),
+        ));
+        signaled.observe(&tool_result(
+            0,
+            "signal",
+            "bash",
+            Value::String(signal.to_string()),
+        ));
+        assert!(
+            signaled
+                .lines()
+                .join("\n")
+                .contains("bash · exit 143 · kill -TERM $$")
+        );
+
+        let unknown = Value::String(
+            r#"{"status":"future","stdout":"keep me","stderr":"","exit_code":0}"#.to_string(),
+        );
+        assert!(super::decoded_bash_result(&unknown).is_none());
+        let mut fallback = TranscriptTurn::new("unknown result");
+        fallback.observe(&tool_call(
+            0,
+            "future",
+            "bash",
+            json!({"command":"inspect"}),
+        ));
+        fallback.observe(&tool_result(0, "future", "bash", unknown.clone()));
+        let fields = fallback.detail_fields();
+        assert!(!fields.iter().any(|(label, _)| label.ends_with("stdout")));
+        assert!(fields.iter().any(|(label, value)| {
+            label.starts_with("Tool bash · result") && value == unknown.as_str().unwrap()
+        }));
+    }
+
+    #[test]
+    fn edit_diff_stays_literal_and_missing_results_are_distinct() {
+        let supplied_diff = "Successfully replaced 1 occurrence.\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n... [diff truncated: 4 more lines]";
+        let mut transcript = TranscriptTurn::new("edit file");
+        transcript.observe(&tool_call(0, "edit", "edit", json!({"path":"file"})));
+        transcript.observe(&tool_result(
+            0,
+            "edit",
+            "edit",
+            Value::String(supplied_diff.to_string()),
+        ));
+        assert!(transcript.detail_fields().iter().any(|(label, value)| {
+            label.starts_with("Tool edit · diff") && value == supplied_diff
+        }));
+
+        let mut no_patch = TranscriptTurn::new("edit without patch");
+        no_patch.observe(&tool_call(0, "no-patch", "edit", json!({"path":"file"})));
+        no_patch.observe(&tool_result(
+            0,
+            "no-patch",
+            "edit",
+            Value::String("edit result without a supplied patch".to_string()),
+        ));
+        assert!(no_patch.detail_fields().iter().any(|(label, value)| {
+            label.starts_with("Tool edit · result")
+                && value == "edit result without a supplied patch"
+        }));
+
+        let mut missing = TranscriptTurn::new("incomplete");
+        missing.observe(&tool_call(0, "lost", "write", json!({"path":"file"})));
+        missing.set_outcome("succeeded", None);
+        let row = missing
+            .source_blocks()
+            .into_iter()
+            .find(|block| matches!(&block.source_id, TranscriptSourceId::Tool { .. }))
+            .expect("tool row");
+        assert!(row.text.contains("write · missing result · file"));
+        assert!(missing.detail_fields().iter().any(|(label, value)| {
+            label.ends_with("outcome") && value.contains("No result record")
+        }));
+
+        let mut denied = TranscriptTurn::new("denied");
+        denied.observe(&tool_call(0, "denied", "bash", json!({"command":"no"})));
+        denied.observe(&StreamEvent::ToolResult {
+            seq: 1,
+            round_index: 0,
+            tool_use_id: "denied".to_string(),
+            tool_name: "bash".to_string(),
+            status: "denied".to_string(),
+            output: Value::String("hook denied".to_string()),
+        });
+        assert!(denied.lines().join("\n").contains("bash · denied · no"));
+        assert!(
+            denied
+                .detail_fields()
+                .iter()
+                .any(|(label, value)| { label.ends_with("error") && value == "hook denied" })
+        );
     }
 
     #[test]

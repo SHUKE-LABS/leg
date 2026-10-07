@@ -287,25 +287,40 @@ background session and show its text state. Returning to it does not submit the
 prompt again.
 
 Ctrl-F searches session titles and the complete sanitized transcript source,
-including assistant text and full tool arguments/results outside the viewport
-or compact tool summary. Up/Down moves between matches; Enter opens the matching
-session at the source row containing the match. Ctrl-U clears the query, and Esc
-closes search. F4 opens the selected turn's inspector. Up/Down selects prompt,
-reply, tool arguments, results, errors, timestamps, and status fields; `[` and
+including assistant text and full tool inputs/results outside the viewport or
+compact tool row. Up/Down moves between matches. Enter opens the matching session
+at the source row; a tool input/output match also opens that exact call's details.
+Ctrl-U clears the query, and Esc closes search. Ctrl-Up/Down focuses the previous
+or next tool row without editing the composer. F4 opens that call's inspector;
+Escape closes it and returns to the same focused row. With no focused tool row,
+F4 keeps its per-turn inspector behavior. Inspector Up/Down selects fields; `[` and
 `]` select a neighboring turn. Long inspector fields can be read with
 Shift-PageUp/Down.
 
-Tool details pair results with the call id inside the same turn. The inspector
-shows completed, failed, denied, pending, and interrupted calls as text, along
-with timestamps, literal arguments and results, missing-result markers, and
-truncation warnings. Tool details use the same terminal-control sanitation as
-the transcript. A failed, interrupted, or incomplete turn is never replayed by
-viewing it.
+Each tool call occupies one elided row at the terminal width, with its text state.
+Rows show the path for `read`, `write`, and `edit`, with `read` offset/limit when
+supplied. Bash rows show its description or command; unknown tools show their
+name and first string input when available. Call IDs stay in details, where they
+pair same-name calls with their own results. Pending, running, completed, failed,
+denied, interrupted, and missing-result states stay distinct. A completed bash
+command with a nonzero decoded exit code shows `exit N`; a timeout is labeled as
+timed out.
 
-F5 requests a terminal OSC 52 copy of the selected inspector field; copying is
-explicit and never executes the text. If the terminal blocks clipboard access,
-F7 saves the selected field to a file. F6 exports transcript data only, without
-catalog metadata or inherited keys, and asks before replacing an existing file.
+The inspector shows the complete sanitized input. Bash JSON result envelopes,
+including the core's JSON-string form, show stdout and stderr separately with
+their exit code, status, and supplied omitted-byte counts. The full literal bash
+result remains available as its own field; malformed or unknown envelopes fall
+back to literal output. Read output stays literal. Supplied edit diffs receive
+addition, removal, and context styling and retain their truncation marker. No
+diff is created for write or missing patch data. All details use the same
+terminal-control sanitation as the transcript. A failed, interrupted, or
+incomplete turn is never replayed by viewing it.
+
+F5 requests a terminal OSC 52 copy of the selected inspector field, including
+readable bash output fields or the full literal input/result; copying is explicit
+and never executes the text. If the terminal blocks clipboard access, F7 saves
+the selected field to a file. F6 exports transcript data only, without catalog
+metadata or inherited keys, and asks before replacing an existing file.
 F1 lists every keyboard action and the retry warning; F2 opens the shorter
 action menu. In the inspector, Ctrl-R offers an explicit retry only for the
 latest failed, interrupted, or incomplete turn. Confirm with Y after reading
@@ -328,9 +343,10 @@ or `Succeeded (truncated)` as text, including when color is disabled. A missing
 terminal outcome is incomplete; forced cleanup is labeled separately from a
 graceful interruption. Streamed text is grouped by round and block, then
 reconciled with the authoritative terminal response so earlier tool rounds stay visible once.
-Tool names and data are shown as text, with large tool output summarized. The
-TUI removes whole ANSI, CSI, and OSC sequences, including sequences split across
-stream deltas, from provider text, tool data, errors, and stderr.
+Tool summaries are bounded to one row, while full output remains navigable in the
+inspector. The TUI removes whole ANSI, CSI, and OSC sequences, including
+sequences split across stream deltas, from provider text, tool data, errors, and
+stderr.
 
 PageUp and PageDown move by visible transcript rows; Ctrl-End follows the newest
 text. The viewport anchors each row to its source message/block and byte offset,
@@ -357,6 +373,13 @@ times against the 200 ms target on the reference machine; catalog loading is
 measured separately. It uses the pinned Python VT parser in
 `companions/leg-tui/tests/requirements.txt`; install that test-only dependency
 in a virtual environment before running it:
+
+The focused `--tool-summary-only` PTY check covers same-name call pairing,
+decoded and nonzero bash results, truncation and literal fallbacks, edit diff,
+denial, missing results, unknown tools, search, copy/save, and the Escape return
+to a focused row. Its 80x24 and 120x40 views are recorded in
+`companions/leg-tui/tests/captures/tool-summary-80x24.txt` and
+`companions/leg-tui/tests/captures/tool-summary-120x40.txt`.
 
 Representative fixture captures are checked in at
 [80x24](../companions/leg-tui/tests/captures/workbench-80x24.txt) and

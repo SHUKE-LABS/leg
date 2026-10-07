@@ -697,9 +697,10 @@ class Fixture:
                 self.check("large_tool_result_returned", True)
                 self.send_stream(handler, [{"type": "text", "text": "The large tool result was returned."}])
             else:
+                command = "printf 'BEGIN_TOOL_OUTPUT\\n'; python3 -c 'print(\"L\" * 12000)'; printf 'END_TOOL_OUTPUT\\n'"
                 self.send_stream(
                     handler,
-                    [{"type": "tool_use", "name": "bash", "input": {"command": "python3 -c 'print(\"L\" * 12000)'"}}],
+                    [{"type": "tool_use", "name": "bash", "input": {"command": command}}],
                     stop_reason="tool_use",
                 )
             return

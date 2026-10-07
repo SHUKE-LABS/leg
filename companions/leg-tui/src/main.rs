@@ -50,8 +50,8 @@ use unicode_width::UnicodeWidthStr;
 const WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
 const WARNING_ACK_KEY: &str = "tui_first_run_warning_acknowledged";
 const HELP: &str =
-    "Ctrl-S send · F3 sessions · F4 inspect · F8 rail · F1 help · F2 actions · Ctrl-C stop/exit";
-const NARROW_HELP: &str = "Ctrl-S send · F3 sessions · F1 help · F2 actions · Ctrl-C stop/exit";
+    "Ctrl-S send · Ctrl-↑/↓ tool rows · F4 inspect · F3 sessions · F1 help · Ctrl-C stop/exit";
+const NARROW_HELP: &str = "Ctrl-↑/↓ tools · F4 inspect · Ctrl-S send · F1 help · Ctrl-C stop/exit";
 const MIN_TERMINAL_COLUMNS: u16 = 80;
 const MIN_TERMINAL_ROWS: u16 = 24;
 const SESSION_RAIL_WIDTH: u16 = 25;
@@ -318,6 +318,7 @@ struct App {
     inspector_field: usize,
     inspector_scroll: usize,
     inspector_scroll_step: usize,
+    focused_tool: Option<TranscriptAnchor>,
     overwrite_export: Option<PathBuf>,
     copy_text: Option<String>,
     terminal_columns: u16,
@@ -573,6 +574,7 @@ impl App {
             inspector_field: 0,
             inspector_scroll: 0,
             inspector_scroll_step: 1,
+            focused_tool: None,
             overwrite_export: None,
             copy_text: None,
             terminal_columns: MIN_TERMINAL_COLUMNS,
@@ -806,19 +808,16 @@ impl App {
             .unwrap_or_else(|| session_id.to_string());
         if target_key == self.state_key {
             if let Some(index) = turn_index {
-                self.inspector_turn = index.min(self.transcript.len().saturating_sub(1));
-                self.transcript_follow_tail = false;
-                self.transcript_anchor = Some(anchor.unwrap_or(TranscriptAnchor {
-                    turn_index: self.inspector_turn,
+                let turn_index = index.min(self.transcript.len().saturating_sub(1));
+                let anchor = anchor.unwrap_or(TranscriptAnchor {
+                    turn_index,
                     source_id: TranscriptSourceId::Prompt,
                     source_order: 0,
                     byte_offset: 0,
-                }));
-                self.transcript_new_content = false;
-                self.inspector_open = true;
-                self.inspector_field = 0;
-                self.inspector_scroll = 0;
-                self.inspector_scroll_step = 1;
+                });
+                self.open_inspector_at_anchor(turn_index, anchor);
+            } else {
+                self.focused_tool = None;
             }
             self.screen = Screen::Conversation;
             return true;
@@ -842,19 +841,17 @@ impl App {
         self.show_menu = false;
         self.inspector_open = turn_index.is_some();
         if let Some(index) = turn_index {
-            self.inspector_turn = index.min(self.transcript.len().saturating_sub(1));
-            self.transcript_follow_tail = false;
-            self.transcript_anchor = Some(anchor.unwrap_or(TranscriptAnchor {
-                turn_index: self.inspector_turn,
+            let turn_index = index.min(self.transcript.len().saturating_sub(1));
+            let anchor = anchor.unwrap_or(TranscriptAnchor {
+                turn_index,
                 source_id: TranscriptSourceId::Prompt,
                 source_order: 0,
                 byte_offset: 0,
-            }));
-            self.transcript_new_content = false;
+            });
+            self.open_inspector_at_anchor(turn_index, anchor);
+        } else {
+            self.focused_tool = None;
         }
-        self.inspector_field = 0;
-        self.inspector_scroll = 0;
-        self.inspector_scroll_step = 1;
         self.status = if self.turn_status.is_active() {
             "This session's turn is still running in the background; its stream continues here."
                 .to_string()
@@ -862,6 +859,95 @@ impl App {
             session_action_status(&session)
         };
         true
+    }
+
+    fn open_inspector_at_anchor(&mut self, turn_index: usize, anchor: TranscriptAnchor) {
+        self.inspector_open = true;
+        self.inspector_turn = turn_index.min(self.transcript.len().saturating_sub(1));
+        self.transcript_follow_tail = false;
+        self.transcript_anchor = Some(anchor.clone());
+        self.transcript_new_content = false;
+        self.focused_tool =
+            matches!(&anchor.source_id, TranscriptSourceId::Tool { .. }).then_some(anchor);
+        self.inspector_field = self
+            .focused_tool
+            .as_ref()
+            .and_then(|focused| match &focused.source_id {
+                TranscriptSourceId::Tool {
+                    round_index,
+                    tool_use_id,
+                } => self
+                    .transcript
+                    .get(self.inspector_turn)
+                    .and_then(|turn| turn.tool_detail_field_index(*round_index, tool_use_id)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        self.inspector_scroll = 0;
+        self.inspector_scroll_step = 1;
+    }
+
+    fn focus_tool_row(&mut self, direction: isize) {
+        let tools = self
+            .transcript
+            .iter()
+            .enumerate()
+            .flat_map(|(turn_index, turn)| {
+                turn.source_blocks().into_iter().enumerate().filter_map(
+                    move |(source_order, block)| {
+                        matches!(&block.source_id, TranscriptSourceId::Tool { .. }).then_some(
+                            TranscriptAnchor {
+                                turn_index,
+                                source_id: block.source_id,
+                                source_order,
+                                byte_offset: 0,
+                            },
+                        )
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if tools.is_empty() {
+            self.status = "No tool rows in this conversation".to_string();
+            return;
+        }
+
+        let current_index = self.focused_tool.as_ref().and_then(|focused| {
+            tools
+                .iter()
+                .position(|candidate| same_tool_anchor(candidate, focused))
+        });
+        let target_index = if let Some(current_index) = current_index {
+            if direction < 0 {
+                current_index.checked_sub(1)
+            } else {
+                (current_index + 1 < tools.len()).then_some(current_index + 1)
+            }
+        } else if direction < 0 {
+            let current = self.transcript_anchor.as_ref();
+            tools.iter().rposition(|candidate| {
+                current.is_none_or(|anchor| anchor_precedes(candidate, anchor))
+            })
+        } else {
+            let current = self.transcript_anchor.as_ref();
+            tools.iter().position(|candidate| {
+                current.is_none_or(|anchor| anchor_precedes(anchor, candidate))
+            })
+        };
+        let Some(target) = target_index.and_then(|index| tools.get(index)).cloned() else {
+            self.status = if direction < 0 {
+                "No earlier tool rows".to_string()
+            } else {
+                "No later tool rows".to_string()
+            };
+            return;
+        };
+        self.inspector_open = false;
+        self.focused_tool = Some(target.clone());
+        self.transcript_follow_tail = false;
+        self.transcript_anchor = Some(target);
+        self.transcript_new_content = false;
+        self.status = "Tool row focused · Ctrl-Up/Down move · F4 inspect".to_string();
     }
 
     fn create_session(&mut self) {
@@ -1530,6 +1616,14 @@ impl App {
             self.scroll_to_newest();
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Up {
+            self.focus_tool_row(-1);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
+            self.focus_tool_row(1);
+            return;
+        }
         match key.code {
             KeyCode::Esc if self.inspector_open => self.inspector_open = false,
             KeyCode::Esc => self.status = "Composer focused".to_string(),
@@ -1537,11 +1631,17 @@ impl App {
             KeyCode::F(2) => self.show_menu = true,
             KeyCode::F(3) => self.begin_session_picker(),
             KeyCode::F(4) => {
-                self.inspector_open = !self.inspector_open;
-                self.inspector_turn = self.transcript.len().saturating_sub(1);
-                self.inspector_field = 0;
-                self.inspector_scroll = 0;
-                self.inspector_scroll_step = 1;
+                if self.inspector_open {
+                    self.inspector_open = false;
+                } else if let Some(anchor) = self.focused_tool.clone() {
+                    self.open_inspector_at_anchor(anchor.turn_index, anchor);
+                } else {
+                    self.inspector_open = true;
+                    self.inspector_turn = self.transcript.len().saturating_sub(1);
+                    self.inspector_field = 0;
+                    self.inspector_scroll = 0;
+                    self.inspector_scroll_step = 1;
+                }
             }
             KeyCode::F(5) => self.copy_selected_detail(),
             KeyCode::F(6) => self.begin_export(),
@@ -2048,6 +2148,7 @@ impl App {
     fn scroll_to_newest(&mut self) {
         self.transcript_follow_tail = true;
         self.transcript_anchor = None;
+        self.focused_tool = None;
         self.transcript_scroll = 0;
         self.transcript_new_content = false;
     }
@@ -2353,6 +2454,14 @@ struct TranscriptRow {
     anchor: TranscriptAnchor,
 }
 
+fn same_tool_anchor(left: &TranscriptAnchor, right: &TranscriptAnchor) -> bool {
+    left.turn_index == right.turn_index && left.source_id == right.source_id
+}
+
+fn anchor_precedes(left: &TranscriptAnchor, right: &TranscriptAnchor) -> bool {
+    (left.turn_index, left.source_order) < (right.turn_index, right.source_order)
+}
+
 struct RenderRun {
     text: String,
     style: Style,
@@ -2360,10 +2469,20 @@ struct RenderRun {
     tracks_source: bool,
 }
 
+#[cfg(test)]
 fn build_transcript_rows(
     turns: &[TranscriptTurn],
     width: usize,
     use_color: bool,
+) -> Vec<TranscriptRow> {
+    build_transcript_rows_with_focus(turns, width, use_color, None)
+}
+
+fn build_transcript_rows_with_focus(
+    turns: &[TranscriptTurn],
+    width: usize,
+    use_color: bool,
+    focused_tool: Option<&TranscriptAnchor>,
 ) -> Vec<TranscriptRow> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -2412,14 +2531,28 @@ fn build_transcript_rows(
                         push_wrapped_runs(&mut rows, &runs, &anchor, line_offset, width);
                     }
                 }
-                TranscriptBlockKind::Tool => push_wrapped_text_block(
-                    &mut rows,
-                    &block.text,
-                    &anchor,
-                    width,
-                    None,
-                    transcript_style(block.kind, use_color),
-                ),
+                TranscriptBlockKind::Tool => {
+                    let focused = focused_tool
+                        .is_some_and(|focused_tool| same_tool_anchor(&anchor, focused_tool));
+                    let style = transcript_style(block.kind, use_color);
+                    let summary_width = width.saturating_sub(if focused { 2 } else { 0 });
+                    let summary = truncate_to_width(&block.text, summary_width);
+                    let line = if focused {
+                        Line::from(vec![
+                            Span::styled("› ", style.add_modifier(Modifier::REVERSED)),
+                            Span::styled(
+                                summary,
+                                style.add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                            ),
+                        ])
+                    } else {
+                        Line::from(Span::styled(summary, style))
+                    };
+                    rows.push(TranscriptRow {
+                        line,
+                        anchor: anchor.clone(),
+                    });
+                }
                 TranscriptBlockKind::Outcome => push_labeled_text_block(
                     &mut rows,
                     "Outcome: ",
@@ -2445,13 +2578,15 @@ fn build_transcript_rows(
                     transcript_style(block.kind, use_color),
                 ),
             }
-            rows.push(TranscriptRow {
-                line: Line::from(""),
-                anchor: TranscriptAnchor {
-                    byte_offset: block.text.len(),
-                    ..anchor
-                },
-            });
+            if block.kind != TranscriptBlockKind::Tool {
+                rows.push(TranscriptRow {
+                    line: Line::from(""),
+                    anchor: TranscriptAnchor {
+                        byte_offset: block.text.len(),
+                        ..anchor
+                    },
+                });
+            }
         }
     }
     rows
@@ -3403,7 +3538,12 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     let transcript_height = transcript_area.height.saturating_sub(2).max(1) as usize;
     let transcript_len = app.transcript.len();
     let transcript_width = transcript_area.width.saturating_sub(2).max(1) as usize;
-    let rows = build_transcript_rows(&app.transcript, transcript_width, app.use_color);
+    let rows = build_transcript_rows_with_focus(
+        &app.transcript,
+        transcript_width,
+        app.use_color,
+        app.focused_tool.as_ref(),
+    );
     let max_scroll = rows.len().saturating_sub(transcript_height);
     app.transcript_max_scroll = max_scroll;
     app.transcript_page_rows = transcript_height;
@@ -3561,10 +3701,12 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("Enter newline · Ctrl-S send · Ctrl-C stop/exit · Ctrl-Z/Y undo/redo."),
                 Line::from("Left/Right move · Home/End line · Backspace/Delete remove · paste keeps Unicode/newlines."),
                 Line::from("PageUp/Down browse transcript rows · Ctrl-End follows the tail · Esc closes the current overlay."),
+                Line::from("Ctrl-Up/Down focuses the previous/next tool row without editing the composer."),
                 Line::from("F1 help · F2 actions · F3 sessions: / filter · N new · R rename · W workspace · Enter reopen."),
                 Line::from("F8 shows or hides the session rail at 105 columns and wider."),
                 Line::from("F3 picker: S search · Ctrl-F searches titles and complete transcript source · Up/Down move through results."),
-                Line::from("Search: Enter opens at the match · Ctrl-U clears · Esc closes. F4 inspects the current or selected turn."),
+                Line::from("Search: Enter opens the match and matching tool details · Ctrl-U clears · Esc closes."),
+                Line::from("F4 inspects the focused tool call; without a focused row, it toggles the latest turn inspector."),
                 Line::from("Inspector: Up/Down fields · [/] previous/next turn · Shift-PageUp/Down scrolls long fields."),
                 Line::from("F5 copies the selected prompt/reply/code/tool field through terminal OSC 52; it never runs it."),
                 Line::from("If clipboard access is blocked, F7 saves the selected field to a file. F6 exports transcript data only."),
@@ -3585,7 +3727,8 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("Keyboard actions"),
                 Line::from("F3  Browse/create/rename/reopen sessions; slash filters titles."),
                 Line::from("Ctrl-F  Search titles and complete sanitized transcript source."),
-                Line::from("F4  Expand the selected turn's tool inspector."),
+                Line::from("Ctrl-Up/Down  Focus the previous/next tool row without editing the composer."),
+                Line::from("F4  Inspect the focused tool call; without a focused row, toggle the latest turn."),
                 Line::from("Up/Down  Choose inspector field; [/]  Select previous/next turn."),
                 Line::from("F5  Send selected field with terminal OSC 52 clipboard."),
                 Line::from("F7  Save the copied field to a file if clipboard is unavailable."),
@@ -3712,15 +3855,15 @@ fn draw_inspector(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         String::new()
     };
-    let after = if end < value.len() {
+    let after = if page_end < value.len() {
         format!(
             "\n[… {} bytes below; Shift-PageDown to continue …]",
-            value.len() - end
+            value.len() - page_end
         )
     } else {
         String::new()
     };
-    let display = format!("{before}{}{after}", &value[start..end]);
+    let display = format!("{before}{}{after}", &value[start..page_end]);
     let lines = vec![
         Line::from(format!(
             "Turn {} · field {} of {}",
@@ -3732,9 +3875,11 @@ fn draw_inspector(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Line::from(""),
     ];
     let mut lines = lines;
-    lines.extend(wrap_transcript(
-        &sanitize::terminal_safe_text(&display),
+    lines.extend(wrap_inspector_value(
+        &display,
         width,
+        label.ends_with(" · diff"),
+        app.use_color,
     ));
     frame.render_widget(
         Paragraph::new(lines)
@@ -3746,6 +3891,54 @@ fn draw_inspector(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn wrap_inspector_value(
+    value: &str,
+    width: usize,
+    is_edit_diff: bool,
+    use_color: bool,
+) -> Vec<Line<'static>> {
+    let safe = sanitize::terminal_safe_text(value);
+    let mut diff_started = false;
+    let mut rows = Vec::new();
+    for logical_line in safe.split('\n') {
+        if is_edit_diff && logical_line.starts_with("--- ") {
+            diff_started = true;
+        }
+        let style = if is_edit_diff && diff_started {
+            edit_diff_line_style(logical_line, use_color)
+        } else {
+            Style::default()
+        };
+        for mut row in wrap_transcript(logical_line, width) {
+            row.style = style;
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn edit_diff_line_style(line: &str, use_color: bool) -> Style {
+    let (color, modifier) = if line.starts_with("... [diff truncated:") {
+        (Color::Yellow, Modifier::BOLD | Modifier::UNDERLINED)
+    } else if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@") {
+        (Color::Cyan, Modifier::BOLD)
+    } else if line.starts_with('+') {
+        (Color::Green, Modifier::BOLD)
+    } else if line.starts_with('-') {
+        (Color::Red, Modifier::UNDERLINED)
+    } else if line.starts_with(' ') {
+        (Color::Blue, Modifier::DIM)
+    } else {
+        (Color::Reset, Modifier::empty())
+    };
+    let style = if use_color {
+        Style::default().fg(color)
+    } else {
+        Style::default()
+    };
+    style.add_modifier(modifier)
 }
 
 fn session_state_label(session: &CatalogSession) -> &'static str {
@@ -4001,9 +4194,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        TranscriptAnchor, TurnStatus, build_transcript_rows, find_case_insensitive,
-        find_transcript_anchor_row, response_stop_reason, restored_draft, should_use_color,
-        successful_status, transcript_page_down_start, transcript_page_up_start, truncate_to_width,
+        TranscriptAnchor, TurnStatus, build_transcript_rows, build_transcript_rows_with_focus,
+        find_case_insensitive, find_transcript_anchor_row, response_stop_reason, restored_draft,
+        same_tool_anchor, should_use_color, successful_status, transcript_page_down_start,
+        transcript_page_up_start, truncate_to_width,
     };
     use unicode_width::UnicodeWidthStr;
 
@@ -4126,6 +4320,98 @@ mod tests {
         assert!(colored.contains("open `inline"));
         assert!(monochrome.contains("`inline`"));
         assert!(monochrome.contains("Code block (rust):"));
+    }
+
+    #[test]
+    fn tool_calls_render_as_single_elided_rows_and_focus_has_a_text_marker() {
+        let mut turn = TranscriptTurn::new("tool summary fixture");
+        turn.observe(&StreamEvent::ToolRound {
+            seq: 1,
+            round_index: 0,
+            content: json!([
+                {"type":"tool_use","id":"hidden-read-id","name":"read","input":{"path":"src/非常长的路径.rs","offset":24,"limit":80}},
+                {"type":"tool_use","id":"hidden-bash-id","name":"bash","input":{"description":"inspect fixture output","command":"echo ignored"}},
+                {"type":"tool_use","id":"hidden-unknown-id","name":"lookup","input":{"query":"界".repeat(200)}}
+            ]),
+        });
+        let rows = build_transcript_rows(&[turn.clone()], 78, false)
+            .into_iter()
+            .filter(|row| matches!(&row.anchor.source_id, TranscriptSourceId::Tool { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            let text = row.line.to_string();
+            assert!(!text.contains('\n'));
+            assert!(UnicodeWidthStr::width(text.as_str()) <= 78);
+            assert!(!text.contains("hidden-"));
+        }
+        assert!(
+            rows[0]
+                .line
+                .to_string()
+                .contains("read · pending · src/非常长的路径.rs")
+        );
+        assert!(
+            rows[1]
+                .line
+                .to_string()
+                .contains("bash · pending · inspect fixture output")
+        );
+        assert!(rows[2].line.to_string().ends_with('…'));
+
+        let focused = build_transcript_rows_with_focus(&[turn], 78, false, Some(&rows[1].anchor));
+        let focused = focused
+            .iter()
+            .find(|row| same_tool_anchor(&row.anchor, &rows[1].anchor))
+            .expect("focused tool row");
+        let focused_text = focused.line.to_string();
+        assert!(
+            focused_text.starts_with("› bash · pending"),
+            "{focused_text}"
+        );
+        assert!(UnicodeWidthStr::width(focused_text.as_str()) <= 78);
+    }
+
+    #[test]
+    fn supplied_edit_diff_lines_keep_distinct_styles_without_color() {
+        let diff = "Success\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n context\n... [diff truncated: 2 more lines]";
+        let colored = super::wrap_inspector_value(diff, 80, true, true);
+        let removed = colored
+            .iter()
+            .find(|line| line.to_string() == "-old")
+            .unwrap();
+        let added = colored
+            .iter()
+            .find(|line| line.to_string() == "+new")
+            .unwrap();
+        let context = colored
+            .iter()
+            .find(|line| line.to_string() == " context")
+            .unwrap();
+        let truncated = colored
+            .iter()
+            .find(|line| line.to_string().starts_with("... [diff truncated:"))
+            .unwrap();
+        assert_eq!(removed.style.fg, Some(ratatui::style::Color::Red));
+        assert_eq!(added.style.fg, Some(ratatui::style::Color::Green));
+        assert_eq!(context.style.fg, Some(ratatui::style::Color::Blue));
+        assert!(
+            truncated
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+
+        let monochrome = super::wrap_inspector_value(diff, 80, true, false);
+        let removed = monochrome
+            .iter()
+            .find(|line| line.to_string() == "-old")
+            .unwrap();
+        let added = monochrome
+            .iter()
+            .find(|line| line.to_string() == "+new")
+            .unwrap();
+        assert_ne!(removed.style.add_modifier, added.style.add_modifier);
     }
 
     #[test]
