@@ -379,7 +379,7 @@ export function createSharedRenderer(ui, features) {
     if (session) ui["session-title"].dataset.sessionId = session.id;
     ui["session-title"].textContent = session ? sessionName(session) : "Opening conversation…";
     ui["empty-transcript"].textContent = state.loadingSession ? "Opening conversation…" : "Your conversation will appear here.";
-    ui["empty-transcript"].hidden = false;
+    ui["empty-transcript"].hidden = state.transcriptItems.length > 0;
     const cwd = session?.cwd || "Workspace not set";
     ui["workspace-label"].textContent = cwd;
     ui["workspace-label"].title = cwd;
@@ -656,6 +656,11 @@ export function createSharedRenderer(ui, features) {
       add(item.key, item.assistantKey, "Reply", item.reply);
       add(item.key, item.assistantKey, "Failure details", item.failureMessage);
       add(item.key, item.assistantKey, "Outcome", item.outcome);
+      for (const round of item.toolRounds || []) {
+        for (const block of round.content || []) {
+          if (block?.type === "text") add(item.key, item.assistantKey, "Tool round text", block.text);
+        }
+      }
       for (const [toolIndex, tool] of (item.tools || []).entries()) {
         add(item.key, item.assistantKey, "Tool name", tool.name, toolIndex);
         if (tool.input !== undefined) add(item.key, item.assistantKey, "Tool input", toolLiteralText(tool.input), toolIndex);
@@ -997,34 +1002,98 @@ export function createSharedRenderer(ui, features) {
     const sourceTurn = Number.isSafeInteger(item.turnIndex)
       ? state.snapshot?.session?.turns?.find((turn) => Number(turn.turn_index) === item.turnIndex)
       : null;
-    const signature = JSON.stringify([item.tools, status, item.capped, item.outcome, Boolean(item.active), canRetryTurn(sourceTurn)]);
+    const signature = JSON.stringify([item.tools, item.toolRounds, status, item.capped, item.outcome, Boolean(item.active), canRetryTurn(sourceTurn)]);
     const rendered = messageRenderState.get(article);
-    if (rendered.details === signature) return;
-    rendered.details = signature;
-    for (const detail of article.querySelectorAll(".tool-summary, .tool-inspector, .turn-outcome, .turn-warning, .retry-turn-control")) {
-      detail.remove();
+    if (rendered.details !== signature) {
+      rendered.details = signature;
+      for (const detail of article.querySelectorAll(".tool-round-text, .tool-summary, .tool-inspector, .turn-outcome, .turn-warning, .retry-turn-control")) {
+        detail.remove();
+      }
+      for (const round of item.toolRounds || []) {
+        for (const [blockIndex, block] of (round.content || []).entries()) {
+          if (block?.type !== "text" || typeof block.text !== "string" || !block.text.trim()) continue;
+          const text = document.createElement("div");
+          text.className = "tool-round-text";
+          text.dataset.roundIndex = String(round.roundIndex);
+          text.dataset.blockIndex = String(blockIndex);
+          text.textContent = block.text;
+          article.append(text);
+        }
+      }
+      for (const [toolIndex, tool] of item.tools.entries()) {
+        if (features.toolInspection) appendToolInspector(article, tool, toolIndex);
+        else appendToolSummary(article, tool, toolIndex);
+      }
+      appendOutcome(article, status);
+      if (item.capped) {
+        const warning = document.createElement("p");
+        warning.className = "turn-warning";
+        warning.textContent = "Output capped by Leg. The available reply and tool results are shown above.";
+        article.append(warning);
+      }
+      if (!item.active && ["incomplete", "interrupted", "failed"].includes(item.outcome)) {
+        const warning = document.createElement("p");
+        warning.className = "turn-warning";
+        warning.textContent = item.outcome === "interrupted"
+          ? "Turn interrupted. Tool calls without results are marked Interrupted."
+          : `Turn ${item.outcome}. Tool calls without results are marked Missing outcome.`;
+        article.append(warning);
+      }
+      if (sourceTurn && ["failed", "interrupted"].includes(sourceTurn.outcome)) {
+        appendRetryTurnControl(article, sourceTurn);
+      }
     }
-    for (const [toolIndex, tool] of item.tools.entries()) {
-      if (features.toolInspection) appendToolInspector(article, tool, toolIndex);
-      else appendToolSummary(article, tool);
+    arrangeMessageDetails(article, item);
+  }
+
+  function arrangeMessageDetails(article, item) {
+    const heading = article.querySelector(".message-heading");
+    const body = article.querySelector(".message-content");
+    if (!heading || !body) return;
+
+    const toolNodes = [...article.querySelectorAll(".tool-inspector, .tool-summary")];
+    const toolById = new Map(toolNodes
+      .filter((node) => node.dataset.toolUseId)
+      .map((node) => [node.dataset.toolUseId, node]));
+    const toolByIndex = new Map(toolNodes.map((node) => [Number(node.dataset.toolIndex), node]));
+    const textByKey = new Map([...article.querySelectorAll(".tool-round-text")]
+      .map((node) => [`${node.dataset.roundIndex}:${node.dataset.blockIndex}`, node]));
+    const ordered = [heading];
+    const included = new Set(ordered);
+
+    const add = (node) => {
+      if (node && !included.has(node)) {
+        ordered.push(node);
+        included.add(node);
+      }
+    };
+    const addTool = (id, toolIndex = null) => add(
+      (id && toolById.get(String(id))) || (toolIndex === null ? null : toolByIndex.get(toolIndex)),
+    );
+
+    if ((item.toolRounds || []).length) {
+      for (const round of item.toolRounds) {
+        for (const [blockIndex, block] of (round.content || []).entries()) {
+          if (block?.type === "text") add(textByKey.get(`${round.roundIndex}:${blockIndex}`));
+        }
+        for (const block of round.content || []) {
+          if (block?.type === "tool_use") addTool(block.id);
+        }
+      }
+      for (const [toolIndex, tool] of (item.tools || []).entries()) addTool(tool.id, toolIndex);
+      add(body);
+    } else {
+      add(body);
+      for (const [toolIndex, tool] of (item.tools || []).entries()) addTool(tool.id, toolIndex);
     }
-    appendOutcome(article, status);
-    if (item.capped) {
-      const warning = document.createElement("p");
-      warning.className = "turn-warning";
-      warning.textContent = "Output capped by Leg. The available reply and tool results are shown above.";
-      article.append(warning);
-    }
-    if (!item.active && ["incomplete", "interrupted", "failed"].includes(item.outcome)) {
-      const warning = document.createElement("p");
-      warning.className = "turn-warning";
-      warning.textContent = item.outcome === "interrupted"
-        ? "Turn interrupted. Tool calls without results are marked Interrupted."
-        : `Turn ${item.outcome}. Tool calls without results are marked Missing outcome.`;
-      article.append(warning);
-    }
-    if (sourceTurn && ["failed", "interrupted"].includes(sourceTurn.outcome)) {
-      appendRetryTurnControl(article, sourceTurn);
+
+    for (const node of article.querySelectorAll(".turn-outcome, .turn-warning, .retry-turn-control")) add(node);
+    for (const node of [...article.children]) add(node);
+
+    let current = article.firstElementChild;
+    for (const node of ordered) {
+      if (node === current) current = current.nextElementSibling;
+      else article.insertBefore(node, current);
     }
   }
 
@@ -1069,6 +1138,7 @@ export function createSharedRenderer(ui, features) {
     const card = document.createElement("section");
     card.className = `tool-inspector tool-inspector-${tool.status}`;
     card.dataset.toolIndex = String(toolIndex);
+    card.dataset.toolUseId = String(tool.id || "");
     const disclosureId = `tool-details-${Math.random().toString(36).slice(2)}`;
     const expanded = state.expandedTools.has(tool.identity);
     const button = document.createElement("button");
@@ -1140,9 +1210,11 @@ export function createSharedRenderer(ui, features) {
     article.append(card);
   }
 
-  function appendToolSummary(article, tool) {
+  function appendToolSummary(article, tool, toolIndex) {
     const summary = document.createElement("p");
     summary.className = `tool-summary tool-summary-${tool.status}`;
+    summary.dataset.toolIndex = String(toolIndex);
+    summary.dataset.toolUseId = String(tool.id || "");
     summary.setAttribute("role", "status");
     let outcome = `Tool ${tool.name || "tool"}: ${toolStatusLabel(tool.status)}.`;
     if (["failed", "denied"].includes(tool.status)) {

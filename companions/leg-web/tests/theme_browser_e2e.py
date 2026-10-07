@@ -140,10 +140,14 @@ async def run(
         )
         outcome_id = "sess-151-outcomes"
         readonly_id = "sess-151-readonly"
+        chronological_id = "sess-159-chronological"
         (sessions_dir / f"{outcome_id}.jsonl").write_text(
             common.long_history_fixture(outcome_id, count=5), encoding="utf-8"
         )
         (sessions_dir / f"{readonly_id}.jsonl").write_text("not json\n", encoding="utf-8")
+        (sessions_dir / f"{chronological_id}.jsonl").write_text(
+            common.chronological_history_fixture(chronological_id), encoding="utf-8"
+        )
 
         provider, provider_lines = common.start_process(
             [os.fspath(common.FAKE_PROVIDER), "--scenario", "browser", "--workspace", str(workspace)]
@@ -416,6 +420,44 @@ async def run(
                 expanded_tool = "#messages .transcript-turn[data-turn-index='0'] .tool-disclosure[aria-expanded='true']"
                 await page.locator(expanded_tool).wait_for(state="visible")
                 assert await page.locator(expanded_tool).count() == 1
+
+                await page.locator(
+                    "#session-list button.session-select[data-session-id='" + chronological_id + "']"
+                ).click()
+                await page.wait_for_function(
+                    "id => document.querySelector('#session-title')?.dataset.sessionId === id && "
+                    "document.querySelector('#messages .message-user .message-content')?.textContent === 'CHRONO_SNAPSHOT_PROMPT'",
+                    arg=chronological_id,
+                )
+                assert await page.locator("#empty-transcript").is_hidden()
+                for theme_id in ("default", "fixture"):
+                    await choose_theme(page, theme_id)
+                    order = await page.locator(
+                        "#messages .transcript-turn[data-turn-index='0']"
+                    ).evaluate(
+                        """turn => {
+                          const order = [turn.querySelector('.message-user .message-content')?.textContent.trim()];
+                          const assistant = turn.querySelector('.message-assistant');
+                          for (const node of assistant.children) {
+                            if (node.classList.contains('tool-round-text')) order.push(node.textContent.trim());
+                            else if (node.classList.contains('tool-inspector') || node.classList.contains('tool-summary')) {
+                              order.push(node.dataset.toolUseId);
+                            } else if (node.classList.contains('message-content')) order.push(node.textContent.trim());
+                            else if (node.classList.contains('turn-outcome')) order.push(`outcome:${node.textContent.trim()}`);
+                          }
+                          return order;
+                        }"""
+                    )
+                    assert order == [
+                        "CHRONO_SNAPSHOT_PROMPT",
+                        "CHRONO_ROUND_A",
+                        "fixture-tool-one",
+                        "fixture-tool-two",
+                        "fixture-tool-orphan",
+                        "CHRONO_FINAL_REPLY_R",
+                        "outcome:Succeeded",
+                    ], (theme_id, order)
+                await choose_theme(page, "default")
 
                 # A malformed saved trail is read-only in either view.
                 await page.locator("#session-list button.session-select[data-session-id='" + readonly_id + "']").click()

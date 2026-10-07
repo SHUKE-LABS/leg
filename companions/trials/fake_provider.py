@@ -133,6 +133,7 @@ class Fixture:
             "TRIAL-CROSS-TAB",
             "TRIAL-LOCAL-PROVENANCE",
             "TRIAL-TOOL-TEXT",
+            "TRIAL-CHRONOLOGICAL-ORDER",
             "TRIAL-TUI-MULTI-TOOL",
             "TRIAL-DENIED",
             "TRIAL-FAILED",
@@ -563,6 +564,30 @@ class Fixture:
             else:
                 self.check("multi_tool_results_returned", self.has_tool_result(payload))
                 self.send_stream(handler, [{"type": "text", "text": "Final multi-round text."}])
+            return
+        if marker == "TRIAL-CHRONOLOGICAL-ORDER":
+            if occurrence == 1:
+                self.send_stream(
+                    handler,
+                    [
+                        {"type": "text", "text": "CHRONO_ROUND_A"},
+                        {"type": "tool_use", "name": "bash", "input": {"command": "printf CHRONO_TOOL_ONE"}},
+                    ],
+                    stop_reason="tool_use",
+                )
+            elif occurrence == 2:
+                self.send_stream(
+                    handler,
+                    [{"type": "tool_use", "name": "bash", "input": {"command": "printf CHRONO_TOOL_TWO"}}],
+                    stop_reason="tool_use",
+                )
+            else:
+                self.send_stream(
+                    handler,
+                    [{"type": "text", "text": "CHRONO_FINAL_REPLY_R", "chunks": ["CHRONO_FINAL_REPLY_R"]}],
+                    pause_ms=4000,
+                    marker=marker,
+                )
             return
         if marker == "denied-tool" or marker == "TRIAL-DENIED":
             self.effect("denied-marker.txt", "absent")

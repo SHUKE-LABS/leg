@@ -456,6 +456,8 @@ export function startController(view) {
         model: null,
         active_tool: null,
         tools: [],
+        tool_rounds: [],
+        text_by_round: {},
       };
       state.active = provisional;
       if (pendingPrompt === null) {
@@ -507,18 +509,47 @@ export function startController(view) {
         state.snapshot.session.display["web.turn_metadata"] = metadata;
       }
     } else if (event.event === "text_delta") {
-      state.active.text += event.text || "";
+      const text = event.text || "";
+      state.active.text += text;
+      const roundIndex = Number.isSafeInteger(event.round_index) ? event.round_index : 0;
+      const blockIndex = Number.isSafeInteger(event.block_index) ? event.block_index : 0;
+      state.active.text_by_round ||= {};
+      const roundText = state.active.text_by_round[String(roundIndex)] ||= {};
+      roundText[String(blockIndex)] = (roundText[String(blockIndex)] || "") + text;
+      const round = state.active.tool_rounds?.[roundIndex];
+      if (round && !round.canonical) {
+        round.content = provisionalToolRoundContent(state.active, roundIndex);
+      }
+    } else if (event.event === "tool_round") {
+      const roundIndex = Number.isSafeInteger(event.round_index)
+        ? event.round_index
+        : (state.active.tool_rounds || []).length;
+      state.active.tool_rounds ||= [];
+      state.active.tool_rounds[roundIndex] = {
+        content: Array.isArray(event.content) ? event.content : [],
+        canonical: true,
+      };
     } else if (event.event === "tool_call") {
+      const roundIndex = Number.isSafeInteger(event.round_index) ? event.round_index : 0;
       const tool = {
         tool_use_id: event.tool_use_id,
         tool_name: event.tool_name,
         input: event.input,
         status: "running",
+        round_index: roundIndex,
         call_observed_at_ms: event.observed_at_ms,
       };
       state.active.tools ||= [];
       state.active.tools.push(tool);
       state.active.active_tool = tool;
+      state.active.tool_rounds ||= [];
+      const round = state.active.tool_rounds[roundIndex];
+      if (!round || !round.canonical) {
+        state.active.tool_rounds[roundIndex] = {
+          content: provisionalToolRoundContent(state.active, roundIndex),
+          canonical: false,
+        };
+      }
     } else if (event.event === "tool_result") {
       const tool = [...(state.active.tools || [])].reverse().find((candidate) => candidate.tool_use_id === event.tool_use_id);
       if (tool) {
@@ -530,6 +561,47 @@ export function startController(view) {
     } else if (event.event === "turn_end") {
       state.active.capped = Boolean(event.capped);
     }
+  }
+
+  function provisionalToolRoundContent(active, roundIndex) {
+    const textBlocks = active.text_by_round?.[String(roundIndex)] || {};
+    const content = Object.entries(textBlocks)
+      .sort(([left], [right]) => Number(left) - Number(right))
+      .filter(([, text]) => text)
+      .map(([, text]) => ({ type: "text", text }));
+    for (const tool of active.tools || []) {
+      if (tool.round_index !== roundIndex) continue;
+      content.push({
+        type: "tool_use",
+        id: tool.tool_use_id,
+        name: tool.tool_name,
+        input: tool.input,
+      });
+    }
+    return content;
+  }
+
+  function liveReplyText(active, toolRounds = []) {
+    const text = active?.text || "";
+    const roundText = (toolRounds || [])
+      .flatMap((round) => round.content || [])
+      .filter((block) => block?.type === "text" && typeof block.text === "string")
+      .map((block) => block.text)
+      .join("");
+    if (roundText && text.startsWith(roundText)) return text.slice(roundText.length);
+
+    const textByRound = active?.text_by_round;
+    if (!textByRound || typeof textByRound !== "object" || !Object.keys(textByRound).length) return text;
+    const toolRoundIndices = new Set((toolRounds || []).map((round) => round.roundIndex));
+    const parts = [];
+    for (const [roundIndex, blocks] of Object.entries(textByRound)
+      .sort(([left], [right]) => Number(left) - Number(right))) {
+      if (toolRoundIndices.has(Number(roundIndex))) continue;
+      parts.push(...Object.entries(blocks || {})
+        .sort(([left], [right]) => Number(left) - Number(right))
+        .map(([, text]) => text));
+    }
+    return parts.join("");
   }
 
   function currentStatus() {
@@ -666,23 +738,26 @@ export function startController(view) {
       }
       if (live) activeAttached = true;
       const key = `turn-${turn.turn_index}-user`;
+      const toolRounds = mergeTurnToolRounds(turn, live);
       items.push({
         key,
         assistantKey: `turn-${turn.turn_index}-assistant`,
         turnIndex,
         prompt: turn.prompt || "",
-        reply: live?.text || turn.reply || "",
+        reply: (live ? liveReplyText(live, toolRounds) : "") || turn.reply || "",
         failureMessage: turn.failure_message || "",
         outcome: turn.outcome || "incomplete",
         active: live,
         provider: live?.provider || metadata.provider,
         model: live?.model || metadata.model,
         capped: Boolean(live?.capped || metadata.capped),
+        toolRounds,
         tools: mergeTurnTools({
           sessionId: session.id,
           turnIndex,
           turn,
           live,
+          toolRounds,
           observations: observationsByIndex[String(turn.turn_index)] || {},
         }),
       });
@@ -692,6 +767,7 @@ export function startController(view) {
       const turnIndex = Number.isSafeInteger(state.active.turn_index) ? state.active.turn_index : null;
       const metadata = turnIndex === null ? null : metadataByIndex[String(turnIndex)] || null;
       const observation = turnIndex === null ? {} : observationsByIndex[String(turnIndex)] || {};
+      const toolRounds = mergeTurnToolRounds({ tool_rounds: [] }, state.active);
       items.push({
         key: turnIndex === null
           ? `active-${state.active.turn_id || "current"}-user`
@@ -701,18 +777,20 @@ export function startController(view) {
           : `turn-${turnIndex}-assistant`,
         turnIndex,
         prompt: state.active.prompt || "",
-        reply: state.active.text || "",
+        reply: liveReplyText(state.active, toolRounds),
         failureMessage: "",
         outcome: "incomplete",
         active: state.active,
         provider: state.active.provider || metadata?.provider,
         model: state.active.model || metadata?.model,
         capped: Boolean(state.active.capped || metadata?.capped),
+        toolRounds,
         tools: mergeTurnTools({
           sessionId: session.id,
           turnIndex: turnIndex ?? `active:${state.active.turn_id || "current"}`,
           turn: { tools: [] },
           live: state.active,
+          toolRounds,
           observations: observation,
         }),
       });
@@ -720,7 +798,23 @@ export function startController(view) {
     return items;
   }
 
-  function mergeTurnTools({ sessionId, turnIndex, turn, live, observations }) {
+  function mergeTurnToolRounds(turn, live) {
+    const byIndex = new Map();
+    for (const [roundIndex, content] of (turn.tool_rounds || []).entries()) {
+      if (Array.isArray(content)) byIndex.set(roundIndex, { roundIndex, content });
+    }
+    for (const [roundIndex, entry] of (live?.tool_rounds || []).entries()) {
+      if (!entry) continue;
+      const content = Array.isArray(entry) ? entry : entry.content;
+      if (!Array.isArray(content)) continue;
+      if (Array.isArray(entry) || entry.canonical || !byIndex.has(roundIndex)) {
+        byIndex.set(roundIndex, { roundIndex, content });
+      }
+    }
+    return [...byIndex.values()].sort((left, right) => left.roundIndex - right.roundIndex);
+  }
+
+  function mergeTurnTools({ sessionId, turnIndex, turn, live, toolRounds, observations }) {
     const toolsById = new Map();
     const outcome = turn.outcome || "incomplete";
     const currentlyRunning = Boolean(live && ["starting", "running", "stopping"].includes(live.status));
@@ -776,6 +870,23 @@ export function startController(view) {
         callObservedAt: streamed.call_observed_at_ms ?? previous.callObservedAt,
         resultObservedAt: streamed.result_observed_at_ms ?? previous.resultObservedAt,
       });
+    }
+    for (const round of toolRounds || []) {
+      for (const block of round.content || []) {
+        const id = String(block?.type === "tool_use" ? block.id ?? "" : "");
+        if (!id || toolsById.has(id)) continue;
+        toolsById.set(id, {
+          id,
+          name: block.name || "tool",
+          input: block.input,
+          status: currentlyRunning ? "pending" : "unavailable",
+          output: undefined,
+          error: undefined,
+          callObservedAt: undefined,
+          resultObservedAt: undefined,
+          identity: disclosureKey(sessionId, turnIndex, id),
+        });
+      }
     }
     return [...toolsById.values()];
   }

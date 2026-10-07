@@ -46,6 +46,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .message-content p { margin: .25rem 0; white-space: pre-wrap; }
 .message-content pre { max-width: 100%; overflow: auto; padding: .55rem; border-radius: .4rem; background: #f0edff; }
 .message-content a { color: #5036bd; }
+.tool-round-text { margin: .25rem 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn-outcome, .turn-warning, .tool-summary { margin: .2rem 0; border-radius: .45rem; padding: .4rem .55rem; color: #453568; background: #f3efff; font-size: .82rem; }
 #composer { display: grid; gap: .45rem; }
 #prompt { width: 100%; min-height: 2.8rem; max-height: 40dvh; resize: none; border: 1px solid #aaa4c8; border-radius: .65rem; padding: .65rem; }
