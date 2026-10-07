@@ -995,9 +995,11 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             idle_memory = sampler.values_between(idle_started_ns, time.perf_counter_ns())
 
             _select_session(terminal, "Stream A", target="RESPONSIVENESS-STREAM-A")
+            terminal.write("RESPONSIVENESS-STREAM-A")
             terminal.write("\x13")  # Ctrl-S submits the seeded stream prompt.
             _wait_fixture_requests(fixture_server.fixture, 1)
             _select_session(terminal, "Stream B", target="RESPONSIVENESS-STREAM-B")
+            terminal.write("RESPONSIVENESS-STREAM-B")
             terminal.write("\x13")
             _wait_fixture_requests(fixture_server.fixture, 2)
             _wait_for_both_streams(fixture_server.fixture)
