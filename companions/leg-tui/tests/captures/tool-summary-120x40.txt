@@ -1,23 +1,23 @@
-status: Succeeded  |  Untitled conversation  |  model: anthropic/trial-fixture
+status: Idle  |  Tool summary fixture  |  model: provider default
 workspace: <workspace> · catalog: Ready · <elapsed>
-┌Sessions───────────────┐┌Rows 1-8 of 8────────────────────────────────────────────────────────────────────────────────┐
+┌Sessions───────────────┐┌Rows 1-18 of 18──────────────────────────────────────────────────────────────────────────────┐
 │F3 picker · F8 hide    ││Turn 1                                                                                       │
-│Untitled conversation  ││You: terminal size recovery draft                                                            │
+│Tool summary fixture   ││You: history fixture prompt 0000                                                             │
 │Status: Ready          ││                                                                                             │
+│                       ││bash · completed · echo output from turn 0000                                                │
+│▶ Tool summary fixture ││bash · exit 7 · check nonzero status                                                         │
+│  Ready                ││bash · completed · truncated output                                                          │
+│  Beta fixture         ││bash · completed · malformed envelope                                                        │
+│  Ready                ││bash · completed · unknown envelope                                                          │
+│                       ││read · completed · history.txt · offset 2 · limit 3                                          │
+│                       ││edit · completed · edit.txt                                                                  │
+│                       ││bash · denied · blocked command                                                              │
+│                       ││write · missing result · missing-result.txt                                                  │
+│                       ││lookup · completed · HIDDEN_UNKNOWN_INPUT                                                    │
 │                       ││Assistant                                                                                    │
-│▶ Untitled             ││Fixture ready. This answer came from a local fake provider.                                  │
-│  Ready                ││                                                                                             │
+│                       ││history fixture reply 0000                                                                   │
+│                       ││                                                                                             │
 │                       ││Outcome: succeeded                                                                           │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
-│                       ││                                                                                             │
 │                       ││                                                                                             │
 │                       ││                                                                                             │
 │                       ││                                                                                             │
@@ -35,6 +35,6 @@ workspace: <workspace> · catalog: Ready · <elapsed>
 │                       ││                                                                                             │
 └───────────────────────┘└─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌Composer (Ctrl-S send)────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                                                      │
+│Alpha draft survives session changes                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Ctrl-S send · Ctrl-↑/↓ tool rows · F4 inspect · F3 sessions · F1 help · Ctrl-C stop/exit
+Session reopened. History browsing did not start an exchange.

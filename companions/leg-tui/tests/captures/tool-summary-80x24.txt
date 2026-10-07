@@ -1,0 +1,24 @@
+status: Idle  |  Tool summary …  |  model: provider default
+workspace: <workspace> · catalog: Ready · <elapsed>
+┌Rows 3-18 of 18───────────────────────────────────────────────────────────────┐
+│                                                                              │
+│bash · completed · echo output from turn 0000                                 │
+│bash · exit 7 · check nonzero status                                          │
+│bash · completed · truncated output                                           │
+│bash · completed · malformed envelope                                         │
+│bash · completed · unknown envelope                                           │
+│read · completed · history.txt · offset 2 · limit 3                           │
+│edit · completed · edit.txt                                                   │
+│bash · denied · blocked command                                               │
+│write · missing result · missing-result.txt                                   │
+│lookup · completed · HIDDEN_UNKNOWN_INPUT                                     │
+│Assistant                                                                     │
+│history fixture reply 0000                                                    │
+│                                                                              │
+│Outcome: succeeded                                                            │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Composer (Ctrl-S send)────────────────────────────────────────────────────────┐
+│Alpha draft survives session changes                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+Session reopened. History browsing did not start an exchange.

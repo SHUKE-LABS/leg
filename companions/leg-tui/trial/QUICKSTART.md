@@ -67,8 +67,11 @@ request.
 Enter inserts a newline; Ctrl-S sends. F3 opens session actions at every size.
 The rail stays hidden at 80 columns and appears from 105 columns; F8 toggles it
 when available. The composer grows with the draft, up to four content rows.
-F4 opens the turn inspector; it docks only when the conversation keeps 60
-columns and details keep 36, otherwise Esc closes its overlay.
+Ctrl-Up/Down focuses the previous or next tool row without editing the draft.
+F4 inspects that call; with no focused tool row, it toggles the latest turn
+inspector. Esc returns from tool details to the same focused row. The inspector
+docks only when the conversation keeps 60 columns and details keep 36;
+otherwise it uses an overlay.
 
 Ctrl-C stops the viewed active turn. If the viewed session is idle while other
 TUI turns run, Ctrl-C opens a named Stop chooser: Escape cancels, and Enter
