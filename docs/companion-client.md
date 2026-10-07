@@ -286,13 +286,14 @@ background while another session is viewed. The footer and picker name each
 background session and show its text state. Returning to it does not submit the
 prompt again.
 
-Ctrl-F searches session titles and the displayed prompt, reply, tool arguments,
-and tool output. Up/Down moves between matches, Enter opens the matching session
-and turn, Ctrl-U clears the query, and Esc closes search. F4 opens the selected
-turn's inspector. Up/Down selects prompt, reply, tool arguments, results, errors,
-timestamps, and status fields; `[` and `]` select a neighboring turn. Long
-inspector fields can be read with Shift-PageUp/Down. The transcript stays
-compact, and the visible turn window avoids redrawing the full history.
+Ctrl-F searches session titles and the complete sanitized transcript source,
+including assistant text and full tool arguments/results outside the viewport
+or compact tool summary. Up/Down moves between matches; Enter opens the matching
+session at the source row containing the match. Ctrl-U clears the query, and Esc
+closes search. F4 opens the selected turn's inspector. Up/Down selects prompt,
+reply, tool arguments, results, errors, timestamps, and status fields; `[` and
+`]` select a neighboring turn. Long inspector fields can be read with
+Shift-PageUp/Down.
 
 Tool details pair results with the call id inside the same turn. The inspector
 shows completed, failed, denied, pending, and interrupted calls as text, along
@@ -311,6 +312,15 @@ latest failed, interrupted, or incomplete turn. Confirm with Y after reading
 `Retry sends this prompt again and may repeat tool side effects.` Press N or Esc
 to cancel; Enter does not retry.
 
+User prompts, assistant messages, tool placeholders, outcomes, errors, and
+warnings have separate labels and spacing, including when color is disabled.
+Assistant headings, lists, inline code, and fenced code receive lightweight
+Markdown styling. Code content and indentation stay literal. Unsupported or
+malformed inline syntax stays readable as source, and an unfinished streamed
+fence shows its content as code. Inspector copy/save and transcript export keep
+the sanitized source and original line breaks; Markdown formatting and visual
+wrapping are only for the reader.
+
 The two-row conversation header shows the viewed session title, workspace,
 model, turn state, elapsed time, and active tool when present. It shows Idle,
 Starting, Running, Stopping, Succeeded, Failed, Interrupted, Incomplete, Capped,
@@ -322,24 +332,29 @@ Tool names and data are shown as text, with large tool output summarized. The
 TUI removes whole ANSI, CSI, and OSC sequences, including sequences split across
 stream deltas, from provider text, tool data, errors, and stderr.
 
-PageUp and PageDown scroll the transcript; Ctrl-End follows the newest text.
-New events keep a reader's historical position and mark that newer content is
-available. Wrapped and long lines remain navigable. Sending clears the editor
-for a new draft. On failure, interruption, or incomplete cleanup, the submitted
-prompt returns only when the editor has not changed; a newer editable draft is
-kept. Ctrl-S on the unchanged failed prompt opens an explicit retry confirmation
-with `Retry sends this prompt again and may repeat tool side effects.` Press Y
-to retry or N/Esc to cancel. Enter remains a newline and never retries.
+PageUp and PageDown move by visible transcript rows; Ctrl-End follows the newest
+text. The viewport anchors each row to its source message/block and byte offset,
+so new stream chunks and response reconciliation keep the same reading position
+and show a new-content indication. Resize keeps that source position as wrapping
+changes. Search jumps into the matching block, and long unbroken text wraps
+without splitting graphemes. Sending clears the editor for a new draft. On
+failure, interruption, or incomplete cleanup, the submitted prompt returns only
+when the editor has not changed; a newer editable draft is kept. Ctrl-S on the
+unchanged failed prompt opens an explicit retry confirmation with `Retry sends
+this prompt again and may repeat tool side effects.` Press Y to retry or N/Esc to
+cancel. Enter remains a newline and never retries.
 
-The native Linux/macOS PTY smoke test uses the local fake provider and explicit
-binary paths. It covers 80x24 and 120x40 layouts, responsive rail and inspector,
-resize recovery, signal cleanup, non-TTY startup, color-disabled output, session
-creation/rename/reopen after restart, history search and inspection,
-cross-interface busy rejection, named background Stop selection, draft and
-scroll retention, copy/export confirmation, a 1,000-turn history, composer and
-active-turn workflows, and the delayed Stop regression. The history test
-records open and inspector response times against the 200 ms target on the
-reference machine; catalog loading is measured separately. It uses the pinned Python VT parser in
+Focused Rust rendering/navigation checks use a generated 10,000-line answer
+with a long unbroken Chinese and emoji line. The native Linux/macOS PTY smoke
+test uses the local fake provider and explicit binary paths. It covers 80x24 and
+120x40 layouts, responsive rail and inspector, resize recovery, signal cleanup,
+non-TTY startup, color-disabled output, session creation/rename/reopen after
+restart, history search and inspection, cross-interface busy rejection, named
+background Stop selection, draft and scroll retention, copy/export
+confirmation, a 1,000-turn history, composer and active-turn workflows, and the
+delayed Stop regression. The history test records open and inspector response
+times against the 200 ms target on the reference machine; catalog loading is
+measured separately. It uses the pinned Python VT parser in
 `companions/leg-tui/tests/requirements.txt`; install that test-only dependency
 in a virtual environment before running it:
 

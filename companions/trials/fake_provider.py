@@ -661,11 +661,19 @@ class Fixture:
             )
             return
         if marker == "TRIAL-TUI-LONG-PAUSE":
-            long_text = "\n".join(
+            lines = [
                 f"Long fixture line {i:03d}: preserve this historical row while new content arrives."
                 for i in range(1, 181)
-            ) + "\nEND OF FIXTURE ANSWER"
-            self.send_stream(handler, [{"type": "text", "text": long_text}], pause_ms=1500, marker=marker)
+            ]
+            first_chunk = "\n".join(lines[:90])
+            final_chunk = "\n" + "\n".join(lines[90:]) + "\nEND OF FIXTURE ANSWER"
+            long_text = first_chunk + final_chunk
+            self.send_stream(
+                handler,
+                [{"type": "text", "text": long_text, "chunks": [first_chunk, final_chunk]}],
+                pause_ms=1500,
+                marker=marker,
+            )
             return
         if marker == "TRIAL-TUI-MAX-TOKENS":
             self.send_stream(
