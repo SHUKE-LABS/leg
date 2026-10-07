@@ -36,7 +36,10 @@ impl ClaudeClient<RetryingHttpClient<UreqHttpClient>> {
     /// timeout and retry policy from `config`.
     pub fn from_config(config: LegConfig) -> Self {
         let retry_policy = RetryPolicy::new(config.max_retries, config.retry_base_delay);
-        let http = RetryingHttpClient::new(UreqHttpClient::new(config.timeout), retry_policy);
+        let http = RetryingHttpClient::new(
+            UreqHttpClient::with_timeouts(config.timeout, config.stream_idle_timeout),
+            retry_policy,
+        );
         Self::with_http(config, http)
     }
 }
@@ -896,6 +899,7 @@ mod tests {
             base_url: base_url.to_string(),
             model: model.to_string(),
             timeout: Duration::from_secs(60),
+            stream_idle_timeout: Duration::from_secs(120),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
             max_retries: crate::config::DEFAULT_MAX_RETRIES,
