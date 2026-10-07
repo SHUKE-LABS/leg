@@ -47,6 +47,8 @@ const FIXTURE_THEME_JS: &str = include_str!("assets/themes/fixture.js");
 const FIXTURE_THEME_HTML: &str = include_str!("assets/themes/fixture.html");
 #[cfg(feature = "browser-e2e-themes")]
 const FIXTURE_THEME_CSS: &str = include_str!("assets/themes/fixture.css");
+/// Fixed default so the launch address stays stable across restarts.
+pub const DEFAULT_PORT: u16 = 13579;
 const STORE_NAME: &str = "web-host-state.json";
 const LOCK_NAME: &str = ".leg-web.lock";
 const STORE_VERSION: u32 = 1;
@@ -57,7 +59,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct HostConfig {
-    /// Only `127.0.0.1:0` is accepted. The OS chooses the port.
+    /// Only `127.0.0.1` is accepted. Port `0` asks the OS for a free port.
     pub bind_addr: SocketAddr,
     pub catalog: SessionCatalogConfig,
     pub event_buffer: usize,
@@ -67,7 +69,7 @@ pub struct HostConfig {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT)),
             catalog: SessionCatalogConfig::default(),
             event_buffer: DEFAULT_EVENT_BUFFER,
             receipt_limit: DEFAULT_RECEIPTS,
@@ -78,6 +80,7 @@ impl Default for HostConfig {
 #[derive(Debug)]
 pub enum HostError {
     BindAddress(SocketAddr),
+    PortInUse(SocketAddr),
     Io(io::Error),
     Catalog(CatalogError),
     State(String),
@@ -88,7 +91,11 @@ impl std::fmt::Display for HostError {
         match self {
             Self::BindAddress(addr) => write!(
                 f,
-                "refusing Web bind address {addr}; leg-web requires 127.0.0.1 and an OS-assigned port"
+                "refusing Web bind address {addr}; leg-web binds only 127.0.0.1"
+            ),
+            Self::PortInUse(addr) => write!(
+                f,
+                "{addr} is already in use; pass --bind 127.0.0.1:<port>, or 127.0.0.1:0 for any free port"
             ),
             Self::Io(error) => write!(f, "Web host I/O failed: {error}"),
             Self::Catalog(error) => write!(f, "could not open the shared session catalog: {error}"),
@@ -164,7 +171,13 @@ impl Host {
     }
 
     pub async fn bind(self) -> Result<BoundHost, HostError> {
-        let listener = TcpListener::bind(self.bind_addr).await?;
+        let listener =
+            TcpListener::bind(self.bind_addr)
+                .await
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::AddrInUse => HostError::PortInUse(self.bind_addr),
+                    _ => HostError::Io(error),
+                })?;
         let addr = listener.local_addr()?;
         *lock(&self.state.inner.authority) = Some(authority_for(addr));
         Ok(BoundHost {
@@ -2213,7 +2226,7 @@ fn save_tool_observation(
 }
 
 fn validate_bind_address(addr: SocketAddr) -> Result<(), HostError> {
-    if addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) || addr.port() != 0 {
+    if addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
         return Err(HostError::BindAddress(addr));
     }
     Ok(())
@@ -2606,16 +2619,45 @@ mod tests {
     }
 
     #[test]
-    fn refuses_non_loopback_and_fixed_port_configuration() {
+    fn refuses_non_loopback_configuration() {
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap()).is_err());
-        assert!(validate_bind_address("127.0.0.1:8080".parse().unwrap()).is_err());
+        assert!(validate_bind_address("[::1]:0".parse().unwrap()).is_err());
+        assert!(validate_bind_address("127.0.0.1:8080".parse().unwrap()).is_ok());
         assert!(validate_bind_address("127.0.0.1:0".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn default_bind_is_the_fixed_loopback_port() {
+        assert_eq!(
+            HostConfig::default().bind_addr,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT))
+        );
+    }
+
+    #[tokio::test]
+    async fn occupied_port_reports_a_bind_hint() {
+        let temp = TempDir::new().unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let host = Host::open(HostConfig {
+            bind_addr: addr,
+            catalog: SessionCatalogConfig {
+                state_dir: Some(temp.path().to_path_buf()),
+                ..SessionCatalogConfig::default()
+            },
+            ..HostConfig::default()
+        })
+        .unwrap();
+        let error = host.bind().await.err().unwrap();
+        assert!(matches!(error, HostError::PortInUse(reported) if reported == addr));
+        assert!(error.to_string().contains("--bind 127.0.0.1:"));
     }
 
     #[tokio::test]
     async fn binding_uses_loopback_and_the_os_assigned_port() {
         let temp = TempDir::new().unwrap();
         let host = Host::open(HostConfig {
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             catalog: SessionCatalogConfig {
                 state_dir: Some(temp.path().to_path_buf()),
                 ..SessionCatalogConfig::default()
