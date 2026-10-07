@@ -78,6 +78,32 @@ class TerminalCapture:
         return bytes(self.raw)
 
 
+def transcript_pane_text(screen: str) -> str:
+    lines = screen.splitlines()
+    title_index = next(
+        (index for index, line in enumerate(lines) if re.search(r"Rows (\d+-\d+ of \d+)", line)),
+        None,
+    )
+    if title_index is None:
+        return ""
+    title_line = lines[title_index]
+    rows_match = re.search(r"Rows (\d+-\d+ of \d+)", title_line)
+    assert rows_match is not None
+    pane_start = title_line.rfind("┌", 0, rows_match.start())
+    pane_end = title_line.find("┐", rows_match.end())
+    if pane_start < 0 or pane_end < 0:
+        return ""
+    pane_end += 1
+
+    body = []
+    for line in lines[title_index + 1 :]:
+        pane = line[pane_start:pane_end]
+        if pane.startswith("└"):
+            break
+        body.append(pane)
+    return "\n".join(body)
+
+
 def workspace_path_text(capture: TerminalCapture) -> str | None:
     lines = capture.text().splitlines()
     path_index = next(
@@ -123,6 +149,17 @@ def test_terminal_screen_redraw() -> None:
     wrapped = TerminalCapture(rows=2, columns=6)
     wrapped.feed(b"\x1b[1;1Hfirst second")
     assert wrapped.contains("first second"), wrapped.text()
+
+    transcript = "\n".join(
+        (
+            "┌Sessions┐┌Rows 1-2 of 2┐",
+            "│        ││first      │",
+            "│        ││second     │",
+            "└────────┘└───────────┘",
+        )
+    )
+    assert "first" in transcript_pane_text(transcript)
+    assert "second" in transcript_pane_text(transcript)
 
 
 def read_until(
@@ -197,9 +234,15 @@ def read_until_rows_change(
     timeout: float = 2.0,
 ) -> str:
     deadline = time.monotonic() + timeout
+    previous_body = transcript_pane_text(capture.text())
     while True:
-        match = re.search(r"Rows (\d+-\d+ of \d+)", capture.text())
-        if match and match.group(1) != previous:
+        screen = capture.text()
+        match = re.search(r"Rows (\d+-\d+ of \d+)", screen)
+        if (
+            match
+            and match.group(1) != previous
+            and transcript_pane_text(screen) != previous_body
+        ):
             return match.group(1)
         capture_owned_processes(child)
         if child.poll() is not None:
