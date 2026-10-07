@@ -33,7 +33,7 @@ use leg_ui_client::{
     CatalogRunState, CatalogSession, CatalogTurn, RetryIntent, SessionCatalog,
     SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome, TurnStopHandle,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -56,6 +56,10 @@ const SESSION_RAIL_MIN_COLUMNS: u16 = 105;
 const MIN_DOCKED_CONVERSATION_WIDTH: u16 = 60;
 const MIN_DOCKED_INSPECTOR_WIDTH: u16 = 36;
 const MAX_COMPOSER_CONTENT_ROWS: usize = 4;
+const MAX_TURN_MESSAGES_PER_CYCLE: usize = 64;
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(34);
+const ACTIVE_CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 const SMALL_TERMINAL_REJECTION: &str = "Send rejected: terminal must be at least 80x24.";
 static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -142,28 +146,64 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         app.status = "Choose an existing session or create a new one".to_string();
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let area = terminal.size()?;
+    app.set_terminal_size(area.width, area.height);
+    let started = Instant::now();
+    let mut redraw = RedrawScheduler::default();
+    redraw.request();
 
     while !app.quit {
-        let area = terminal.size()?;
-        app.set_terminal_size(area.width, area.height);
-        terminal.draw(|frame| draw(frame, &mut app))?;
-        app.receive_turn_messages();
+        app.begin_turn_message_cycle();
+        let received_turn_messages = app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
+        if received_turn_messages > 0 {
+            redraw.request();
+        }
         if let Some(signal) = signals.take() {
             app.handle_external_signal(signal);
+            redraw.request();
         }
         if app.quit {
             break;
         }
-        if event::poll(Duration::from_millis(30))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-                Event::Paste(text) => app.handle_paste(&text),
-                Event::Resize(columns, rows) => app.set_terminal_size(columns, rows),
-                _ => {}
+
+        let now = started.elapsed();
+        redraw.update_clock(now, app.turn_status.is_active());
+        if redraw.is_due_after_batch(now, app.turn_messages_this_cycle) {
+            let area = terminal.size()?;
+            app.set_terminal_size(area.width, area.height);
+            draw_terminal(&mut terminal, &mut app)?;
+            redraw.mark_drawn(now);
+            continue;
+        }
+
+        if event::poll(redraw.poll_timeout(now))? {
+            let changed = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.handle_key(key);
+                    true
+                }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                    true
+                }
+                Event::Resize(columns, rows) => {
+                    app.set_terminal_size(columns, rows);
+                    true
+                }
+                _ => false,
+            };
+            if changed {
+                redraw.request();
             }
         }
     }
     app.persist_all_drafts()?;
+    Ok(())
+}
+
+fn draw_terminal<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+    terminal.draw(|frame| draw(frame, app))?;
+    app.render_counters.draws = app.render_counters.draws.saturating_add(1);
     Ok(())
 }
 
@@ -362,8 +402,106 @@ struct App {
     stop_picker_index: usize,
     quit: bool,
     exit_after_turn: bool,
+    render_counters: RenderCounters,
+    turn_messages_this_cycle: usize,
     turn_tx: Sender<TurnMessage>,
     turn_rx: Receiver<TurnMessage>,
+}
+
+#[derive(Default)]
+struct RenderCounters {
+    draws: u64,
+    turn_messages: u64,
+    transcript_turn_rebuilds: u64,
+    transcript_rows_built: u64,
+}
+
+#[derive(Default)]
+struct CachedTranscriptTurn {
+    revision: Option<u64>,
+    width: usize,
+    use_color: bool,
+    row_start: usize,
+    build_count: u64,
+    rows: Vec<TranscriptRow>,
+}
+
+#[derive(Default)]
+struct TranscriptRowsCache {
+    turns: Vec<CachedTranscriptTurn>,
+    total_rows: usize,
+}
+
+#[derive(Default)]
+struct RedrawScheduler {
+    requested: bool,
+    deferred_full_batch: bool,
+    last_draw: Option<Duration>,
+    next_clock_tick: Option<Duration>,
+    draws: u64,
+}
+
+impl RedrawScheduler {
+    fn request(&mut self) {
+        self.requested = true;
+    }
+
+    fn update_clock(&mut self, now: Duration, active: bool) {
+        if !active {
+            self.next_clock_tick = None;
+            return;
+        }
+        let Some(next_tick) = self.next_clock_tick else {
+            self.next_clock_tick = Some(now + ACTIVE_CLOCK_INTERVAL);
+            return;
+        };
+        if now >= next_tick {
+            self.request();
+            let missed_ticks = now.saturating_sub(next_tick).as_secs().saturating_add(1);
+            self.next_clock_tick = Some(next_tick + Duration::from_secs(missed_ticks));
+        }
+    }
+
+    fn poll_timeout(&self, now: Duration) -> Duration {
+        let mut timeout = EVENT_POLL_INTERVAL;
+        if let Some(next_tick) = self.next_clock_tick {
+            timeout = timeout.min(next_tick.saturating_sub(now));
+        }
+        if self.requested {
+            if let Some(last_draw) = self.last_draw {
+                let until_frame = MIN_RENDER_INTERVAL.saturating_sub(now.saturating_sub(last_draw));
+                timeout = timeout.min(until_frame);
+            } else {
+                return Duration::ZERO;
+            }
+        }
+        timeout
+    }
+
+    fn is_due(&self, now: Duration) -> bool {
+        self.requested
+            && self
+                .last_draw
+                .is_none_or(|last_draw| now.saturating_sub(last_draw) >= MIN_RENDER_INTERVAL)
+    }
+
+    fn is_due_after_batch(&mut self, now: Duration, received: usize) -> bool {
+        if !self.is_due(now) {
+            return false;
+        }
+        if received >= MAX_TURN_MESSAGES_PER_CYCLE && !self.deferred_full_batch {
+            self.deferred_full_batch = true;
+            return false;
+        }
+        true
+    }
+
+    fn mark_drawn(&mut self, now: Duration) {
+        self.requested = false;
+        self.deferred_full_batch = false;
+        self.last_draw = Some(now);
+        self.draws = self.draws.saturating_add(1);
+    }
 }
 
 struct ConversationState {
@@ -373,6 +511,7 @@ struct ConversationState {
     session_id: Option<String>,
     composer: ComposerEditor,
     transcript: Vec<TranscriptTurn>,
+    transcript_rows_cache: TranscriptRowsCache,
     status: String,
     active_tool: Option<String>,
     turn_status: TurnStatus,
@@ -454,6 +593,7 @@ impl ConversationState {
             session_id: None,
             composer: ComposerEditor::default(),
             transcript: Vec::new(),
+            transcript_rows_cache: TranscriptRowsCache::default(),
             status: "Choose a workspace".to_string(),
             active_tool: None,
             turn_status: TurnStatus::Idle,
@@ -628,6 +768,8 @@ impl App {
             stop_picker_index: 0,
             quit: false,
             exit_after_turn: false,
+            render_counters: RenderCounters::default(),
+            turn_messages_this_cycle: 0,
             turn_tx,
             turn_rx,
         }
@@ -1540,10 +1682,8 @@ impl App {
                     return;
                 };
 
-                // Drain turn completion messages and refresh process ownership before
-                // dispatch so an entry that went stale while the palette was open
-                // cannot act on the old state.
-                self.receive_turn_messages();
+                // Process a bounded batch before refreshing ownership and dispatching.
+                self.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
                 self.refresh_sessions();
                 if let Some(reason) = self.action_disabled_reason(action) {
                     self.status = reason.clone();
@@ -2333,7 +2473,7 @@ impl App {
     }
 
     fn handle_ctrl_c(&mut self) {
-        self.receive_turn_messages();
+        self.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
         if self.turn_status.is_active() {
             if self.turn_status.is_stopping() {
                 return;
@@ -2357,7 +2497,7 @@ impl App {
     }
 
     fn stop_from_palette(&mut self) {
-        self.receive_turn_messages();
+        self.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
         if self.turn_status.is_active() {
             self.stop_current_session();
             return;
@@ -2753,19 +2893,33 @@ impl App {
         self.transcript_new_content = false;
     }
 
-    fn receive_turn_messages(&mut self) {
-        loop {
+    fn begin_turn_message_cycle(&mut self) {
+        self.turn_messages_this_cycle = 0;
+    }
+
+    fn receive_turn_messages(&mut self, limit: usize) -> usize {
+        let remaining = limit.saturating_sub(self.turn_messages_this_cycle);
+        let mut received = 0;
+        while received < remaining {
             match self.turn_rx.try_recv() {
                 Ok(TurnMessage::Event { owner, event }) => {
                     self.with_conversation(&owner, |app| app.handle_stream_event(event));
+                    received += 1;
                 }
                 Ok(TurnMessage::Finished { owner, result }) => {
                     self.with_conversation(&owner, |app| app.finish_turn(result));
                     self.refresh_sessions();
+                    received += 1;
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
+        self.render_counters.turn_messages = self
+            .render_counters
+            .turn_messages
+            .saturating_add(received as u64);
+        self.turn_messages_this_cycle += received;
+        received
     }
 
     fn with_conversation(&mut self, owner: &str, apply: impl FnOnce(&mut Self)) {
@@ -3052,6 +3206,112 @@ fn format_duration(duration: Duration) -> String {
 struct TranscriptRow {
     line: Line<'static>,
     anchor: TranscriptAnchor,
+}
+
+impl TranscriptRowsCache {
+    fn refresh(
+        &mut self,
+        turns: &[TranscriptTurn],
+        width: usize,
+        use_color: bool,
+    ) -> (usize, usize) {
+        self.turns.truncate(turns.len());
+        self.turns
+            .resize_with(turns.len(), CachedTranscriptTurn::default);
+        let mut rebuilt_turns = 0;
+        let mut built_rows = 0;
+        for (turn_index, turn) in turns.iter().enumerate() {
+            let revision = turn.render_revision();
+            let cached = &mut self.turns[turn_index];
+            if cached.revision != Some(revision)
+                || cached.width != width
+                || cached.use_color != use_color
+            {
+                cached.rows = build_transcript_turn_rows(turn, turn_index, width, use_color);
+                cached.revision = Some(revision);
+                cached.width = width;
+                cached.use_color = use_color;
+                cached.build_count = cached.build_count.saturating_add(1);
+                rebuilt_turns += 1;
+                built_rows += cached.rows.len();
+            }
+        }
+        let mut row_start = 0;
+        for cached in &mut self.turns {
+            cached.row_start = row_start;
+            row_start = row_start.saturating_add(cached.rows.len());
+        }
+        self.total_rows = row_start;
+        (rebuilt_turns, built_rows)
+    }
+
+    fn row_for_anchor(&self, anchor: &TranscriptAnchor) -> Option<usize> {
+        let cached = self.turns.get(anchor.turn_index)?;
+        find_transcript_anchor_row(&cached.rows, anchor)
+            .map(|row_index| cached.row_start + row_index)
+    }
+
+    fn rows_in_range(&self, start: usize, end: usize) -> Vec<&TranscriptRow> {
+        let start = start.min(self.total_rows);
+        let end = end.min(self.total_rows).max(start);
+        let mut rows = Vec::with_capacity(end - start);
+        for cached in &self.turns {
+            let cached_end = cached.row_start + cached.rows.len();
+            let local_start = start
+                .saturating_sub(cached.row_start)
+                .min(cached.rows.len());
+            let local_end = end.saturating_sub(cached.row_start).min(cached.rows.len());
+            if start < cached_end && local_start < local_end {
+                rows.extend(cached.rows[local_start..local_end].iter());
+            }
+        }
+        rows
+    }
+}
+
+fn build_transcript_turn_rows(
+    turn: &TranscriptTurn,
+    turn_index: usize,
+    width: usize,
+    use_color: bool,
+) -> Vec<TranscriptRow> {
+    let mut rows =
+        build_transcript_rows_with_focus(std::slice::from_ref(turn), width, use_color, None);
+    for row in &mut rows {
+        row.anchor.turn_index = turn_index;
+    }
+    if let Some(header) = rows.first_mut() {
+        header.line = Line::from(Span::styled(
+            format!("Turn {}", turn_index + 1),
+            transcript_style(TranscriptBlockKind::Outcome, use_color),
+        ));
+    }
+    rows
+}
+
+fn transcript_row_line(
+    row: &TranscriptRow,
+    focused_tool: Option<&TranscriptAnchor>,
+    width: usize,
+    use_color: bool,
+) -> Line<'static> {
+    if !focused_tool.is_some_and(|focused| same_tool_anchor(&row.anchor, focused)) {
+        return row.line.clone();
+    }
+    let style = transcript_style(TranscriptBlockKind::Tool, use_color);
+    let summary = row
+        .line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    Line::from(vec![
+        Span::styled("› ", style.add_modifier(Modifier::REVERSED)),
+        Span::styled(
+            truncate_to_width(&summary, width.saturating_sub(2)),
+            style.add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        ),
+    ])
 }
 
 fn same_tool_anchor(left: &TranscriptAnchor, right: &TranscriptAnchor) -> bool {
@@ -4138,19 +4398,35 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     let transcript_height = transcript_area.height.saturating_sub(2).max(1) as usize;
     let transcript_len = app.transcript.len();
     let transcript_width = transcript_area.width.saturating_sub(2).max(1) as usize;
-    let rows = build_transcript_rows_with_focus(
-        &app.transcript,
-        transcript_width,
-        app.use_color,
-        app.focused_tool.as_ref(),
-    );
-    let max_scroll = rows.len().saturating_sub(transcript_height);
+    let (rebuilt_turns, built_rows, total_rows) = {
+        let view = &mut app.view;
+        let transcript = &view.transcript;
+        let (rebuilt_turns, built_rows) =
+            view.transcript_rows_cache
+                .refresh(transcript, transcript_width, app.use_color);
+        (
+            rebuilt_turns,
+            built_rows,
+            view.transcript_rows_cache.total_rows,
+        )
+    };
+    app.render_counters.transcript_turn_rebuilds = app
+        .render_counters
+        .transcript_turn_rebuilds
+        .saturating_add(rebuilt_turns as u64);
+    app.render_counters.transcript_rows_built = app
+        .render_counters
+        .transcript_rows_built
+        .saturating_add(built_rows as u64);
+    let max_scroll = total_rows.saturating_sub(transcript_height);
     app.transcript_max_scroll = max_scroll;
     app.transcript_page_rows = transcript_height;
     let start_row = if app.transcript_follow_tail {
         max_scroll
     } else if let Some(anchor) = &app.transcript_anchor {
-        find_transcript_anchor_row(&rows, anchor)
+        app.view
+            .transcript_rows_cache
+            .row_for_anchor(anchor)
             .unwrap_or(app.transcript_scroll)
             .min(max_scroll)
     } else {
@@ -4160,21 +4436,35 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     if app.transcript_follow_tail {
         app.transcript_anchor = None;
     } else {
-        app.transcript_anchor = rows.get(start_row).map(|row| row.anchor.clone());
+        app.transcript_anchor = app
+            .view
+            .transcript_rows_cache
+            .rows_in_range(start_row, start_row + 1)
+            .first()
+            .map(|row| row.anchor.clone());
     }
     app.inspector_turn = app
         .inspector_turn
         .min(app.transcript.len().saturating_sub(1));
-    let end_row = (start_row + transcript_height).min(rows.len());
+    let end_row = (start_row + transcript_height).min(total_rows);
     let wrapped_transcript = if transcript_len == 0 {
         wrap_transcript(
             "Choose a workspace, acknowledge the warning, then send a prompt with Ctrl-S.",
             transcript_width,
         )
     } else {
-        rows[start_row..end_row]
-            .iter()
-            .map(|row| row.line.clone())
+        app.view
+            .transcript_rows_cache
+            .rows_in_range(start_row, end_row)
+            .into_iter()
+            .map(|row| {
+                transcript_row_line(
+                    row,
+                    app.focused_tool.as_ref(),
+                    transcript_width,
+                    app.use_color,
+                )
+            })
             .collect()
     };
     let transcript_title = if transcript_len == 0 {
@@ -4184,10 +4474,10 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             "Rows {}-{} of {} · new content below (Ctrl-End)",
             start_row + 1,
             end_row,
-            rows.len()
+            total_rows
         )
     } else {
-        format!("Rows {}-{} of {}", start_row + 1, end_row, rows.len())
+        format!("Rows {}-{} of {}", start_row + 1, end_row, total_rows)
     };
     frame.render_widget(
         Paragraph::new(wrapped_transcript).block(
@@ -4837,6 +5127,388 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod responsiveness_tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use leg_ui_client::{StreamEvent, TurnOutcome};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use serde_json::json;
+
+    use super::{
+        App, ConversationState, MAX_TURN_MESSAGES_PER_CYCLE, MIN_RENDER_INTERVAL, RedrawScheduler,
+        Screen, SessionCatalog, SessionCatalogConfig, TranscriptTurn, TurnMessage, TurnStatus,
+        draw_terminal,
+    };
+
+    fn test_app(name: &str) -> (App, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let state_dir =
+            std::env::temp_dir().join(format!("leg-tui-{name}-{}-{unique}", std::process::id()));
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state_dir.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("temporary test catalog opens");
+        let mut app = App::new(catalog);
+        app.screen = Screen::Conversation;
+        app.use_color = false;
+        app.set_terminal_size(80, 24);
+        (app, state_dir)
+    }
+
+    fn text_delta(seq: u64, block_index: u64, text: String) -> StreamEvent {
+        StreamEvent::TextDelta {
+            seq,
+            round_index: 0,
+            block_index,
+            text,
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn seeded_history_is_cached_and_stays_quiescent_for_thirty_seconds() {
+        let (mut app, state_dir) = test_app("idle-cache");
+        let base_reply = "r".repeat(4 * 1024);
+        let mut turns = (0..1_000)
+            .map(|index| {
+                let mut turn = TranscriptTurn::new(&format!("prompt {index}"));
+                assert!(turn.observe(&text_delta(0, 0, base_reply.clone())));
+                turn
+            })
+            .collect::<Vec<_>>();
+        let long_answer = (0..10_000)
+            .map(|line| format!("answer line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(long_answer.lines().count(), 10_000);
+        turns[998].observe(&text_delta(1, 1, long_answer));
+        let tool_output = "t".repeat(1024 * 1024);
+        assert_eq!(tool_output.len(), 1024 * 1024);
+        turns[999].observe(&StreamEvent::ToolCall {
+            seq: 0,
+            round_index: 0,
+            tool_use_id: "large-result".to_string(),
+            tool_name: "bash".to_string(),
+            input: json!({"command": "fixture"}),
+        });
+        turns[999].observe(&StreamEvent::ToolResult {
+            seq: 1,
+            round_index: 0,
+            tool_use_id: "large-result".to_string(),
+            tool_name: "bash".to_string(),
+            status: "completed".to_string(),
+            output: json!({"stdout": tool_output, "exit_code": 0}),
+        });
+        app.transcript = turns;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal opens");
+        let mut scheduler = RedrawScheduler::default();
+        scheduler.request();
+        assert!(scheduler.is_due(Duration::ZERO));
+        draw_terminal(&mut terminal, &mut app).expect("initial headless draw succeeds");
+        scheduler.mark_drawn(Duration::ZERO);
+        assert_eq!(app.render_counters.draws, 1);
+        assert_eq!(app.render_counters.transcript_turn_rebuilds, 1_000);
+        assert!(app.view.transcript_rows_cache.turns[998].rows.len() >= 10_000);
+
+        let build_counts = app
+            .view
+            .transcript_rows_cache
+            .turns
+            .iter()
+            .map(|cached| cached.build_count)
+            .collect::<Vec<_>>();
+        let width = app.view.transcript_rows_cache.turns[0].width;
+        for milliseconds in 1..=30_000 {
+            let now = Duration::from_millis(milliseconds);
+            scheduler.update_clock(now, false);
+            assert!(!scheduler.is_due(now));
+        }
+        assert_eq!(scheduler.draws, 1);
+        assert_eq!(app.render_counters.draws, 1);
+        let unchanged_refresh = {
+            let view = &mut app.view;
+            let transcript = &view.transcript;
+            view.transcript_rows_cache.refresh(transcript, width, false)
+        };
+        assert_eq!(unchanged_refresh, (0, 0));
+
+        app.transcript[500].observe(&text_delta(2, 1, "changed row".to_string()));
+        let changed_rebuilt_turns = {
+            let view = &mut app.view;
+            let transcript = &view.transcript;
+            view.transcript_rows_cache
+                .refresh(transcript, width, false)
+                .0
+        };
+        assert_eq!(changed_rebuilt_turns, 1);
+        for (index, cached) in app.view.transcript_rows_cache.turns.iter().enumerate() {
+            assert_eq!(
+                cached.build_count,
+                build_counts[index] + u64::from(index == 500),
+                "unexpected rebuild for turn {index}"
+            );
+        }
+        drop(terminal);
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
+    }
+
+    #[test]
+    fn dual_stream_is_bounded_and_final_outcome_appears_on_first_due_draw() {
+        let (mut app, state_dir) = test_app("stream-cache");
+        app.view.state_key = "session-one".to_string();
+        app.view.turn_status = TurnStatus::Running;
+        let history_turns = (0..32)
+            .map(|index| {
+                let mut turn = TranscriptTurn::new(&format!("history {index}"));
+                assert!(turn.observe(&text_delta(0, 0, "history reply".to_string())));
+                turn
+            })
+            .collect::<Vec<_>>();
+        let history_turn_count = history_turns.len();
+        app.view.transcript = history_turns;
+        app.view
+            .transcript
+            .push(TranscriptTurn::new("first stream"));
+        let mut second_view = ConversationState::empty();
+        second_view.state_key = "session-two".to_string();
+        second_view.turn_status = TurnStatus::Running;
+        second_view
+            .transcript
+            .push(TranscriptTurn::new("second stream"));
+        app.views.insert("session-two".to_string(), second_view);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal opens");
+        draw_terminal(&mut terminal, &mut app).expect("initial headless draw succeeds");
+        let mut scheduler = RedrawScheduler::default();
+        scheduler.mark_drawn(Duration::ZERO);
+        let history_build_counts = app.view.transcript_rows_cache.turns[..history_turn_count]
+            .iter()
+            .map(|cached| cached.build_count)
+            .collect::<Vec<_>>();
+
+        let total_chunks = 12_000_u64;
+        let mut next_chunk = 1_u64;
+        let mut emitted = 0;
+        let mut received = 0;
+        let mut completion_received_at = None;
+        let mut first_completion_draw = None;
+        for milliseconds in 1..=30_034 {
+            let now = Duration::from_millis(milliseconds);
+            let mut received_turn_messages = 0;
+            while next_chunk <= total_chunks && Duration::from_micros(next_chunk * 2_500) <= now {
+                let owner = if next_chunk % 2 == 0 {
+                    "session-two"
+                } else {
+                    "session-one"
+                };
+                app.turn_tx
+                    .send(TurnMessage::Event {
+                        owner: owner.to_string(),
+                        event: text_delta(next_chunk, 0, "x".repeat(32)),
+                    })
+                    .expect("stream receiver remains connected");
+                emitted += 1;
+                next_chunk += 1;
+            }
+            if milliseconds % 30 == 0 {
+                if milliseconds == 30_000 {
+                    app.turn_tx
+                        .send(TurnMessage::Finished {
+                            owner: "session-one".to_string(),
+                            result: Ok(TurnOutcome::Succeeded {
+                                response: json!({"body": "final response"}),
+                                capped: false,
+                            }),
+                        })
+                        .expect("stream receiver remains connected");
+                    emitted += 1;
+                }
+                app.begin_turn_message_cycle();
+                let batch = app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
+                assert!(batch <= MAX_TURN_MESSAGES_PER_CYCLE);
+                received_turn_messages = batch;
+                received += batch;
+                if batch > 0 {
+                    scheduler.request();
+                }
+                if milliseconds == 30_000 {
+                    completion_received_at = Some(now);
+                }
+            }
+            scheduler.update_clock(now, app.turn_status.is_active());
+            if scheduler.is_due_after_batch(now, received_turn_messages) {
+                assert!(
+                    now.saturating_sub(scheduler.last_draw.expect("initial frame was drawn"))
+                        >= MIN_RENDER_INTERVAL
+                );
+                draw_terminal(&mut terminal, &mut app)
+                    .expect("headless stream frame draws successfully");
+                if completion_received_at.is_some() && first_completion_draw.is_none() {
+                    assert!(buffer_text(&terminal).contains("Outcome: succeeded"));
+                    first_completion_draw = Some(now);
+                }
+                scheduler.mark_drawn(now);
+            }
+        }
+
+        assert_eq!(emitted, total_chunks as usize + 1);
+        assert_eq!(received, emitted);
+        assert_eq!(app.render_counters.turn_messages, emitted as u64);
+        assert_eq!(app.transcript.last().unwrap().render_revision(), 6_001);
+        assert_eq!(
+            app.views["session-two"].transcript[0].render_revision(),
+            6_000
+        );
+        assert_eq!(app.render_counters.draws, scheduler.draws);
+        assert!(app.render_counters.draws <= 900);
+        for (index, cached) in app.view.transcript_rows_cache.turns[..history_turn_count]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                cached.build_count, history_build_counts[index],
+                "unchanged offscreen turn {index} was rebuilt"
+            );
+        }
+        let completion_received_at = completion_received_at.expect("completion was received");
+        let first_completion_draw = first_completion_draw.expect("completion was drawn");
+        assert!(first_completion_draw >= completion_received_at);
+        assert!(first_completion_draw - completion_received_at <= Duration::from_millis(34));
+        drop(terminal);
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
+    }
+
+    #[test]
+    fn each_message_receive_cycle_has_a_hard_bound_without_dropping_events() {
+        let (mut app, state_dir) = test_app("message-bound");
+        app.view.state_key = "session-one".to_string();
+        app.view
+            .transcript
+            .push(TranscriptTurn::new("bounded stream"));
+        for seq in 0..(MAX_TURN_MESSAGES_PER_CYCLE as u64 + 1) {
+            app.turn_tx
+                .send(TurnMessage::Event {
+                    owner: "session-one".to_string(),
+                    event: text_delta(seq, 0, "chunk".to_string()),
+                })
+                .expect("stream receiver remains connected");
+        }
+        app.begin_turn_message_cycle();
+        assert_eq!(
+            app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE),
+            MAX_TURN_MESSAGES_PER_CYCLE
+        );
+        assert_eq!(app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE), 0);
+        app.begin_turn_message_cycle();
+        assert_eq!(app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE), 1);
+        assert_eq!(
+            app.transcript[0].render_revision(),
+            MAX_TURN_MESSAGES_PER_CYCLE as u64 + 1
+        );
+        assert_eq!(
+            app.render_counters.turn_messages,
+            MAX_TURN_MESSAGES_PER_CYCLE as u64 + 1
+        );
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
+    }
+
+    #[test]
+    fn queued_outcome_is_rendered_after_a_full_message_batch() {
+        let (mut app, state_dir) = test_app("outcome-message-bound");
+        app.view.turn_status = TurnStatus::Running;
+        app.transcript.push(TranscriptTurn::new("bounded stream"));
+        for seq in 0..MAX_TURN_MESSAGES_PER_CYCLE as u64 {
+            app.turn_tx
+                .send(TurnMessage::Event {
+                    owner: app.state_key.clone(),
+                    event: text_delta(seq, 0, "chunk".to_string()),
+                })
+                .expect("stream receiver remains connected");
+        }
+        app.turn_tx
+            .send(TurnMessage::Finished {
+                owner: app.state_key.clone(),
+                result: Ok(TurnOutcome::Succeeded {
+                    response: json!({"body": "final response"}),
+                    capped: false,
+                }),
+            })
+            .expect("stream receiver remains connected");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal opens");
+        let mut scheduler = RedrawScheduler::default();
+        draw_terminal(&mut terminal, &mut app).expect("initial headless draw succeeds");
+        scheduler.mark_drawn(Duration::ZERO);
+
+        let now = Duration::from_millis(34);
+        app.begin_turn_message_cycle();
+        let first_batch = app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE / 2);
+        assert_eq!(first_batch, MAX_TURN_MESSAGES_PER_CYCLE / 2);
+        let second_batch = app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
+        assert_eq!(second_batch, MAX_TURN_MESSAGES_PER_CYCLE / 2);
+        assert_eq!(app.turn_messages_this_cycle, MAX_TURN_MESSAGES_PER_CYCLE);
+        scheduler.request();
+        assert!(scheduler.is_due(now));
+        assert!(!scheduler.is_due_after_batch(now, app.turn_messages_this_cycle));
+        assert!(!buffer_text(&terminal).contains("Outcome: succeeded"));
+
+        app.begin_turn_message_cycle();
+        let completion_batch = app.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
+        assert_eq!(completion_batch, 1);
+        scheduler.request();
+        assert!(scheduler.is_due_after_batch(now, app.turn_messages_this_cycle));
+        draw_terminal(&mut terminal, &mut app)
+            .expect("completed state draws on the headless backend");
+        scheduler.mark_drawn(now);
+
+        assert!(buffer_text(&terminal).contains("Outcome: succeeded"));
+        assert_eq!(
+            app.render_counters.turn_messages,
+            MAX_TURN_MESSAGES_PER_CYCLE as u64 + 1
+        );
+        drop(terminal);
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
+    }
+
+    #[test]
+    fn repeated_full_message_batches_do_not_starve_due_draws() {
+        let mut scheduler = RedrawScheduler::default();
+        scheduler.mark_drawn(Duration::ZERO);
+        scheduler.request();
+
+        let first_due_frame = Duration::from_millis(34);
+        assert!(!scheduler.is_due_after_batch(first_due_frame, MAX_TURN_MESSAGES_PER_CYCLE));
+        assert!(scheduler.is_due_after_batch(first_due_frame, MAX_TURN_MESSAGES_PER_CYCLE));
+        scheduler.mark_drawn(first_due_frame);
+
+        scheduler.request();
+        let second_due_frame = first_due_frame + MIN_RENDER_INTERVAL;
+        assert!(!scheduler.is_due_after_batch(second_due_frame, MAX_TURN_MESSAGES_PER_CYCLE));
+        assert!(scheduler.is_due_after_batch(second_due_frame, MAX_TURN_MESSAGES_PER_CYCLE));
+    }
 }
 
 #[cfg(test)]

@@ -252,6 +252,20 @@ you to resize; it keeps the draft and active turn, and rejects sends until the
 terminal is large enough again. `NO_COLOR` and `TERM=dumb` disable color while
 text labels continue to identify every status.
 
+The TUI redraws for visible changes and coalesces stream updates to no more than
+one frame every 34 ms. It processes at most 64 queued turn messages per event
+loop cycle. A due repaint may wait one extra batch after a full batch, then draws
+even if the next batch is full, so sustained streams cannot suppress redraws.
+Elapsed-time redraws run only while a turn is active. Rendered transcript rows
+are cached by turn revision, terminal width, and color policy, so unchanged turns
+are not reparsed or wrapped again. Deterministic tests track draw and message
+counts, rebuilt turns, and generated rows, including a simulated idle interval
+and dual-session stream. Run them with:
+
+```sh
+cargo test --locked --manifest-path companions/Cargo.toml -p leg-tui
+```
+
 The conversation uses a two-row header, a one-row footer, and a composer that
 grows from one to four content rows as the draft wraps. The remaining height
 goes to the conversation. The session rail is hidden below 105 columns; at
