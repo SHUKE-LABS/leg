@@ -29,7 +29,7 @@ export function createSharedRenderer(ui, features) {
     "provider-model", "elapsed-time", "turn-status", "active-tool", "stop-turn",
     "workspace-warning", "connection-message", "transcript-warnings", "transcript",
     "messages", "empty-transcript", "new-content", "composer", "prompt",
-    "retry-submission", "send", "send-error", "live-status",
+    "retry-submission", "send-error", "live-status",
   ];
   const featureElements = {
     titleFilter: ["session-filter"],
@@ -283,7 +283,7 @@ export function createSharedRenderer(ui, features) {
     ui["stop-turn"].hidden = !state.active;
     ui["stop-turn"].disabled = !state.availability.stop;
     if (features.download) ui["download-transcript"].disabled = !state.snapshot;
-    ui.send.disabled = !state.availability.send || !state.draft.trim();
+    if (ui.send) ui.send.disabled = !state.availability.send || !state.draft.trim();
     ui["new-conversation"].disabled = !state.availability.createSession;
     const canRetry = Boolean(state.availability.retrySameSend);
     ui["retry-submission"].hidden = !canRetry;
@@ -1467,7 +1467,9 @@ export function createSharedRenderer(ui, features) {
     }
     if (ui["rename-input"] && state.renameDraft !== ui["rename-input"].value) ui["rename-input"].value = state.renameDraft;
     const platform = navigator.userAgentData?.platform || navigator.platform || "";
-    ui.prompt.placeholder = /mac/i.test(platform) ? "Message — ⌘+Enter to send" : "Message — Ctrl+Enter to send";
+    ui.prompt.placeholder = /mac/i.test(platform)
+      ? "Enter for a new line · ⌘+Enter to send"
+      : "Enter for a new line · Ctrl+Enter to send";
     adjustTextarea();
     renderAll(state.renderOptions);
   }
