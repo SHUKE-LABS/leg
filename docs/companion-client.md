@@ -252,16 +252,28 @@ you to resize; it keeps the draft and active turn, and rejects sends until the
 terminal is large enough again. `NO_COLOR` and `TERM=dumb` disable color while
 text labels continue to identify every status.
 
+The conversation uses a two-row header, a one-row footer, and a composer that
+grows from one to four content rows as the draft wraps. The remaining height
+goes to the conversation. The session rail is hidden below 105 columns; at
+wider sizes F8 toggles it, while F3 always opens the full session picker. The
+inspector docks only when it leaves at least 60 columns for the conversation
+and 36 for details; otherwise it opens as an Esc-dismissible overlay. Long
+header values are elided to fit, and the session picker retains complete
+titles and workspace paths plus the current model when known.
+
 Enter inserts a newline; Ctrl-S sends a nonblank prompt. Left/Right move by
 grapheme, Home/End move within the current line, and Backspace/Delete remove a
 grapheme. Ctrl-Z undoes and Ctrl-Y redoes; a bracketed paste is one edit,
 preserves Unicode and line breaks, normalizes CRLF/CR to LF, and discards other
 control characters. A literal `?` is prompt text. F1 opens help, F2 opens the
-keyboard action menu, and Esc closes either overlay. Ctrl-C stops a running
-turn; when idle it exits and keeps the draft. External SIGINT and SIGTERM use
-the shared turn controller to stop an active turn, wait for process cleanup,
-save the draft, and restore the terminal. Editing stays available during a
-turn, but another Ctrl-S is rejected while busy.
+keyboard action menu, and Esc closes either overlay. Ctrl-C first stops the
+viewed active turn. If the viewed session is idle while background turns are
+active, Ctrl-C opens a named Stop chooser; Escape cancels, and Enter stops only
+the selected run after its session and turn are rechecked. If no TUI turns are
+active, Ctrl-C saves drafts and exits. External SIGINT and SIGTERM use the
+shared turn controller to stop an active turn, wait for process cleanup, save
+the draft, and restore the terminal. Editing stays available during a turn,
+but another Ctrl-S is rejected while busy.
 
 F3 opens the session picker. It shows each title, workspace, recent activity,
 turn count, and state. Use `/` to filter titles, Up/Down to select, Enter to
@@ -270,8 +282,9 @@ search. Busy, recovered, read-only, missing-workspace, and unverified ownership
 states are labeled in the picker and have an actionable status when opened.
 Reopening only reads history; it does not send a request. Each open session keeps
 its own composer draft and scroll position. An active turn continues in the
-background while another session is viewed, and the header reports that
-activity. Returning to it does not submit the prompt again.
+background while another session is viewed. The footer and picker name each
+background session and show its text state. Returning to it does not submit the
+prompt again.
 
 Ctrl-F searches session titles and the displayed prompt, reply, tool arguments,
 and tool output. Up/Down moves between matches, Enter opens the matching session
@@ -298,12 +311,13 @@ latest failed, interrupted, or incomplete turn. Confirm with Y after reading
 `Retry sends this prompt again and may repeat tool side effects.` Press N or Esc
 to cancel; Enter does not retry.
 
-The conversation header shows Idle, Starting, Running, Stopping, Succeeded,
-Failed, Interrupted, Incomplete, Capped, or `Succeeded (truncated)`,
-along with elapsed time and the active tool where applicable. A missing terminal
-outcome is incomplete; forced cleanup is labeled separately from a graceful
-interruption. Streamed text is grouped by round and block, then reconciled with
-the authoritative terminal response so earlier tool rounds stay visible once.
+The two-row conversation header shows the viewed session title, workspace,
+model, turn state, elapsed time, and active tool when present. It shows Idle,
+Starting, Running, Stopping, Succeeded, Failed, Interrupted, Incomplete, Capped,
+or `Succeeded (truncated)` as text, including when color is disabled. A missing
+terminal outcome is incomplete; forced cleanup is labeled separately from a
+graceful interruption. Streamed text is grouped by round and block, then
+reconciled with the authoritative terminal response so earlier tool rounds stay visible once.
 Tool names and data are shown as text, with large tool output summarized. The
 TUI removes whole ANSI, CSI, and OSC sequences, including sequences split across
 stream deltas, from provider text, tool data, errors, and stderr.
@@ -318,15 +332,20 @@ with `Retry sends this prompt again and may repeat tool side effects.` Press Y
 to retry or N/Esc to cancel. Enter remains a newline and never retries.
 
 The native Linux/macOS PTY smoke test uses the local fake provider and explicit
-binary paths. It covers both supported sizes, resize recovery, signal cleanup,
-non-TTY startup, color-disabled output, session creation/rename/reopen after
-restart, history search and inspection, cross-interface busy rejection, draft
-and scroll retention, copy/export confirmation, a 1,000-turn history, composer
-and active-turn workflows, and the delayed Stop regression. The history test
+binary paths. It covers 80x24 and 120x40 layouts, responsive rail and inspector,
+resize recovery, signal cleanup, non-TTY startup, color-disabled output, session
+creation/rename/reopen after restart, history search and inspection,
+cross-interface busy rejection, named background Stop selection, draft and
+scroll retention, copy/export confirmation, a 1,000-turn history, composer and
+active-turn workflows, and the delayed Stop regression. The history test
 records open and inspector response times against the 200 ms target on the
 reference machine; catalog loading is measured separately. It uses the pinned Python VT parser in
 `companions/leg-tui/tests/requirements.txt`; install that test-only dependency
 in a virtual environment before running it:
+
+Representative fixture captures are checked in at
+[80x24](../companions/leg-tui/tests/captures/workbench-80x24.txt) and
+[120x40](../companions/leg-tui/tests/captures/workbench-120x40.txt).
 
 ```sh
 python3 -m venv /tmp/leg-pty-test-venv

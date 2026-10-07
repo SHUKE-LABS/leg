@@ -49,10 +49,16 @@ use unicode_width::UnicodeWidthStr;
 
 const WARNING: &str = "Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.";
 const WARNING_ACK_KEY: &str = "tui_first_run_warning_acknowledged";
-const HELP: &str = "Ctrl-S send · F3 sessions · Ctrl-F search · F4 inspect · F5 copy · F6 export · F7 save copy · F1 help · F2 actions · Ctrl-C stop/exit";
-const NARROW_HELP: &str = "Ctrl-S send · Ctrl-C stop/exit · F1 help · F2 actions · F3 sessions";
+const HELP: &str =
+    "Ctrl-S send · F3 sessions · F4 inspect · F8 rail · F1 help · F2 actions · Ctrl-C stop/exit";
+const NARROW_HELP: &str = "Ctrl-S send · F3 sessions · F1 help · F2 actions · Ctrl-C stop/exit";
 const MIN_TERMINAL_COLUMNS: u16 = 80;
 const MIN_TERMINAL_ROWS: u16 = 24;
+const SESSION_RAIL_WIDTH: u16 = 25;
+const SESSION_RAIL_MIN_COLUMNS: u16 = 105;
+const MIN_DOCKED_CONVERSATION_WIDTH: u16 = 60;
+const MIN_DOCKED_INSPECTOR_WIDTH: u16 = 36;
+const MAX_COMPOSER_CONTENT_ROWS: usize = 4;
 const SMALL_TERMINAL_REJECTION: &str = "Send rejected: terminal must be at least 80x24.";
 static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -316,9 +322,13 @@ struct App {
     copy_text: Option<String>,
     terminal_columns: u16,
     terminal_rows: u16,
+    rail_requested_visible: bool,
     use_color: bool,
     show_help: bool,
     show_menu: bool,
+    stop_chooser_open: bool,
+    stop_targets: Vec<StopTarget>,
+    stop_picker_index: usize,
     quit: bool,
     exit_after_turn: bool,
     turn_tx: Sender<TurnMessage>,
@@ -365,6 +375,15 @@ struct SearchEntry {
     turn_index: Option<usize>,
     label: String,
     text: String,
+}
+
+#[derive(Clone)]
+struct StopTarget {
+    state_key: String,
+    record_id: String,
+    title: String,
+    status: String,
+    turn_index: Option<u64>,
 }
 
 impl ConversationState {
@@ -539,9 +558,13 @@ impl App {
             copy_text: None,
             terminal_columns: MIN_TERMINAL_COLUMNS,
             terminal_rows: MIN_TERMINAL_ROWS,
+            rail_requested_visible: true,
             use_color: terminal_color_enabled(),
             show_help: false,
             show_menu: false,
+            stop_chooser_open: false,
+            stop_targets: Vec::new(),
+            stop_picker_index: 0,
             quit: false,
             exit_after_turn: false,
             turn_tx,
@@ -568,6 +591,77 @@ impl App {
             }
             Err(error) => self.status = format!("Could not read session catalog: {error}"),
         }
+    }
+
+    fn session_rail_visible(&self) -> bool {
+        self.rail_requested_visible && self.terminal_columns >= SESSION_RAIL_MIN_COLUMNS
+    }
+
+    fn toggle_session_rail(&mut self) {
+        if self.terminal_columns < SESSION_RAIL_MIN_COLUMNS {
+            self.status = format!(
+                "Session rail is available at {SESSION_RAIL_MIN_COLUMNS} columns and wider"
+            );
+            return;
+        }
+        self.rail_requested_visible = !self.rail_requested_visible;
+        self.status = if self.rail_requested_visible {
+            "Session rail shown".to_string()
+        } else {
+            "Session rail hidden".to_string()
+        };
+    }
+
+    fn session_title_for_view(&self, key: &str, view: &ConversationState) -> String {
+        let record_id = view
+            .session_id
+            .as_deref()
+            .or(view.draft_id.as_deref())
+            .unwrap_or(key);
+        self.sessions
+            .iter()
+            .find(|session| session.id == record_id || session.id == key)
+            .and_then(|session| session.name.as_deref())
+            .filter(|name| !name.trim().is_empty())
+            .map(sanitize::terminal_safe_text)
+            .unwrap_or_else(|| "Untitled conversation".to_string())
+    }
+
+    fn background_stop_targets(&self) -> Vec<StopTarget> {
+        let mut targets = self
+            .views
+            .iter()
+            .filter(|(_, view)| view.turn_status.is_active())
+            .map(|(state_key, view)| {
+                let record_id = view
+                    .session_id
+                    .as_deref()
+                    .or(view.draft_id.as_deref())
+                    .unwrap_or(state_key);
+                StopTarget {
+                    state_key: state_key.clone(),
+                    record_id: record_id.to_string(),
+                    title: self.session_title_for_view(state_key, view),
+                    status: view.turn_status.display(),
+                    turn_index: view.transcript.last().and_then(TranscriptTurn::turn_index),
+                }
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| {
+            left.title
+                .to_lowercase()
+                .cmp(&right.title.to_lowercase())
+                .then_with(|| left.record_id.cmp(&right.record_id))
+        });
+        targets
+    }
+
+    fn background_activity_text(&self) -> String {
+        self.background_stop_targets()
+            .iter()
+            .map(|target| format!("{} ({})", target.title, target.status))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn rebuild_search_entries(&mut self) {
@@ -1158,6 +1252,10 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.stop_chooser_open {
+            self.handle_stop_chooser_key(key);
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.show_help = false;
             self.show_menu = false;
@@ -1378,6 +1476,7 @@ impl App {
                     self.status = "Copy a selected inspector field with F5 first".to_string();
                 }
             }
+            KeyCode::F(8) => self.toggle_session_rail(),
             KeyCode::Up if self.inspector_open => {
                 self.inspector_field = self.inspector_field.saturating_sub(1);
                 self.inspector_scroll = 0;
@@ -1532,22 +1631,117 @@ impl App {
             }
             return;
         }
-        if let Some(active) = self
-            .views
-            .values_mut()
-            .find(|view| view.turn_status.is_active())
-            && let Some(handle) = &active.stop_handle
-        {
-            match handle.stop() {
-                Ok(()) => {
-                    active.turn_status = TurnStatus::Stopping;
-                    self.status = "Stopping the active turn in another session".to_string();
-                }
-                Err(error) => self.status = format!("Stop failed: {error}"),
-            }
+        self.refresh_sessions();
+        self.stop_targets = self.background_stop_targets();
+        if !self.stop_targets.is_empty() {
+            self.stop_picker_index = 0;
+            self.stop_chooser_open = true;
+            self.status = "Choose a background session to stop".to_string();
             return;
         }
         self.quit = true;
+    }
+
+    fn handle_stop_chooser_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.stop_chooser_open = false;
+                self.stop_targets.clear();
+                self.status = "Background Stop cancelled".to_string();
+            }
+            KeyCode::Up => {
+                self.stop_picker_index = self.stop_picker_index.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.stop_picker_index =
+                    (self.stop_picker_index + 1).min(self.stop_targets.len().saturating_sub(1));
+            }
+            KeyCode::Enter => self.stop_selected_background(),
+            _ => {}
+        }
+    }
+
+    fn stop_selected_background(&mut self) {
+        let Some(target) = self.stop_targets.get(self.stop_picker_index).cloned() else {
+            self.stop_chooser_open = false;
+            self.status = "No background Stop target is available".to_string();
+            return;
+        };
+        let Some(view) = self.views.get(&target.state_key) else {
+            self.close_stop_chooser(format!(
+                "{} is no longer active; nothing was stopped",
+                target.title
+            ));
+            return;
+        };
+        if !view.turn_status.is_active()
+            || target.turn_index.is_some_and(|turn_index| {
+                view.transcript.last().and_then(TranscriptTurn::turn_index) != Some(turn_index)
+            })
+        {
+            self.close_stop_chooser(format!(
+                "{} changed state; nothing was stopped",
+                target.title
+            ));
+            return;
+        }
+        let record_id = view
+            .session_id
+            .as_deref()
+            .or(view.draft_id.as_deref())
+            .unwrap_or(&view.state_key)
+            .to_string();
+        let Some(handle) = view.stop_handle.clone() else {
+            self.close_stop_chooser(format!(
+                "{} has no Stop control; nothing was stopped",
+                target.title
+            ));
+            return;
+        };
+        let current_turn_index = view.transcript.last().and_then(TranscriptTurn::turn_index);
+
+        let session = match self.catalog.get(&record_id) {
+            Ok(session) => session,
+            Err(error) => {
+                self.close_stop_chooser(format!(
+                    "Could not verify {} ({error}); nothing was stopped",
+                    target.title
+                ));
+                return;
+            }
+        };
+        if session.run_state != CatalogRunState::Active
+            || current_turn_index.is_some_and(|turn_index| {
+                session.turns.last().map(|turn| turn.turn_index) != Some(turn_index)
+            })
+        {
+            self.close_stop_chooser(format!(
+                "{} changed state; nothing was stopped",
+                target.title
+            ));
+            return;
+        }
+
+        self.stop_chooser_open = false;
+        self.stop_targets.clear();
+        match handle.stop() {
+            Ok(()) => {
+                if let Some(view) = self.views.get_mut(&target.state_key) {
+                    view.turn_status = TurnStatus::Stopping;
+                }
+                self.status = format!("Stopping {}", target.title);
+            }
+            Err(error) => {
+                self.status = format!("Stop failed for {}: {error}", target.title);
+            }
+        }
+    }
+
+    fn close_stop_chooser(&mut self, message: String) {
+        self.stop_chooser_open = false;
+        self.stop_targets.clear();
+        self.refresh_sessions();
+        self.status = message;
     }
 
     fn set_terminal_size(&mut self, columns: u16, rows: u16) {
@@ -2307,11 +2501,17 @@ fn draw_session_picker(frame: &mut Frame<'_>, app: &App) {
             .map(Path::display)
             .map(|path| path.to_string())
             .unwrap_or_else(|| "(workspace not set)".to_string());
+        let model = if current {
+            format!("  ·  model: {}", sanitize::terminal_safe_text(&app.model))
+        } else {
+            String::new()
+        };
         let second = Line::from(format!(
-            "    {}  ·  {} turns  ·  {}",
+            "    {}  ·  {} turns  ·  {}{}",
             sanitize::terminal_safe_text(&workspace),
             session.turns.len(),
             sanitize::terminal_safe_text(&session.id),
+            model,
         ));
         lines.push(if selected && app.use_color {
             first.style(
@@ -2432,15 +2632,20 @@ fn draw_text_dialog(frame: &mut Frame<'_>, app: &App, title: &str, prompt: &str)
 }
 
 fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
+    let frame_area = frame.area();
+    let composer_width = frame_area.width.saturating_sub(2).max(1) as usize;
+    let (composer_lines, (cursor_row, cursor_column)) = app.composer.layout(composer_width);
+    let composer_content_rows = composer_lines.len().clamp(1, MAX_COMPOSER_CONTENT_ROWS);
+    let composer_panel_height = (composer_content_rows as u16).saturating_add(2);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
-            Constraint::Min(4),
-            Constraint::Length(4),
             Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(composer_panel_height),
+            Constraint::Length(1),
         ])
-        .split(frame.area());
+        .split(frame_area);
 
     let active_id = app.session_id.as_deref().or(app.draft_id.as_deref());
     let active = active_id.and_then(|id| app.sessions.iter().find(|session| session.id == id));
@@ -2454,46 +2659,43 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
         .map(Path::display)
         .map(|path| path.to_string())
         .unwrap_or_else(|| "(workspace not set)".to_string());
-    let activity = app
-        .active_tool
-        .as_deref()
-        .map(|tool| format!("  |  tool: {tool}"))
-        .unwrap_or_default();
     let elapsed = format_duration(app.elapsed());
-    let background_turns = app
-        .views
-        .values()
-        .filter(|view| view.turn_status.is_active())
-        .count();
-    let background = if background_turns > 0 {
-        format!("{background_turns} turn(s) active in other session(s)")
-    } else {
-        String::new()
-    };
     let catalog_state = active
         .map(|session| session_state_label(session).to_string())
         .unwrap_or_else(|| app.external_run_state.clone());
-    let detail = app
-        .terminal_detail
-        .as_deref()
-        .or_else(|| (!app.status.is_empty()).then_some(app.status.as_str()))
-        .unwrap_or_default();
-    let detail = if background.is_empty() {
-        detail.to_string()
-    } else if detail.is_empty() {
-        background
+    let catalog_summary = format!("{catalog_state} · {elapsed}");
+    let narrow_header = frame_area.width < 120;
+    let (status_width, title_width, model_width) = if narrow_header {
+        (23, 14, 18)
     } else {
-        format!("{background} · {detail}")
+        (27, 32, 30)
     };
-    let header = format!(
-        "leg-tui  |  status: {}  |  {}  |  model: {}  |  catalog: {}  |  elapsed: {elapsed}{activity}\nworkspace: {workspace}\n{detail}",
-        app.turn_status.display(),
-        sanitize::terminal_safe_text(title),
-        sanitize::terminal_safe_text(&app.model),
-        catalog_state,
+    let header_first = format!(
+        "status: {}  |  {}  |  model: {}",
+        truncate_to_width(&app.turn_status.display(), status_width),
+        truncate_to_width(&sanitize::terminal_safe_text(title), title_width),
+        truncate_to_width(&sanitize::terminal_safe_text(&app.model), model_width),
     );
-    let header = Paragraph::new(sanitize::terminal_safe_text(&header))
-        .block(Block::default().borders(Borders::ALL));
+    let (workspace_width, catalog_width, tool_width) = if narrow_header {
+        (19, 14, 12)
+    } else {
+        (32, 20, 24)
+    };
+    let tool = app
+        .active_tool
+        .as_deref()
+        .map(|tool| format!(" · tool: {}", truncate_to_width(tool, tool_width)))
+        .unwrap_or_default();
+    let header_second = format!(
+        "workspace: {} · catalog: {}{}",
+        truncate_to_width(&sanitize::terminal_safe_text(&workspace), workspace_width),
+        truncate_to_width(&catalog_summary, catalog_width),
+        tool,
+    );
+    let header = Paragraph::new(vec![
+        Line::from(truncate_to_width(&header_first, frame_area.width as usize)),
+        Line::from(truncate_to_width(&header_second, frame_area.width as usize)),
+    ]);
     frame.render_widget(
         if app.use_color {
             header.style(Style::default().fg(Color::Cyan))
@@ -2503,54 +2705,70 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
         chunks[0],
     );
 
-    let body_constraints = if app.inspector_open {
-        vec![
-            Constraint::Length(25),
-            Constraint::Min(24),
-            Constraint::Length(40),
-        ]
+    let rail_visible = app.session_rail_visible();
+    let rail_width = if rail_visible { SESSION_RAIL_WIDTH } else { 0 };
+    let workbench_width = frame_area.width.saturating_sub(rail_width);
+    let inspector_docked = app.inspector_open
+        && workbench_width >= MIN_DOCKED_CONVERSATION_WIDTH + MIN_DOCKED_INSPECTOR_WIDTH;
+    let mut body_constraints = Vec::new();
+    if rail_visible {
+        body_constraints.push(Constraint::Length(SESSION_RAIL_WIDTH));
+    }
+    if inspector_docked {
+        body_constraints.push(Constraint::Min(MIN_DOCKED_CONVERSATION_WIDTH));
+        body_constraints.push(Constraint::Length(MIN_DOCKED_INSPECTOR_WIDTH));
     } else {
-        vec![Constraint::Length(25), Constraint::Min(1)]
-    };
+        body_constraints.push(Constraint::Min(1));
+    }
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(body_constraints)
         .split(chunks[1]);
-    let mut rail_lines = vec![
-        Line::from("F3 sessions"),
-        Line::from(sanitize::terminal_safe_text(title)),
-        Line::from(format!("Status: {catalog_state}")),
-        Line::from(""),
-    ];
-    for session in app.sessions.iter().take(4) {
-        let name = session
-            .name
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or("Untitled");
-        let marker = if Some(session.id.as_str()) == active_id {
-            "▶"
-        } else {
-            " "
-        };
-        rail_lines.push(Line::from(format!(
-            "{marker} {} · {}",
-            sanitize::terminal_safe_text(name),
-            session_state_label(session)
-        )));
-        rail_lines.push(Line::from(format!(
-            "  {}",
-            relative_time(session.updated_at_ms)
-        )));
+    let transcript_index = if rail_visible { 1 } else { 0 };
+    if rail_visible {
+        let mut rail_lines = vec![
+            Line::from("F3 picker · F8 hide"),
+            Line::from(truncate_to_width(
+                &sanitize::terminal_safe_text(title),
+                (SESSION_RAIL_WIDTH - 2) as usize,
+            )),
+            Line::from(truncate_to_width(
+                &format!("Status: {catalog_state}"),
+                (SESSION_RAIL_WIDTH - 2) as usize,
+            )),
+            Line::from(""),
+        ];
+        for session in app.sessions.iter().take(4) {
+            let name = session
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("Untitled");
+            let marker = if Some(session.id.as_str()) == active_id {
+                "▶"
+            } else {
+                " "
+            };
+            rail_lines.push(Line::from(format!(
+                "{marker} {}",
+                truncate_to_width(
+                    &sanitize::terminal_safe_text(name),
+                    (SESSION_RAIL_WIDTH - 4) as usize,
+                )
+            )));
+            rail_lines.push(Line::from(truncate_to_width(
+                &format!("  {}", session_state_label(session)),
+                (SESSION_RAIL_WIDTH - 2) as usize,
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(rail_lines)
+                .block(Block::default().borders(Borders::ALL).title("Sessions")),
+            body[0],
+        );
     }
-    frame.render_widget(
-        Paragraph::new(rail_lines)
-            .block(Block::default().borders(Borders::ALL).title("Sessions"))
-            .wrap(Wrap { trim: false }),
-        body[0],
-    );
 
-    let transcript_area = body[1];
+    let transcript_area = body[transcript_index];
     let transcript_height = transcript_area.height.saturating_sub(2).max(1) as usize;
     let transcript_len = app.transcript.len();
     let transcript_width = transcript_area.width.saturating_sub(2).max(1) as usize;
@@ -2646,7 +2864,13 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
         transcript_area,
     );
     if app.inspector_open {
-        draw_inspector(frame, app, body[2]);
+        if inspector_docked {
+            draw_inspector(frame, app, body[transcript_index + 1]);
+        } else {
+            let area = centered_rect(90, 72, frame_area);
+            frame.render_widget(Clear, area);
+            draw_inspector(frame, app, area);
+        }
     }
 
     let composer_title = if app.turn_status.is_active() {
@@ -2656,9 +2880,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         "Composer (Ctrl-S send)"
     };
-    let composer_width = chunks[2].width.saturating_sub(2).max(1) as usize;
     let composer_height = chunks[2].height.saturating_sub(2).max(1) as usize;
-    let (composer_lines, (cursor_row, cursor_column)) = app.composer.layout(composer_width);
     let composer_text = composer_lines
         .into_iter()
         .map(|line| Line::from(sanitize::terminal_safe_text(&line)))
@@ -2670,14 +2892,53 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             .scroll((composer_scroll.min(u16::MAX as usize) as u16, 0)),
         chunks[2],
     );
-    let help = if app.terminal_columns < 120 {
-        NARROW_HELP
+    let footer_text = if app.stop_chooser_open {
+        "↑/↓ choose background session · Enter stop selected · Esc cancel".to_string()
     } else {
-        HELP
+        let detail = app
+            .terminal_detail
+            .as_deref()
+            .or_else(|| (!app.status.is_empty()).then_some(app.status.as_str()))
+            .unwrap_or_default();
+        let blocked_reason = app.terminal_detail.is_some()
+            || [
+                "Busy:",
+                "Send rejected:",
+                "Blank prompts",
+                "Choose a workspace",
+                "This session is",
+                "Recorded workspace",
+                "Workspace is",
+                "Could not",
+                "Stop failed",
+                "Ownership",
+            ]
+            .iter()
+            .any(|prefix| detail.starts_with(prefix));
+        let background = app.background_activity_text();
+        if blocked_reason {
+            detail.to_string()
+        } else if !background.is_empty() {
+            format!("Background: {background} · Ctrl-C choose Stop · F3 sessions")
+        } else if !detail.is_empty() && detail != "Ready" {
+            detail.to_string()
+        } else if app.terminal_columns < 120 {
+            NARROW_HELP.to_string()
+        } else {
+            HELP.to_string()
+        }
     };
-    frame.render_widget(Paragraph::new(help), chunks[3]);
+    frame.render_widget(
+        Paragraph::new(truncate_to_width(
+            &sanitize::terminal_safe_text(&footer_text),
+            chunks[3].width as usize,
+        )),
+        chunks[3],
+    );
 
-    if app.retry_confirmation.is_some() {
+    if app.stop_chooser_open {
+        draw_stop_chooser(frame, app);
+    } else if app.retry_confirmation.is_some() {
         let area = centered_rect(76, 28, frame.area());
         frame.render_widget(Clear, area);
         let warning = app
@@ -2707,6 +2968,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("Left/Right move · Home/End line · Backspace/Delete remove · paste keeps Unicode/newlines."),
                 Line::from("PageUp/Down browse turns · Ctrl-End newest · Esc closes the current overlay."),
                 Line::from("F1 help · F2 actions · F3 sessions: / filter · N new · R rename · W workspace · Enter reopen."),
+                Line::from("F8 shows or hides the session rail at 105 columns and wider."),
                 Line::from("F3 picker: S search · Ctrl-F searches titles and transcript · Up/Down move through results."),
                 Line::from("Search: Enter opens · Ctrl-U clears · Esc closes. F4 inspects the current or selected turn."),
                 Line::from("Inspector: Up/Down fields · [/] previous/next turn · Shift-PageUp/Down scrolls long fields."),
@@ -2740,8 +3002,12 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from(
                     "PageUp/Down  Browse history; Shift-PageUp/Down  Scroll inspector text.",
                 ),
+                Line::from("F8  Show or hide the session rail at 105 columns and wider."),
                 Line::from(
-                    "Enter newline · Ctrl-S send · Ctrl-C stop or exit · F1 help · F2 actions.",
+                    "Ctrl-C  Stop viewed active run; otherwise choose a background run; idle saves drafts and exits.",
+                ),
+                Line::from(
+                    "Enter newline · Ctrl-S send · F1 help · F2 actions.",
                 ),
                 Line::from("Esc closes this menu."),
             ])
@@ -2761,6 +3027,55 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             .min(chunks[2].bottom().saturating_sub(2));
         frame.set_cursor_position((x, y));
     }
+}
+
+fn draw_stop_chooser(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(78, 70, frame.area());
+    let mut lines = vec![
+        Line::from("Choose a background session to stop"),
+        Line::from("The selected run is rechecked before Stop is sent."),
+        Line::from(""),
+    ];
+    for (index, target) in app.stop_targets.iter().enumerate() {
+        let state = app
+            .views
+            .get(&target.state_key)
+            .map(|view| {
+                if view.turn_status.is_active() {
+                    view.turn_status.display()
+                } else {
+                    "No longer active".to_string()
+                }
+            })
+            .unwrap_or_else(|| "No longer available".to_string());
+        let marker = if index == app.stop_picker_index {
+            ">"
+        } else {
+            " "
+        };
+        lines.push(Line::from(truncate_to_width(
+            &format!(
+                "{marker} {} · {} · {}",
+                target.title, state, target.record_id
+            ),
+            area.width.saturating_sub(4) as usize,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "↑/↓ select · Enter stop only this run · Esc cancel",
+    ));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Stop background run"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_inspector(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -3020,6 +3335,32 @@ fn next_inspector_scroll(current: usize, step: usize, value_len: usize) -> usize
     if next >= value_len { current } else { next }
 }
 
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+
+    let content_width = width - 1;
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if used + grapheme_width > content_width {
+            break;
+        }
+        result.push_str(grapheme);
+        used += grapheme_width;
+    }
+    result.push('…');
+    result
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -3048,7 +3389,18 @@ mod tests {
 
     use super::{
         TurnStatus, response_stop_reason, restored_draft, should_use_color, successful_status,
+        truncate_to_width,
     };
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn metadata_truncation_preserves_graphemes_and_display_width() {
+        assert_eq!(truncate_to_width("Alpha", 3), "Al…");
+        assert_eq!(truncate_to_width("中👩‍👩‍👧‍👦z", 4), "中…");
+        assert_eq!(truncate_to_width("🙂", 2), "🙂");
+        assert_eq!(truncate_to_width("anything", 0), "");
+        assert!(UnicodeWidthStr::width(truncate_to_width("中👩‍👩‍👧‍👦z", 4).as_str()) <= 4);
+    }
 
     #[test]
     fn color_policy_respects_no_color_and_dumb_term() {

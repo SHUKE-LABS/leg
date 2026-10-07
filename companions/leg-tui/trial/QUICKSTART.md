@@ -60,7 +60,21 @@ LEG_UI_STATE_DIR="$PWD/.trial-state" ./start-tui.sh
 Select the printed disposable workspace path when prompted. Follow the shared
 tasks and safety gates in `docs/ui-experiments.md`. The fixture uses only its
 fake-only key, reports deterministic workspace checks, and makes no paid API
-request. Stop the TUI and fixture with Ctrl-C.
+request.
+
+## Keyboard guide
+
+Enter inserts a newline; Ctrl-S sends. F3 opens session actions at every size.
+The rail stays hidden at 80 columns and appears from 105 columns; F8 toggles it
+when available. The composer grows with the draft, up to four content rows.
+F4 opens the turn inspector; it docks only when the conversation keeps 60
+columns and details keep 36, otherwise Esc closes its overlay.
+
+Ctrl-C stops the viewed active turn. If the viewed session is idle while other
+TUI turns run, Ctrl-C opens a named Stop chooser: Escape cancels, and Enter
+stops only the selected run after a state check. When no TUI turns are active,
+Ctrl-C saves drafts and exits. Use Ctrl-C in the fixture terminal to stop the
+fake provider.
 
 ## Revisions and human observations
 

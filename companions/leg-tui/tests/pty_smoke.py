@@ -1490,14 +1490,14 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x1b[B")
             read_until(master_fd, child, output, "Assistant reply")
             os.write(master_fd, b"\x1b[6;2~\x1b[6;2~")
-            read_until(master_fd, child, output, "Long fixture line 020")
+            read_until(master_fd, child, output, "Long fixture line 062")
             read_until(master_fd, child, output, "new content below")
             preserved_screen = output.text()
             assert "TRIAL-LARGE-TOOL" in preserved_screen, preserved_screen
             os.write(master_fd, b"\x1b[6;2~" * 22)
             read_until(master_fd, child, output, "END OF FIXTURE ANSWER")
             os.write(master_fd, b"\x1b[1;5F")
-            drain_for(master_fd, output, 0.1, child)
+            read_until_not_contains(master_fd, child, output, "new content below")
             newest_screen = output.text()
             assert "END OF FIXTURE ANSWER" in newest_screen, newest_screen
             assert "new content below" not in newest_screen, newest_screen
@@ -1830,7 +1830,7 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, alpha_draft.encode())
             read_until(master_fd, child, output, alpha_draft)
             os.write(master_fd, b"\x1bORn")
-            read_until(master_fd, child, output, "New session draft")
+            read_until(master_fd, child, output, "Untitled conversation  |  model:")
             os.write(master_fd, b"\x1bORr")
             read_until(master_fd, child, output, "Rename session")
             os.write(master_fd, b"Beta\r")
@@ -2331,7 +2331,7 @@ def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Sessions · title · workspace · recent · status")
             assert "Alpha  [Busy]" in output.text(), output.text()
             os.write(master_fd, b"n")
-            read_until(master_fd, child, output, "New session draft")
+            read_until(master_fd, child, output, "Untitled conversation  |  model:")
             os.write(master_fd, b"\x1bORr")
             read_until(master_fd, child, output, "Rename session")
             os.write(master_fd, b"Beta\r")
@@ -2347,7 +2347,7 @@ def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
             assert "status: Running" in output.text(), output.text()
             select_picker_session(master_fd, child, output, "Beta")
             read_until(master_fd, child, output, beta_draft)
-            assert "1 turn(s) active in other session(s)" in output.text(), output.text()
+            assert "Background: Alpha (Running)" in output.text(), output.text()
 
             release_gate(status_url.removesuffix("/__trial/status"), 1)
             wait_for_status(
@@ -2379,6 +2379,179 @@ def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
                     web_host.kill()
                     web_host.wait(timeout=2)
             if child is not None:
+                kill_owned_process_group(child)
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
+            stop_fixture(fixture)
+
+
+def run_background_stop_chooser_smoke(args: argparse.Namespace) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    fixture_path = repository / "trials" / "fake_provider.py"
+    with tempfile.TemporaryDirectory(prefix="leg-tui-stop-chooser-pty-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        state_dir = root / "state"
+        fixture, status_url = start_fixture(
+            fixture_path,
+            "paused-live-text",
+            workspace,
+            hold_after_first_chunk=True,
+        )
+        master_fd = slave_fd = None
+        child = None
+        output = TerminalCapture()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "TERM": "xterm-256color",
+                    "LEG_PROVIDER": "anthropic",
+                    "ANTHROPIC_BASE_URL": status_url.removesuffix("/__trial/status"),
+                    "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+                    "LEG_MODEL": "trial-fixture",
+                    "LEG_MAX_RETRIES": "0",
+                    "LEG_UI_STATE_DIR": str(state_dir),
+                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
+                }
+            )
+            master_fd, slave_fd, child, initial_termios, output = launch_conversation(
+                args, env, workspace
+            )
+
+            os.write(master_fd, b"\x1bORr")
+            read_until(master_fd, child, output, "Rename session")
+            os.write(master_fd, b"Alpha\r\r")
+            read_until(master_fd, child, output, "Alpha  |  model:")
+            os.write(master_fd, b"Alpha run held for chooser\x13")
+            read_until(master_fd, child, output, LIVE_TEXT)
+            wait_for_status(
+                status_url,
+                lambda value: value["requests"] == 1
+                and value["active_requests"] == [1]
+                and value["pause_gates"].get("1") == "held",
+                "Alpha's request to be active and held",
+            )
+            alpha_draft = "Alpha draft stays with Alpha"
+            os.write(master_fd, alpha_draft.encode())
+            read_until(master_fd, child, output, alpha_draft)
+
+            os.write(master_fd, b"\x1bORn")
+            read_until(master_fd, child, output, "Untitled conversation  |  model:")
+            os.write(master_fd, b"\x1bORr")
+            read_until(master_fd, child, output, "Rename session")
+            os.write(master_fd, b"Beta\r")
+            read_until(master_fd, child, output, "Beta")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Beta  |  model:")
+            os.write(master_fd, b"Beta run held for chooser\x13")
+            read_until(master_fd, child, output, STOP_LIVE_TEXT)
+            wait_for_status(
+                status_url,
+                lambda value: value["requests"] == 2
+                and value["active_requests"] == [1, 2]
+                and value["pause_gates"].get("2") == "held",
+                "Beta's request to be active beside Alpha",
+            )
+            beta_draft = "Beta draft stays with Beta"
+            os.write(master_fd, beta_draft.encode())
+            read_until(master_fd, child, output, beta_draft)
+
+            os.write(master_fd, b"\x1bORn")
+            read_until(master_fd, child, output, "Untitled conversation  |  model:")
+            os.write(master_fd, b"\x1bORr")
+            read_until(master_fd, child, output, "Rename session")
+            os.write(master_fd, b"Gamma\r")
+            read_until(master_fd, child, output, "Gamma")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Gamma  |  model:")
+            gamma_draft = "Gamma remains idle while two runs continue"
+            os.write(master_fd, gamma_draft.encode())
+            read_until(master_fd, child, output, gamma_draft)
+            assert "Background: Alpha (Running), Beta (Running)" in output.text(), output.text()
+
+            select_picker_session(master_fd, child, output, "Beta")
+            read_until(master_fd, child, output, beta_draft)
+            select_picker_session(master_fd, child, output, "Alpha")
+            read_until(master_fd, child, output, alpha_draft)
+            select_picker_session(master_fd, child, output, "Gamma")
+            read_until(master_fd, child, output, gamma_draft)
+            assert request_status(status_url)["requests"] == 2, (
+                "switching sessions replayed a background prompt"
+            )
+
+            os.write(master_fd, b"\x03")
+            read_until(master_fd, child, output, "Choose a background session to stop")
+            read_until(master_fd, child, output, "Alpha")
+            read_until(master_fd, child, output, "Beta")
+            held = request_status(status_url)
+            assert held["active_requests"] == [1, 2], (
+                f"opening the chooser stopped a run: {held!r}"
+            )
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.1, child)
+            assert "Choose a background session to stop" not in output.text(), output.text()
+            held = request_status(status_url)
+            assert held["active_requests"] == [1, 2], (
+                f"cancelling the chooser stopped a run: {held!r}"
+            )
+
+            os.write(master_fd, b"\x03")
+            read_until(master_fd, child, output, "Choose a background session to stop")
+            os.write(master_fd, b"\x1b[B\r")
+            stopped = wait_for_status(
+                status_url,
+                lambda value: value["request_outcomes"].get("2") == "interrupted"
+                and value["active_requests"] == [1],
+                "only Beta to stop from the selected background target",
+            )
+            assert stopped["request_outcomes"].get("1") == "active", stopped
+            assert stopped["requests"] == 2, stopped
+
+            select_picker_session(master_fd, child, output, "Beta")
+            read_until(master_fd, child, output, beta_draft)
+            assert "status: Interrupted" in output.text(), output.text()
+            assert request_status(status_url)["active_requests"] == [1]
+            select_picker_session(master_fd, child, output, "Gamma")
+            read_until(master_fd, child, output, gamma_draft)
+
+            # Let Alpha finish while its entry remains visible in the chooser.
+            # Enter must recheck that exact target and leave no other run to stop.
+            os.write(master_fd, b"\x03")
+            read_until(master_fd, child, output, "Choose a background session to stop")
+            assert "Alpha" in output.text(), output.text()
+            release_gate(status_url.removesuffix("/__trial/status"), 1)
+            completed = wait_for_status(
+                status_url,
+                lambda value: value["request_outcomes"].get("1") == "completed",
+                "Alpha to finish while the chooser is open",
+            )
+            assert completed["active_requests"] == [], completed
+            read_until(master_fd, child, output, "No longer active")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "changed state; nothing was stopped")
+            assert request_status(status_url)["request_outcomes"] == {
+                "1": "completed",
+                "2": "interrupted",
+            }
+
+            os.write(master_fd, b"\x03")
+            status = drain_until_exit(master_fd, child, output)
+            assert status == 0, f"TUI exit status was {status}"
+            termios_fd = master_fd if sys.platform == "darwin" else slave_fd
+            assert_terminal_restored(bytes(output.raw), termios_fd, initial_termios, child)
+            catalog = json.loads((state_dir / "catalog.json").read_text(encoding="utf-8"))
+            gamma_record = next(
+                record
+                for record in catalog["sessions"].values()
+                if record.get("name") == "Gamma"
+            )
+            assert gamma_record.get("drafts", {}).get("tui") == gamma_draft, gamma_record
+        finally:
+            if child is not None and child.poll() is None:
                 kill_owned_process_group(child)
             if master_fd is not None:
                 os.close(master_fd)
@@ -2435,7 +2608,7 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x1b[5~")
             read_until(master_fd, child, output, "Tool failed")
             os.write(master_fd, b"\x1b[1;5F")
-            read_until(master_fd, child, output, "Turns 997-1000 of 1000")
+            read_until(master_fd, child, output, "Turns 996-1000 of 1000")
 
             inspector_started = time.perf_counter()
             os.write(master_fd, b"\x1bOS")
@@ -2448,7 +2621,7 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x1b[B" * 6)
             read_until(master_fd, child, output, "literal Ω output from turn 0999")
             os.write(master_fd, b"\x1b[5~")
-            read_until(master_fd, child, output, "Turns 995-998 of 1000")
+            read_until(master_fd, child, output, "Turns 991-996 of 1000")
             before_switch = re.search(r"Turns (\d+-\d+ of 1000)", output.text())
             assert before_switch, output.text()
             scroll_position = before_switch.group(1)
@@ -2573,6 +2746,30 @@ def terminal_screen_text(
         column += width
         index += size
     return "\n".join("".join(line) for line in screen)
+
+
+def normalized_workbench_capture(screen: str) -> str:
+    lines = []
+    for line in screen.splitlines():
+        line = re.sub(r"(workspace: ).*?( · catalog: )", r"\1<workspace>\2", line)
+        line = re.sub(r"(catalog: [^·]+ · )[^ ]+", r"\1<elapsed>", line)
+        lines.append(line.rstrip())
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def compare_workbench_capture(name: str, screen: str, update: bool) -> None:
+    capture_path = Path(__file__).resolve().parent / "captures" / name
+    actual = normalized_workbench_capture(screen)
+    if update:
+        capture_path.parent.mkdir(parents=True, exist_ok=True)
+        capture_path.write_text(actual, encoding="utf-8")
+        return
+    expected = capture_path.read_text(encoding="utf-8")
+    assert actual == expected, (
+        f"{name} differs from the checked-in screen capture; "
+        f"rerun with --update-workbench-captures to review a replacement"
+    )
+
 
 def screen_contains(screen: str, expected: str) -> bool:
     for border in "│─┌┐└┘├┤┬┴┼":
@@ -2733,6 +2930,64 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
                 assert hint in conversation_screen, (
                     f"conversation omitted {hint!r} at 80x24: {conversation_screen!r}"
                 )
+            assert "Sessions" not in conversation_screen, (
+                f"session rail should be hidden at 80x24: {conversation_screen!r}"
+            )
+            os.write(master_fd, b"\x1bOR")
+            read_until_screen_text(
+                master_fd,
+                child,
+                output,
+                "Sessions · title · workspace · recent · status",
+                rows=24,
+                columns=80,
+            )
+            os.write(master_fd, b"\x1b")
+            read_until_screen_text(
+                master_fd, child, output, "status: Idle", rows=24, columns=80
+            )
+
+            layout_draft = "one\r\ntwo\r\nthree\r\nfour"
+            os.write(
+                master_fd,
+                b"\x1b[200~" + layout_draft.encode() + b"\x1b[201~",
+            )
+            read_until_screen_text(
+                master_fd, child, output, "four", rows=24, columns=80
+            )
+            layout_screen = terminal_screen_text(bytes(output), 24, 80)
+            compare_workbench_capture(
+                "workbench-80x24.txt",
+                layout_screen,
+                getattr(args, "update_workbench_captures", False),
+            )
+            layout_lines = layout_screen.splitlines()
+            conversation_row = next(
+                index for index, line in enumerate(layout_lines) if "Conversation" in line
+            )
+            composer_row = next(
+                index for index, line in enumerate(layout_lines) if "Composer" in line
+            )
+            assert composer_row - conversation_row >= 12, (
+                f"four-row draft left too little conversation at 80x24: {layout_screen!r}"
+            )
+            for offset, line in enumerate(("one", "two", "three", "four"), start=1):
+                assert line in layout_lines[composer_row + offset], (
+                    f"composer did not show its four content rows: {layout_screen!r}"
+                )
+            os.write(master_fd, b"\x1a")
+            drain_for(master_fd, output, 0.1)
+            shrink_screen = terminal_screen_text(bytes(output), 24, 80)
+            shrink_lines = shrink_screen.splitlines()
+            shrink_conversation_row = next(
+                index for index, line in enumerate(shrink_lines) if "Conversation" in line
+            )
+            shrink_composer_row = next(
+                index for index, line in enumerate(shrink_lines) if "Composer" in line
+            )
+            assert shrink_composer_row - shrink_conversation_row > composer_row - conversation_row, (
+                f"composer did not shrink with its draft: {shrink_screen!r}"
+            )
 
             prompt = "terminal size recovery draft"
             os.write(master_fd, prompt.encode())
@@ -2783,6 +3038,57 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             drain_for(master_fd, output, 0.2)
             final_screen = terminal_screen_text(bytes(output), 40, 120)
             assert "Succeeded" in final_screen and "Turns 1-1 of 1" in final_screen, final_screen
+            compare_workbench_capture(
+                "workbench-120x40.txt",
+                final_screen,
+                getattr(args, "update_workbench_captures", False),
+            )
+            resize_pty(slave_fd, 40, 100)
+            drain_for(master_fd, output, 0.1)
+            medium_screen = terminal_screen_text(bytes(output), 40, 100)
+            assert "Sessions" not in medium_screen, (
+                f"rail should stay hidden below its width threshold: {medium_screen!r}"
+            )
+            resize_pty(slave_fd, 40, 105)
+            drain_for(master_fd, output, 0.1)
+            threshold_screen = terminal_screen_text(bytes(output), 40, 105)
+            assert "Sessions" in threshold_screen, (
+                f"rail should appear when the conversation retains 80 columns: {threshold_screen!r}"
+            )
+            resize_pty(slave_fd, 40, 120)
+            drain_for(master_fd, output, 0.1)
+            os.write(master_fd, b"\x1bOS")
+            read_until_screen_text(
+                master_fd,
+                child,
+                output,
+                "Inspector · Up/Down field · F5 copy",
+                rows=40,
+                columns=120,
+            )
+            inspector_screen = terminal_screen_text(bytes(output), 40, 120)
+            inspector_title = next(
+                line for line in inspector_screen.splitlines() if "Inspector · Up/Down field" in line
+            )
+            assert 0 < inspector_title.find("Inspector") < 25, (
+                f"120x40 rail should force the inspector overlay: {inspector_screen!r}"
+            )
+            os.write(master_fd, b"\x1b[19~")
+            drain_for(master_fd, output, 0.1)
+            inspector_screen = terminal_screen_text(bytes(output), 40, 120)
+            inspector_title = next(
+                line for line in inspector_screen.splitlines() if "Inspector · Up/Down field" in line
+            )
+            assert "Sessions" not in inspector_screen, inspector_screen
+            assert inspector_title.find("Inspector") >= 70, (
+                f"hiding the rail should allow the inspector to dock at 120x40: {inspector_screen!r}"
+            )
+            os.write(master_fd, b"\x1b[19~")
+            drain_for(master_fd, output, 0.1)
+            inspector_screen = terminal_screen_text(bytes(output), 40, 120)
+            assert "Sessions" in inspector_screen, inspector_screen
+            os.write(master_fd, b"\x1bOS")
+            drain_for(master_fd, output, 0.1)
             os.write(master_fd, b"\x03")
             status = drain_until_exit(master_fd, child, output)
             assert status == 0, f"TUI exit status was {status}"
@@ -3037,7 +3343,28 @@ def main() -> None:
         action="store_true",
         help="run the bundle-safe issue #82 workflow against the selected fixture",
     )
+    parser.add_argument(
+        "--workbench-only",
+        action="store_true",
+        help="run the adaptive layout and background Stop PTY checks",
+    )
+    parser.add_argument(
+        "--update-workbench-captures",
+        action="store_true",
+        help="rewrite the checked-in 80x24 and 120x40 screen captures",
+    )
     args = parser.parse_args()
+    if args.workbench_only:
+        test_terminal_screen_redraw()
+        if sys.platform == "linux":
+            run_smoke(args)
+        run_resize_and_non_tty_smoke(args)
+        run_session_navigation_smoke(args)
+        if args.web_bin:
+            run_background_session_busy_smoke(args)
+        run_background_stop_chooser_smoke(args)
+        print("leg-tui adaptive workbench and background Stop PTY checks passed")
+        return
     if args.trial_coverage_only:
         runtime_path = os.environ.get("PATH", "")
         for command in ("cargo", "node"):
@@ -3057,6 +3384,7 @@ def main() -> None:
     run_session_navigation_smoke(args)
     run_workspace_flow_smoke(args)
     run_background_session_busy_smoke(args)
+    run_background_stop_chooser_smoke(args)
     run_windowed_history_smoke(args)
     run_resize_and_non_tty_smoke(args)
     run_signal_smoke(args)
