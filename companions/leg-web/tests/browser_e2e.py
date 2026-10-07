@@ -351,6 +351,41 @@ async def wait_status(page, expected: str, timeout: int = 30000) -> None:
     )
 
 
+async def wait_for_keyboard_send_ready(page) -> None:
+    """Mirror the former Send button's readiness using existing rendered state."""
+    await page.wait_for_function(
+        """() => {
+          const sessionId = sessionStorage.getItem('leg-web-current-session');
+          const conversation = document.querySelector('#conversation');
+          const title = document.querySelector('#session-title');
+          const connection = document.querySelector('#connection-state');
+          const guidance = document.querySelector('#session-guidance');
+          const status = document.querySelector('#turn-status')?.textContent;
+          const retry = document.querySelector('#retry-submission');
+          const stop = document.querySelector('#stop-turn');
+          return Boolean(sessionId && title?.dataset.sessionId === sessionId &&
+            conversation && !conversation.hidden && connection?.textContent === '' &&
+            guidance?.hidden === true && retry?.hidden === true && stop?.hidden === true &&
+            status && !['Starting', 'Running', 'Stopping', 'Reconnecting'].includes(status));
+        }""",
+        timeout=15000,
+    )
+
+
+async def send_with_keyboard(page, *, wait_ready: bool = True) -> None:
+    if wait_ready:
+        await wait_for_keyboard_send_ready(page)
+    modifier = "Meta" if platform.system() == "Darwin" else "Control"
+    if wait_ready:
+        async with page.expect_request(
+            lambda request: request.method == "POST" and request.url.endswith("/submit"),
+            timeout=5000,
+        ):
+            await page.locator("#prompt").press(f"{modifier}+Enter")
+    else:
+        await page.locator("#prompt").press(f"{modifier}+Enter")
+
+
 async def assert_control_visible_in_viewport(page, selector: str) -> None:
     bounds = await page.locator(selector).bounding_box()
     assert bounds is not None, f"{selector} has no layout box"
@@ -616,7 +651,7 @@ async def run(
                 assert await page.locator("#workspace-label").text_content() == str(workspace)
                 assert await page.locator("#workspace-label").get_attribute("title") == str(workspace)
                 assert await page.locator("#workspace-warning").is_visible()
-                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#send").count() == 0
                 assert host_snapshot(authority, token, session_id)["high_water"] == 0
                 assert fixture_status(provider_authority)["requests"] == 0
 
@@ -630,15 +665,18 @@ async def run(
                       const form = document.querySelector('#composer');
                       const field = document.querySelector('.composer-field');
                       const prompt = document.querySelector('#prompt');
-                      const send = document.querySelector('#send');
+                      const platform = navigator.userAgentData?.platform || navigator.platform || "";
                       return {
                         formHeight: bounds(form).height,
                         field: bounds(field),
                         prompt: bounds(prompt),
-                        send: bounds(send),
+                        sendCount: document.querySelectorAll('#send').length,
                         rows: prompt.rows,
                         ariaLabel: prompt.getAttribute('aria-label'),
                         placeholder: prompt.placeholder,
+                        expectedPlaceholder: /mac/i.test(platform)
+                          ? 'Enter for a new line · ⌘+Enter to send'
+                          : 'Enter for a new line · Ctrl+Enter to send',
                         retryHidden: document.querySelector('#retry-submission').hidden,
                         errorHidden: document.querySelector('#send-error').hidden,
                         keyHelpExists: Boolean(document.querySelector('.key-help')),
@@ -648,14 +686,8 @@ async def run(
                 assert idle_composer["formHeight"] <= 64, idle_composer
                 assert idle_composer["rows"] == 1, idle_composer
                 assert idle_composer["ariaLabel"] == "Message", idle_composer
-                assert idle_composer["placeholder"].startswith("Message — "), idle_composer
-                assert (
-                    "Ctrl+Enter" in idle_composer["placeholder"] or "⌘+Enter" in idle_composer["placeholder"]
-                ), idle_composer
-                assert idle_composer["prompt"]["right"] <= idle_composer["send"]["left"], idle_composer
-                assert idle_composer["send"]["right"] <= idle_composer["field"]["right"], idle_composer
-                assert idle_composer["send"]["top"] >= idle_composer["field"]["top"], idle_composer
-                assert idle_composer["send"]["bottom"] <= idle_composer["field"]["bottom"], idle_composer
+                assert idle_composer["placeholder"] == idle_composer["expectedPlaceholder"], idle_composer
+                assert idle_composer["sendCount"] == 0, idle_composer
                 assert idle_composer["retryHidden"] and idle_composer["errorHidden"], idle_composer
                 assert not idle_composer["keyHelpExists"], idle_composer
                 await page.set_viewport_size({"width": 1280, "height": 800})
@@ -666,6 +698,16 @@ async def run(
                 await composer.press("Enter")
                 assert await composer.input_value() == "Plain Enter keeps this as a draft\n"
                 assert host_snapshot(authority, token, session_id)["high_water"] == 0
+
+                blank_submit_count = len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                )
+                await composer.fill(" \t\n ")
+                await send_with_keyboard(page, wait_ready=False)
+                assert host_snapshot(authority, token, session_id)["high_water"] == 0
+                assert len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                ) == blank_submit_count
 
                 await composer.fill("TRIAL-CHINESE draft")
                 await page.evaluate(
@@ -736,13 +778,14 @@ async def run(
                 await page.route("**/submit", hold_first_send)
                 first_receipt_task = None
                 try:
-                    await page.evaluate(
-                        """() => {
-                          const send = document.querySelector('#send');
-                          send.click();
-                          send.click();
-                        }"""
+                    await send_with_keyboard(page)
+                    submit_count_after_first = len(
+                        [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
                     )
+                    await send_with_keyboard(page, wait_ready=False)
+                    assert len(
+                        [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                    ) == submit_count_after_first
                     await page.wait_for_function(
                         "() => document.querySelector('#turn-status')?.textContent === 'Starting'",
                         timeout=5000,
@@ -829,7 +872,7 @@ async def run(
 
                 await page.route("**/submit", abort_before_accept)
                 await composer.fill("TRIAL-CONTINUE: retry the same request ID after a lost connection")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.get_by_role("button", name="Retry same send").wait_for(state="visible")
                 retry_layout = await page.evaluate(
                     """() => {
@@ -841,15 +884,12 @@ async def run(
                         field: bounds('.composer-field'),
                         prompt: bounds('#prompt'),
                         retry: bounds('#retry-submission'),
-                        send: bounds('#send'),
                       };
                     }"""
                 )
                 assert retry_layout["prompt"]["right"] <= retry_layout["retry"]["left"], retry_layout
-                assert retry_layout["retry"]["right"] <= retry_layout["send"]["left"], retry_layout
-                assert retry_layout["send"]["right"] <= retry_layout["field"]["right"], retry_layout
+                assert retry_layout["retry"]["right"] <= retry_layout["field"]["right"], retry_layout
                 assert retry_layout["retry"]["top"] >= retry_layout["field"]["top"], retry_layout
-                assert retry_layout["send"]["bottom"] <= retry_layout["field"]["bottom"], retry_layout
                 snapshot_before_retry = host_snapshot(authority, token, session_id)
                 assert snapshot_before_retry["high_water"] == 1
                 assert snapshot_before_retry["next_request_id"] == 2
@@ -867,10 +907,10 @@ async def run(
 
                 await page.route("**/submit", lose_response_after_accept)
                 await composer.fill("TRIAL-PAUSE: expose provisional text and Stop before reload")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await page.wait_for_function(
-                    "() => document.querySelector('#send').disabled && !document.querySelector('#stop-turn').hidden"
+                    "() => !document.querySelector('#stop-turn').hidden"
                 )
                 await wait_status(page, "Running")
                 assert await page.locator("#elapsed-time").is_visible()
@@ -878,7 +918,15 @@ async def run(
                 active_draft = "A draft remains editable\nwhile this turn runs.\nAcross three lines."
                 await composer.fill(active_draft)
                 assert await composer.input_value() == active_draft
-                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#send").count() == 0
+                active_submit_count = len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                )
+                await send_with_keyboard(page, wait_ready=False)
+                assert await composer.input_value() == active_draft
+                assert len(
+                    [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
+                ) == active_submit_count
                 paused = host_snapshot(authority, token, session_id)
                 assert paused["high_water"] == 3 and paused["active"], paused
                 assert paused["active"]["provider"] == "anthropic"
@@ -895,7 +943,7 @@ async def run(
                 # A 384x512 CSS viewport approximates 768x1024 at 200% browser zoom.
                 await page.set_viewport_size({"width": 384, "height": 512})
                 await assert_control_visible_in_viewport(page, "#composer")
-                await assert_control_visible_in_viewport(page, "#send")
+                assert await page.locator("#send").count() == 0
                 await assert_control_visible_in_viewport(page, "#stop-turn")
                 await page.set_viewport_size({"width": 1280, "height": 800})
 
@@ -920,7 +968,7 @@ async def run(
                 )
                 assert restored_layout["height"] > idle_composer["prompt"]["height"], restored_layout
                 assert restored_layout["scrollHeight"] <= restored_layout["clientHeight"] + 1, restored_layout
-                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#send").count() == 0
                 await asyncio.to_thread(wait_high_water, authority, token, session_id, 3)
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 3)
                 assert len([url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]) == submit_count_before_lost_response_reload
@@ -950,7 +998,7 @@ async def run(
                 assert await composer.input_value() == active_draft
 
                 await composer.fill("TRIAL-TOOL-TEXT: write and confirm a fixture file")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 tool_turn = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 4)
                 await wait_status(page, "Succeeded")
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 5)
@@ -976,7 +1024,7 @@ async def run(
                 assert (workspace / "fixture-write.txt").read_text(encoding="utf-8") == "fixture-write-ok\n"
 
                 await composer.fill("TRIAL-LARGE-TOOL: summarize the large tool result")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 large_turn = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 5)
                 await wait_status(page, "Succeeded")
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 7)
@@ -1004,7 +1052,7 @@ async def run(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
                 )
                 await composer.fill("TRIAL-UNTRUSTED-MARKDOWN: read the malicious fixture as plain content")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 xss_turn = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 6)
                 await wait_status(page, "Succeeded")
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 9)
@@ -1053,7 +1101,7 @@ async def run(
                 assert xss_turn["high_water"] == 6
 
                 await composer.fill("TRIAL-LONG: create a long readable history")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 7)
                 await wait_status(page, "Succeeded")
                 await asyncio.to_thread(wait_fixture_count, provider_authority, 10)
@@ -1071,7 +1119,7 @@ async def run(
                 )
                 assert anchor_before is not None
                 await composer.fill("TRIAL-PAUSE: keep the history reading position while new text arrives")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await page.get_by_role("button", name="New content · Jump to latest").wait_for(state="visible")
                 anchor_after = await page.evaluate(
@@ -1108,21 +1156,21 @@ async def run(
                 await assert_latest_remains_pinned()
 
                 await composer.fill("TRIAL-AUTH: retain this failed prompt")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 failed = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 9)
                 await wait_status(page, "Failed")
                 assert failed["last_submission"]["status"] == "failed", failed
                 assert await composer.input_value() == "TRIAL-AUTH: retain this failed prompt"
 
                 await composer.fill("TRIAL-CAP: show the host's capped status")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 capped = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 10)
                 await wait_status(page, "Capped")
                 assert capped["last_submission"]["outcome"]["capped"] is True, capped
                 assert "Output capped by Leg" in await page.locator(".turn-warning").last.inner_text()
 
                 await composer.fill("TRIAL-REOPEN-INTERRUPTION: expose an incomplete stream")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 try:
                     failed_stream = await asyncio.to_thread(wait_completed_submission, authority, token, session_id, 11)
                 except AssertionError as error:
@@ -1149,7 +1197,7 @@ async def run(
                     "return element.scrollHeight - element.clientHeight - element.scrollTop <= 5; }"
                 )
                 await composer.fill("TRIAL-STOP: leave this turn incomplete on host restart")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.locator("#active-tool").wait_for(state="visible")
                 pending_turn = page.locator(".transcript-turn").last
                 pending_tool = pending_turn.locator(".tool-disclosure")
@@ -1296,7 +1344,7 @@ async def run(
                     [url for method, url in browser_requests if method == "POST" and url.endswith("/submit")]
                 )
                 await composer.fill("TRIAL-PROVIDER-RETRY: retry one transient provider response")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.wait_for_function(
                     "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
                     timeout=15000,
@@ -1486,7 +1534,7 @@ async def run_session_navigation(
 
                 async def send_and_wait(target_page, request_id: int, prompt: str, session_id: str) -> dict[str, object]:
                     await target_page.locator("#prompt").fill(prompt)
-                    await target_page.get_by_role("button", name="Send").click()
+                    await send_with_keyboard(target_page)
                     try:
                         result = await asyncio.to_thread(
                             wait_completed_submission, authority, token, session_id, request_id
@@ -1560,7 +1608,7 @@ async def run_session_navigation(
                 await page.locator(f'#session-list .session-select[data-session-id="{missing_id}"]').wait_for()
                 await open_session(page, missing_id, None)
                 assert "Choose a workspace folder" in await page.locator("#session-guidance").inner_text()
-                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#send").count() == 0
                 await page.locator("#session-guidance").get_by_role("button", name="Set workspace").click()
                 await page.locator("#recovery-workspace-input").fill(str(workspace_a))
                 await page.locator("#set-workspace-form").get_by_role("button", name="Set workspace").click()
@@ -1588,12 +1636,12 @@ async def run_session_navigation(
                     "() => document.querySelector('#session-guidance')?.textContent.includes('read-only')"
                 )
                 assert "start a new conversation" in (await page.locator("#session-guidance").inner_text()).lower()
-                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#send").count() == 0
 
                 alpha_draft_id = await create_session(page, workspace_a)
                 await rename_session(page, alpha_draft_id, "Alpha")
                 await page.locator("#prompt").fill("TRIAL-NAV-SEED: create prior tool history")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.wait_for_function(
                     "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
                     timeout=15000,
@@ -1713,7 +1761,7 @@ async def run_session_navigation(
                     [url for method, url in page_requests if method == "POST" and url.endswith("/submit")]
                 )
                 await page.locator("#prompt").fill("TRIAL-PAUSE: keep the background run visible")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await wait_status(page, "Running")
                 busy_rejection = await page2.evaluate(
@@ -1767,7 +1815,7 @@ async def run_session_navigation(
                         f"active={host_state.get('active')}; lastSubmission={host_state.get('last_submission')}"
                     ) from error
                 assert await page2.locator("#prompt").input_value() == loser_draft
-                assert await page2.get_by_role("button", name="Send").is_disabled()
+                assert await page2.locator("#send").count() == 0
                 await open_session(page, beta_draft_id, "Beta")
                 await page.wait_for_function(
                     "id => [...document.querySelectorAll('#session-list .session-entry')].some(entry => "
@@ -1951,7 +1999,7 @@ async def run_session_navigation(
                 assert submit_count_after_search == submit_count_before_search
 
                 await page.locator("#prompt").fill("TRIAL-SEARCH-LARGE-TOOL: keep its long result out of the DOM")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 large_search_turn = await asyncio.to_thread(
                     wait_completed_submission, authority, token, alpha_id, 5
                 )
@@ -2020,7 +2068,7 @@ async def run_session_navigation(
 
                 copy_prompt = "TRIAL-COPY-UNICODE: copy this prompt\nsecond line Ω"
                 await page.locator("#prompt").fill(copy_prompt)
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 unicode_turn = await asyncio.to_thread(
                     wait_completed_submission, authority, token, alpha_id, 6
                 )
@@ -2182,7 +2230,7 @@ async def run_session_navigation(
                 await rename_session(page, retry_draft_id, "Retry source")
                 failed_prompt = "TRIAL-REOPEN-FAILURE: retry this recorded prompt"
                 await page.locator("#prompt").fill(failed_prompt)
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.wait_for_function(
                     "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
                     timeout=15000,
@@ -2285,7 +2333,7 @@ async def run_session_navigation(
                 assert submit_count_after_turn_retry - submit_count_before_turn_retry == 1
 
                 await page.locator("#prompt").fill("TRIAL-RUNNING: verify retry is disabled while busy")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.locator("#active-tool").wait_for(state="visible")
                 retry_action = page.locator('#messages [data-key="turn-0-assistant"] .retry-turn-button')
                 assert await retry_action.is_disabled()
@@ -2307,7 +2355,7 @@ async def run_session_navigation(
                 paused_provider_calls_before_interruption = provider_before_interrupted_turn[
                     "scenario_requests"
                 ].get("TRIAL-PAUSE", 0)
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await page.wait_for_function(
                     "!document.querySelector('#stop-turn').hidden"
@@ -2400,7 +2448,7 @@ async def run_session_navigation(
 
                 await create_session(page, workspace_a)
                 await page.locator("#prompt").fill("TRIAL-HISTORY-SEED: create selectable historical link")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.wait_for_function(
                     "() => { const id = sessionStorage.getItem('leg-web-current-session'); return id && !id.startsWith('draft-'); }",
                     timeout=15000,
@@ -2425,7 +2473,7 @@ async def run_session_navigation(
                     "node => node.getBoundingClientRect().top - document.querySelector('#transcript').getBoundingClientRect().top"
                 )
                 await page.locator("#prompt").fill("TRIAL-HISTORY-STREAM: stream several later deltas")
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await page.evaluate(
                     """() => {
@@ -2516,7 +2564,7 @@ async def run_session_navigation(
                     await asyncio.to_thread(fixture_status, provider_authority)
                 )["requests"]
                 await page2.locator("#prompt").fill(cross_tab_prompt)
-                await page2.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page2)
                 await snapshot_started.wait()
                 await page.get_by_text("Submitted prompt is loading…", exact=True).wait_for()
                 assert await page.locator("#prompt").input_value() == cross_tab_draft
@@ -2593,7 +2641,7 @@ async def run_session_navigation(
                     await asyncio.to_thread(fixture_status, provider_authority)
                 )["requests"]
                 await page.locator("#prompt").fill(local_prompt)
-                await page.get_by_role("button", name="Send").click()
+                await send_with_keyboard(page)
                 await submit_intercepted.wait()
                 assert host_snapshot(authority, token, local_id)["high_water"] == 0
                 await page.locator("#prompt").fill(local_draft)

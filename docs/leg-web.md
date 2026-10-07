@@ -31,11 +31,13 @@ companions/target/debug/leg-web --no-open \
   --supervisor-bin "$PWD/companions/target/debug/leg-ui-supervisor"
 ```
 
-The host binds only `127.0.0.1` and asks the OS for a free port. `--bind` is
-accepted only as `127.0.0.1:0`; other addresses and fixed ports are rejected.
-It prints the actual address and a one-time launch URL. By default it opens
-that URL in the system browser; pass `--no-open` to keep startup in the
-terminal. `--state-dir`, `--leg-bin`, and `--supervisor-bin` select the shared
+The host binds only `127.0.0.1`, on port `13579` by default, so the address
+stays the same across restarts. `--bind 127.0.0.1:<port>` picks another port,
+and `--bind 127.0.0.1:0` asks the OS for a free one; non-loopback addresses are
+rejected. If the port is taken, startup fails with a `--bind` hint instead of
+moving to another port. It prints the actual address and a one-time launch
+URL. By default it opens that URL in the system browser; pass `--no-open` to
+keep startup in the terminal. `--state-dir`, `--leg-bin`, and `--supervisor-bin` select the shared
 catalog and native executables. `--event-buffer` and `--receipt-limit` set
 the retention sizes; defaults are 256 and 128. Run `leg-web --help` for the
 launch warning:
@@ -199,11 +201,11 @@ repeat tool side effects. **Retry same send** is separate:
 it appears only when the host proves that a pending submission was not
 accepted, then reuses that send's ID and exact text for reconciliation.
 
-Press Enter for a newline. Press Ctrl+Enter or Cmd+Enter, or select **Send**,
-to submit. Send is disabled while leg is running; a draft can still be edited
-and failed prompts remain available. Markdown formatting uses local DOM
-rendering: raw HTML is shown as text, unsupported or unsafe links remain text,
-and model/tool output cannot load remote images or other resources.
+Press Enter for a newline. Press Ctrl+Enter or Cmd+Enter to submit. Blank
+drafts are ignored, and sends are refused while a turn is running. A draft can
+still be edited, and failed prompts remain available. Markdown formatting uses
+local DOM rendering: raw HTML is shown as text, unsupported or unsafe links
+remain text, and model/tool output cannot load remote images or other resources.
 
 The default theme's tool inspector is opened with its **Show details** button. It shows
 the tool name and ID, literal arguments, result or error, and call/result

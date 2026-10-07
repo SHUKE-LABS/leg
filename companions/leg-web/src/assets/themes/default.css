@@ -549,7 +549,7 @@ textarea:focus-visible,
 }
 
 .turn-status-group {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   gap: 0.4rem;
   min-width: 0;
 }
