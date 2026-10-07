@@ -234,6 +234,10 @@ impl TranscriptTurn {
         sources
     }
 
+    pub fn has_tool_rows(&self) -> bool {
+        self.rounds.values().any(|round| !round.tools.is_empty())
+    }
+
     /// Ordered semantic transcript content. Stable source IDs let the reader
     /// keep a position when rows are rewrapped or provisional text reconciles.
     pub fn source_blocks(&self) -> Vec<TranscriptBlock> {
@@ -1266,6 +1270,7 @@ mod tests {
     #[test]
     fn tool_rows_prioritize_readable_inputs_and_hide_call_ids() {
         let mut transcript = TranscriptTurn::new("run calls");
+        assert!(!transcript.has_tool_rows());
         transcript.observe(&tool_round(
             0,
             json!([
@@ -1276,6 +1281,7 @@ mod tests {
                 {"type":"tool_use","id":"same-e","name":"lookup","input":{"query":"find this"}}
             ]),
         ));
+        assert!(transcript.has_tool_rows());
         let rows = transcript
             .source_blocks()
             .into_iter()

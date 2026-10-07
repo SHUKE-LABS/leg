@@ -435,6 +435,16 @@ struct StopTarget {
     turn_index: Option<u64>,
 }
 
+struct ActionDisabledInputs {
+    current_busy: bool,
+    current_owner_unverified: bool,
+    current_read_only: bool,
+    workspace_available: bool,
+    has_any_active_session: bool,
+    has_unverified_session_owner: bool,
+    background_stop_targets: Vec<StopTarget>,
+}
+
 impl ConversationState {
     fn empty() -> Self {
         Self {
@@ -1153,23 +1163,36 @@ impl App {
     }
 
     fn has_tool_rows(&self) -> bool {
-        self.transcript.iter().any(|turn| {
-            turn.source_blocks()
-                .iter()
-                .any(|block| matches!(&block.source_id, TranscriptSourceId::Tool { .. }))
-        })
+        self.transcript.iter().any(TranscriptTurn::has_tool_rows)
+    }
+
+    fn action_disabled_inputs(&self) -> ActionDisabledInputs {
+        let current_session = self.current_catalog_session();
+        ActionDisabledInputs {
+            current_busy: self.turn_status.is_active()
+                || current_session
+                    .is_some_and(|session| session.run_state == CatalogRunState::Active),
+            current_owner_unverified: current_session
+                .is_some_and(|session| session.run_state == CatalogRunState::Unknown),
+            current_read_only: self.read_only
+                || current_session.is_some_and(|session| session.read_only),
+            workspace_available: self.workspace.as_ref().is_some_and(|path| path.is_dir()),
+            has_any_active_session: self.has_any_active_session(),
+            has_unverified_session_owner: self.has_unverified_session_owner(),
+            background_stop_targets: self.background_stop_targets(),
+        }
     }
 
     fn action_disabled_reason(&self, action: PaletteAction) -> Option<String> {
-        let current_session = self.current_catalog_session();
-        let current_busy = self.turn_status.is_active()
-            || current_session.is_some_and(|session| session.run_state == CatalogRunState::Active);
-        let current_owner_unverified =
-            current_session.is_some_and(|session| session.run_state == CatalogRunState::Unknown);
-        let current_read_only =
-            self.read_only || current_session.is_some_and(|session| session.read_only);
-        let workspace_available = self.workspace.as_ref().is_some_and(|path| path.is_dir());
+        let inputs = self.action_disabled_inputs();
+        self.action_disabled_reason_with_inputs(action, &inputs)
+    }
 
+    fn action_disabled_reason_with_inputs(
+        &self,
+        action: PaletteAction,
+        inputs: &ActionDisabledInputs,
+    ) -> Option<String> {
         match action {
             PaletteAction::Sessions if self.sessions.is_empty() => {
                 Some("No sessions to browse.".to_string())
@@ -1177,16 +1200,16 @@ impl App {
             PaletteAction::Rename if self.current_record_id().is_none() => {
                 Some("No session is open.".to_string())
             }
-            PaletteAction::Rename if current_busy => {
+            PaletteAction::Rename if inputs.current_busy => {
                 Some("Session has an active turn.".to_string())
             }
-            PaletteAction::Rename if current_owner_unverified => {
+            PaletteAction::Rename if inputs.current_owner_unverified => {
                 Some("Session ownership could not be verified.".to_string())
             }
-            PaletteAction::Workspace if current_busy => {
+            PaletteAction::Workspace if inputs.current_busy => {
                 Some("Session has an active turn.".to_string())
             }
-            PaletteAction::Workspace if current_owner_unverified => {
+            PaletteAction::Workspace if inputs.current_owner_unverified => {
                 Some("Session ownership could not be verified.".to_string())
             }
             PaletteAction::Search if self.sessions.is_empty() => {
@@ -1212,12 +1235,16 @@ impl App {
             PaletteAction::Retry if self.session_id.is_none() => {
                 Some("No saved session to retry.".to_string())
             }
-            PaletteAction::Retry if current_busy => Some("Session has an active turn.".to_string()),
-            PaletteAction::Retry if current_owner_unverified => {
+            PaletteAction::Retry if inputs.current_busy => {
+                Some("Session has an active turn.".to_string())
+            }
+            PaletteAction::Retry if inputs.current_owner_unverified => {
                 Some("Session ownership could not be verified.".to_string())
             }
-            PaletteAction::Retry if current_read_only => Some("Session is read-only.".to_string()),
-            PaletteAction::Retry if !workspace_available => {
+            PaletteAction::Retry if inputs.current_read_only => {
+                Some("Session is read-only.".to_string())
+            }
+            PaletteAction::Retry if !inputs.workspace_available => {
                 Some("Recorded workspace is missing.".to_string())
             }
             PaletteAction::Retry
@@ -1231,7 +1258,7 @@ impl App {
             PaletteAction::ToggleRail if self.terminal_columns < SESSION_RAIL_MIN_COLUMNS => Some(
                 format!("Available at {SESSION_RAIL_MIN_COLUMNS} columns and wider."),
             ),
-            PaletteAction::Stop if current_owner_unverified => {
+            PaletteAction::Stop if inputs.current_owner_unverified => {
                 Some("Session ownership could not be verified.".to_string())
             }
             PaletteAction::Stop if self.turn_status.is_stopping() => {
@@ -1242,7 +1269,7 @@ impl App {
             }
             PaletteAction::Stop
                 if !self.turn_status.is_active()
-                    && self.background_stop_targets().is_empty()
+                    && inputs.background_stop_targets.is_empty()
                     && self
                         .sessions
                         .iter()
@@ -1251,11 +1278,11 @@ impl App {
                 Some("Active turn is owned by another interface.".to_string())
             }
             PaletteAction::Stop
-                if !self.turn_status.is_active() && self.background_stop_targets().is_empty() =>
+                if !self.turn_status.is_active() && inputs.background_stop_targets.is_empty() =>
             {
                 Some("No active TUI session to stop.".to_string())
             }
-            PaletteAction::Exit if self.has_any_active_session() => {
+            PaletteAction::Exit if inputs.has_any_active_session => {
                 let catalog_title = self
                     .sessions
                     .iter()
@@ -1267,7 +1294,8 @@ impl App {
                     if self.turn_status.is_active() {
                         self.current_session_title()
                     } else {
-                        self.background_stop_targets()
+                        inputs
+                            .background_stop_targets
                             .first()
                             .map(|target| target.title.clone())
                             .unwrap_or_else(|| "session".to_string())
@@ -1275,18 +1303,22 @@ impl App {
                 });
                 Some(format!("Active turn in {active_title}."))
             }
-            PaletteAction::Exit if self.has_unverified_session_owner() => {
+            PaletteAction::Exit if inputs.has_unverified_session_owner => {
                 Some("Session ownership could not be verified.".to_string())
             }
             PaletteAction::Send if self.terminal_too_small() => {
                 Some("Terminal must be at least 80x24.".to_string())
             }
-            PaletteAction::Send if current_busy => Some("Session has an active turn.".to_string()),
-            PaletteAction::Send if current_owner_unverified => {
+            PaletteAction::Send if inputs.current_busy => {
+                Some("Session has an active turn.".to_string())
+            }
+            PaletteAction::Send if inputs.current_owner_unverified => {
                 Some("Session ownership could not be verified.".to_string())
             }
-            PaletteAction::Send if current_read_only => Some("Session is read-only.".to_string()),
-            PaletteAction::Send if !workspace_available => {
+            PaletteAction::Send if inputs.current_read_only => {
+                Some("Session is read-only.".to_string())
+            }
+            PaletteAction::Send if !inputs.workspace_available => {
                 Some("Choose an existing workspace.".to_string())
             }
             PaletteAction::Send if self.composer.text().trim().is_empty() => {
@@ -1300,6 +1332,7 @@ impl App {
     }
 
     fn palette_entries(&self) -> Vec<PaletteEntry> {
+        let inputs = self.action_disabled_inputs();
         let mut entries = vec![
             (
                 PaletteAction::Sessions,
@@ -1373,7 +1406,7 @@ impl App {
             action,
             label,
             shortcut,
-            disabled_reason: self.action_disabled_reason(action),
+            disabled_reason: self.action_disabled_reason_with_inputs(action, &inputs),
         })
         .collect::<Vec<_>>();
         for entry in &mut entries {
@@ -1405,7 +1438,11 @@ impl App {
     }
 
     fn idle_footer_text(&self, width: usize) -> String {
-        let enabled = |action| self.action_disabled_reason(action).is_none();
+        let inputs = self.action_disabled_inputs();
+        let enabled = |action| {
+            self.action_disabled_reason_with_inputs(action, &inputs)
+                .is_none()
+        };
         let mut hints = vec!["F2/Ctrl-P actions".to_string()];
         if enabled(PaletteAction::Send) {
             hints.push("Ctrl-S send".to_string());
@@ -1415,7 +1452,7 @@ impl App {
             hints.push("Ctrl-C stop".to_string());
         } else if enabled(PaletteAction::Exit) {
             hints.push("Ctrl-C exit".to_string());
-        } else if !self.background_stop_targets().is_empty() {
+        } else if !inputs.background_stop_targets.is_empty() {
             hints.push("Ctrl-C choose Stop".to_string());
         }
         let mut optional = Vec::new();
