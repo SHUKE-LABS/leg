@@ -4,7 +4,7 @@ w┌Command palette · F2/Ctrl-P────────────────
 ││> Browse/switch sessions  [F3]                                                                                      ││
 ││  New conversation  [F3 → N]                                                                                        ││
 ││  Rename current session  [F3 → R]                                                                                  ││
-││  Choose/replace workspace  [W]                                                                                     ││
+││  Choose/replace workspace  [F3 → W]                                                                                ││
 ││  Search sessions and transcript  [Ctrl-F]                                                                          ││
 ││  Inspect transcript  [F4]                                                                                          ││
 ││× Copy selected field  [F5] · disabled                                                                              ││

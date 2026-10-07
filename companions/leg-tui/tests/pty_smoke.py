@@ -968,7 +968,9 @@ def run_smoke(args: argparse.Namespace) -> None:
                 assert delayed["pause_gates"].get("2") == "held", delayed
                 assert capture.contains(STOP_LIVE_TEXT), capture.text()
 
-                os.write(master_fd, b"\x03")
+                os.write(master_fd, b"\x1bOQstop")
+                read_until(master_fd, child, capture, "Stop Untitled conversation")
+                os.write(master_fd, b"\r")
                 read_until(master_fd, child, capture, "Interrupted")
                 assert capture.contains("Interrupted"), capture.text()
                 os.write(master_fd, b"\x03")

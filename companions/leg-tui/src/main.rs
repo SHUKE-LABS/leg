@@ -1319,7 +1319,7 @@ impl App {
             (
                 PaletteAction::Workspace,
                 "Choose/replace workspace".to_string(),
-                "W",
+                "F3 → W",
             ),
             (
                 PaletteAction::Search,
@@ -1574,7 +1574,7 @@ impl App {
                 self.retry_selected_turn();
             }
             PaletteAction::ToggleRail => self.toggle_session_rail(),
-            PaletteAction::Stop => self.handle_ctrl_c(),
+            PaletteAction::Stop => self.stop_from_palette(),
             PaletteAction::Help => self.show_help = true,
             PaletteAction::Exit => self.quit = true,
             PaletteAction::Send | PaletteAction::FocusTools => {}
@@ -2305,11 +2305,7 @@ impl App {
             return;
         }
         self.refresh_sessions();
-        self.stop_targets = self.background_stop_targets();
-        if !self.stop_targets.is_empty() {
-            self.stop_picker_index = 0;
-            self.stop_chooser_open = true;
-            self.status = "Choose a background session to stop".to_string();
+        if self.open_background_stop_chooser() {
             return;
         }
         if self.has_any_active_session() {
@@ -2321,6 +2317,29 @@ impl App {
             return;
         }
         self.quit = true;
+    }
+
+    fn stop_from_palette(&mut self) {
+        self.receive_turn_messages();
+        if self.turn_status.is_active() {
+            self.stop_current_session();
+            return;
+        }
+        self.refresh_sessions();
+        if !self.open_background_stop_chooser() {
+            self.status = "No active TUI session to stop".to_string();
+        }
+    }
+
+    fn open_background_stop_chooser(&mut self) -> bool {
+        self.stop_targets = self.background_stop_targets();
+        if self.stop_targets.is_empty() {
+            return false;
+        }
+        self.stop_picker_index = 0;
+        self.stop_chooser_open = true;
+        self.status = "Choose a background session to stop".to_string();
+        true
     }
 
     fn stop_current_session(&mut self) {
@@ -4357,7 +4376,10 @@ fn draw_command_palette(frame: &mut Frame<'_>, app: &App) {
     );
     let cursor_x = area
         .x
-        .saturating_add(1 + UnicodeWidthStr::width(palette.query.as_str()) as u16)
+        .saturating_add(
+            1 + UnicodeWidthStr::width("Filter: ") as u16
+                + UnicodeWidthStr::width(palette.query.as_str()) as u16,
+        )
         .min(area.right().saturating_sub(2));
     frame.set_cursor_position((cursor_x, area.y.saturating_add(1)));
 }
@@ -4783,17 +4805,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::transcript::{TranscriptSourceId, TranscriptTurn};
     use leg_ui_client::StreamEvent;
     use serde_json::json;
 
     use super::{
-        TranscriptAnchor, TurnStatus, build_transcript_rows, build_transcript_rows_with_focus,
-        find_case_insensitive, find_transcript_anchor_row, response_stop_reason, restored_draft,
-        same_tool_anchor, should_use_color, successful_status, transcript_page_down_start,
-        transcript_page_up_start, truncate_to_width,
+        App, PaletteAction, SessionCatalog, SessionCatalogConfig, TranscriptAnchor, TurnStatus,
+        build_transcript_rows, build_transcript_rows_with_focus, find_case_insensitive,
+        find_transcript_anchor_row, response_stop_reason, restored_draft, same_tool_anchor,
+        should_use_color, successful_status, transcript_page_down_start, transcript_page_up_start,
+        truncate_to_width,
     };
     use unicode_width::UnicodeWidthStr;
 
@@ -4828,6 +4851,32 @@ mod tests {
         status = TurnStatus::Starting;
         status.mark_running_unless_stopping();
         assert_eq!(status, TurnStatus::Running);
+    }
+
+    #[test]
+    fn palette_stop_with_no_active_tui_run_never_exits() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!(
+            "leg-tui-palette-stop-{}-{unique}",
+            std::process::id()
+        ));
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state_dir.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("temporary test catalog opens");
+        let mut app = App::new(catalog);
+
+        app.invoke_palette_action(PaletteAction::Stop);
+
+        assert!(!app.quit);
+        assert!(!app.stop_chooser_open);
+        assert_eq!(app.status, "No active TUI session to stop");
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
     }
 
     #[test]
