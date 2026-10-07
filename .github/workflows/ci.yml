@@ -398,6 +398,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test development install script
+        run: python3 scripts/tests/test_dev_script.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.89.0
         with:
