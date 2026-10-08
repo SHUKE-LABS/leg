@@ -407,6 +407,14 @@ to a focused row. Its 80x24 and 120x40 views are recorded in
 `companions/leg-tui/tests/captures/tool-summary-80x24.txt` and
 `companions/leg-tui/tests/captures/tool-summary-120x40.txt`.
 
+Issue #183 adds a native Linux/Windows paired responsiveness gate and a Windows
+ConPTY behavior harness. The gate records its 30-second idle CPU counters and
+keeps native core/controller failures unmet until fixed or tracked by a linked
+issue. Thresholds, baseline rules, report contents, and the Windows runner's
+lack of a Windows Terminal frontend are documented in
+[`ui-experiments.md`](ui-experiments.md#tui-responsiveness-harness-182).
+The current native Stop failure is tracked in [#187](https://github.com/SHUKE-LABS/leg/issues/187); do not treat Windows Stop as verified until that check passes.
+
 Command-palette captures are checked in at
 [80x24](../companions/leg-tui/tests/captures/command-palette-80x24.txt) and
 [120x40](../companions/leg-tui/tests/captures/command-palette-120x40.txt).

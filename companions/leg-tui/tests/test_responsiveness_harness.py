@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
+import sys
 import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
 import responsiveness_harness as harness
@@ -148,6 +153,108 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         self.assertEqual(context["emit_age_before_ms"], 3.0)
         self.assertEqual(context["emit_wait_after_ms"], 2.0)
         self.assertEqual(context["inter_emit_gap_ms"], 5.0)
+
+    def test_idle_cpu_is_normalized_to_one_logical_cpu_and_keeps_raw_counters(self) -> None:
+        process = SimpleNamespace(
+            cpu_times=Mock(
+                side_effect=[
+                    SimpleNamespace(user=10.0, system=2.0),
+                    SimpleNamespace(user=10.20012, system=2.1),
+                ]
+            )
+        )
+        with (
+            patch.object(harness.psutil, "Process", return_value=process),
+            patch.object(harness.time, "perf_counter_ns", side_effect=[1_000, 30_000_001_000]),
+            patch.object(harness.time, "sleep") as sleep,
+        ):
+            measurement = harness.measure_idle_cpu(1234, 30.0)
+
+        sleep.assert_called_once_with(30.0)
+        self.assertEqual(measurement["scope"], "leg-tui process only, identified by the spawned root PID")
+        self.assertEqual(measurement["raw_counters"]["start"]["user_seconds"], 10.0)
+        self.assertEqual(measurement["raw_counters"]["end"]["system_seconds"], 2.1)
+        self.assertAlmostEqual(measurement["average_percent_of_one_logical_cpu"], 1.0004)
+
+    def test_responsiveness_gates_enforce_each_group_opening_bound_and_idle_cpu(self) -> None:
+        groups = {
+            f"{action}@{columns}x{rows}": {
+                "sample_count": harness.SAMPLE_COUNT,
+                "p95_ms": 100.0,
+            }
+            for action in harness.RESPONSIVENESS_ACTIONS
+            for rows, columns in harness.DIMENSIONS
+        }
+        timings = {"cached_history_open_ms": 200.0, "inspector_open_ms": 200.0}
+
+        passed = harness.responsiveness_gates(groups, timings, 1.0)
+
+        self.assertEqual(passed["status"], "passed")
+        self.assertEqual(
+            harness.summarize_latencies(
+                [{"latency_ms": 100.0004}] * harness.SAMPLE_COUNT
+            )["p95_ms"],
+            100.0004,
+        )
+        groups["inspection@120x40"]["p95_ms"] = 100.0004
+        failed = harness.responsiveness_gates(groups, timings, 1.0)
+        self.assertEqual(failed["status"], "failed")
+        self.assertFalse(failed["checks"]["input_to_visible_output"]["groups"]["inspection@120x40"]["passed"])
+        over_cpu_limit = harness.responsiveness_gates(groups, timings, 1.0004)
+        self.assertFalse(over_cpu_limit["checks"]["idle_cpu"]["passed"])
+        over_open_limit = harness.responsiveness_gates(
+            groups,
+            {"cached_history_open_ms": 200.0004, "inspector_open_ms": 200.0},
+            1.0,
+        )
+        self.assertFalse(over_open_limit["checks"]["cached_history_open"]["passed"])
+        del groups["history_scrolling@80x24"]
+        missing = harness.responsiveness_gates(groups, timings, 1.0)
+        self.assertFalse(missing["checks"]["input_to_visible_output"]["groups"]["history_scrolling@80x24"]["passed"])
+        self.assertEqual(harness.percent_of_one_logical_cpu(0.3, 30.0), 1.0)
+        with self.assertRaisesRegex(ValueError, "elapsed_seconds"):
+            harness.percent_of_one_logical_cpu(0.0, 0.0)
+
+    def test_only_final_comparison_role_fails_on_unmet_gates(self) -> None:
+        report = {
+            "source_revision": "measured",
+            "harness_revision": "harness",
+            "comparison_role": "observation",
+            "terminal_transport": "native PTY",
+            "terminal": {},
+            "dimensions": [],
+            "groups": {},
+            "timings": {},
+            "idle_cpu": {},
+            "gates": {"status": "failed"},
+            "memory": {},
+        }
+        with TemporaryDirectory() as temporary:
+            binary_paths = {}
+            for name in ("tui", "leg", "supervisor"):
+                binary_path = Path(temporary) / name
+                binary_path.write_text("test binary", encoding="utf-8")
+                binary_paths[name] = str(binary_path)
+            for role, expected_status in (("observation", 0), ("final", 1)):
+                report["comparison_role"] = role
+                output = Path(temporary) / f"{role}.json"
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "responsiveness_harness.py",
+                            "--tui-bin", binary_paths["tui"],
+                            "--leg-bin", binary_paths["leg"],
+                            "--supervisor-bin", binary_paths["supervisor"],
+                            "--output", str(output),
+                            "--comparison-role", role,
+                        ],
+                    ),
+                    patch.object(harness, "run_harness", return_value=report),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(harness.main(), expected_status)
 
     def test_provider_summary_reads_module_from_fixture_server(self) -> None:
         stream_id = "RESPONSIVENESS-STREAM-A-PAIR-001"

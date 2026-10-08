@@ -426,6 +426,30 @@ dimensions, and build profile.
 For pull request CI runs, `source_revision` is GitHub Actions' `github.sha`
 (the merge commit tested by CI), not the PR branch head; the workflow run records
 the PR head SHA separately.
-CI uploads separate `leg-tui-responsiveness-linux-*` and
-`leg-tui-responsiveness-windows-*` artifacts on the PR run. Attach both reports
-to the issue PR.
+Ordinary CI runs upload separate `leg-tui-responsiveness-linux-*` and
+`leg-tui-responsiveness-windows-*` artifacts. A PR whose body contains
+`Closes #183` or `Part of #183` runs the paired baseline/final gate on native
+Linux and Windows instead. It builds baseline
+`b5444f9f409a6edbab7cd02ed776a7df36e6e412` and the PR revision in release mode
+on each same runner, then uploads each report and
+its command logs as `leg-tui-responsiveness-comparison-<os>-*`.
+
+The #183 final revision passes only when every action/size group has at least
+100 samples and p95 input-to-visible-output latency is at most 100 ms, cached
+history and inspector opening each take at most 200 ms, and idle TUI CPU stays
+at or below 1% of one logical CPU during a fixed 30-second window. The CPU
+report records requested and actual elapsed time plus raw user/system counters.
+A Windows baseline that cannot run the workload may be recorded with its exact
+failure; a Linux baseline failure fails the gate. A native core/controller
+failure remains an unmet gate: link a separate issue in the PR and docs, and do
+not relax a threshold to pass. The paired job also runs the Windows behavior
+harness for multiline Chinese/emoji paste, resize recovery, `NO_COLOR`, OSC 52
+with F7 save fallback, terminal restoration, Stop process-tree cleanup, session
+switching, retry cancellation, and same-session busy rejection. Its terminal is
+Windows ConPTY with no Windows Terminal frontend; reports identify that setup.
+The local native run on Windows 11 build 26300 currently fails the Stop check:
+the active catalog reports `Ownership unknown`, the TUI says
+`Active session changed state; nothing was stopped`, and the owned Bash/PowerShell
+process tree remains alive after 10 seconds. This is tracked by [#187](https://github.com/SHUKE-LABS/leg/issues/187).
+Keep the #183 Stop gate unmet until that issue is resolved and the native check
+passes.

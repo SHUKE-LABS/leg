@@ -63,7 +63,18 @@ NARROW_STATUS_TITLE_WIDTH = 14
 ACTIVE_SESSION_STATUS_LABELS = {"Starting", "Running", "Stopping"}
 TRANSCRIPT_WINDOW_PATTERN = re.compile(r"Rows (\d+)-(\d+) of (\d+)")
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.1
-IDLE_MEMORY_WINDOW_SECONDS = 2.0
+IDLE_CPU_WINDOW_SECONDS = 30.0
+IDLE_CPU_LIMIT_PERCENT = 1.0
+LATENCY_P95_LIMIT_MS = 100.0
+OPEN_HISTORY_LIMIT_MS = 200.0
+OPEN_INSPECTOR_LIMIT_MS = 200.0
+IDLE_MEMORY_WINDOW_SECONDS = IDLE_CPU_WINDOW_SECONDS
+RESPONSIVENESS_ACTIONS = (
+    "draft_editing",
+    "history_scrolling",
+    "palette_filtering",
+    "inspection",
+)
 
 
 def load_fake_provider() -> Any:
@@ -399,8 +410,109 @@ def summarize_latencies(samples: list[dict[str, Any]]) -> dict[str, Any]:
     values = [float(sample["latency_ms"]) for sample in samples]
     return {
         "sample_count": len(values),
-        "p95_ms": round(p95(values), 3),
+        "p95_ms": p95(values),
         "max_ms": round(max(values), 3),
+    }
+
+
+def percent_of_one_logical_cpu(cpu_seconds: float, elapsed_seconds: float) -> float:
+    if elapsed_seconds <= 0:
+        raise ValueError("elapsed_seconds must be positive")
+    if cpu_seconds < 0:
+        raise ValueError("cpu_seconds cannot be negative")
+    return 100.0 * cpu_seconds / elapsed_seconds
+
+
+def responsiveness_gates(
+    groups: dict[str, dict[str, Any]],
+    timings: dict[str, float],
+    idle_cpu_percent: float,
+) -> dict[str, Any]:
+    expected_groups = {
+        f"{action}@{columns}x{rows}"
+        for action in RESPONSIVENESS_ACTIONS
+        for rows, columns in DIMENSIONS
+    }
+    group_results: dict[str, dict[str, Any]] = {}
+    for name in sorted(expected_groups | groups.keys()):
+        summary = groups.get(name)
+        sample_count = int(summary["sample_count"]) if summary else 0
+        p95_ms = float(summary["p95_ms"]) if summary else None
+        group_results[name] = {
+            "sample_count": sample_count,
+            "minimum_samples": SAMPLE_COUNT,
+            "p95_ms": p95_ms,
+            "limit_ms": LATENCY_P95_LIMIT_MS,
+            "passed": (
+                summary is not None
+                and sample_count >= SAMPLE_COUNT
+                and p95_ms is not None
+                and p95_ms <= LATENCY_P95_LIMIT_MS
+            ),
+        }
+
+    history_ms = float(timings["cached_history_open_ms"])
+    inspector_ms = float(timings["inspector_open_ms"])
+    checks = {
+        "input_to_visible_output": {
+            "passed": all(result["passed"] for result in group_results.values()),
+            "groups": group_results,
+        },
+        "cached_history_open": {
+            "observed_ms": history_ms,
+            "limit_ms": OPEN_HISTORY_LIMIT_MS,
+            "passed": history_ms <= OPEN_HISTORY_LIMIT_MS,
+        },
+        "inspector_open": {
+            "observed_ms": inspector_ms,
+            "limit_ms": OPEN_INSPECTOR_LIMIT_MS,
+            "passed": inspector_ms <= OPEN_INSPECTOR_LIMIT_MS,
+        },
+        "idle_cpu": {
+            "observed_percent_of_one_logical_cpu": idle_cpu_percent,
+            "limit_percent": IDLE_CPU_LIMIT_PERCENT,
+            "passed": idle_cpu_percent <= IDLE_CPU_LIMIT_PERCENT,
+        },
+    }
+    return {
+        "status": "passed" if all(check["passed"] for check in checks.values()) else "failed",
+        "checks": checks,
+    }
+
+
+def measure_idle_cpu(root_pid: int, window_seconds: float = IDLE_CPU_WINDOW_SECONDS) -> dict[str, Any]:
+    process = psutil.Process(root_pid)
+    start_wall_ns = time.perf_counter_ns()
+    start_cpu = process.cpu_times()
+    time.sleep(window_seconds)
+    end_wall_ns = time.perf_counter_ns()
+    end_cpu = process.cpu_times()
+    elapsed_seconds = (end_wall_ns - start_wall_ns) / 1_000_000_000
+    user_delta = max(0.0, end_cpu.user - start_cpu.user)
+    system_delta = max(0.0, end_cpu.system - start_cpu.system)
+    total_delta = user_delta + system_delta
+    average_percent = percent_of_one_logical_cpu(total_delta, elapsed_seconds)
+    return {
+        "scope": "leg-tui process only, identified by the spawned root PID",
+        "window_seconds_requested": window_seconds,
+        "elapsed_wall_seconds": round(elapsed_seconds, 6),
+        "root_pid": root_pid,
+        "raw_counters": {
+            "start": {
+                "monotonic_ns": start_wall_ns,
+                "user_seconds": start_cpu.user,
+                "system_seconds": start_cpu.system,
+            },
+            "end": {
+                "monotonic_ns": end_wall_ns,
+                "user_seconds": end_cpu.user,
+                "system_seconds": end_cpu.system,
+            },
+            "delta_user_seconds": round(user_delta, 9),
+            "delta_system_seconds": round(system_delta, 9),
+            "delta_cpu_seconds": round(total_delta, 9),
+        },
+        "average_percent_of_one_logical_cpu": average_percent,
     }
 
 
@@ -770,9 +882,14 @@ class ProcessTreeRssSampler:
 
 
 class FixtureServer:
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        scenario: str = "responsiveness",
+        hold_after_first_chunk: bool = False,
+    ) -> None:
         self.module = load_fake_provider()
-        self.fixture = self.module.Fixture("responsiveness", workspace)
+        self.fixture = self.module.Fixture(scenario, workspace, hold_after_first_chunk)
         self.fixture.prepare_hook()
         handler = type("ResponsivenessFixtureHandler", (self.module.Handler,), {"fixture": self.fixture})
         self.server = self.module.LoopbackThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -781,7 +898,7 @@ class FixtureServer:
         self.base_url = f"http://{host}:{port}"
         self.thread = threading.Thread(target=self.server.serve_forever, name="leg-tui-fixture", daemon=True)
         self.thread.start()
-        self.environment = self.module.environment(self.base_url, "responsiveness", self.fixture.denial_hook)
+        self.environment = self.module.environment(self.base_url, scenario, self.fixture.denial_hook)
 
     def close(self) -> None:
         self.server.shutdown()
@@ -1500,6 +1617,7 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
     sampler: ProcessTreeRssSampler | None = None
     fixture_server: FixtureServer | None = None
     idle_memory: list[int] = []
+    idle_cpu: dict[str, Any] | None = None
     catalog_load_ms: float | None = None
     history_open_ms: float | None = None
     with ExitStack() as workspace_cleanup:
@@ -1545,8 +1663,9 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             catalog_load_ms = (visible_ns - selected_ns) / 1_000_000
 
             idle_started_ns = time.perf_counter_ns()
-            time.sleep(IDLE_MEMORY_WINDOW_SECONDS)
-            idle_memory = sampler.values_between(idle_started_ns, time.perf_counter_ns())
+            idle_cpu = measure_idle_cpu(terminal.pid)
+            idle_ended_ns = time.perf_counter_ns()
+            idle_memory = sampler.values_between(idle_started_ns, idle_ended_ns)
 
             stream_pairs = ResponsivenessStreamPairManager(
                 terminal,
@@ -1608,13 +1727,37 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError("memory sampler collected no RSS samples during the idle window")
             if not memory_samples:
                 raise RuntimeError("memory sampler collected no process-tree RSS samples")
+            if idle_cpu is None:
+                raise RuntimeError("idle CPU measurement did not run")
+            timings = {
+                "startup_ms": round(startup_ms, 3),
+                "catalog_load_ms": round(catalog_load_ms, 3),
+                "cached_history_open_ms": history_open_ms,
+                "inspector_open_ms": inspector_open_ms,
+            }
+            gates = responsiveness_gates(
+                summaries,
+                timings,
+                float(idle_cpu["average_percent_of_one_logical_cpu"]),
+            )
+            comparison_role = getattr(args, "comparison_role", "final")
+            gates["enforced"] = comparison_role == "final"
+            if comparison_role != "final":
+                gates["status"] = "observed"
             report = {
-                "schema": "leg-tui.responsiveness-report/v1",
-                "source_revision": _git_revision(),
+                "schema": "leg-tui.responsiveness-report/v2",
+                "source_revision": getattr(args, "source_revision", None) or _git_revision(),
+                "harness_revision": _git_revision(),
+                "comparison_role": comparison_role,
                 "os": platform.platform(),
                 "cpu": _cpu_model(),
                 "terminal_version": _terminal_version(),
                 "terminal_transport": "Windows ConPTY via pywinpty" if os.name == "nt" else "native Unix PTY",
+                "terminal": {
+                    "backend": "Windows ConPTY via pywinpty" if os.name == "nt" else "native Unix PTY",
+                    "frontend": "none; pywinpty drove the ConPTY API directly" if os.name == "nt" else "none; harness drove the native PTY directly",
+                    "version": _terminal_version(),
+                },
                 "dimensions": [
                     {"rows": rows, "columns": columns}
                     for rows, columns in DIMENSIONS
@@ -1628,11 +1771,14 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                     "total_history_turns": dataset["total_history_turns"],
                     "stream_pair_pool_size": len(dataset["stream_pair_pool"]),
                 },
-                "timings": {
-                    "startup_ms": round(startup_ms, 3),
-                    "catalog_load_ms": round(catalog_load_ms, 3),
-                    "cached_history_open_ms": round(history_open_ms, 3),
-                    "inspector_open_ms": round(inspector_open_ms, 3),
+                "timings": timings,
+                "gates": gates,
+                "idle_cpu": {
+                    **idle_cpu,
+                    "window_state": "seeded catalog open; no active turn, clock, overlay, or resize",
+                    "limit_percent_of_one_logical_cpu": IDLE_CPU_LIMIT_PERCENT,
+                    "passed": float(idle_cpu["average_percent_of_one_logical_cpu"])
+                    <= IDLE_CPU_LIMIT_PERCENT,
                 },
                 "memory": {
                     "scope": "leg-tui process tree; excludes harness and provider fixture",
@@ -1663,6 +1809,16 @@ def main() -> int:
     parser.add_argument("--supervisor-bin", required=True, help="leg-ui-supervisor executable")
     parser.add_argument("--output", required=True, type=Path, help="path for the JSON report")
     parser.add_argument(
+        "--source-revision",
+        help="revision of the measured binaries (defaults to the harness checkout)",
+    )
+    parser.add_argument(
+        "--comparison-role",
+        choices=("observation", "baseline", "final"),
+        default="observation",
+        help="observation and baseline record gates; final enforces all gates",
+    )
+    parser.add_argument(
         "--build-profile",
         choices=("debug", "release"),
         help="build profile (inferred from binary paths when omitted)",
@@ -1688,15 +1844,22 @@ def main() -> int:
         json.dumps(
             {
                 "source_revision": report["source_revision"],
+                "harness_revision": report["harness_revision"],
+                "comparison_role": report["comparison_role"],
                 "terminal_transport": report["terminal_transport"],
+                "terminal": report["terminal"],
                 "dimensions": report["dimensions"],
                 "groups": report["groups"],
                 "timings": report["timings"],
+                "idle_cpu": report["idle_cpu"],
+                "gates": report["gates"],
                 "memory": report["memory"],
             },
             indent=2,
         )
     )
+    if args.comparison_role == "final" and report["gates"]["status"] != "passed":
+        return 1
     return 0
 
 

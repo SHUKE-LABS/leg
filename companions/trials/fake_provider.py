@@ -66,6 +66,42 @@ def text_content(value: Any) -> str:
     return ""
 
 
+def process_is_running(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            error = ctypes.get_last_error()
+            if error in (87, 1168):  # INVALID_PARAMETER, NOT_FOUND
+                return False
+            raise OSError(error, ctypes.FormatError(error))
+        try:
+            result = kernel32.WaitForSingleObject(handle, 0)
+            if result == 0x00000102:  # WAIT_TIMEOUT
+                return True
+            if result == 0x00000000:  # WAIT_OBJECT_0
+                return False
+            raise OSError(f"WaitForSingleObject returned 0x{result:08x}")
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def sse(name: str, data: dict[str, Any]) -> bytes:
     return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode()
 
@@ -187,7 +223,7 @@ class Fixture:
             self.counts[marker] = self.counts.get(marker, 0) + 1
             self.active_requests.add(request)
             self.request_outcomes[request] = "active"
-            if self.hold_after_first_chunk and marker == "paused-live-text":
+            if self.hold_after_first_chunk and marker in ("paused-live-text", "TRIAL-PAUSE"):
                 self.pause_gates[request] = threading.Event()
                 self.pause_gate_states[request] = "waiting"
             return request, self.counts[marker]
@@ -599,7 +635,20 @@ class Fixture:
             return
         if marker == "TRIAL-CHINESE" or marker == "chinese-multiline":
             all_text = "\n".join(text_content(item.get("content")) for item in payload.get("messages", []) if isinstance(item, dict) and item.get("role") == "user")
-            self.check("chinese_multiline_prompt", TRIAL_LINES in all_text)
+            normalized_text = all_text.replace("\r\n", "\n").replace("\r", "\n")
+            line_checks = {
+                "pasted_line_one": "Line one: keep this first." in normalized_text,
+                "pasted_chinese_line": "第二行：保留中文。" in normalized_text,
+                "pasted_line_three": "Line three: keep this third." in normalized_text,
+                "pasted_emoji": "😀" in normalized_text,
+            }
+            for name, passed in line_checks.items():
+                self.check(name, passed)
+            self.check(
+                "chinese_multiline_prompt",
+                all(line_checks[name] for name in ("pasted_line_one", "pasted_chinese_line", "pasted_line_three")),
+            )
+            self.check("emoji_paste", line_checks["pasted_emoji"])
             self.send_stream(handler, [{"type": "text", "text": "Three lines received, including the Chinese second line."}])
             return
         if marker == "text-tool-text" or marker == "TRIAL-TOOL-TEXT":
@@ -698,8 +747,20 @@ class Fixture:
             return
         if marker == "stalled-bash" or marker == "TRIAL-STOP":
             self.effect("trial-stall-finished.txt", "absent")
+            self.effect("trial-stalled-root.pid", "exists")
             self.effect("trial-stalled-child.pid", "pid_stopped")
-            command = "sleep 600 & child=$!; printf '%s\\n' \"$child\" > trial-stalled-child.pid; wait \"$child\"; printf unexpected > trial-stall-finished.txt"
+            if os.name == "nt":
+                command = (
+                    "powershell.exe -NoProfile -NonInteractive -Command "
+                    "'$parent = Get-CimInstance Win32_Process -Filter \"ProcessId = $PID\"; "
+                    "[System.IO.File]::WriteAllText(\"trial-stalled-root.pid\", "
+                    "[string]$parent.ParentProcessId); "
+                    "[System.IO.File]::WriteAllText(\"trial-stalled-child.pid\", [string]$PID); "
+                    "Start-Sleep -Seconds 600; "
+                    "[System.IO.File]::WriteAllText(\"trial-stall-finished.txt\", \"unexpected\")'"
+                )
+            else:
+                command = "printf '%s\\n' \"$$\" > trial-stalled-root.pid; sleep 600 & child=$!; printf '%s\\n' \"$child\" > trial-stalled-child.pid; wait \"$child\"; printf unexpected > trial-stall-finished.txt"
             self.send_stream(handler, [{"type": "tool_use", "name": "bash", "input": {"command": command}}], stop_reason="tool_use")
             return
         if marker == "TRIAL-RUNNING":
@@ -872,12 +933,8 @@ class Fixture:
                         ok = False
                     else:
                         try:
-                            os.kill(pid, 0)
-                        except ProcessLookupError:
-                            ok = True
-                        except (PermissionError, OSError):
-                            ok = False
-                        else:
+                            ok = not process_is_running(pid)
+                        except OSError:
                             ok = False
             else:
                 ok = False

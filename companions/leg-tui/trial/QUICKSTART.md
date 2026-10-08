@@ -87,6 +87,15 @@ measurements, and the #79 results template. Human fields remain unmeasured
 until actual paired observations are collected; fixture success is not a
 winner recommendation.
 
+Issue #183's native regression check runs on Linux and Windows when its PR
+body contains `Closes #183` or `Part of #183`. Windows CI drives ConPTY through
+pywinpty and has no Windows Terminal frontend. The paired responsiveness
+thresholds and behavior cases are described in the repository's
+[`UI experiment notes`](../../../docs/ui-experiments.md#tui-responsiveness-harness-182).
+The current Windows Stop case is still unmet and tracked in
+[#187](https://github.com/SHUKE-LABS/leg/issues/187); this run does not establish
+that an active tool tree is stopped on Windows.
+
 ## Remove the bundle
 
 Stop the TUI and fixture, then remove the extracted bundle and disposable
