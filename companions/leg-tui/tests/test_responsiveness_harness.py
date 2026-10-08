@@ -55,9 +55,13 @@ class ResponsivenessHarnessTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.writes: list[str] = []
                 self.requests: list[str] = []
+                self.stall_once = True
 
             def write(self, value: str) -> int:
                 self.requests.append(value)
+                if self.stall_once:
+                    self.stall_once = False
+                    return 0
                 written = min(2, len(value.encode("utf-8")))
                 self.writes.append(value[:written])
                 return written
@@ -73,9 +77,9 @@ class ResponsivenessHarnessTests(unittest.TestCase):
 
         self.assertEqual("".join(terminal.process.writes), "draft010")
         self.assertEqual(terminal.process.requests[0], "draft010")
-        self.assertEqual(len(terminal.process.requests), 4)
+        self.assertEqual(len(terminal.process.requests), 5)
 
-    def test_windows_terminal_write_rejects_zero_progress(self) -> None:
+    def test_windows_terminal_write_fails_after_persistent_zero_progress(self) -> None:
         class StalledWriter:
             def write(self, value: str) -> int:
                 return 0
@@ -85,10 +89,40 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         original_name = harness.os.name
         try:
             harness.os.name = "nt"
-            with self.assertRaisesRegex(RuntimeError, "invalid progress"):
+            with (
+                patch.object(harness, "WINDOWS_WRITE_STALL_TIMEOUT_SECONDS", 0.0),
+                self.assertRaisesRegex(RuntimeError, "stalled without progress"),
+            ):
                 terminal.write("draft010")
         finally:
             harness.os.name = original_name
+
+    def test_windows_terminal_close_releases_an_exited_pty(self) -> None:
+        class ExitedProcess:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def isalive(self) -> bool:
+                return False
+
+            def close(self, force: bool = False) -> None:
+                self.closed = True
+
+        terminal = harness.TerminalProcess.__new__(harness.TerminalProcess)
+        terminal._stop_reader = threading.Event()
+        terminal.reader = threading.Thread(target=lambda: None)
+        terminal.reader.start()
+        terminal.process = ExitedProcess()
+        terminal.master_fd = None
+        terminal.slave_fd = None
+        original_name = harness.os.name
+        try:
+            harness.os.name = "nt"
+            terminal.close()
+        finally:
+            harness.os.name = original_name
+
+        self.assertTrue(terminal.process.closed)
 
     @unittest.skipUnless(harness.os.name == "nt", "requires Windows ConPTY")
     def test_windows_conpty_reader_does_not_batch_output_for_100ms(self) -> None:

@@ -124,7 +124,7 @@ def with_tui(
             )
             return action(terminal, workspace, server)
         finally:
-            if terminal is not None and terminal.alive():
+            if terminal is not None:
                 terminal.close()
             server.close()
 
