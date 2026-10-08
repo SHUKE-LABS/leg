@@ -61,7 +61,7 @@ STREAM_PAIR_RENEWAL_MARGIN_SECONDS = 5.0
 STREAM_PAIR_POOL_SIZE = 2
 NARROW_STATUS_TITLE_WIDTH = 14
 ACTIVE_SESSION_STATUS_LABELS = {"Starting", "Running", "Stopping"}
-TRANSCRIPT_WINDOW_PATTERN = re.compile(r"Rows (\d+)-(\d+) of (\d+)")
+TRANSCRIPT_WINDOW_PATTERN = re.compile(r"(?:Rows|Turns) (\d+)-(\d+) of (\d+)")
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.1
 IDLE_CPU_WINDOW_SECONDS = 30.0
 IDLE_CPU_LIMIT_PERCENT = 1.0
@@ -75,6 +75,12 @@ RESPONSIVENESS_ACTIONS = (
     "palette_filtering",
     "inspection",
 )
+BASELINE_NOT_COMPARABLE_ACTIONS = {
+    "palette_filtering": (
+        "The b5444f9 baseline has no command palette, so Ctrl-P/F2 query filtering "
+        "is unavailable."
+    )
+}
 
 
 def load_fake_provider() -> Any:
@@ -436,9 +442,21 @@ def responsiveness_gates(
     group_results: dict[str, dict[str, Any]] = {}
     for name in sorted(expected_groups | groups.keys()):
         summary = groups.get(name)
+        if summary and summary.get("status") == "not_comparable":
+            group_results[name] = {
+                "status": "not_comparable",
+                "reason": summary["reason"],
+                "sample_count": 0,
+                "minimum_samples": SAMPLE_COUNT,
+                "p95_ms": None,
+                "limit_ms": LATENCY_P95_LIMIT_MS,
+                "passed": None,
+            }
+            continue
         sample_count = int(summary["sample_count"]) if summary else 0
         p95_ms = float(summary["p95_ms"]) if summary else None
         group_results[name] = {
+            "status": "measured",
             "sample_count": sample_count,
             "minimum_samples": SAMPLE_COUNT,
             "p95_ms": p95_ms,
@@ -451,11 +469,21 @@ def responsiveness_gates(
             ),
         }
 
+    comparable_groups = [
+        result for result in group_results.values() if result["status"] == "measured"
+    ]
     history_ms = float(timings["cached_history_open_ms"])
     inspector_ms = float(timings["inspector_open_ms"])
     checks = {
         "input_to_visible_output": {
-            "passed": all(result["passed"] for result in group_results.values()),
+            "passed": bool(comparable_groups)
+            and all(result["passed"] for result in comparable_groups),
+            "comparable_group_count": len(comparable_groups),
+            "not_comparable_groups": [
+                name
+                for name, result in sorted(group_results.items())
+                if result["status"] == "not_comparable"
+            ],
             "groups": group_results,
         },
         "cached_history_open": {
@@ -1046,22 +1074,22 @@ def _restore_transcript_bottom(terminal: TerminalProcess) -> None:
         window = _transcript_window(text)
         return window is not None and window[1] == window[2]
 
-    terminal.wait_for(at_bottom, "transcript to return to its newest rows", timeout=2.0)
+    terminal.wait_for(at_bottom, "transcript to return to its newest entries", timeout=2.0)
 
 
 def _position_transcript_for_scrolling(terminal: TerminalProcess) -> None:
     for attempt in range(4):
         window = _transcript_window(terminal.capture.text())
         if window is None:
-            raise RuntimeError("transcript row counter is not visible before history scrolling")
+            raise RuntimeError("transcript counter is not visible before history scrolling")
         first, last, total = window
-        page_rows = last - first + 1
-        if first - 1 >= 2 * page_rows and total - last >= 2 * page_rows:
+        page_entries = last - first + 1
+        if first - 1 >= 2 * page_entries and total - last >= 2 * page_entries:
             return
 
         key_name, key = (
             ("PageDown", "\x1b[6~")
-            if first - 1 < 2 * page_rows
+            if first - 1 < 2 * page_entries
             else ("PageUp", "\x1b[5~")
         )
         terminal.write(key)
@@ -1080,7 +1108,7 @@ def _position_transcript_for_scrolling(terminal: TerminalProcess) -> None:
             )
             raise RuntimeError(
                 f"history scroll preposition {key_name} {attempt}: "
-                f"rows {first}-{last} of {total} -> {after_text}"
+                f"entries {first}-{last} of {total} -> {after_text}"
             ) from None
     else:
         window = _transcript_window(terminal.capture.text())
@@ -1091,7 +1119,7 @@ def _position_transcript_for_scrolling(terminal: TerminalProcess) -> None:
         )
         raise RuntimeError(
             "could not position transcript away from both scroll boundaries: "
-            f"rows {position}"
+            f"entries {position}"
         )
 
 
@@ -1393,12 +1421,14 @@ def _measure_dimension(
     columns: int,
     sample_count: int,
     stream_pairs: ResponsivenessStreamPairManager,
+    not_comparable_actions: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    not_comparable_actions = not_comparable_actions or {}
     dimension = {"rows": rows, "columns": columns}
     suffix = f"{columns}x{rows}"
     groups: dict[str, list[dict[str, Any]]] = {
         f"{action}@{suffix}": []
-        for action in ("draft_editing", "history_scrolling", "palette_filtering", "inspection")
+        for action in RESPONSIVENESS_ACTIONS
     }
 
     for index in range(sample_count):
@@ -1432,14 +1462,14 @@ def _measure_dimension(
             before = _transcript_window(terminal.capture.text())
             if before is None:
                 raise RuntimeError(
-                    f"history scroll sample {index}: transcript row counter is unavailable"
+                    f"history scroll sample {index}: transcript counter is unavailable"
                 )
             first, last, total = before
-            page_rows = last - first + 1
-            if first - 1 < page_rows or total - last < page_rows:
+            page_entries = last - first + 1
+            if first - 1 < page_entries or total - last < page_entries:
                 raise RuntimeError(
                     f"history scroll sample {index} starts at a boundary: "
-                    f"rows {first}-{last} of {total}"
+                    f"entries {first}-{last} of {total}"
                 )
 
         key_name, key = (
@@ -1454,7 +1484,7 @@ def _measure_dimension(
                 index,
                 key,
                 lambda text: _transcript_window(text) != before,
-                f"{key_name} sample {index} transcript row counter change",
+                f"{key_name} sample {index} transcript counter change",
                 after_pair_restore=lambda: _position_transcript_for_scrolling(terminal),
                 before_injection=capture_history_scroll_baseline,
             )
@@ -1471,7 +1501,7 @@ def _measure_dimension(
                 else "<counter unavailable>"
             )
             raise TimeoutError(
-                f"{key_name} sample {index} rows "
+                f"{key_name} sample {index} entries "
                 f"{before_text} -> {after_text} did not change"
             ) from None
         groups[f"history_scrolling@{suffix}"].append(sample)
@@ -1488,25 +1518,26 @@ def _measure_dimension(
     def clear_palette() -> None:
         terminal.write_control("u")  # Ctrl-U clears the prior query.
 
-    open_palette()
-    for index in range(sample_count):
-        query = f"q{index:03d}"
-        groups[f"palette_filtering@{suffix}"].append(
-            _measure_streamed_sample(
-                stream_pairs,
-                terminal,
-                "palette_filtering",
-                dimension,
-                index,
-                query,
-                lambda text, expected=query: expected in text,
-                f"palette query {query}",
-                before_pair_switch=close_palette,
-                after_pair_restore=open_palette,
-                before_injection=clear_palette,
+    if "palette_filtering" not in not_comparable_actions:
+        open_palette()
+        for index in range(sample_count):
+            query = f"q{index:03d}"
+            groups[f"palette_filtering@{suffix}"].append(
+                _measure_streamed_sample(
+                    stream_pairs,
+                    terminal,
+                    "palette_filtering",
+                    dimension,
+                    index,
+                    query,
+                    lambda text, expected=query: expected in text,
+                    f"palette query {query}",
+                    before_pair_switch=close_palette,
+                    after_pair_restore=open_palette,
+                    before_injection=clear_palette,
+                )
             )
-        )
-    close_palette()
+        close_palette()
 
     for index in range(sample_count):
         groups[f"inspection@{suffix}"].append(
@@ -1624,6 +1655,15 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
     run_started_ns = time.perf_counter_ns()
     output_path = Path(args.output).resolve()
     profile = _build_profile(args)
+    comparison_role = getattr(args, "comparison_role", "final")
+    not_comparable_actions = (
+        BASELINE_NOT_COMPARABLE_ACTIONS if comparison_role == "baseline" else {}
+    )
+    not_comparable_groups = {
+        f"{action}@{columns}x{rows}": reason
+        for rows, columns in DIMENSIONS
+        for action, reason in not_comparable_actions.items()
+    }
     groups: dict[str, list[dict[str, Any]]] = {}
     terminal: TerminalProcess | None = None
     sampler: ProcessTreeRssSampler | None = None
@@ -1701,7 +1741,14 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                         timeout=3.0,
                     )
                 groups.update(
-                    _measure_dimension(terminal, rows, columns, args.samples, stream_pairs)
+                    _measure_dimension(
+                        terminal,
+                        rows,
+                        columns,
+                        args.samples,
+                        stream_pairs,
+                        not_comparable_actions,
+                    )
                 )
 
             stream_pairs.wait_for_all_pairs()
@@ -1727,13 +1774,18 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             _decorate_sample_provider_context(
                 groups, fixture_server.fixture, run_started_ns, stream_pairs.pairs
             )
-            summaries = {
-                group: {
+            summaries: dict[str, dict[str, Any]] = {}
+            for group, samples in groups.items():
+                if not samples:
+                    reason = not_comparable_groups.get(group)
+                    if reason is None:
+                        raise RuntimeError(f"responsiveness group {group} collected no samples")
+                    summaries[group] = {"status": "not_comparable", "reason": reason}
+                    continue
+                summaries[group] = {
                     **summarize_latencies(samples),
                     "stream_pair_ids": sorted({sample["stream_pair_id"] for sample in samples}),
                 }
-                for group, samples in groups.items()
-            }
             memory_samples = sampler.all_values() if sampler else []
             if not idle_memory:
                 raise RuntimeError("memory sampler collected no RSS samples during the idle window")
@@ -1752,7 +1804,6 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                 timings,
                 float(idle_cpu["average_percent_of_one_logical_cpu"]),
             )
-            comparison_role = getattr(args, "comparison_role", "final")
             gates["enforced"] = comparison_role == "final"
             if comparison_role != "final":
                 gates["status"] = "observed"

@@ -20,6 +20,11 @@ import responsiveness_harness as harness
 
 
 class ResponsivenessHarnessTests(unittest.TestCase):
+    def test_transcript_window_accepts_current_rows_and_baseline_turns_counters(self) -> None:
+        self.assertEqual(harness._transcript_window("Rows 8-12 of 1002"), (8, 12, 1002))
+        self.assertEqual(harness._transcript_window("Turns 8-12 of 1002"), (8, 12, 1002))
+        self.assertIsNone(harness._transcript_window("Transcript has 1002 entries"))
+
     def test_session_title_visibility_handles_narrow_header_truncation(self) -> None:
         history_screen = "status: Idle  |  History fixtu\ufffd  |  model: trial-fixture"
         legacy_history_screen = "│leg-tui  |  status: Idle  |  History fixture  |  model: trial-fixture"
@@ -306,6 +311,44 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         self.assertEqual(harness.percent_of_one_logical_cpu(0.3, 30.0), 1.0)
         with self.assertRaisesRegex(ValueError, "elapsed_seconds"):
             harness.percent_of_one_logical_cpu(0.0, 0.0)
+
+    def test_responsiveness_gates_record_non_comparable_groups_and_measure_the_rest(self) -> None:
+        groups = {
+            f"{action}@{columns}x{rows}": {
+                "sample_count": harness.SAMPLE_COUNT,
+                "p95_ms": 50.0,
+            }
+            for action in harness.RESPONSIVENESS_ACTIONS
+            for rows, columns in harness.DIMENSIONS
+        }
+        reason = "baseline has no command palette"
+        groups["palette_filtering@80x24"] = {
+            "status": "not_comparable",
+            "reason": reason,
+        }
+
+        gates = harness.responsiveness_gates(
+            groups,
+            {"cached_history_open_ms": 150.0, "inspector_open_ms": 150.0},
+            0.5,
+        )
+
+        input_check = gates["checks"]["input_to_visible_output"]
+        self.assertEqual(gates["status"], "passed")
+        self.assertEqual(input_check["comparable_group_count"], 7)
+        self.assertEqual(input_check["not_comparable_groups"], ["palette_filtering@80x24"])
+        self.assertEqual(
+            input_check["groups"]["palette_filtering@80x24"],
+            {
+                "status": "not_comparable",
+                "reason": reason,
+                "sample_count": 0,
+                "minimum_samples": harness.SAMPLE_COUNT,
+                "p95_ms": None,
+                "limit_ms": harness.LATENCY_P95_LIMIT_MS,
+                "passed": None,
+            },
+        )
 
     def test_only_final_comparison_role_fails_on_unmet_gates(self) -> None:
         report = {
