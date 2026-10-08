@@ -423,6 +423,9 @@ each pair's stream IDs and overlap interval. The report also separates first
 catalog load from cached history/inspector opening, and records startup,
 idle/peak process-tree RSS, revision, OS/CPU, terminal transport/version,
 dimensions, and build profile.
+For pull request CI runs, `source_revision` is GitHub Actions' `github.sha`
+(the merge commit tested by CI), not the PR branch head; the workflow run records
+the PR head SHA separately.
 CI uploads separate `leg-tui-responsiveness-linux-*` and
 `leg-tui-responsiveness-windows-*` artifacts on the PR run. Attach both reports
 to the issue PR.
