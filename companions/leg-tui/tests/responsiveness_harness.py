@@ -92,6 +92,33 @@ def _write_session(path: Path, events: list[dict[str, Any]]) -> None:
         pass
 
 
+def _catalog_workspace_path(workspace: Path) -> str:
+    resolved = str(workspace.resolve())
+    if os.name != "nt":
+        return resolved
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_long_path_name = kernel32.GetLongPathNameW
+    get_long_path_name.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+    get_long_path_name.restype = ctypes.c_uint32
+    capacity = max(260, len(resolved) + 1)
+    while True:
+        buffer = ctypes.create_unicode_buffer(capacity)
+        length = get_long_path_name(resolved, buffer, capacity)
+        if length == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if length < capacity:
+            resolved = buffer.value
+            break
+        capacity = length + 1
+    if resolved.startswith("\\\\?\\"):
+        return resolved
+    if resolved.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + resolved[2:]
+    return "\\\\?\\" + resolved
+
+
 def seed_responsiveness_catalog(
     state_dir: Path,
     workspace: Path,
@@ -108,6 +135,7 @@ def seed_responsiveness_catalog(
     sessions_dir = state_dir / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
+    workspace_cwd = _catalog_workspace_path(workspace)
     now_ms = int(time.time() * 1000)
     history_id = "responsiveness-history"
     stream_ids = {
@@ -239,7 +267,7 @@ def seed_responsiveness_catalog(
     session_records: dict[str, dict[str, Any]] = {
         history_id: {
             "name": "History fixture",
-            "cwd": str(workspace.resolve()),
+            "cwd": workspace_cwd,
             "created_at_ms": now_ms,
             "updated_at_ms": now_ms + (turn_count + 2) * 10,
             "drafts": {"tui": ""},
@@ -271,7 +299,7 @@ def seed_responsiveness_catalog(
         _write_session(sessions_dir / f"{session_id}.jsonl", stream_events)
         session_records[session_id] = {
             "name": "Stream A" if marker.endswith("A") else "Stream B",
-            "cwd": str(workspace.resolve()),
+            "cwd": workspace_cwd,
             "created_at_ms": created_ms,
             "updated_at_ms": created_ms,
             "drafts": {"tui": marker},
@@ -1018,11 +1046,9 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             idle_memory = sampler.values_between(idle_started_ns, time.perf_counter_ns())
 
             _select_session(terminal, "Stream A", target="RESPONSIVENESS-STREAM-A")
-            terminal.write("RESPONSIVENESS-STREAM-A")
             terminal.write_control("s")  # Ctrl-S submits the seeded stream prompt.
             _wait_fixture_requests(fixture_server.fixture, 1, terminal=terminal)
             _select_session(terminal, "Stream B", target="RESPONSIVENESS-STREAM-B")
-            terminal.write("RESPONSIVENESS-STREAM-B")
             terminal.write_control("s")
             _wait_fixture_requests(fixture_server.fixture, 2, terminal=terminal)
             _wait_for_both_streams(fixture_server.fixture)
