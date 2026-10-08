@@ -23,6 +23,8 @@ const MAX_STREAM_RECORD: usize = 16 * 1024 * 1024;
 const MAX_CHILD_STDERR: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STOP_GRACE: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const PROCESS_IDENTITY_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Deserialize)]
 struct StartRequest {
@@ -718,6 +720,28 @@ fn begin_stop(
 
 fn capture_process_identity(pid: u32) -> Option<ProcessIdentity> {
     let mut system = System::new();
+    #[cfg(windows)]
+    {
+        // Windows can briefly fail to expose a newly spawned child's identity.
+        let deadline = Instant::now() + PROCESS_IDENTITY_RETRY_TIMEOUT;
+        loop {
+            if let Some(identity) = capture_process_identity_once(pid, &mut system) {
+                return Some(identity);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            thread::sleep(POLL_INTERVAL.min(remaining));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        capture_process_identity_once(pid, &mut system)
+    }
+}
+
+fn capture_process_identity_once(pid: u32, system: &mut System) -> Option<ProcessIdentity> {
     system.refresh_processes(ProcessesToUpdate::All, true);
     system
         .processes()
@@ -964,6 +988,32 @@ mod tests {
         assert!(child.try_wait().expect("inspect child status").is_none());
         child.kill().expect("clean up identity test child");
         let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn newly_spawned_windows_child_identity_is_verifiable() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/C", "set /P response="])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start a waiting Windows child for identity capture");
+
+        let identity = capture_process_identity(child.id());
+        let owner_is_alive = identity
+            .as_ref()
+            .is_some_and(|identity| identity.owner.inspect() == OwnerState::Alive);
+        child.kill().expect("stop the waiting Windows child");
+        child.wait().expect("reap the Windows child");
+
+        let identity = identity.expect("capture the newly spawned child identity");
+        assert_eq!(identity.owner.pid, child.id());
+        assert!(
+            owner_is_alive,
+            "captured child identity should still be alive"
+        );
     }
 
     #[test]
