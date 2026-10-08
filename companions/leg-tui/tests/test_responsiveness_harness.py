@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import math
+import queue
+import re
 import sys
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -80,6 +84,84 @@ class ResponsivenessHarnessTests(unittest.TestCase):
                 terminal.write("draft010")
         finally:
             harness.os.name = original_name
+
+    @unittest.skipUnless(harness.os.name == "nt", "requires Windows ConPTY")
+    def test_windows_conpty_reader_does_not_batch_output_for_100ms(self) -> None:
+        sample_count = 20
+        child_code = (
+            "import time\n"
+            f"for index in range({sample_count}):\n"
+            "    print(f'CAPTURE:{index}:{time.perf_counter_ns()}', flush=True)\n"
+            "    time.sleep(0.01)\n"
+        )
+        environment = {
+            name: harness.os.environ[name]
+            for name in ("PATH", "SystemRoot", "TEMP", "TMP")
+            if name in harness.os.environ
+        }
+        process = harness.PtyProcess.spawn(
+            [sys.executable, "-u", "-c", child_code],
+            env=environment,
+            dimensions=(24, 80),
+            backend=harness.Backend.ConPTY,
+        )
+        chunks: queue.Queue[tuple[int, str]] = queue.Queue()
+        stop_reader = threading.Event()
+
+        def read_output() -> None:
+            while not stop_reader.is_set():
+                try:
+                    chunk = process.read(4096)
+                except (EOFError, OSError, ValueError):
+                    return
+                if chunk:
+                    chunks.put((time.perf_counter_ns(), chunk))
+                elif not process.isalive():
+                    return
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            latencies_ms: list[float] = []
+            output = ""
+            seen: set[int] = set()
+            marker_pattern = re.compile(r"CAPTURE:(\d+):(\d+)")
+            deadline = time.monotonic() + 5.0
+            while len(seen) < sample_count and time.monotonic() < deadline:
+                try:
+                    observed_ns, chunk = chunks.get(timeout=0.25)
+                except queue.Empty:
+                    if not process.isalive():
+                        break
+                    continue
+                output += chunk
+                for match in marker_pattern.finditer(output):
+                    index = int(match.group(1))
+                    if index in seen:
+                        continue
+                    seen.add(index)
+                    generated_ns = int(match.group(2))
+                    latencies_ms.append((observed_ns - generated_ns) / 1_000_000)
+
+            self.assertEqual(
+                seen,
+                set(range(sample_count)),
+                f"ConPTY output markers were missing: {sorted(seen)!r}; output={output!r}",
+            )
+
+            p95_index = math.ceil(0.95 * len(latencies_ms)) - 1
+            p95_ms = sorted(latencies_ms)[p95_index]
+            self.assertLess(
+                p95_ms,
+                50.0,
+                f"ConPTY output reader added a polling delay: {latencies_ms!r}",
+            )
+        finally:
+            stop_reader.set()
+            try:
+                process.close(force=True)
+            finally:
+                reader.join(timeout=1.0)
 
     def test_harness_environment_removes_ambient_credentials(self) -> None:
         ambient = {name: f"ambient-{name}" for name in harness._CREDENTIAL_ENV_VARS}
