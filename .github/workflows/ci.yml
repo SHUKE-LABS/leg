@@ -487,7 +487,7 @@ jobs:
         run: cargo clippy --locked --manifest-path companions/Cargo.toml -p leg-web --all-targets -- -D warnings
 
   tui-responsiveness-comparison:
-    if: "${{ github.event_name == 'pull_request' && (contains(github.event.pull_request.body, 'Closes #183') || contains(github.event.pull_request.body, 'Part of #183')) }}"
+    if: "${{ always() && github.event_name == 'pull_request' && (contains(github.event.pull_request.body, 'Closes #183') || contains(github.event.pull_request.body, 'Part of #183')) }}"
     needs: [native, lint]
     strategy:
       fail-fast: false
