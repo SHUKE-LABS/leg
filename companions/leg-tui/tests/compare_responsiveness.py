@@ -339,7 +339,7 @@ def compare(args: argparse.Namespace) -> int:
     )
     write_json(output_dir / "comparison.json", comparison)
     print(f"comparison_report={output_dir / 'comparison.json'}")
-    print(json.dumps(comparison, ensure_ascii=False, indent=2))
+    print(json.dumps(comparison, ensure_ascii=True, indent=2))
     return 1 if failed else 0
 
 
