@@ -61,8 +61,6 @@ STREAM_PAIR_RENEWAL_MARGIN_SECONDS = 5.0
 STREAM_PAIR_POOL_SIZE = 2
 NARROW_STATUS_TITLE_WIDTH = 14
 ACTIVE_SESSION_STATUS_LABELS = {"Starting", "Running", "Stopping"}
-WINDOWS_WRITE_STALL_TIMEOUT_SECONDS = 1.0
-WINDOWS_WRITE_RETRY_INTERVAL_SECONDS = 0.001
 TRANSCRIPT_WINDOW_PATTERN = re.compile(r"(?:Rows|Turns) (\d+)-(\d+) of (\d+)")
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.1
 IDLE_CPU_WINDOW_SECONDS = 30.0
@@ -700,7 +698,6 @@ class TerminalProcess:
         if os.name == "nt":
             remaining = value
             characters_written = 0
-            zero_progress_started: float | None = None
             while remaining:
                 encoded = remaining.encode("utf-8")
                 written = self.process.write(remaining)
@@ -709,24 +706,10 @@ class TerminalProcess:
                         f"Windows ConPTY write made invalid progress: {written} bytes for {len(encoded)} bytes"
                     )
                 if written == 0:
-                    now = time.monotonic()
-                    if zero_progress_started is None:
-                        zero_progress_started = now
-                    stalled_seconds = now - zero_progress_started
-                    if stalled_seconds >= WINDOWS_WRITE_STALL_TIMEOUT_SECONDS:
-                        raise RuntimeError(
-                            "Windows ConPTY write stalled without progress for "
-                            f"{stalled_seconds:.3f}s with {len(encoded)} bytes remaining"
-                        )
-                    time.sleep(
-                        min(
-                            WINDOWS_WRITE_RETRY_INTERVAL_SECONDS,
-                            WINDOWS_WRITE_STALL_TIMEOUT_SECONDS - stalled_seconds,
-                        )
-                    )
-                    continue
-                zero_progress_started = None
-                if written == len(encoded):
+                    # pywinpty 3.0.5's ConPTY backend delivers the full input
+                    # but returns zero; retrying duplicates the text.
+                    written_text = remaining
+                elif written == len(encoded):
                     written_text = remaining
                 else:
                     try:

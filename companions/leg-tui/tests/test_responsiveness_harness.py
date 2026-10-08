@@ -50,18 +50,14 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         self.assertTrue(harness._session_is_inactive(legacy_history_screen, "History fixture"))
         self.assertTrue(harness._session_is_inactive(completed_screen, "Stream 1 A"))
 
-    def test_windows_terminal_write_completes_partial_writes(self) -> None:
+    def test_windows_terminal_write_completes_positive_partial_writes(self) -> None:
         class PartialWriter:
             def __init__(self) -> None:
                 self.writes: list[str] = []
                 self.requests: list[str] = []
-                self.stall_once = True
 
             def write(self, value: str) -> int:
                 self.requests.append(value)
-                if self.stall_once:
-                    self.stall_once = False
-                    return 0
                 written = min(2, len(value.encode("utf-8")))
                 self.writes.append(value[:written])
                 return written
@@ -77,25 +73,30 @@ class ResponsivenessHarnessTests(unittest.TestCase):
 
         self.assertEqual("".join(terminal.process.writes), "draft010")
         self.assertEqual(terminal.process.requests[0], "draft010")
-        self.assertEqual(len(terminal.process.requests), 5)
+        self.assertEqual(len(terminal.process.requests), 4)
 
-    def test_windows_terminal_write_fails_after_persistent_zero_progress(self) -> None:
-        class StalledWriter:
+    def test_windows_terminal_write_treats_zero_return_as_completed_input(self) -> None:
+        class ZeroReturningWriter:
+            def __init__(self) -> None:
+                self.accepted: list[str] = []
+                self.requests: list[str] = []
+
             def write(self, value: str) -> int:
+                self.requests.append(value)
+                self.accepted.append(value)
                 return 0
 
         terminal = harness.TerminalProcess.__new__(harness.TerminalProcess)
-        terminal.process = StalledWriter()
+        terminal.process = ZeroReturningWriter()
         original_name = harness.os.name
         try:
             harness.os.name = "nt"
-            with (
-                patch.object(harness, "WINDOWS_WRITE_STALL_TIMEOUT_SECONDS", 0.0),
-                self.assertRaisesRegex(RuntimeError, "stalled without progress"),
-            ):
-                terminal.write("draft010")
+            terminal.write("draft010")
         finally:
             harness.os.name = original_name
+
+        self.assertEqual(terminal.process.accepted, ["draft010"])
+        self.assertEqual(terminal.process.requests, ["draft010"])
 
     def test_windows_terminal_close_releases_an_exited_pty(self) -> None:
         class ExitedProcess:
@@ -123,6 +124,62 @@ class ResponsivenessHarnessTests(unittest.TestCase):
             harness.os.name = original_name
 
         self.assertTrue(terminal.process.closed)
+
+    @unittest.skipUnless(harness.os.name == "nt", "requires Windows ConPTY")
+    def test_windows_conpty_zero_write_return_delivers_complete_input(self) -> None:
+        child_code = (
+            "import sys\n"
+            "received = sys.stdin.readline().rstrip('\\r\\n')\n"
+            "print('RECEIVED:' + received, flush=True)\n"
+        )
+        environment = {
+            name: harness.os.environ[name]
+            for name in ("PATH", "SystemRoot", "TEMP", "TMP")
+            if name in harness.os.environ
+        }
+        process = harness.PtyProcess.spawn(
+            [sys.executable, "-u", "-c", child_code],
+            env=environment,
+            dimensions=(24, 80),
+            backend=harness.Backend.ConPTY,
+        )
+        chunks: queue.Queue[str] = queue.Queue()
+        stop_reader = threading.Event()
+
+        def read_output() -> None:
+            while not stop_reader.is_set():
+                try:
+                    chunk = process.read(4096)
+                except (EOFError, OSError, ValueError):
+                    return
+                if chunk:
+                    chunks.put(chunk)
+                elif not process.isalive():
+                    return
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            written = process.write("draft010\r")
+            self.assertEqual(written, 0)
+
+            output = ""
+            deadline = time.monotonic() + 5.0
+            while "RECEIVED:draft010" not in output and time.monotonic() < deadline:
+                try:
+                    output += chunks.get(timeout=0.25)
+                except queue.Empty:
+                    if not process.isalive():
+                        break
+
+            self.assertIn("RECEIVED:draft010", output)
+            self.assertEqual(output.count("RECEIVED:"), 1)
+        finally:
+            stop_reader.set()
+            try:
+                process.close(force=True)
+            finally:
+                reader.join(timeout=1.0)
 
     @unittest.skipUnless(harness.os.name == "nt", "requires Windows ConPTY")
     def test_windows_conpty_reader_does_not_batch_output_for_100ms(self) -> None:
