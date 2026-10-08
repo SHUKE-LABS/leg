@@ -1101,10 +1101,21 @@ def _visible_status_title(title: str) -> str:
     return title
 
 
+def _status_header_content(line: str) -> str | None:
+    prefix, marker, content = line.partition("status:")
+    if not marker:
+        return None
+    label = prefix.replace("│", "").strip()
+    if label and not label.endswith("|"):
+        return None
+    return content
+
+
 def _session_title_visible(text: str, title: str) -> bool:
     visible_title = _visible_status_title(title)
     return any(
-        line.startswith("status:") and f"|  {visible_title}" in line
+        (content := _status_header_content(line)) is not None
+        and f"|  {visible_title}" in content
         for line in text.splitlines()
     )
 
@@ -1112,9 +1123,10 @@ def _session_title_visible(text: str, title: str) -> bool:
 def _session_is_inactive(text: str, title: str) -> bool:
     visible_title = _visible_status_title(title)
     for line in text.splitlines():
-        if not line.startswith("status:") or f"|  {visible_title}" not in line:
+        content = _status_header_content(line)
+        if content is None or f"|  {visible_title}" not in content:
             continue
-        status = line[len("status:") :].split("  |", 1)[0].strip()
+        status = content.split("  |", 1)[0].strip()
         return status not in ACTIVE_SESSION_STATUS_LABELS
     return False
 

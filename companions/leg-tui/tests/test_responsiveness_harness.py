@@ -18,17 +18,27 @@ import responsiveness_harness as harness
 class ResponsivenessHarnessTests(unittest.TestCase):
     def test_session_title_visibility_handles_narrow_header_truncation(self) -> None:
         history_screen = "status: Idle  |  History fixtu\ufffd  |  model: trial-fixture"
+        legacy_history_screen = "│leg-tui  |  status: Idle  |  History fixture  |  model: trial-fixture"
         stream_screen = "status: Idle  |  Stream 1 A  |  model: trial-fixture"
         running_screen = "status: Running  |  Stream 1 A  |  model: trial-fixture"
+        legacy_running_screen = "│leg-tui  |  status: Running  |  Stream 1 A  |  model: trial-fixture"
         completed_screen = "status: Succeeded  |  Stream 1 A  |  model: trial-fixture"
 
         self.assertTrue(harness._session_title_visible(history_screen, "History fixture"))
+        self.assertTrue(harness._session_title_visible(legacy_history_screen, "History fixture"))
         self.assertTrue(harness._session_title_visible(stream_screen, "Stream 1 A"))
         self.assertFalse(harness._session_title_visible(stream_screen, "Stream 1 B"))
         self.assertFalse(
             harness._session_title_visible("transcript mentions History fixtu", "History fixture")
         )
+        self.assertFalse(
+            harness._session_title_visible(
+                "transcript status: Idle  |  History fixture", "History fixture"
+            )
+        )
         self.assertFalse(harness._session_is_inactive(running_screen, "Stream 1 A"))
+        self.assertFalse(harness._session_is_inactive(legacy_running_screen, "Stream 1 A"))
+        self.assertTrue(harness._session_is_inactive(legacy_history_screen, "History fixture"))
         self.assertTrue(harness._session_is_inactive(completed_screen, "Stream 1 A"))
 
     def test_windows_terminal_write_completes_partial_writes(self) -> None:
