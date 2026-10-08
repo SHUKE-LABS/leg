@@ -11,15 +11,46 @@ import responsiveness_harness as harness
 
 
 class ResponsivenessHarnessTests(unittest.TestCase):
+    def test_harness_environment_removes_ambient_credentials(self) -> None:
+        ambient = {name: f"ambient-{name}" for name in harness._CREDENTIAL_ENV_VARS}
+        ambient["PATH"] = "fixture-path"
+
+        environment = harness._build_harness_environment(
+            ambient,
+            {
+                "LEG_PROVIDER": "anthropic",
+                "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
+            },
+            Path("state"),
+            Path("leg-ui-supervisor.exe"),
+        )
+
+        self.assertEqual(environment["PATH"], "fixture-path")
+        self.assertEqual(environment["ANTHROPIC_API_KEY"], "trial-only-not-a-secret")
+        for name in harness._CREDENTIAL_ENV_VARS[1:]:
+            with self.subTest(name=name):
+                self.assertNotIn(name, environment)
+
     def test_seeded_dataset_has_required_sizes(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
-            dataset = harness.seed_responsiveness_catalog(root / "state", workspace)
+            state_dir = root / "state"
+            dataset = harness.seed_responsiveness_catalog(state_dir, workspace)
             events = [
                 json.loads(line)
                 for line in Path(dataset["history_path"]).read_text(encoding="utf-8").splitlines()
             ]
+            seeded_response_events = [event for event in events if event["event"] == "response_ok"]
+            for session_id in dataset["stream_session_ids"].values():
+                stream_path = state_dir / "sessions" / f"{session_id}.jsonl"
+                stream_events = [
+                    json.loads(line)
+                    for line in stream_path.read_text(encoding="utf-8").splitlines()
+                ]
+                seeded_response_events.extend(
+                    event for event in stream_events if event["event"] == "response_ok"
+                )
 
         ordinary_replies = [
             event["reply"]
@@ -38,6 +69,10 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         self.assertTrue(all(len(reply.encode("utf-8")) == 4096 for reply in ordinary_replies))
         self.assertEqual(len(long_answer.splitlines()), 10_000)
         self.assertEqual(len(tool_result.encode("utf-8")), 1024 * 1024)
+        self.assertTrue(seeded_response_events)
+        self.assertTrue(
+            all(isinstance(event.get("duration_ms"), int) for event in seeded_response_events)
+        )
 
     def test_latency_summary_and_provider_context_use_actual_timestamps(self) -> None:
         samples = [{"latency_ms": float(value)} for value in range(1, 101)]

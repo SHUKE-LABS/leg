@@ -43,6 +43,13 @@ else:
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_PATH = ROOT / "companions" / "trials" / "fake_provider.py"
+_CREDENTIAL_ENV_VARS = (
+    # Mirrors CREDENTIAL_ENV_VARS in src/config.rs.
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+)
 PICKER_HEADER = "Sessions · title · workspace · recent · status"
 PALETTE_HEADER = "Command palette · F2/Ctrl-P"
 COMPOSER_HINT = "Composer ("
@@ -169,6 +176,7 @@ def seed_responsiveness_catalog(
                     history_id,
                     index,
                     reply=reply,
+                    duration_ms=1,
                     stop_reason="end_turn",
                 ),
             )
@@ -198,6 +206,7 @@ def seed_responsiveness_catalog(
                 history_id,
                 long_turn,
                 reply=long_answer,
+                duration_ms=1,
                 stop_reason="end_turn",
             ),
         )
@@ -258,6 +267,7 @@ def seed_responsiveness_catalog(
                 history_id,
                 tool_turn,
                 reply="Large tool result fixture completed.",
+                duration_ms=1,
                 stop_reason="end_turn",
             ),
         )
@@ -293,6 +303,7 @@ def seed_responsiveness_catalog(
                 session_id,
                 0,
                 reply="Background stream fixture ready.",
+                duration_ms=1,
                 stop_reason="end_turn",
             ),
         ]
@@ -703,6 +714,26 @@ class FixtureServer:
         self.thread.join(timeout=2)
 
 
+def _build_harness_environment(
+    parent_environment: dict[str, str],
+    fixture_environment: dict[str, str],
+    state_dir: Path,
+    supervisor_bin: Path,
+) -> dict[str, str]:
+    environment = parent_environment.copy()
+    for name in _CREDENTIAL_ENV_VARS:
+        environment.pop(name, None)
+    environment.update(fixture_environment)
+    environment.update(
+        {
+            "TERM": "xterm-256color",
+            "LEG_UI_STATE_DIR": str(state_dir),
+            "LEG_UI_SUPERVISOR_BIN": str(supervisor_bin.resolve()),
+        }
+    )
+    return environment
+
+
 def _provider_summary(fixture: Any, run_started_ns: int) -> dict[str, Any]:
     timings = fixture.status()["responsiveness_streams"]
     streams: dict[str, Any] = {}
@@ -1008,14 +1039,11 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             dataset = seed_responsiveness_catalog(state_dir, workspace)
             fixture_server = FixtureServer(workspace)
             process_cleanup.callback(fixture_server.close)
-            env = os.environ.copy()
-            env.update(fixture_server.environment)
-            env.update(
-                {
-                    "TERM": "xterm-256color",
-                    "LEG_UI_STATE_DIR": str(state_dir),
-                    "LEG_UI_SUPERVISOR_BIN": str(Path(args.supervisor_bin).resolve()),
-                }
+            env = _build_harness_environment(
+                os.environ.copy(),
+                fixture_server.environment,
+                state_dir,
+                Path(args.supervisor_bin),
             )
             command = [
                 str(Path(args.tui_bin).resolve()),
