@@ -362,8 +362,11 @@ The test-only harness measures key injection to rendered terminal cells on a
 native PTY. Windows uses pywinpty's ConPTY backend; Linux/macOS use the native
 PTY. Its fixture creates 1,000
 history turns with 4 KiB replies, then adds one 10,000-line answer and one
-1 MiB tool result. It starts two background provider sessions that each emit
-6,000 32-byte chunks at 200 chunks/second.
+1 MiB tool result. It runs background stream pairs; each pair has two sessions
+that each emit 6,000 32-byte chunks at 200 chunks/second for 30 seconds. The
+harness starts another pair as needed, and every timed sample must have both its
+input and visible-output timestamps inside that pair's overlap. Untimed session
+switching may occur between pairs.
 
 Use Python 3.12 and build the three binaries in release mode. On Windows, run
 from Git Bash/MSYS2; the harness records the Windows OS build as the ConPTY
@@ -415,9 +418,11 @@ draft editing, history scrolling, palette filtering, and inspection at 80x24
 and 120x40, with p95/max per group.
 Sample records include provider chunk emit timestamps before and after each
 input; the provider's actual inter-chunk intervals are reported separately
-from UI latency. The report also separates first catalog load from cached
-history/inspector opening, and records startup, idle/peak process-tree RSS,
-revision, OS/CPU, terminal transport/version, dimensions, and build profile.
+from UI latency. Each sample identifies its stream pair, and the report records
+each pair's stream IDs and overlap interval. The report also separates first
+catalog load from cached history/inspector opening, and records startup,
+idle/peak process-tree RSS, revision, OS/CPU, terminal transport/version,
+dimensions, and build profile.
 CI uploads separate `leg-tui-responsiveness-linux-*` and
 `leg-tui-responsiveness-windows-*` artifacts on the PR run. Attach both reports
 to the issue PR.

@@ -7,6 +7,7 @@ import argparse
 import http.server
 import json
 import os
+import re
 import select
 import shlex
 import socket
@@ -39,6 +40,7 @@ PAUSE_MS = 1200
 BROWSER_PAUSE_MS = 12000
 RESPONSIVENESS_CHUNKS_PER_SECOND = 200
 RESPONSIVENESS_CHUNK_BYTES = 32
+RESPONSIVENESS_CHUNK_TEXT = "0123456789abcdefghijklmnopqrstuv"
 RESPONSIVENESS_DURATION_SECONDS = 30
 RESPONSIVENESS_CHUNK_COUNT = RESPONSIVENESS_CHUNKS_PER_SECOND * RESPONSIVENESS_DURATION_SECONDS
 RESPONSIVENESS_CHUNK_INTERVAL_MS = 1000 // RESPONSIVENESS_CHUNKS_PER_SECOND
@@ -169,6 +171,10 @@ class Fixture:
             if not isinstance(message, dict):
                 continue
             body = text_content(message.get("content"))
+            if self.scenario == "responsiveness":
+                match = re.search(r"RESPONSIVENESS-STREAM-[AB]-PAIR-\d+", body)
+                if match:
+                    return match.group(0)
             for marker in markers:
                 if marker in body:
                     return marker
@@ -465,11 +471,11 @@ class Fixture:
         request, occurrence = self.advance(marker)
         handler.fixture_request_number = request
 
-        if self.scenario == "responsiveness" and marker in (
-            "RESPONSIVENESS-STREAM-A",
-            "RESPONSIVENESS-STREAM-B",
+        if self.scenario == "responsiveness" and (
+            marker in ("RESPONSIVENESS-STREAM-A", "RESPONSIVENESS-STREAM-B")
+            or re.fullmatch(r"RESPONSIVENESS-STREAM-[AB]-PAIR-\d+", marker)
         ):
-            chunk = "0123456789abcdefghijklmnopqrstuv"
+            chunk = RESPONSIVENESS_CHUNK_TEXT
             assert len(chunk.encode("utf-8")) == RESPONSIVENESS_CHUNK_BYTES
             chunks = [chunk] * RESPONSIVENESS_CHUNK_COUNT
             completed = self.send_stream(

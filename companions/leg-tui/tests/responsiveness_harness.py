@@ -56,6 +56,12 @@ COMPOSER_HINT = "Composer ("
 INSPECTOR_HEADER = "Inspector · Up/Down field"
 DIMENSIONS = ((24, 80), (40, 120))
 SAMPLE_COUNT = 100
+SAMPLE_TIMEOUT_SECONDS = 2.0
+STREAM_PAIR_RENEWAL_MARGIN_SECONDS = 5.0
+STREAM_PAIR_POOL_SIZE = 2
+NARROW_STATUS_TITLE_WIDTH = 14
+ACTIVE_SESSION_STATUS_LABELS = {"Starting", "Running", "Stopping"}
+TRANSCRIPT_WINDOW_PATTERN = re.compile(r"Rows (\d+)-(\d+) of (\d+)")
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.1
 IDLE_MEMORY_WINDOW_SECONDS = 2.0
 
@@ -97,6 +103,38 @@ def _write_session(path: Path, events: list[dict[str, Any]]) -> None:
         path.chmod(0o600)
     except OSError:
         pass
+
+
+def _validate_seeded_session_logs(
+    leg_bin: Path, state_dir: Path, dataset: dict[str, Any], env: dict[str, str]
+) -> None:
+    session_paths = [Path(dataset["history_path"])]
+    session_paths.extend(
+        state_dir / "sessions" / f"{session_id}.jsonl"
+        for session_id in dataset["stream_session_ids"].values()
+    )
+    for session_path in session_paths:
+        try:
+            result = subprocess.run(
+                [str(leg_bin.resolve()), "log", "show", "--file", str(session_path.resolve())],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"leg log show timed out validating seeded session {session_path.name}"
+            ) from error
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"exit status {result.returncode}"
+            raise RuntimeError(f"leg rejected seeded session {session_path.name}: {detail}")
 
 
 def _catalog_workspace_path(workspace: Path) -> str:
@@ -145,10 +183,8 @@ def seed_responsiveness_catalog(
     workspace_cwd = _catalog_workspace_path(workspace)
     now_ms = int(time.time() * 1000)
     history_id = "responsiveness-history"
-    stream_ids = {
-        "RESPONSIVENESS-STREAM-A": "responsiveness-stream-a",
-        "RESPONSIVENESS-STREAM-B": "responsiveness-stream-b",
-    }
+    stream_ids: dict[str, str] = {}
+    stream_pair_pool: list[dict[str, Any]] = []
 
     events = [_exchange_event("session_start", now_ms, history_id)]
     for index in range(turn_count):
@@ -284,38 +320,50 @@ def seed_responsiveness_catalog(
             "display": {"tui_first_run_warning_acknowledged": True},
         }
     }
-    for offset, (marker, session_id) in enumerate(stream_ids.items(), start=1):
-        created_ms = now_ms - offset
-        stream_events = [
-            _exchange_event("session_start", created_ms, session_id),
-            _exchange_event(
-                "request",
-                created_ms + 1,
-                session_id,
-                0,
-                model="fixture",
-                base_url="local",
-                prompt="background stream session seed",
-            ),
-            _exchange_event(
-                "response_ok",
-                created_ms + 2,
-                session_id,
-                0,
-                reply="Background stream fixture ready.",
-                duration_ms=1,
-                stop_reason="end_turn",
-            ),
-        ]
-        _write_session(sessions_dir / f"{session_id}.jsonl", stream_events)
-        session_records[session_id] = {
-            "name": "Stream A" if marker.endswith("A") else "Stream B",
-            "cwd": workspace_cwd,
-            "created_at_ms": created_ms,
-            "updated_at_ms": created_ms,
-            "drafts": {"tui": marker},
-            "display": {"tui_first_run_warning_acknowledged": True},
-        }
+    for pool_index in range(STREAM_PAIR_POOL_SIZE):
+        pair_number = pool_index + 1
+        pool_sessions: dict[str, dict[str, str]] = {}
+        for side in ("A", "B"):
+            marker = f"RESPONSIVENESS-STREAM-{side}-PAIR-{pair_number:03d}"
+            session_id = f"responsiveness-stream-{side.lower()}-pool-{pair_number:02d}"
+            created_ms = now_ms - pool_index * 2 - (0 if side == "A" else 1)
+            stream_events = [
+                _exchange_event("session_start", created_ms, session_id),
+                _exchange_event(
+                    "request",
+                    created_ms + 1,
+                    session_id,
+                    0,
+                    model="fixture",
+                    base_url="local",
+                    prompt="background stream session seed",
+                ),
+                _exchange_event(
+                    "response_ok",
+                    created_ms + 2,
+                    session_id,
+                    0,
+                    reply="Background stream fixture ready.",
+                    duration_ms=1,
+                    stop_reason="end_turn",
+                ),
+            ]
+            _write_session(sessions_dir / f"{session_id}.jsonl", stream_events)
+            session_records[session_id] = {
+                "name": f"Stream {pair_number} {side}",
+                "cwd": workspace_cwd,
+                "created_at_ms": created_ms,
+                "updated_at_ms": created_ms,
+                "drafts": {"tui": marker},
+                "display": {"tui_first_run_warning_acknowledged": True},
+            }
+            stream_ids[marker] = session_id
+            pool_sessions[side] = {
+                "marker": marker,
+                "session_id": session_id,
+                "title": f"Stream {pair_number} {side}",
+            }
+        stream_pair_pool.append({"pool_index": pool_index, "sessions": pool_sessions})
 
     catalog_path = state_dir / "catalog.json"
     catalog_path.write_text(
@@ -333,6 +381,7 @@ def seed_responsiveness_catalog(
         "tool_result_bytes": tool_result_bytes,
         "history_session_id": history_id,
         "stream_session_ids": stream_ids,
+        "stream_pair_pool": stream_pair_pool,
         "total_history_turns": turn_count + 2,
         "catalog_path": str(catalog_path),
         "history_path": str(sessions_dir / f"{history_id}.jsonl"),
@@ -507,7 +556,33 @@ class TerminalProcess:
 
     def write(self, value: str) -> None:
         if os.name == "nt":
-            self.process.write(value)
+            remaining = value
+            characters_written = 0
+            while remaining:
+                encoded = remaining.encode("utf-8")
+                written = self.process.write(remaining)
+                if not isinstance(written, int) or written <= 0 or written > len(encoded):
+                    raise RuntimeError(
+                        f"Windows ConPTY write made invalid progress: {written} bytes for {len(encoded)} bytes"
+                    )
+                if written == len(encoded):
+                    written_text = remaining
+                else:
+                    try:
+                        # pywinpty reports bytes written while this API accepts text.
+                        written_text = encoded[:written].decode("utf-8")
+                    except UnicodeDecodeError as error:
+                        raise RuntimeError(
+                            "Windows ConPTY partial write ended inside a UTF-8 character"
+                        ) from error
+                if not written_text:
+                    raise RuntimeError("Windows ConPTY write made no text progress")
+                characters_written += len(written_text)
+                remaining = remaining[len(written_text) :]
+            if characters_written != len(value):
+                raise RuntimeError(
+                    f"Windows ConPTY wrote {characters_written} of {len(value)} input characters"
+                )
         else:
             assert self.master_fd is not None
             data = value.encode("utf-8")
@@ -734,7 +809,9 @@ def _build_harness_environment(
     return environment
 
 
-def _provider_summary(fixture: Any, run_started_ns: int) -> dict[str, Any]:
+def _provider_summary(fixture_server: FixtureServer, run_started_ns: int) -> dict[str, Any]:
+    fixture = fixture_server.fixture
+    module = fixture_server.module
     timings = fixture.status()["responsiveness_streams"]
     streams: dict[str, Any] = {}
     for stream_id, events in fixture.stream_emissions.items():
@@ -747,9 +824,9 @@ def _provider_summary(fixture: Any, run_started_ns: int) -> dict[str, Any]:
         streams[stream_id] = {
             "request": timing.get("request"),
             "chunk_count": len(events),
-            "chunk_bytes": fixture.module.RESPONSIVENESS_CHUNK_BYTES,
-            "configured_chunks_per_second": fixture.module.RESPONSIVENESS_CHUNKS_PER_SECOND,
-            "configured_chunk_interval_ms": fixture.module.RESPONSIVENESS_CHUNK_INTERVAL_MS,
+            "chunk_bytes": module.RESPONSIVENESS_CHUNK_BYTES,
+            "configured_chunks_per_second": module.RESPONSIVENESS_CHUNKS_PER_SECOND,
+            "configured_chunk_interval_ms": module.RESPONSIVENESS_CHUNK_INTERVAL_MS,
             "started_offset_ms": round((timing.get("started_ns", 0) - run_started_ns) / 1_000_000, 3),
             "ended_offset_ms": round((timing.get("ended_ns", 0) - run_started_ns) / 1_000_000, 3),
             "actual_duration_ms": round(
@@ -769,7 +846,8 @@ def _provider_summary(fixture: Any, run_started_ns: int) -> dict[str, Any]:
         }
     return {
         "scenario": "responsiveness",
-        "stream_count": 2,
+        "stream_count": len(streams),
+        "stream_pair_count": len(streams) // 2,
         "streams": streams,
         "timestamps_share_the_harness_monotonic_clock": True,
     }
@@ -839,21 +917,94 @@ def _wait_fixture_requests(
     )
 
 
-def _wait_for_both_streams(fixture: Any, timeout: float = 8.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status = fixture.status()
-        if len(status["active_requests"]) == 2 and len(fixture.stream_emissions) == 2:
-            if all(fixture.stream_emissions.get(name) for name in fixture.stream_emissions):
-                return
-        time.sleep(0.01)
-    raise TimeoutError(f"both provider streams did not become active: {fixture.status()}")
+def _transcript_window(text: str) -> tuple[int, int, int] | None:
+    match = TRANSCRIPT_WINDOW_PATTERN.search(text)
+    return tuple(map(int, match.groups())) if match else None
+
+
+def _restore_transcript_bottom(terminal: TerminalProcess) -> None:
+    terminal.write("\x1b[1;5F")  # Ctrl-End returns to the newest transcript rows.
+
+    def at_bottom(text: str) -> bool:
+        window = _transcript_window(text)
+        return window is not None and window[1] == window[2]
+
+    terminal.wait_for(at_bottom, "transcript to return to its newest rows", timeout=2.0)
+
+
+def _position_transcript_for_scrolling(terminal: TerminalProcess) -> None:
+    for attempt in range(4):
+        window = _transcript_window(terminal.capture.text())
+        if window is None:
+            raise RuntimeError("transcript row counter is not visible before history scrolling")
+        first, last, total = window
+        page_rows = last - first + 1
+        if first - 1 >= 2 * page_rows and total - last >= 2 * page_rows:
+            return
+
+        key_name, key = (
+            ("PageDown", "\x1b[6~")
+            if first - 1 < 2 * page_rows
+            else ("PageUp", "\x1b[5~")
+        )
+        terminal.write(key)
+        try:
+            terminal.wait_for(
+                lambda text, previous=window: _transcript_window(text) != previous,
+                f"untimed {key_name} preposition {attempt} from {first}-{last} of {total}",
+                timeout=2.0,
+            )
+        except TimeoutError:
+            after = _transcript_window(terminal.capture.text())
+            after_text = (
+                f"{after[0]}-{after[1]} of {after[2]}"
+                if after is not None
+                else "<counter unavailable>"
+            )
+            raise RuntimeError(
+                f"history scroll preposition {key_name} {attempt}: "
+                f"rows {first}-{last} of {total} -> {after_text}"
+            ) from None
+    else:
+        window = _transcript_window(terminal.capture.text())
+        position = (
+            f"{window[0]}-{window[1]} of {window[2]}"
+            if window is not None
+            else "<counter unavailable>"
+        )
+        raise RuntimeError(
+            "could not position transcript away from both scroll boundaries: "
+            f"rows {position}"
+        )
+
+
+def _visible_status_title(title: str) -> str:
+    if len(title) > NARROW_STATUS_TITLE_WIDTH:
+        return title[: NARROW_STATUS_TITLE_WIDTH - 1]
+    return title
+
+
+def _session_title_visible(text: str, title: str) -> bool:
+    visible_title = _visible_status_title(title)
+    return any(
+        line.startswith("status:") and f"|  {visible_title}" in line
+        for line in text.splitlines()
+    )
+
+
+def _session_is_inactive(text: str, title: str) -> bool:
+    visible_title = _visible_status_title(title)
+    for line in text.splitlines():
+        if not line.startswith("status:") or f"|  {visible_title}" not in line:
+            continue
+        status = line[len("status:") :].split("  |", 1)[0].strip()
+        return status not in ACTIVE_SESSION_STATUS_LABELS
+    return False
 
 
 def _select_session(
     terminal: TerminalProcess,
     title: str,
-    target: str,
     already_in_picker: bool = False,
 ) -> tuple[int, int]:
     if not already_in_picker:
@@ -865,8 +1016,187 @@ def _select_session(
     terminal.wait_contains(PICKER_HEADER)
     selected_at = time.perf_counter_ns()
     terminal.write("\r")
-    _, visible_at = terminal.wait_contains(target, timeout=10.0)
+    _, visible_at = terminal.wait_for(
+        lambda text: _session_title_visible(text, title),
+        f"selected session title {title}",
+        timeout=10.0,
+    )
     return selected_at, visible_at
+
+
+class ResponsivenessStreamPairManager:
+    def __init__(
+        self,
+        terminal: TerminalProcess,
+        fixture_server: FixtureServer,
+        stream_pair_pool: list[dict[str, Any]],
+    ) -> None:
+        if len(stream_pair_pool) < 2:
+            raise ValueError("the responsiveness harness needs at least two reusable stream pairs")
+        self.terminal = terminal
+        self.fixture = fixture_server.fixture
+        self.module = fixture_server.module
+        self.stream_pair_pool = stream_pair_pool
+        self.pairs: list[dict[str, Any]] = []
+        self.active_pair: dict[str, Any] | None = None
+
+    def start_next_pair(
+        self,
+        before_switch: Callable[[], None] | None = None,
+        after_restore: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        if before_switch is not None:
+            before_switch()
+        if self.active_pair is not None:
+            self._wait_for_pair_requests(self.active_pair)
+
+        pair_number = len(self.pairs) + 1
+        pair_id = f"pair-{pair_number:03d}"
+        pool = self.stream_pair_pool[(pair_number - 1) % len(self.stream_pair_pool)]
+        previous_markers = pool.get("last_markers", {})
+        self._wait_for_pool_requests(previous_markers)
+        stream_ids = {
+            side: f"RESPONSIVENESS-STREAM-{side}-PAIR-{pair_number:03d}"
+            for side in ("A", "B")
+        }
+
+        for side in ("A", "B"):
+            session = pool["sessions"][side]
+            previous_marker = previous_markers.get(side)
+            _select_session(self.terminal, session["title"])
+            requests_before = self.fixture.status()["requests"]
+            if previous_marker:
+                self.terminal.write_control("u")
+                self.terminal.write(stream_ids[side])
+            self.terminal.write_control("s")
+            _wait_fixture_requests(self.fixture, requests_before + 1, terminal=self.terminal)
+            previous_markers[side] = stream_ids[side]
+        pool["last_markers"] = previous_markers
+
+        _wait_for_stream_pair(self.fixture, stream_ids.values())
+        timings = self.fixture.status()["responsiveness_streams"]
+        overlap_start_ns = max(timings[stream_id]["started_ns"] for stream_id in stream_ids.values())
+        duration_ns = self.module.RESPONSIVENESS_DURATION_SECONDS * 1_000_000_000
+        planned_overlap_end_ns = min(
+            timings[stream_id]["started_ns"] + duration_ns - 100_000_000
+            for stream_id in stream_ids.values()
+        )
+        if planned_overlap_end_ns <= overlap_start_ns:
+            raise RuntimeError(f"provider stream pair {pair_id} has no planned overlap")
+
+        pair = {
+            "pair_id": pair_id,
+            "stream_ids": list(stream_ids.values()),
+            "pool_index": pool["pool_index"],
+            "overlap_start_ns": overlap_start_ns,
+            "planned_overlap_end_ns": planned_overlap_end_ns,
+        }
+        self.pairs.append(pair)
+        self.active_pair = pair
+        _select_session(self.terminal, "History fixture")
+        if after_restore is not None:
+            after_restore()
+        else:
+            _restore_transcript_bottom(self.terminal)
+        return pair
+
+    def pair_for_next_sample(
+        self,
+        before_switch: Callable[[], None] | None = None,
+        after_restore: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        now_ns = time.perf_counter_ns()
+        renewal_margin_ns = int(STREAM_PAIR_RENEWAL_MARGIN_SECONDS * 1_000_000_000)
+        if (
+            self.active_pair is None
+            or not self._pair_requests_active(self.active_pair)
+            or now_ns + renewal_margin_ns >= self.active_pair["planned_overlap_end_ns"]
+        ):
+            return self.start_next_pair(before_switch, after_restore)
+        return self.active_pair
+
+    def _pair_requests_active(self, pair: dict[str, Any]) -> bool:
+        status = self.fixture.status()
+        timings = status["responsiveness_streams"]
+        active_requests = set(status["active_requests"])
+        return all(
+            stream_id in timings and timings[stream_id]["request"] in active_requests
+            for stream_id in pair["stream_ids"]
+        )
+
+    def _wait_for_pool_requests(self, previous_markers: dict[str, str]) -> None:
+        if not previous_markers:
+            return
+        status = self.fixture.status()
+        previous_requests = {
+            status["responsiveness_streams"][marker]["request"]
+            for marker in previous_markers.values()
+            if marker in status["responsiveness_streams"]
+        }
+        self._wait_for_requests(previous_requests, f"stream pool requests did not finish before reuse: {previous_markers}")
+
+    def _wait_for_pair_requests(self, pair: dict[str, Any]) -> None:
+        status = self.fixture.status()
+        timings = status["responsiveness_streams"]
+        requests = {
+            int(timings[stream_id]["request"])
+            for stream_id in pair["stream_ids"]
+            if stream_id in timings
+        }
+        self._wait_for_requests(requests, f"stream pair {pair['pair_id']} did not finish")
+
+    def _wait_for_requests(self, request_ids: set[int], error: str) -> None:
+        deadline = time.monotonic() + self.module.RESPONSIVENESS_DURATION_SECONDS + 5.0
+        while request_ids.intersection(self.fixture.status()["active_requests"]):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{error}: {self.fixture.status()}")
+            time.sleep(0.02)
+
+    def wait_for_all_pairs(self) -> None:
+        request_ids: set[int] = set()
+        status = self.fixture.status()
+        for pair in self.pairs:
+            for stream_id in pair["stream_ids"]:
+                timing = status["responsiveness_streams"].get(stream_id)
+                if timing is None:
+                    raise RuntimeError(f"provider fixture did not record stream {stream_id}")
+                request_ids.add(int(timing["request"]))
+        deadline = time.monotonic() + self.module.RESPONSIVENESS_DURATION_SECONDS + 5.0
+        while request_ids.intersection(self.fixture.status()["active_requests"]):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"provider stream pairs did not finish: {self.fixture.status()}")
+            time.sleep(0.02)
+
+    def wait_for_tui_sessions_to_finish(self) -> None:
+        for pool in self.stream_pair_pool:
+            for session in pool["sessions"].values():
+                title = session["title"]
+                _select_session(self.terminal, title)
+                self.terminal.wait_for(
+                    lambda text, session_title=title: _session_is_inactive(text, session_title),
+                    f"stream session {title} to finish in the TUI",
+                    timeout=10.0,
+                )
+        _select_session(self.terminal, "History fixture")
+        _restore_transcript_bottom(self.terminal)
+
+
+def _wait_for_stream_pair(fixture: Any, stream_ids: Any, timeout: float = 8.0) -> None:
+    expected = tuple(stream_ids)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = fixture.status()
+        timings = status["responsiveness_streams"]
+        active = set(status["active_requests"])
+        if all(
+            stream_id in timings
+            and fixture.stream_emissions.get(stream_id)
+            and timings[stream_id]["request"] in active
+            for stream_id in expected
+        ):
+            return
+        time.sleep(0.01)
+    raise TimeoutError(f"provider stream pair {expected} did not become active: {fixture.status()}")
 
 
 def _measure_sample(
@@ -877,7 +1207,7 @@ def _measure_sample(
     payload: str,
     predicate: Callable[[str], bool],
     description: str,
-    timeout: float = 2.0,
+    timeout: float = SAMPLE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     injected_ns = time.perf_counter_ns()
     terminal.write(payload)
@@ -892,11 +1222,48 @@ def _measure_sample(
     }
 
 
+def _measure_streamed_sample(
+    stream_pairs: ResponsivenessStreamPairManager,
+    terminal: TerminalProcess,
+    action: str,
+    dimension: dict[str, int],
+    index: int,
+    payload: str,
+    predicate: Callable[[str], bool],
+    description: str,
+    before_pair_switch: Callable[[], None] | None = None,
+    after_pair_restore: Callable[[], None] | None = None,
+    before_injection: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    pair = stream_pairs.pair_for_next_sample(before_pair_switch, after_pair_restore)
+    if before_injection is not None:
+        before_injection()
+    sample = _measure_sample(
+        terminal,
+        action,
+        dimension,
+        index,
+        payload,
+        predicate,
+        description,
+    )
+    for timestamp_key in ("input_monotonic_ns", "visible_monotonic_ns"):
+        timestamp = int(sample[timestamp_key])
+        if not pair["overlap_start_ns"] <= timestamp < pair["planned_overlap_end_ns"]:
+            raise RuntimeError(
+                f"{action} sample {index} did not fit stream pair {pair['pair_id']} overlap "
+                f"at {timestamp_key}={timestamp}"
+            )
+    sample["stream_pair_id"] = pair["pair_id"]
+    return sample
+
+
 def _measure_dimension(
     terminal: TerminalProcess,
     rows: int,
     columns: int,
     sample_count: int,
+    stream_pairs: ResponsivenessStreamPairManager,
 ) -> dict[str, list[dict[str, Any]]]:
     dimension = {"rows": rows, "columns": columns}
     suffix = f"{columns}x{rows}"
@@ -908,7 +1275,8 @@ def _measure_dimension(
     for index in range(sample_count):
         marker = f"draft{index:03d}"
         groups[f"draft_editing@{suffix}"].append(
-            _measure_sample(
+            _measure_streamed_sample(
+                stream_pairs,
                 terminal,
                 "draft_editing",
                 dimension,
@@ -918,33 +1286,85 @@ def _measure_dimension(
                 f"draft text {marker}",
             )
         )
+        terminal.write("\x7f" * len(marker))
+        terminal.wait_for(
+            lambda text, expected=marker: expected not in text,
+            f"cleared draft text {marker}",
+            timeout=2.0,
+        )
+
+    _position_transcript_for_scrolling(terminal)
 
     for index in range(sample_count):
-        before = re.search(r"Rows (\d+-\d+ of \d+)", terminal.capture.text())
-        if before is None:
-            raise RuntimeError("transcript row counter is not visible before history scrolling")
-        key = "\x1b[5~" if index % 2 == 0 else "\x1b[6~"
-        previous = before.group(1)
-        groups[f"history_scrolling@{suffix}"].append(
-            _measure_sample(
+        before: tuple[int, int, int] | None = None
+
+        def capture_history_scroll_baseline() -> None:
+            nonlocal before
+            before = _transcript_window(terminal.capture.text())
+            if before is None:
+                raise RuntimeError(
+                    f"history scroll sample {index}: transcript row counter is unavailable"
+                )
+            first, last, total = before
+            page_rows = last - first + 1
+            if first - 1 < page_rows or total - last < page_rows:
+                raise RuntimeError(
+                    f"history scroll sample {index} starts at a boundary: "
+                    f"rows {first}-{last} of {total}"
+                )
+
+        key_name, key = (
+            ("PageUp", "\x1b[5~") if index % 2 == 0 else ("PageDown", "\x1b[6~")
+        )
+        try:
+            sample = _measure_streamed_sample(
+                stream_pairs,
                 terminal,
                 "history_scrolling",
                 dimension,
                 index,
                 key,
-                lambda text, previous=previous: (match := re.search(r"Rows (\d+-\d+ of \d+)", text)) is not None
-                and match.group(1) != previous,
-                "transcript row counter to change",
+                lambda text: _transcript_window(text) != before,
+                f"{key_name} sample {index} transcript row counter change",
+                after_pair_restore=lambda: _position_transcript_for_scrolling(terminal),
+                before_injection=capture_history_scroll_baseline,
             )
-        )
+        except TimeoutError:
+            after = _transcript_window(terminal.capture.text())
+            before_text = (
+                f"{before[0]}-{before[1]} of {before[2]}"
+                if before is not None
+                else "<counter unavailable>"
+            )
+            after_text = (
+                f"{after[0]}-{after[1]} of {after[2]}"
+                if after is not None
+                else "<counter unavailable>"
+            )
+            raise TimeoutError(
+                f"{key_name} sample {index} rows "
+                f"{before_text} -> {after_text} did not change"
+            ) from None
+        groups[f"history_scrolling@{suffix}"].append(sample)
 
-    terminal.write_control("p")  # Ctrl-P
-    terminal.wait_contains(PALETTE_HEADER)
-    for index in range(sample_count):
+    def close_palette() -> None:
+        terminal.write("\x1b")
+        terminal.wait_for(lambda text: PALETTE_HEADER not in text, "palette to close")
+
+    def open_palette() -> None:
+        _restore_transcript_bottom(terminal)
+        terminal.write_control("p")  # Ctrl-P
+        terminal.wait_contains(PALETTE_HEADER)
+
+    def clear_palette() -> None:
         terminal.write_control("u")  # Ctrl-U clears the prior query.
+
+    open_palette()
+    for index in range(sample_count):
         query = f"q{index:03d}"
         groups[f"palette_filtering@{suffix}"].append(
-            _measure_sample(
+            _measure_streamed_sample(
+                stream_pairs,
                 terminal,
                 "palette_filtering",
                 dimension,
@@ -952,14 +1372,17 @@ def _measure_dimension(
                 query,
                 lambda text, expected=query: expected in text,
                 f"palette query {query}",
+                before_pair_switch=close_palette,
+                after_pair_restore=open_palette,
+                before_injection=clear_palette,
             )
         )
-    terminal.write("\x1b")
-    terminal.wait_for(lambda text: PALETTE_HEADER not in text, "palette to close")
+    close_palette()
 
     for index in range(sample_count):
         groups[f"inspection@{suffix}"].append(
-            _measure_sample(
+            _measure_streamed_sample(
+                stream_pairs,
                 terminal,
                 "inspection",
                 dimension,
@@ -981,40 +1404,91 @@ def _decorate_sample_provider_context(
     groups: dict[str, list[dict[str, Any]]],
     fixture: Any,
     run_started_ns: int,
+    stream_pairs: list[dict[str, Any]],
 ) -> None:
+    pairs_by_id = {pair["pair_id"]: pair for pair in stream_pairs}
     for samples in groups.values():
         for sample in samples:
             input_ns = int(sample.pop("input_monotonic_ns"))
             visible_ns = int(sample.pop("visible_monotonic_ns"))
+            pair = pairs_by_id[sample["stream_pair_id"]]
             sample["input_offset_ms"] = round((input_ns - run_started_ns) / 1_000_000, 3)
             sample["visible_offset_ms"] = round((visible_ns - run_started_ns) / 1_000_000, 3)
             sample["provider_fixture_context"] = {
-                stream_id: provider_context(events, input_ns, run_started_ns)
-                for stream_id, events in fixture.stream_emissions.items()
+                stream_id: provider_context(
+                    fixture.stream_emissions[stream_id], input_ns, run_started_ns
+                )
+                for stream_id in pair["stream_ids"]
             }
 
 
 def _check_workload_overlap(
-    groups: dict[str, list[dict[str, Any]]], fixture: Any
-) -> tuple[int, int]:
+    groups: dict[str, list[dict[str, Any]]],
+    fixture_server: FixtureServer,
+    stream_pairs: list[dict[str, Any]],
+) -> None:
+    fixture = fixture_server.fixture
+    module = fixture_server.module
     status = fixture.status()
     timings = status["responsiveness_streams"]
-    expected = ("RESPONSIVENESS-STREAM-A", "RESPONSIVENESS-STREAM-B")
-    if any(name not in timings for name in expected):
-        raise RuntimeError(f"provider fixture did not record both streams: {status}")
-    overlap_start = max(timings[name]["started_ns"] for name in expected)
-    overlap_end = min(timings[name]["ended_ns"] for name in expected)
-    if overlap_end <= overlap_start:
-        raise RuntimeError("the two provider fixture streams did not overlap")
+    pairs_by_id: dict[str, dict[str, Any]] = {}
+    for pair in stream_pairs:
+        stream_ids = pair["stream_ids"]
+        if any(stream_id not in timings for stream_id in stream_ids):
+            raise RuntimeError(f"provider fixture did not record both streams for {pair['pair_id']}: {status}")
+        if any(
+            timings[stream_id]["chunks_emitted"] != module.RESPONSIVENESS_CHUNK_COUNT
+            for stream_id in stream_ids
+        ):
+            raise RuntimeError(f"provider stream pair {pair['pair_id']} did not emit all configured chunks")
+        overlap_start = max(timings[stream_id]["started_ns"] for stream_id in stream_ids)
+        overlap_end = min(timings[stream_id]["ended_ns"] for stream_id in stream_ids)
+        if overlap_end <= overlap_start:
+            raise RuntimeError(f"provider stream pair {pair['pair_id']} did not overlap")
+        pair["overlap_start_ns"] = overlap_start
+        pair["overlap_end_ns"] = overlap_end
+        pairs_by_id[pair["pair_id"]] = pair
+
     for samples in groups.values():
         for sample in samples:
             injected = int(sample["input_monotonic_ns"])
             visible = int(sample["visible_monotonic_ns"])
-            if not overlap_start <= injected < overlap_end or not overlap_start <= visible < overlap_end:
+            pair_id = sample.get("stream_pair_id")
+            pair = pairs_by_id.get(pair_id)
+            if pair is None:
                 raise RuntimeError(
-                    f"{sample['action']} sample {sample['sample_index']} was outside the two-stream overlap"
+                    f"{sample['action']} sample {sample['sample_index']} has no valid stream pair id: {pair_id}"
                 )
-    return overlap_start, overlap_end
+            if not (
+                pair["overlap_start_ns"] <= injected < pair["overlap_end_ns"]
+                and pair["overlap_start_ns"] <= visible < pair["overlap_end_ns"]
+            ):
+                raise RuntimeError(
+                    f"{sample['action']} sample {sample['sample_index']} was outside stream pair "
+                    f"{pair_id} overlap (input={injected}, visible={visible}, "
+                    f"window={pair['overlap_start_ns']}..{pair['overlap_end_ns']})"
+                )
+
+
+def _stream_pair_summaries(
+    stream_pairs: list[dict[str, Any]], run_started_ns: int
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "pair_id": pair["pair_id"],
+            "stream_ids": pair["stream_ids"],
+            "overlap_start_offset_ms": round(
+                (pair["overlap_start_ns"] - run_started_ns) / 1_000_000, 3
+            ),
+            "overlap_end_offset_ms": round(
+                (pair["overlap_end_ns"] - run_started_ns) / 1_000_000, 3
+            ),
+            "overlap_ms": round(
+                (pair["overlap_end_ns"] - pair["overlap_start_ns"]) / 1_000_000, 3
+            ),
+        }
+        for pair in stream_pairs
+    ]
 
 
 def run_harness(args: argparse.Namespace) -> dict[str, Any]:
@@ -1045,6 +1519,7 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                 state_dir,
                 Path(args.supervisor_bin),
             )
+            _validate_seeded_session_logs(Path(args.leg_bin), state_dir, dataset, env)
             command = [
                 str(Path(args.tui_bin).resolve()),
                 "--leg-bin",
@@ -1065,26 +1540,25 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                 terminal,
                 "History fixture",
                 already_in_picker=True,
-                target="Large tool result fixture completed.",
             )
+            _restore_transcript_bottom(terminal)
             catalog_load_ms = (visible_ns - selected_ns) / 1_000_000
 
             idle_started_ns = time.perf_counter_ns()
             time.sleep(IDLE_MEMORY_WINDOW_SECONDS)
             idle_memory = sampler.values_between(idle_started_ns, time.perf_counter_ns())
 
-            _select_session(terminal, "Stream A", target="RESPONSIVENESS-STREAM-A")
-            terminal.write_control("s")  # Ctrl-S submits the seeded stream prompt.
-            _wait_fixture_requests(fixture_server.fixture, 1, terminal=terminal)
-            _select_session(terminal, "Stream B", target="RESPONSIVENESS-STREAM-B")
-            terminal.write_control("s")
-            _wait_fixture_requests(fixture_server.fixture, 2, terminal=terminal)
-            _wait_for_both_streams(fixture_server.fixture)
+            stream_pairs = ResponsivenessStreamPairManager(
+                terminal,
+                fixture_server,
+                dataset["stream_pair_pool"],
+            )
+            stream_pairs.start_next_pair()
             selected_ns, visible_ns = _select_session(
                 terminal,
                 "History fixture",
-                target="Large tool result fixture completed.",
             )
+            _restore_transcript_bottom(terminal)
             history_open_ms = (visible_ns - selected_ns) / 1_000_000
 
             for rows, columns in DIMENSIONS:
@@ -1095,27 +1569,13 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                         "composer to render at 120x40",
                         timeout=3.0,
                     )
-                groups.update(_measure_dimension(terminal, rows, columns, args.samples))
+                groups.update(
+                    _measure_dimension(terminal, rows, columns, args.samples, stream_pairs)
+                )
 
-            deadline = time.monotonic() + 35.0
-            required_streams = {"RESPONSIVENESS-STREAM-A", "RESPONSIVENESS-STREAM-B"}
-            while time.monotonic() < deadline:
-                status = fixture_server.fixture.status()
-                if (
-                    not status["active_requests"]
-                    and required_streams.issubset(fixture_server.fixture.stream_emissions)
-                    and all(
-                        len(fixture_server.fixture.stream_emissions[name])
-                        == fixture_server.module.RESPONSIVENESS_CHUNK_COUNT
-                        for name in required_streams
-                    )
-                ):
-                    break
-                time.sleep(0.02)
-            else:
-                raise TimeoutError(f"provider fixture streams did not finish: {fixture_server.fixture.status()}")
-
-            overlap_start, overlap_end = _check_workload_overlap(groups, fixture_server.fixture)
+            stream_pairs.wait_for_all_pairs()
+            _check_workload_overlap(groups, fixture_server, stream_pairs.pairs)
+            stream_pairs.wait_for_tui_sessions_to_finish()
             inspector_samples = [
                 sample
                 for samples in groups.values()
@@ -1126,11 +1586,23 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
 
             terminal.write_control("c")
             if not terminal.wait_exit(timeout=5.0):
-                raise RuntimeError("leg-tui did not exit after the harness sent Ctrl-C")
+                raise RuntimeError(
+                    "leg-tui did not exit after the harness sent Ctrl-C; "
+                    f"current screen:\n{terminal.capture.text()[-3000:]}\n"
+                    f"provider fixture status: {fixture_server.fixture.status()}"
+                )
 
             assert catalog_load_ms is not None and history_open_ms is not None
-            _decorate_sample_provider_context(groups, fixture_server.fixture, run_started_ns)
-            summaries = {group: summarize_latencies(samples) for group, samples in groups.items()}
+            _decorate_sample_provider_context(
+                groups, fixture_server.fixture, run_started_ns, stream_pairs.pairs
+            )
+            summaries = {
+                group: {
+                    **summarize_latencies(samples),
+                    "stream_pair_ids": sorted({sample["stream_pair_id"] for sample in samples}),
+                }
+                for group, samples in groups.items()
+            }
             memory_samples = sampler.all_values() if sampler else []
             if not idle_memory:
                 raise RuntimeError("memory sampler collected no RSS samples during the idle window")
@@ -1154,6 +1626,7 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                     "long_answer_lines": dataset["long_answer_lines"],
                     "tool_result_bytes": dataset["tool_result_bytes"],
                     "total_history_turns": dataset["total_history_turns"],
+                    "stream_pair_pool_size": len(dataset["stream_pair_pool"]),
                 },
                 "timings": {
                     "startup_ms": round(startup_ms, 3),
@@ -1168,8 +1641,8 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                     "idle_process_tree_rss_bytes": int(median(idle_memory)),
                     "peak_process_tree_rss_bytes": max(memory_samples),
                 },
-                "provider_fixture": _provider_summary(fixture_server.fixture, run_started_ns),
-                "two_stream_overlap_ms": round((overlap_end - overlap_start) / 1_000_000, 3),
+                "provider_fixture": _provider_summary(fixture_server, run_started_ns),
+                "stream_pairs": _stream_pair_summaries(stream_pairs.pairs, run_started_ns),
                 "groups": summaries,
                 "samples": [sample for samples in groups.values() for sample in samples],
             }
