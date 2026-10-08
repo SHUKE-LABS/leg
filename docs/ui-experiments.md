@@ -355,3 +355,77 @@ Use Python's `os.path.getsize()` or an equivalent byte-counting command. Keep
 both archives and all measurements from the same source revisions and host.
 The Web report records the browser-only baseline separately so its incremental
 host-and-page cost can be interpreted.
+
+## TUI responsiveness harness (#182)
+
+The test-only harness measures key injection to rendered terminal cells on a
+native PTY. Windows uses pywinpty's ConPTY backend; Linux/macOS use the native
+PTY. Its fixture creates 1,000
+history turns with 4 KiB replies, then adds one 10,000-line answer and one
+1 MiB tool result. It runs background stream pairs; each pair has two sessions
+that each emit 6,000 32-byte chunks at 200 chunks/second for 30 seconds. The
+harness starts another pair as needed, and every timed sample must have both its
+input and visible-output timestamps inside that pair's overlap. Untimed session
+switching may occur between pairs.
+
+Use Python 3.12 and build the three binaries in release mode. On Windows, run
+from Git Bash/MSYS2; the harness records the Windows OS build as the ConPTY
+host version, not as a Windows Terminal version. Its memory sampler uses
+psutil to sum the `leg-tui` process tree and excludes the harness and fixture.
+
+On Windows, install the test requirements in a task-specific environment:
+
+```sh
+LEG_TUI_RESPONSIVENESS_VENV="$(cygpath -u "${TEMP}")/leg-tui-responsiveness-venv"
+python -m venv "${LEG_TUI_RESPONSIVENESS_VENV}"
+"${LEG_TUI_RESPONSIVENESS_VENV}/Scripts/python.exe" -m pip install \
+  --requirement companions/leg-tui/tests/requirements.txt
+cargo build --locked --release --bin leg
+cargo build --locked --manifest-path companions/Cargo.toml --release \
+  -p leg-ui-client --bin leg-ui-supervisor
+cargo build --locked --manifest-path companions/Cargo.toml --release -p leg-tui
+"${LEG_TUI_RESPONSIVENESS_VENV}/Scripts/python.exe" \
+  companions/leg-tui/tests/responsiveness_harness.py \
+  --tui-bin companions/target/release/leg-tui.exe \
+  --leg-bin target/release/leg.exe \
+  --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
+  --build-profile release \
+  --output companions/leg-tui/tests/reports/responsiveness-windows.json
+```
+
+On Linux/macOS, install the same requirements and use the native PTY binaries:
+
+```sh
+LEG_TUI_RESPONSIVENESS_VENV="${TMPDIR:-/tmp}/leg-tui-responsiveness-venv"
+python3 -m venv "${LEG_TUI_RESPONSIVENESS_VENV}"
+"${LEG_TUI_RESPONSIVENESS_VENV}/bin/python" -m pip install \
+  --requirement companions/leg-tui/tests/requirements.txt
+cargo build --locked --release --bin leg
+cargo build --locked --manifest-path companions/Cargo.toml --release \
+  -p leg-ui-client --bin leg-ui-supervisor
+cargo build --locked --manifest-path companions/Cargo.toml --release -p leg-tui
+"${LEG_TUI_RESPONSIVENESS_VENV}/bin/python" \
+  companions/leg-tui/tests/responsiveness_harness.py \
+  --tui-bin companions/target/release/leg-tui \
+  --leg-bin target/release/leg \
+  --supervisor-bin companions/target/release/leg-ui-supervisor \
+  --build-profile release \
+  --output companions/leg-tui/tests/reports/responsiveness-unix.json
+```
+
+Each report contains at least 100 raw samples for every action/size pair:
+draft editing, history scrolling, palette filtering, and inspection at 80x24
+and 120x40, with p95/max per group.
+Sample records include provider chunk emit timestamps before and after each
+input; the provider's actual inter-chunk intervals are reported separately
+from UI latency. Each sample identifies its stream pair, and the report records
+each pair's stream IDs and overlap interval. The report also separates first
+catalog load from cached history/inspector opening, and records startup,
+idle/peak process-tree RSS, revision, OS/CPU, terminal transport/version,
+dimensions, and build profile.
+For pull request CI runs, `source_revision` is GitHub Actions' `github.sha`
+(the merge commit tested by CI), not the PR branch head; the workflow run records
+the PR head SHA separately.
+CI uploads separate `leg-tui-responsiveness-linux-*` and
+`leg-tui-responsiveness-windows-*` artifacts on the PR run. Attach both reports
+to the issue PR.
