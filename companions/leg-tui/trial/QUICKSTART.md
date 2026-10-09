@@ -89,8 +89,18 @@ winner recommendation.
 
 Issue #183's native regression check runs on Linux and Windows when its PR
 body contains `Closes #183` or `Part of #183`. Windows CI drives ConPTY through
-pywinpty and has no Windows Terminal frontend. The paired responsiveness
-thresholds and behavior cases are described in the repository's
+pywinpty without a Windows Terminal frontend. Timing uses pywinpty 3.0.5; the
+behavior checks use 2.0.15 because the newer test transport drops emoji from
+the TUI's bracketed-paste input, while a raw child receives the full code point.
+The older version's ConPTY reader adds about 100 ms, so it is limited to
+behavior checks. Run 37853682089 measured final p95 latency at 32.6–39.7 ms on
+Linux and 47.4–54.3 ms on Windows. Final cached history/inspector opening
+measured 34.412/39.663 ms on Linux and 46.437/54.149 ms on Windows; final idle
+CPU was 0.033% and 0.104%, respectively. Baseline opening times were
+8.165/13.216 ms on Linux and 11.205/24.704 ms on Windows. The baseline palette
+result is `not_comparable` because it has no palette. The paired responsiveness
+thresholds, exact Windows commands, and remaining limitations are described in
+the repository's
 [`UI experiment notes`](../../../docs/ui-experiments.md#tui-responsiveness-harness-182).
 The current Windows Stop case is still unmet and tracked in
 [#187](https://github.com/SHUKE-LABS/leg/issues/187); this run does not establish

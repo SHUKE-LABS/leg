@@ -513,7 +513,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install native responsiveness test requirements
+      - name: Install native responsiveness and behavior requirements
         shell: bash
         run: |
           set -euo pipefail
@@ -522,6 +522,10 @@ jobs:
             venv="${runner_temp}/leg-tui-183-venv"
             python -m venv "${venv}"
             responsiveness_python="${venv}/Scripts/python.exe"
+            behavior_venv="${runner_temp}/leg-tui-183-behavior-venv"
+            python -m venv "${behavior_venv}"
+            behavior_python="${behavior_venv}/Scripts/python.exe"
+            behavior_python_native="$(cygpath -w "${behavior_python}")"
           else
             venv="${RUNNER_TEMP}/leg-tui-183-venv"
             python3 -m venv "${venv}"
@@ -530,6 +534,17 @@ jobs:
           echo "TUI_RESPONSIVENESS_PYTHON=${responsiveness_python}" >>"${GITHUB_ENV}"
           "${responsiveness_python}" -m pip install \
             --requirement companions/leg-tui/tests/requirements.txt
+          if [[ "${{ matrix.host }}" == windows ]]; then
+            "${behavior_python}" -m pip install \
+              --requirement companions/leg-tui/tests/requirements.txt
+            # 2.0.15 preserves the TUI emoji paste path; its ~100 ms ConPTY
+            # reader floor makes it unsuitable for the responsiveness timing.
+            "${behavior_python}" -m pip install --force-reinstall pywinpty==2.0.15
+            echo "TUI_WINDOWS_BEHAVIOR_PYTHON=${behavior_python_native}" >>"${GITHUB_ENV}"
+            cd companions/leg-tui/tests
+            "${responsiveness_python}" -m unittest \
+              test_responsiveness_harness.ResponsivenessHarnessTests.test_windows_conpty_zero_write_return_delivers_complete_input
+          fi
 
       - name: Build final TUI responsiveness binaries
         shell: bash
@@ -556,6 +571,7 @@ jobs:
             --host "${{ matrix.host }}" \
             --baseline-revision b5444f9f409a6edbab7cd02ed776a7df36e6e412 \
             --final-revision "${GITHUB_SHA}" \
+            --pull-request-head-revision "${{ github.event.pull_request.head.sha }}" \
             --tui-bin "companions/target/release/leg-tui${suffix}" \
             --leg-bin "target/release/leg${suffix}" \
             --supervisor-bin "companions/target/release/leg-ui-supervisor${suffix}" \

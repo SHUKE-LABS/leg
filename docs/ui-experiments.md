@@ -369,17 +369,32 @@ input and visible-output timestamps inside that pair's overlap. Untimed session
 switching may occur between pairs.
 
 Use Python 3.12 and build the three binaries in release mode. On Windows, run
-from Git Bash/MSYS2; the harness records the Windows OS build as the ConPTY
-host version, not as a Windows Terminal version. Its memory sampler uses
-psutil to sum the `leg-tui` process tree and excludes the harness and fixture.
+from Git Bash/MSYS2. The timing harness uses pywinpty 3.0.5; the behavior
+harness uses a separate pywinpty 2.0.15 environment. Version 2.0.15 batches
+ConPTY reads for about 100 ms, so it cannot measure the 100 ms input-latency
+gate accurately. With 3.0.5, `PtyProcess.write()` returns 0 while a raw child
+still receives the complete input, including non-BMP code points; however, the
+TUI's bracketed-paste path drops the emoji under that transport. The same TUI
+paste check passes under 2.0.15, so CI uses 3.0.5 for timing and 2.0.15 for
+behavior checks. Reports identify the pywinpty version, Windows build, and the
+direct ConPTY setup; the Windows job also checks that a 3.0.5 write returning
+0 reaches a child as the exact Unicode code points. There is no Windows
+Terminal frontend. The memory sampler uses psutil to sum the `leg-tui` process
+tree and excludes the harness and fixture.
 
 On Windows, install the test requirements in a task-specific environment:
 
 ```sh
 LEG_TUI_RESPONSIVENESS_VENV="$(cygpath -u "${TEMP}")/leg-tui-responsiveness-venv"
+LEG_TUI_WINDOWS_BEHAVIOR_VENV="$(cygpath -u "${TEMP}")/leg-tui-windows-behavior-venv"
 python -m venv "${LEG_TUI_RESPONSIVENESS_VENV}"
+python -m venv "${LEG_TUI_WINDOWS_BEHAVIOR_VENV}"
 "${LEG_TUI_RESPONSIVENESS_VENV}/Scripts/python.exe" -m pip install \
   --requirement companions/leg-tui/tests/requirements.txt
+"${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe" -m pip install \
+  --requirement companions/leg-tui/tests/requirements.txt
+"${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe" -m pip install \
+  --force-reinstall pywinpty==2.0.15
 cargo build --locked --release --bin leg
 cargo build --locked --manifest-path companions/Cargo.toml --release \
   -p leg-ui-client --bin leg-ui-supervisor
@@ -391,6 +406,27 @@ cargo build --locked --manifest-path companions/Cargo.toml --release -p leg-tui
   --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
   --build-profile release \
   --output companions/leg-tui/tests/reports/responsiveness-windows.json
+
+LEG_TUI_REPORT_DIR="$(cygpath -u "${TEMP}")/leg-tui-183"
+TUI_WINDOWS_BEHAVIOR_PYTHON="$(cygpath -w "${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe")" \
+"${LEG_TUI_RESPONSIVENESS_VENV}/Scripts/python.exe" \
+  companions/leg-tui/tests/compare_responsiveness.py \
+  --host windows \
+  --baseline-revision b5444f9f409a6edbab7cd02ed776a7df36e6e412 \
+  --final-revision "$(git rev-parse HEAD)" \
+  --pull-request-head-revision "$(git rev-parse HEAD)" \
+  --tui-bin companions/target/release/leg-tui.exe \
+  --leg-bin target/release/leg.exe \
+  --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
+  --output-dir "${LEG_TUI_REPORT_DIR}"
+
+"${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe" \
+  companions/leg-tui/tests/windows_behavior_harness.py \
+  --tui-bin companions/target/release/leg-tui.exe \
+  --leg-bin target/release/leg.exe \
+  --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
+  --source-revision "$(git rev-parse HEAD)" \
+  --output "${LEG_TUI_REPORT_DIR}/windows-behavior-standalone.json"
 ```
 
 On Linux/macOS, install the same requirements and use the native PTY binaries:
@@ -424,8 +460,8 @@ catalog load from cached history/inspector opening, and records startup,
 idle/peak process-tree RSS, revision, OS/CPU, terminal transport/version,
 dimensions, and build profile.
 For pull request CI runs, `source_revision` is GitHub Actions' `github.sha`
-(the merge commit tested by CI), not the PR branch head; the workflow run records
-the PR head SHA separately.
+(the merge commit tested by CI). The comparison report records both that
+revision and `pull_request_head_revision`, the PR branch SHA.
 Ordinary CI runs upload separate `leg-tui-responsiveness-linux-*` and
 `leg-tui-responsiveness-windows-*` artifacts. A PR whose body contains
 `Closes #183` or `Part of #183` runs the paired baseline/final gate on native
@@ -433,6 +469,17 @@ Linux and Windows instead. It builds baseline
 `b5444f9f409a6edbab7cd02ed776a7df36e6e412` and the PR revision in release mode
 on each same runner, then uploads each report and
 its command logs as `leg-tui-responsiveness-comparison-<os>-*`.
+
+Run 37853682089 recorded these baseline-to-final p95 input latencies (80x24 /
+120x40): Linux draft editing 67.7/77.4 ms, history scrolling 5.9/7.8 ms, and
+inspection 11.2/13.8 ms; Windows draft editing 227/285 ms, history scrolling
+16.4/19.2 ms, and inspection 23.8/25.1 ms. The baseline has no command palette,
+so palette filtering is `not_comparable`. Final p95 across the eight comparable
+action/size groups was 32.6–39.7 ms on Linux and 47.4–54.3 ms on Windows. The
+cached-history / inspector opening times were 8.165/13.216 ms on the Linux
+baseline and 34.412/39.663 ms on the Linux final revision; Windows measured
+11.205/24.704 ms on the baseline and 46.437/54.149 ms on the final revision.
+Final idle CPU was 0.033% of one logical CPU on Linux and 0.104% on Windows.
 
 The #183 final revision passes only when every action/size group has at least
 100 samples and p95 input-to-visible-output latency is at most 100 ms, cached
@@ -446,10 +493,11 @@ not relax a threshold to pass. The paired job also runs the Windows behavior
 harness for multiline Chinese/emoji paste, resize recovery, `NO_COLOR`, OSC 52
 with F7 save fallback, terminal restoration, Stop process-tree cleanup, session
 switching, retry cancellation, and same-session busy rejection. Its terminal is
-Windows ConPTY with no Windows Terminal frontend; reports identify that setup.
-The local native run on Windows 11 build 26300 currently fails the Stop check:
-the active catalog reports `Ownership unknown`, the TUI says
-`Active session changed state; nothing was stopped`, and the owned Bash/PowerShell
-process tree remains alive after 10 seconds. This is tracked by [#187](https://github.com/SHUKE-LABS/leg/issues/187).
-Keep the #183 Stop gate unmet until that issue is resolved and the native check
+Windows ConPTY with no Windows Terminal frontend; reports identify that setup
+and pywinpty version. The pywinpty 2.0.15 behavior run passes the multiline
+Chinese/emoji paste check. Stop remains unmet: the active catalog reports
+`Ownership unknown`, the TUI says `Active session changed state; nothing was
+stopped`, and the owned Bash/PowerShell process tree remains alive after 10
+seconds. This is tracked by [#187](https://github.com/SHUKE-LABS/leg/issues/187);
+keep the #183 Stop gate unmet until that issue is resolved and the native check
 passes.

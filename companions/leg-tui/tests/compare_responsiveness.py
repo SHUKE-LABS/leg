@@ -194,7 +194,7 @@ def run_windows_behavior(
     output_dir: Path,
 ) -> dict[str, Any]:
     command = [
-        sys.executable,
+        os.environ.get("TUI_WINDOWS_BEHAVIOR_PYTHON", sys.executable),
         str(WINDOWS_BEHAVIOR),
         "--tui-bin",
         bins["tui_bin"],
@@ -252,6 +252,9 @@ def compare(args: argparse.Namespace) -> int:
         "baseline": {},
         "final": {},
     }
+    pull_request_head_revision = getattr(args, "pull_request_head_revision", None)
+    if pull_request_head_revision:
+        comparison["pull_request_head_revision"] = pull_request_head_revision
     failed = False
 
     with tempfile.TemporaryDirectory(prefix="leg-tui-183-baseline-") as temporary:
@@ -348,6 +351,7 @@ def main() -> int:
     parser.add_argument("--host", choices=("windows", "linux"), required=True)
     parser.add_argument("--baseline-revision", default=DEFAULT_BASELINE)
     parser.add_argument("--final-revision")
+    parser.add_argument("--pull-request-head-revision")
     parser.add_argument("--tui-bin", required=True, type=Path)
     parser.add_argument("--leg-bin", required=True, type=Path)
     parser.add_argument("--supervisor-bin", required=True, type=Path)

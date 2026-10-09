@@ -58,8 +58,14 @@ class ResponsivenessHarnessTests(unittest.TestCase):
 
             def write(self, value: str) -> int:
                 self.requests.append(value)
-                written = min(2, len(value.encode("utf-8")))
-                self.writes.append(value[:written])
+                encoded = value.encode("utf-8")
+                if len(self.requests) == 1:
+                    written = 2
+                elif value.startswith("😀"):
+                    written = 4
+                else:
+                    written = len(encoded)
+                self.writes.append(encoded[:written].decode("utf-8"))
                 return written
 
         terminal = harness.TerminalProcess.__new__(harness.TerminalProcess)
@@ -67,13 +73,13 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         original_name = harness.os.name
         try:
             harness.os.name = "nt"
-            terminal.write("draft010")
+            terminal.write("ab😀cd")
         finally:
             harness.os.name = original_name
 
-        self.assertEqual("".join(terminal.process.writes), "draft010")
-        self.assertEqual(terminal.process.requests[0], "draft010")
-        self.assertEqual(len(terminal.process.requests), 4)
+        self.assertEqual("".join(terminal.process.writes), "ab😀cd")
+        self.assertEqual(terminal.process.requests, ["ab😀cd", "😀cd", "cd"])
+        self.assertEqual(len(terminal.process.requests), 3)
 
     def test_windows_terminal_write_treats_zero_return_as_completed_input(self) -> None:
         class ZeroReturningWriter:
@@ -91,12 +97,12 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         original_name = harness.os.name
         try:
             harness.os.name = "nt"
-            terminal.write("draft010")
+            terminal.write("draft😀")
         finally:
             harness.os.name = original_name
 
-        self.assertEqual(terminal.process.accepted, ["draft010"])
-        self.assertEqual(terminal.process.requests, ["draft010"])
+        self.assertEqual(terminal.process.accepted, ["draft😀"])
+        self.assertEqual(terminal.process.requests, ["draft😀"])
 
     def test_windows_terminal_close_releases_an_exited_pty(self) -> None:
         class ExitedProcess:
@@ -131,6 +137,7 @@ class ResponsivenessHarnessTests(unittest.TestCase):
             "import sys\n"
             "received = sys.stdin.readline().rstrip('\\r\\n')\n"
             "print('RECEIVED:' + received, flush=True)\n"
+            "print('CODEPOINTS:' + ','.join(str(ord(c)) for c in received), flush=True)\n"
         )
         environment = {
             name: harness.os.environ[name]
@@ -160,19 +167,21 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
         try:
-            written = process.write("draft010\r")
+            written = process.write("draft😀\r")
             self.assertEqual(written, 0)
 
             output = ""
             deadline = time.monotonic() + 5.0
-            while "RECEIVED:draft010" not in output and time.monotonic() < deadline:
+            expected_codepoints = "CODEPOINTS:" + ",".join(str(ord(char)) for char in "draft😀")
+            while expected_codepoints not in output and time.monotonic() < deadline:
                 try:
                     output += chunks.get(timeout=0.25)
                 except queue.Empty:
                     if not process.isalive():
                         break
 
-            self.assertIn("RECEIVED:draft010", output)
+            self.assertIn("RECEIVED:draft😀", output)
+            self.assertIn(expected_codepoints, output)
             self.assertEqual(output.count("RECEIVED:"), 1)
         finally:
             stop_reader.set()

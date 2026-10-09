@@ -19,6 +19,7 @@ class ResponsivenessComparisonTests(unittest.TestCase):
         baseline_status: str,
         final_status: str,
         behavior_status: str = "passed",
+        pull_request_head_revision: str | None = None,
     ) -> tuple[int, dict[str, object]]:
         with TemporaryDirectory() as temporary:
             output_dir = Path(temporary)
@@ -27,6 +28,7 @@ class ResponsivenessComparisonTests(unittest.TestCase):
                 output_dir=output_dir,
                 baseline_revision="baseline-revision",
                 final_revision="final-revision",
+                pull_request_head_revision=pull_request_head_revision,
                 tui_bin=Path("leg-tui"),
                 leg_bin=Path("leg"),
                 supervisor_bin=Path("leg-ui-supervisor"),
@@ -91,6 +93,44 @@ class ResponsivenessComparisonTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(report["windows_behavior"]["status"], "failed")
+
+    def test_windows_behavior_uses_configured_python(self) -> None:
+        with TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            output_path = output_dir / "windows-behavior.json"
+
+            def invoke(command, _cwd, _env, _log_path, _timeout):
+                output_path.write_text(
+                    json.dumps({"checks": {}, "status": "passed"}),
+                    encoding="utf-8",
+                )
+                return {"status": "passed"}
+
+            with (
+                patch.dict(comparison.os.environ, {"TUI_WINDOWS_BEHAVIOR_PYTHON": "behavior-python"}),
+                patch.object(comparison, "invoke", side_effect=invoke) as mocked_invoke,
+            ):
+                result = comparison.run_windows_behavior(
+                    {"tui_bin": "tui.exe", "leg_bin": "leg.exe", "supervisor_bin": "supervisor.exe"},
+                    "source-revision",
+                    output_path,
+                    output_dir,
+                )
+
+        self.assertEqual(mocked_invoke.call_args.args[0][0], "behavior-python")
+        self.assertEqual(result["status"], "passed")
+
+    def test_comparison_report_records_pull_request_head_revision(self) -> None:
+        exit_code, report = self.run_comparison(
+            "linux",
+            "passed",
+            "passed",
+            pull_request_head_revision="pr-head-revision",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["final_revision"], "final-revision")
+        self.assertEqual(report["pull_request_head_revision"], "pr-head-revision")
 
 
 if __name__ == "__main__":

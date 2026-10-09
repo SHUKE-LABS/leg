@@ -413,7 +413,17 @@ keeps native core/controller failures unmet until fixed or tracked by a linked
 issue. Thresholds, baseline rules, report contents, and the Windows runner's
 lack of a Windows Terminal frontend are documented in
 [`ui-experiments.md`](ui-experiments.md#tui-responsiveness-harness-182).
-The current native Stop failure is tracked in [#187](https://github.com/SHUKE-LABS/leg/issues/187); do not treat Windows Stop as verified until that check passes.
+Run 37853682089 measured final p95 latency at 32.6–39.7 ms on Linux and
+47.4–54.3 ms on Windows; Windows cached history and inspector opening measured
+46.437 ms and 54.149 ms, with idle CPU at 0.033% on Linux and 0.104% on
+Windows. Baseline cached history/inspector opening measured 8.165/13.216 ms on
+Linux and 11.205/24.704 ms on Windows. The baseline palette result is
+`not_comparable` because that revision has no palette. Timing uses pywinpty
+3.0.5 because pywinpty 2.0.15 adds about 100 ms to ConPTY reads; the Windows
+behavior harness uses 2.0.15, under which multiline Chinese/emoji paste passes.
+The 3.0.5 TUI paste path loses the emoji even though a raw child receives it.
+Windows behavior is driven through ConPTY without a Windows Terminal frontend.
+The Stop failure remains tracked in [#187](https://github.com/SHUKE-LABS/leg/issues/187); do not treat Windows Stop as verified until that check passes.
 
 Command-palette captures are checked in at
 [80x24](../companions/leg-tui/tests/captures/command-palette-80x24.txt) and

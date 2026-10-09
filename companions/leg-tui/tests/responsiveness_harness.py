@@ -7,6 +7,7 @@ import argparse
 import bisect
 import codecs
 from contextlib import ExitStack
+import importlib.metadata
 import importlib.util
 import json
 import math
@@ -1027,7 +1028,8 @@ def _cpu_model() -> str:
 def _terminal_version() -> str:
     if os.name == "nt":
         version = sys.getwindowsversion()
-        return f"ConPTY on Windows build {version.build}"
+        pywinpty_version = importlib.metadata.version("pywinpty")
+        return f"ConPTY on Windows build {version.build} via pywinpty {pywinpty_version}"
     return f"kernel PTY on {platform.system()} {platform.release()}"
 
 
