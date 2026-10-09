@@ -374,17 +374,32 @@ input and visible-output timestamps inside that pair's overlap. Untimed session
 switching may occur between pairs.
 
 Use Python 3.12 and build the three binaries in release mode. On Windows, run
-from Git Bash/MSYS2; the harness records the Windows OS build as the ConPTY
-host version, not as a Windows Terminal version. Its memory sampler uses
-psutil to sum the `leg-tui` process tree and excludes the harness and fixture.
+from Git Bash/MSYS2. The timing harness uses pywinpty 3.0.5; the behavior
+harness uses a separate pywinpty 2.0.15 environment. Version 2.0.15 batches
+ConPTY reads for about 100 ms, so it cannot measure the 100 ms input-latency
+gate accurately. With 3.0.5, `PtyProcess.write()` returns 0 while a raw child
+still receives the complete input, including non-BMP code points; however, the
+TUI's bracketed-paste path drops the emoji under that transport. The same TUI
+paste check passes under 2.0.15, so CI uses 3.0.5 for timing and 2.0.15 for
+behavior checks. Reports identify the pywinpty version, Windows build, and the
+direct ConPTY setup; the Windows job also checks that a 3.0.5 write returning
+0 reaches a child as the exact Unicode code points. There is no Windows
+Terminal frontend. The memory sampler uses psutil to sum the `leg-tui` process
+tree and excludes the harness and fixture.
 
 On Windows, install the test requirements in a task-specific environment:
 
 ```sh
 LEG_TUI_RESPONSIVENESS_VENV="$(cygpath -u "${TEMP}")/leg-tui-responsiveness-venv"
+LEG_TUI_WINDOWS_BEHAVIOR_VENV="$(cygpath -u "${TEMP}")/leg-tui-windows-behavior-venv"
 python -m venv "${LEG_TUI_RESPONSIVENESS_VENV}"
+python -m venv "${LEG_TUI_WINDOWS_BEHAVIOR_VENV}"
 "${LEG_TUI_RESPONSIVENESS_VENV}/Scripts/python.exe" -m pip install \
   --requirement companions/leg-tui/tests/requirements.txt
+"${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe" -m pip install \
+  --requirement companions/leg-tui/tests/requirements.txt
+"${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe" -m pip install \
+  --force-reinstall pywinpty==2.0.15
 cargo build --locked --release --bin leg
 cargo build --locked --manifest-path companions/Cargo.toml --release \
   -p leg-ui-client --bin leg-ui-supervisor
@@ -396,6 +411,27 @@ cargo build --locked --manifest-path companions/Cargo.toml --release -p leg-tui
   --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
   --build-profile release \
   --output companions/leg-tui/tests/reports/responsiveness-windows.json
+
+LEG_TUI_REPORT_DIR="$(cygpath -u "${TEMP}")/leg-tui-183"
+TUI_WINDOWS_BEHAVIOR_PYTHON="$(cygpath -w "${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe")" \
+"${LEG_TUI_RESPONSIVENESS_VENV}/Scripts/python.exe" \
+  companions/leg-tui/tests/compare_responsiveness.py \
+  --host windows \
+  --baseline-revision b5444f9f409a6edbab7cd02ed776a7df36e6e412 \
+  --final-revision "$(git rev-parse HEAD)" \
+  --pull-request-head-revision "$(git rev-parse HEAD)" \
+  --tui-bin companions/target/release/leg-tui.exe \
+  --leg-bin target/release/leg.exe \
+  --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
+  --output-dir "${LEG_TUI_REPORT_DIR}"
+
+"${LEG_TUI_WINDOWS_BEHAVIOR_VENV}/Scripts/python.exe" \
+  companions/leg-tui/tests/windows_behavior_harness.py \
+  --tui-bin companions/target/release/leg-tui.exe \
+  --leg-bin target/release/leg.exe \
+  --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
+  --source-revision "$(git rev-parse HEAD)" \
+  --output "${LEG_TUI_REPORT_DIR}/windows-behavior-standalone.json"
 ```
 
 On Linux/macOS, install the same requirements and use the native PTY binaries:
@@ -429,8 +465,58 @@ catalog load from cached history/inspector opening, and records startup,
 idle/peak process-tree RSS, revision, OS/CPU, terminal transport/version,
 dimensions, and build profile.
 For pull request CI runs, `source_revision` is GitHub Actions' `github.sha`
-(the merge commit tested by CI), not the PR branch head; the workflow run records
-the PR head SHA separately.
-CI uploads separate `leg-tui-responsiveness-linux-*` and
-`leg-tui-responsiveness-windows-*` artifacts on the PR run. Attach both reports
-to the issue PR.
+(the merge commit tested by CI). The comparison report records both that
+revision and `pull_request_head_revision`, the PR branch SHA.
+Ordinary CI runs upload separate `leg-tui-responsiveness-linux-*` and
+`leg-tui-responsiveness-windows-*` artifacts. A PR whose body contains
+`Closes #183` or `Part of #183` runs the paired baseline/final gate on native
+Linux and Windows instead. It builds baseline
+`b5444f9f409a6edbab7cd02ed776a7df36e6e412` and the PR revision in release mode
+on each same runner, then uploads each report and
+its command logs as `leg-tui-responsiveness-comparison-<os>-*`.
+
+Run [37891673575](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575)
+tested CI revision `b921d3f7804c700f600683dcbbaab4747fa8b4e2` for PR head
+`8d0478d4a28ac46f892c2ecfddb12212586f1c40`. Its artifacts contain the paired
+Linux report and raw logs
+([Linux](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599321737)),
+the paired Windows report and raw logs
+([Windows](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11598638324)),
+and the complete Windows behavior report
+([Windows behavior](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599295198)).
+Each baseline and final pair ran on the same native host and workload: Linux
+kernel PTY on Linux 6.17.0-1022-azure, and ConPTY on Windows build 26100 with
+pywinpty 3.0.5 for timing.
+
+Baseline p95 input latencies (80x24 / 120x40) were Linux draft editing
+76.053/94.842 ms, history scrolling 6.498/10.096 ms, and inspection
+12.560/16.370 ms; Windows draft editing 223.338/284.979 ms, history scrolling
+17.101/22.576 ms, and inspection 25.627/29.686 ms. The baseline has no command
+palette, so palette filtering is `not_comparable`. Final p95 across all eight
+action/size groups ranged from 32.722–41.410 ms on Linux and 46.255–61.386 ms
+on Windows; each group met the 100 ms limit. Cached-history / inspector opening
+times were 10.281/16.071 ms on the Linux baseline and 33.673/41.203 ms on the
+Linux final revision; Windows measured 13.887/28.258 ms on baseline and
+35.414/56.167 ms on final. Baseline idle CPU was 13.700% on Linux and 14.471%
+on Windows; final idle CPU was 0.100% and 0.417%, respectively, below the 1%
+limit.
+
+The #183 final revision passes only when every action/size group has at least
+100 samples and p95 input-to-visible-output latency is at most 100 ms, cached
+history and inspector opening each take at most 200 ms, and idle TUI CPU stays
+at or below 1% of one logical CPU during a fixed 30-second window. The CPU
+report records requested and actual elapsed time plus raw user/system counters.
+A Windows baseline that cannot run the workload may be recorded with its exact
+failure; a Linux baseline failure fails the gate. A native core/controller
+failure remains an unmet gate: link a separate issue in the PR and docs, and do
+not relax a threshold to pass. The paired job also runs the Windows behavior
+harness under ConPTY with no Windows Terminal frontend, using pywinpty 2.0.15.
+All nine checks passed: Chinese/emoji multiline paste, minimum-size recovery,
+`NO_COLOR`, clipboard denial with F7 save fallback, normal terminal
+restoration, Stop process-tree cleanup, background browsing and session
+switching, retry cancellation, and same-session busy rejection. Stop reported
+the interrupted turn and confirmed the owned Bash/PowerShell process tree was
+gone; Stop, retry cancellation, and busy rejection each recorded only the
+expected fixture request, with no prompt replay. Every check confirmed
+terminal restoration. The report records the direct ConPTY setup and pywinpty
+version.

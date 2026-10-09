@@ -414,6 +414,32 @@ to a focused row. Its 80x24 and 120x40 views are recorded in
 `companions/leg-tui/tests/captures/tool-summary-80x24.txt` and
 `companions/leg-tui/tests/captures/tool-summary-120x40.txt`.
 
+Issue #183 adds a native Linux/Windows paired responsiveness gate and a Windows
+ConPTY behavior harness. The gate records its 30-second idle CPU counters and
+keeps native core/controller failures unmet until fixed or tracked by a linked
+issue. Thresholds, baseline rules, report contents, and the Windows runner's
+lack of a Windows Terminal frontend are documented in
+[`ui-experiments.md`](ui-experiments.md#tui-responsiveness-harness-182).
+Run [37891673575](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575)
+tested CI revision `b921d3f` for PR head `8d0478d`. Final p95 latency across
+the eight comparable action/size groups ranged from 32.722–41.410 ms on Linux
+and 46.255–61.386 ms on Windows; all groups passed. Cached history/inspector
+opening measured 10.281/16.071 ms on the Linux baseline and 33.673/41.203 ms
+on final; Windows measured 13.887/28.258 ms on baseline and 35.414/56.167 ms
+on final. Final idle CPU was 0.100% on Linux and 0.417% on Windows, under the
+1% limit. The baseline palette result is `not_comparable` because it has no
+palette. The full Windows ConPTY report passed all nine checks, including
+Chinese/emoji multiline paste, resize recovery, `NO_COLOR`, clipboard save
+fallback, terminal restoration, Stop process-tree cleanup, background
+switching, retry cancellation, and busy rejection. Stop, retry cancellation,
+and busy rejection each left the fixture request count at one, with no prompt
+replayed. Windows uses pywinpty 3.0.5 for timing and 2.0.15 for behavior; the
+runner has no Windows Terminal frontend.
+
+Reports: [Linux comparison](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599321737),
+[Windows comparison](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11598638324),
+and [full Windows behavior](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599295198).
+
 Command-palette captures are checked in at
 [80x24](../companions/leg-tui/tests/captures/command-palette-80x24.txt) and
 [120x40](../companions/leg-tui/tests/captures/command-palette-120x40.txt).

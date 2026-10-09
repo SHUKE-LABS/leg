@@ -1,32 +1,56 @@
 from __future__ import annotations
 
+import io
 import json
+import math
+import queue
+import re
+import sys
 import threading
+import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
 import responsiveness_harness as harness
 
 
 class ResponsivenessHarnessTests(unittest.TestCase):
+    def test_transcript_window_accepts_current_rows_and_baseline_turns_counters(self) -> None:
+        self.assertEqual(harness._transcript_window("Rows 8-12 of 1002"), (8, 12, 1002))
+        self.assertEqual(harness._transcript_window("Turns 8-12 of 1002"), (8, 12, 1002))
+        self.assertIsNone(harness._transcript_window("Transcript has 1002 entries"))
+
     def test_session_title_visibility_handles_narrow_header_truncation(self) -> None:
         history_screen = "status: Idle  |  History fixtu\ufffd  |  model: trial-fixture"
+        legacy_history_screen = "│leg-tui  |  status: Idle  |  History fixture  |  model: trial-fixture"
         stream_screen = "status: Idle  |  Stream 1 A  |  model: trial-fixture"
         running_screen = "status: Running  |  Stream 1 A  |  model: trial-fixture"
+        legacy_running_screen = "│leg-tui  |  status: Running  |  Stream 1 A  |  model: trial-fixture"
         completed_screen = "status: Succeeded  |  Stream 1 A  |  model: trial-fixture"
 
         self.assertTrue(harness._session_title_visible(history_screen, "History fixture"))
+        self.assertTrue(harness._session_title_visible(legacy_history_screen, "History fixture"))
         self.assertTrue(harness._session_title_visible(stream_screen, "Stream 1 A"))
         self.assertFalse(harness._session_title_visible(stream_screen, "Stream 1 B"))
         self.assertFalse(
             harness._session_title_visible("transcript mentions History fixtu", "History fixture")
         )
+        self.assertFalse(
+            harness._session_title_visible(
+                "transcript status: Idle  |  History fixture", "History fixture"
+            )
+        )
         self.assertFalse(harness._session_is_inactive(running_screen, "Stream 1 A"))
+        self.assertFalse(harness._session_is_inactive(legacy_running_screen, "Stream 1 A"))
+        self.assertTrue(harness._session_is_inactive(legacy_history_screen, "History fixture"))
         self.assertTrue(harness._session_is_inactive(completed_screen, "Stream 1 A"))
 
-    def test_windows_terminal_write_completes_partial_writes(self) -> None:
+    def test_windows_terminal_write_completes_positive_partial_writes(self) -> None:
         class PartialWriter:
             def __init__(self) -> None:
                 self.writes: list[str] = []
@@ -34,8 +58,14 @@ class ResponsivenessHarnessTests(unittest.TestCase):
 
             def write(self, value: str) -> int:
                 self.requests.append(value)
-                written = min(2, len(value.encode("utf-8")))
-                self.writes.append(value[:written])
+                encoded = value.encode("utf-8")
+                if len(self.requests) == 1:
+                    written = 2
+                elif value.startswith("😀"):
+                    written = 4
+                else:
+                    written = len(encoded)
+                self.writes.append(encoded[:written].decode("utf-8"))
                 return written
 
         terminal = harness.TerminalProcess.__new__(harness.TerminalProcess)
@@ -43,28 +73,200 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         original_name = harness.os.name
         try:
             harness.os.name = "nt"
-            terminal.write("draft010")
+            terminal.write("ab😀cd")
         finally:
             harness.os.name = original_name
 
-        self.assertEqual("".join(terminal.process.writes), "draft010")
-        self.assertEqual(terminal.process.requests[0], "draft010")
-        self.assertEqual(len(terminal.process.requests), 4)
+        self.assertEqual("".join(terminal.process.writes), "ab😀cd")
+        self.assertEqual(terminal.process.requests, ["ab😀cd", "😀cd", "cd"])
+        self.assertEqual(len(terminal.process.requests), 3)
 
-    def test_windows_terminal_write_rejects_zero_progress(self) -> None:
-        class StalledWriter:
+    def test_windows_terminal_write_treats_zero_return_as_completed_input(self) -> None:
+        class ZeroReturningWriter:
+            def __init__(self) -> None:
+                self.accepted: list[str] = []
+                self.requests: list[str] = []
+
             def write(self, value: str) -> int:
+                self.requests.append(value)
+                self.accepted.append(value)
                 return 0
 
         terminal = harness.TerminalProcess.__new__(harness.TerminalProcess)
-        terminal.process = StalledWriter()
+        terminal.process = ZeroReturningWriter()
         original_name = harness.os.name
         try:
             harness.os.name = "nt"
-            with self.assertRaisesRegex(RuntimeError, "invalid progress"):
-                terminal.write("draft010")
+            terminal.write("draft😀")
         finally:
             harness.os.name = original_name
+
+        self.assertEqual(terminal.process.accepted, ["draft😀"])
+        self.assertEqual(terminal.process.requests, ["draft😀"])
+
+    def test_windows_terminal_close_releases_an_exited_pty(self) -> None:
+        class ExitedProcess:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def isalive(self) -> bool:
+                return False
+
+            def close(self, force: bool = False) -> None:
+                self.closed = True
+
+        terminal = harness.TerminalProcess.__new__(harness.TerminalProcess)
+        terminal._stop_reader = threading.Event()
+        terminal.reader = threading.Thread(target=lambda: None)
+        terminal.reader.start()
+        terminal.process = ExitedProcess()
+        terminal.master_fd = None
+        terminal.slave_fd = None
+        original_name = harness.os.name
+        try:
+            harness.os.name = "nt"
+            terminal.close()
+        finally:
+            harness.os.name = original_name
+
+        self.assertTrue(terminal.process.closed)
+
+    @unittest.skipUnless(harness.os.name == "nt", "requires Windows ConPTY")
+    def test_windows_conpty_zero_write_return_delivers_complete_input(self) -> None:
+        child_code = (
+            "import sys\n"
+            "received = sys.stdin.readline().rstrip('\\r\\n')\n"
+            "print('RECEIVED:' + received, flush=True)\n"
+            "print('CODEPOINTS:' + ','.join(str(ord(c)) for c in received), flush=True)\n"
+        )
+        environment = {
+            name: harness.os.environ[name]
+            for name in ("PATH", "SystemRoot", "TEMP", "TMP")
+            if name in harness.os.environ
+        }
+        process = harness.PtyProcess.spawn(
+            [sys.executable, "-u", "-c", child_code],
+            env=environment,
+            dimensions=(24, 80),
+            backend=harness.Backend.ConPTY,
+        )
+        chunks: queue.Queue[str] = queue.Queue()
+        stop_reader = threading.Event()
+
+        def read_output() -> None:
+            while not stop_reader.is_set():
+                try:
+                    chunk = process.read(4096)
+                except (EOFError, OSError, ValueError):
+                    return
+                if chunk:
+                    chunks.put(chunk)
+                elif not process.isalive():
+                    return
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            written = process.write("draft😀\r")
+            self.assertEqual(written, 0)
+
+            output = ""
+            deadline = time.monotonic() + 5.0
+            expected_codepoints = "CODEPOINTS:" + ",".join(str(ord(char)) for char in "draft😀")
+            while expected_codepoints not in output and time.monotonic() < deadline:
+                try:
+                    output += chunks.get(timeout=0.25)
+                except queue.Empty:
+                    if not process.isalive():
+                        break
+
+            self.assertIn("RECEIVED:draft😀", output)
+            self.assertIn(expected_codepoints, output)
+            self.assertEqual(output.count("RECEIVED:"), 1)
+        finally:
+            stop_reader.set()
+            try:
+                process.close(force=True)
+            finally:
+                reader.join(timeout=1.0)
+
+    @unittest.skipUnless(harness.os.name == "nt", "requires Windows ConPTY")
+    def test_windows_conpty_reader_does_not_batch_output_for_100ms(self) -> None:
+        sample_count = 20
+        child_code = (
+            "import time\n"
+            f"for index in range({sample_count}):\n"
+            "    print(f'CAPTURE:{index}:{time.perf_counter_ns()}', flush=True)\n"
+            "    time.sleep(0.01)\n"
+        )
+        environment = {
+            name: harness.os.environ[name]
+            for name in ("PATH", "SystemRoot", "TEMP", "TMP")
+            if name in harness.os.environ
+        }
+        process = harness.PtyProcess.spawn(
+            [sys.executable, "-u", "-c", child_code],
+            env=environment,
+            dimensions=(24, 80),
+            backend=harness.Backend.ConPTY,
+        )
+        chunks: queue.Queue[tuple[int, str]] = queue.Queue()
+        stop_reader = threading.Event()
+
+        def read_output() -> None:
+            while not stop_reader.is_set():
+                try:
+                    chunk = process.read(4096)
+                except (EOFError, OSError, ValueError):
+                    return
+                if chunk:
+                    chunks.put((time.perf_counter_ns(), chunk))
+                elif not process.isalive():
+                    return
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            latencies_ms: list[float] = []
+            output = ""
+            seen: set[int] = set()
+            marker_pattern = re.compile(r"CAPTURE:(\d+):(\d+)")
+            deadline = time.monotonic() + 5.0
+            while len(seen) < sample_count and time.monotonic() < deadline:
+                try:
+                    observed_ns, chunk = chunks.get(timeout=0.25)
+                except queue.Empty:
+                    if not process.isalive():
+                        break
+                    continue
+                output += chunk
+                for match in marker_pattern.finditer(output):
+                    index = int(match.group(1))
+                    if index in seen:
+                        continue
+                    seen.add(index)
+                    generated_ns = int(match.group(2))
+                    latencies_ms.append((observed_ns - generated_ns) / 1_000_000)
+
+            self.assertEqual(
+                seen,
+                set(range(sample_count)),
+                f"ConPTY output markers were missing: {sorted(seen)!r}; output={output!r}",
+            )
+
+            p95_index = math.ceil(0.95 * len(latencies_ms)) - 1
+            p95_ms = sorted(latencies_ms)[p95_index]
+            self.assertLess(
+                p95_ms,
+                50.0,
+                f"ConPTY output reader added a polling delay: {latencies_ms!r}",
+            )
+        finally:
+            stop_reader.set()
+            try:
+                process.close(force=True)
+            finally:
+                reader.join(timeout=1.0)
 
     def test_harness_environment_removes_ambient_credentials(self) -> None:
         ambient = {name: f"ambient-{name}" for name in harness._CREDENTIAL_ENV_VARS}
@@ -148,6 +350,146 @@ class ResponsivenessHarnessTests(unittest.TestCase):
         self.assertEqual(context["emit_age_before_ms"], 3.0)
         self.assertEqual(context["emit_wait_after_ms"], 2.0)
         self.assertEqual(context["inter_emit_gap_ms"], 5.0)
+
+    def test_idle_cpu_is_normalized_to_one_logical_cpu_and_keeps_raw_counters(self) -> None:
+        process = SimpleNamespace(
+            cpu_times=Mock(
+                side_effect=[
+                    SimpleNamespace(user=10.0, system=2.0),
+                    SimpleNamespace(user=10.20012, system=2.1),
+                ]
+            )
+        )
+        with (
+            patch.object(harness.psutil, "Process", return_value=process),
+            patch.object(harness.time, "perf_counter_ns", side_effect=[1_000, 30_000_001_000]),
+            patch.object(harness.time, "sleep") as sleep,
+        ):
+            measurement = harness.measure_idle_cpu(1234, 30.0)
+
+        sleep.assert_called_once_with(30.0)
+        self.assertEqual(measurement["scope"], "leg-tui process only, identified by the spawned root PID")
+        self.assertEqual(measurement["raw_counters"]["start"]["user_seconds"], 10.0)
+        self.assertEqual(measurement["raw_counters"]["end"]["system_seconds"], 2.1)
+        self.assertAlmostEqual(measurement["average_percent_of_one_logical_cpu"], 1.0004)
+
+    def test_responsiveness_gates_enforce_each_group_opening_bound_and_idle_cpu(self) -> None:
+        groups = {
+            f"{action}@{columns}x{rows}": {
+                "sample_count": harness.SAMPLE_COUNT,
+                "p95_ms": 100.0,
+            }
+            for action in harness.RESPONSIVENESS_ACTIONS
+            for rows, columns in harness.DIMENSIONS
+        }
+        timings = {"cached_history_open_ms": 200.0, "inspector_open_ms": 200.0}
+
+        passed = harness.responsiveness_gates(groups, timings, 1.0)
+
+        self.assertEqual(passed["status"], "passed")
+        self.assertEqual(
+            harness.summarize_latencies(
+                [{"latency_ms": 100.0004}] * harness.SAMPLE_COUNT
+            )["p95_ms"],
+            100.0004,
+        )
+        groups["inspection@120x40"]["p95_ms"] = 100.0004
+        failed = harness.responsiveness_gates(groups, timings, 1.0)
+        self.assertEqual(failed["status"], "failed")
+        self.assertFalse(failed["checks"]["input_to_visible_output"]["groups"]["inspection@120x40"]["passed"])
+        over_cpu_limit = harness.responsiveness_gates(groups, timings, 1.0004)
+        self.assertFalse(over_cpu_limit["checks"]["idle_cpu"]["passed"])
+        over_open_limit = harness.responsiveness_gates(
+            groups,
+            {"cached_history_open_ms": 200.0004, "inspector_open_ms": 200.0},
+            1.0,
+        )
+        self.assertFalse(over_open_limit["checks"]["cached_history_open"]["passed"])
+        del groups["history_scrolling@80x24"]
+        missing = harness.responsiveness_gates(groups, timings, 1.0)
+        self.assertFalse(missing["checks"]["input_to_visible_output"]["groups"]["history_scrolling@80x24"]["passed"])
+        self.assertEqual(harness.percent_of_one_logical_cpu(0.3, 30.0), 1.0)
+        with self.assertRaisesRegex(ValueError, "elapsed_seconds"):
+            harness.percent_of_one_logical_cpu(0.0, 0.0)
+
+    def test_responsiveness_gates_record_non_comparable_groups_and_measure_the_rest(self) -> None:
+        groups = {
+            f"{action}@{columns}x{rows}": {
+                "sample_count": harness.SAMPLE_COUNT,
+                "p95_ms": 50.0,
+            }
+            for action in harness.RESPONSIVENESS_ACTIONS
+            for rows, columns in harness.DIMENSIONS
+        }
+        reason = "baseline has no command palette"
+        groups["palette_filtering@80x24"] = {
+            "status": "not_comparable",
+            "reason": reason,
+        }
+
+        gates = harness.responsiveness_gates(
+            groups,
+            {"cached_history_open_ms": 150.0, "inspector_open_ms": 150.0},
+            0.5,
+        )
+
+        input_check = gates["checks"]["input_to_visible_output"]
+        self.assertEqual(gates["status"], "passed")
+        self.assertEqual(input_check["comparable_group_count"], 7)
+        self.assertEqual(input_check["not_comparable_groups"], ["palette_filtering@80x24"])
+        self.assertEqual(
+            input_check["groups"]["palette_filtering@80x24"],
+            {
+                "status": "not_comparable",
+                "reason": reason,
+                "sample_count": 0,
+                "minimum_samples": harness.SAMPLE_COUNT,
+                "p95_ms": None,
+                "limit_ms": harness.LATENCY_P95_LIMIT_MS,
+                "passed": None,
+            },
+        )
+
+    def test_only_final_comparison_role_fails_on_unmet_gates(self) -> None:
+        report = {
+            "source_revision": "measured",
+            "harness_revision": "harness",
+            "comparison_role": "observation",
+            "terminal_transport": "native PTY",
+            "terminal": {},
+            "dimensions": [],
+            "groups": {},
+            "timings": {},
+            "idle_cpu": {},
+            "gates": {"status": "failed"},
+            "memory": {},
+        }
+        with TemporaryDirectory() as temporary:
+            binary_paths = {}
+            for name in ("tui", "leg", "supervisor"):
+                binary_path = Path(temporary) / name
+                binary_path.write_text("test binary", encoding="utf-8")
+                binary_paths[name] = str(binary_path)
+            for role, expected_status in (("observation", 0), ("final", 1)):
+                report["comparison_role"] = role
+                output = Path(temporary) / f"{role}.json"
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "responsiveness_harness.py",
+                            "--tui-bin", binary_paths["tui"],
+                            "--leg-bin", binary_paths["leg"],
+                            "--supervisor-bin", binary_paths["supervisor"],
+                            "--output", str(output),
+                            "--comparison-role", role,
+                        ],
+                    ),
+                    patch.object(harness, "run_harness", return_value=report),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(harness.main(), expected_status)
 
     def test_provider_summary_reads_module_from_fixture_server(self) -> None:
         stream_id = "RESPONSIVENESS-STREAM-A-PAIR-001"

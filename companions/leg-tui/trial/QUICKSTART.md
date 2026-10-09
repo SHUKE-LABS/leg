@@ -91,6 +91,28 @@ measurements, and the #79 results template. Human fields remain unmeasured
 until actual paired observations are collected; fixture success is not a
 winner recommendation.
 
+Issue #183's native regression check runs on Linux and Windows when its PR
+body contains `Closes #183` or `Part of #183`. Windows CI drives ConPTY through
+pywinpty without a Windows Terminal frontend. Timing uses pywinpty 3.0.5; the
+behavior checks use 2.0.15 because the newer test transport drops emoji from
+the TUI's bracketed-paste input, while a raw child receives the full code point.
+The older version's ConPTY reader adds about 100 ms, so it is limited to
+behavior checks. Run [37891673575](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575)
+passed both native comparisons and the full Windows behavior gate. Final p95
+latency ranged from 32.722–41.410 ms on Linux and 46.255–61.386 ms on Windows.
+Cached history/inspector opening measured 10.281/16.071 ms on the Linux baseline
+and 33.673/41.203 ms on final; Windows measured 13.887/28.258 ms on baseline
+and 35.414/56.167 ms on final. Final idle CPU was 0.100% on Linux and 0.417%
+on Windows. The baseline palette result is `not_comparable` because it has no
+palette. All nine Windows cases passed, including Stop process-tree cleanup,
+retry cancellation, and same-session busy rejection without prompt replay.
+The paired responsiveness thresholds, exact Windows commands, report links,
+and remaining limitations are described in the repository's
+[`UI experiment notes`](../../../docs/ui-experiments.md#tui-responsiveness-harness-182).
+Reports: [Linux comparison](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599321737),
+[Windows comparison](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11598638324),
+and [Windows behavior](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599295198).
+
 ## Remove the bundle
 
 Stop the TUI and fixture, then remove the extracted bundle and disposable

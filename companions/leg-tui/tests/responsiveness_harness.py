@@ -7,6 +7,7 @@ import argparse
 import bisect
 import codecs
 from contextlib import ExitStack
+import importlib.metadata
 import importlib.util
 import json
 import math
@@ -61,9 +62,26 @@ STREAM_PAIR_RENEWAL_MARGIN_SECONDS = 5.0
 STREAM_PAIR_POOL_SIZE = 2
 NARROW_STATUS_TITLE_WIDTH = 14
 ACTIVE_SESSION_STATUS_LABELS = {"Starting", "Running", "Stopping"}
-TRANSCRIPT_WINDOW_PATTERN = re.compile(r"Rows (\d+)-(\d+) of (\d+)")
+TRANSCRIPT_WINDOW_PATTERN = re.compile(r"(?:Rows|Turns) (\d+)-(\d+) of (\d+)")
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.1
-IDLE_MEMORY_WINDOW_SECONDS = 2.0
+IDLE_CPU_WINDOW_SECONDS = 30.0
+IDLE_CPU_LIMIT_PERCENT = 1.0
+LATENCY_P95_LIMIT_MS = 100.0
+OPEN_HISTORY_LIMIT_MS = 200.0
+OPEN_INSPECTOR_LIMIT_MS = 200.0
+IDLE_MEMORY_WINDOW_SECONDS = IDLE_CPU_WINDOW_SECONDS
+RESPONSIVENESS_ACTIONS = (
+    "draft_editing",
+    "history_scrolling",
+    "palette_filtering",
+    "inspection",
+)
+BASELINE_NOT_COMPARABLE_ACTIONS = {
+    "palette_filtering": (
+        "The b5444f9 baseline has no command palette, so Ctrl-P/F2 query filtering "
+        "is unavailable."
+    )
+}
 
 
 def load_fake_provider() -> Any:
@@ -399,8 +417,131 @@ def summarize_latencies(samples: list[dict[str, Any]]) -> dict[str, Any]:
     values = [float(sample["latency_ms"]) for sample in samples]
     return {
         "sample_count": len(values),
-        "p95_ms": round(p95(values), 3),
+        "p95_ms": p95(values),
         "max_ms": round(max(values), 3),
+    }
+
+
+def percent_of_one_logical_cpu(cpu_seconds: float, elapsed_seconds: float) -> float:
+    if elapsed_seconds <= 0:
+        raise ValueError("elapsed_seconds must be positive")
+    if cpu_seconds < 0:
+        raise ValueError("cpu_seconds cannot be negative")
+    return 100.0 * cpu_seconds / elapsed_seconds
+
+
+def responsiveness_gates(
+    groups: dict[str, dict[str, Any]],
+    timings: dict[str, float],
+    idle_cpu_percent: float,
+) -> dict[str, Any]:
+    expected_groups = {
+        f"{action}@{columns}x{rows}"
+        for action in RESPONSIVENESS_ACTIONS
+        for rows, columns in DIMENSIONS
+    }
+    group_results: dict[str, dict[str, Any]] = {}
+    for name in sorted(expected_groups | groups.keys()):
+        summary = groups.get(name)
+        if summary and summary.get("status") == "not_comparable":
+            group_results[name] = {
+                "status": "not_comparable",
+                "reason": summary["reason"],
+                "sample_count": 0,
+                "minimum_samples": SAMPLE_COUNT,
+                "p95_ms": None,
+                "limit_ms": LATENCY_P95_LIMIT_MS,
+                "passed": None,
+            }
+            continue
+        sample_count = int(summary["sample_count"]) if summary else 0
+        p95_ms = float(summary["p95_ms"]) if summary else None
+        group_results[name] = {
+            "status": "measured",
+            "sample_count": sample_count,
+            "minimum_samples": SAMPLE_COUNT,
+            "p95_ms": p95_ms,
+            "limit_ms": LATENCY_P95_LIMIT_MS,
+            "passed": (
+                summary is not None
+                and sample_count >= SAMPLE_COUNT
+                and p95_ms is not None
+                and p95_ms <= LATENCY_P95_LIMIT_MS
+            ),
+        }
+
+    comparable_groups = [
+        result for result in group_results.values() if result["status"] == "measured"
+    ]
+    history_ms = float(timings["cached_history_open_ms"])
+    inspector_ms = float(timings["inspector_open_ms"])
+    checks = {
+        "input_to_visible_output": {
+            "passed": bool(comparable_groups)
+            and all(result["passed"] for result in comparable_groups),
+            "comparable_group_count": len(comparable_groups),
+            "not_comparable_groups": [
+                name
+                for name, result in sorted(group_results.items())
+                if result["status"] == "not_comparable"
+            ],
+            "groups": group_results,
+        },
+        "cached_history_open": {
+            "observed_ms": history_ms,
+            "limit_ms": OPEN_HISTORY_LIMIT_MS,
+            "passed": history_ms <= OPEN_HISTORY_LIMIT_MS,
+        },
+        "inspector_open": {
+            "observed_ms": inspector_ms,
+            "limit_ms": OPEN_INSPECTOR_LIMIT_MS,
+            "passed": inspector_ms <= OPEN_INSPECTOR_LIMIT_MS,
+        },
+        "idle_cpu": {
+            "observed_percent_of_one_logical_cpu": idle_cpu_percent,
+            "limit_percent": IDLE_CPU_LIMIT_PERCENT,
+            "passed": idle_cpu_percent <= IDLE_CPU_LIMIT_PERCENT,
+        },
+    }
+    return {
+        "status": "passed" if all(check["passed"] for check in checks.values()) else "failed",
+        "checks": checks,
+    }
+
+
+def measure_idle_cpu(root_pid: int, window_seconds: float = IDLE_CPU_WINDOW_SECONDS) -> dict[str, Any]:
+    process = psutil.Process(root_pid)
+    start_wall_ns = time.perf_counter_ns()
+    start_cpu = process.cpu_times()
+    time.sleep(window_seconds)
+    end_wall_ns = time.perf_counter_ns()
+    end_cpu = process.cpu_times()
+    elapsed_seconds = (end_wall_ns - start_wall_ns) / 1_000_000_000
+    user_delta = max(0.0, end_cpu.user - start_cpu.user)
+    system_delta = max(0.0, end_cpu.system - start_cpu.system)
+    total_delta = user_delta + system_delta
+    average_percent = percent_of_one_logical_cpu(total_delta, elapsed_seconds)
+    return {
+        "scope": "leg-tui process only, identified by the spawned root PID",
+        "window_seconds_requested": window_seconds,
+        "elapsed_wall_seconds": round(elapsed_seconds, 6),
+        "root_pid": root_pid,
+        "raw_counters": {
+            "start": {
+                "monotonic_ns": start_wall_ns,
+                "user_seconds": start_cpu.user,
+                "system_seconds": start_cpu.system,
+            },
+            "end": {
+                "monotonic_ns": end_wall_ns,
+                "user_seconds": end_cpu.user,
+                "system_seconds": end_cpu.system,
+            },
+            "delta_user_seconds": round(user_delta, 9),
+            "delta_system_seconds": round(system_delta, 9),
+            "delta_cpu_seconds": round(total_delta, 9),
+        },
+        "average_percent_of_one_logical_cpu": average_percent,
     }
 
 
@@ -561,11 +702,15 @@ class TerminalProcess:
             while remaining:
                 encoded = remaining.encode("utf-8")
                 written = self.process.write(remaining)
-                if not isinstance(written, int) or written <= 0 or written > len(encoded):
+                if not isinstance(written, int) or written < 0 or written > len(encoded):
                     raise RuntimeError(
                         f"Windows ConPTY write made invalid progress: {written} bytes for {len(encoded)} bytes"
                     )
-                if written == len(encoded):
+                if written == 0:
+                    # pywinpty 3.0.5's ConPTY backend delivers the full input
+                    # but returns zero; retrying duplicates the text.
+                    written_text = remaining
+                elif written == len(encoded):
                     written_text = remaining
                 else:
                     try:
@@ -883,7 +1028,8 @@ def _cpu_model() -> str:
 def _terminal_version() -> str:
     if os.name == "nt":
         version = sys.getwindowsversion()
-        return f"ConPTY on Windows build {version.build}"
+        pywinpty_version = importlib.metadata.version("pywinpty")
+        return f"ConPTY on Windows build {version.build} via pywinpty {pywinpty_version}"
     return f"kernel PTY on {platform.system()} {platform.release()}"
 
 
@@ -934,22 +1080,22 @@ def _restore_transcript_bottom(terminal: TerminalProcess) -> None:
         window = _transcript_window(text)
         return window is not None and window[1] == window[2]
 
-    terminal.wait_for(at_bottom, "transcript to return to its newest rows", timeout=2.0)
+    terminal.wait_for(at_bottom, "transcript to return to its newest entries", timeout=2.0)
 
 
 def _position_transcript_for_scrolling(terminal: TerminalProcess) -> None:
     for attempt in range(4):
         window = _transcript_window(terminal.capture.text())
         if window is None:
-            raise RuntimeError("transcript row counter is not visible before history scrolling")
+            raise RuntimeError("transcript counter is not visible before history scrolling")
         first, last, total = window
-        page_rows = last - first + 1
-        if first - 1 >= 2 * page_rows and total - last >= 2 * page_rows:
+        page_entries = last - first + 1
+        if first - 1 >= 2 * page_entries and total - last >= 2 * page_entries:
             return
 
         key_name, key = (
             ("PageDown", "\x1b[6~")
-            if first - 1 < 2 * page_rows
+            if first - 1 < 2 * page_entries
             else ("PageUp", "\x1b[5~")
         )
         terminal.write(key)
@@ -968,7 +1114,7 @@ def _position_transcript_for_scrolling(terminal: TerminalProcess) -> None:
             )
             raise RuntimeError(
                 f"history scroll preposition {key_name} {attempt}: "
-                f"rows {first}-{last} of {total} -> {after_text}"
+                f"entries {first}-{last} of {total} -> {after_text}"
             ) from None
     else:
         window = _transcript_window(terminal.capture.text())
@@ -979,7 +1125,7 @@ def _position_transcript_for_scrolling(terminal: TerminalProcess) -> None:
         )
         raise RuntimeError(
             "could not position transcript away from both scroll boundaries: "
-            f"rows {position}"
+            f"entries {position}"
         )
 
 
@@ -989,10 +1135,21 @@ def _visible_status_title(title: str) -> str:
     return title
 
 
+def _status_header_content(line: str) -> str | None:
+    prefix, marker, content = line.partition("status:")
+    if not marker:
+        return None
+    label = prefix.replace("│", "").strip()
+    if label and not label.endswith("|"):
+        return None
+    return content
+
+
 def _session_title_visible(text: str, title: str) -> bool:
     visible_title = _visible_status_title(title)
     return any(
-        line.startswith("status:") and f"|  {visible_title}" in line
+        (content := _status_header_content(line)) is not None
+        and f"|  {visible_title}" in content
         for line in text.splitlines()
     )
 
@@ -1000,9 +1157,10 @@ def _session_title_visible(text: str, title: str) -> bool:
 def _session_is_inactive(text: str, title: str) -> bool:
     visible_title = _visible_status_title(title)
     for line in text.splitlines():
-        if not line.startswith("status:") or f"|  {visible_title}" not in line:
+        content = _status_header_content(line)
+        if content is None or f"|  {visible_title}" not in content:
             continue
-        status = line[len("status:") :].split("  |", 1)[0].strip()
+        status = content.split("  |", 1)[0].strip()
         return status not in ACTIVE_SESSION_STATUS_LABELS
     return False
 
@@ -1269,12 +1427,14 @@ def _measure_dimension(
     columns: int,
     sample_count: int,
     stream_pairs: ResponsivenessStreamPairManager,
+    not_comparable_actions: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    not_comparable_actions = not_comparable_actions or {}
     dimension = {"rows": rows, "columns": columns}
     suffix = f"{columns}x{rows}"
     groups: dict[str, list[dict[str, Any]]] = {
         f"{action}@{suffix}": []
-        for action in ("draft_editing", "history_scrolling", "palette_filtering", "inspection")
+        for action in RESPONSIVENESS_ACTIONS
     }
 
     for index in range(sample_count):
@@ -1308,14 +1468,14 @@ def _measure_dimension(
             before = _transcript_window(terminal.capture.text())
             if before is None:
                 raise RuntimeError(
-                    f"history scroll sample {index}: transcript row counter is unavailable"
+                    f"history scroll sample {index}: transcript counter is unavailable"
                 )
             first, last, total = before
-            page_rows = last - first + 1
-            if first - 1 < page_rows or total - last < page_rows:
+            page_entries = last - first + 1
+            if first - 1 < page_entries or total - last < page_entries:
                 raise RuntimeError(
                     f"history scroll sample {index} starts at a boundary: "
-                    f"rows {first}-{last} of {total}"
+                    f"entries {first}-{last} of {total}"
                 )
 
         key_name, key = (
@@ -1330,7 +1490,7 @@ def _measure_dimension(
                 index,
                 key,
                 lambda text: _transcript_window(text) != before,
-                f"{key_name} sample {index} transcript row counter change",
+                f"{key_name} sample {index} transcript counter change",
                 after_pair_restore=lambda: _position_transcript_for_scrolling(terminal),
                 before_injection=capture_history_scroll_baseline,
             )
@@ -1347,7 +1507,7 @@ def _measure_dimension(
                 else "<counter unavailable>"
             )
             raise TimeoutError(
-                f"{key_name} sample {index} rows "
+                f"{key_name} sample {index} entries "
                 f"{before_text} -> {after_text} did not change"
             ) from None
         groups[f"history_scrolling@{suffix}"].append(sample)
@@ -1364,25 +1524,26 @@ def _measure_dimension(
     def clear_palette() -> None:
         terminal.write_control("u")  # Ctrl-U clears the prior query.
 
-    open_palette()
-    for index in range(sample_count):
-        query = f"q{index:03d}"
-        groups[f"palette_filtering@{suffix}"].append(
-            _measure_streamed_sample(
-                stream_pairs,
-                terminal,
-                "palette_filtering",
-                dimension,
-                index,
-                query,
-                lambda text, expected=query: expected in text,
-                f"palette query {query}",
-                before_pair_switch=close_palette,
-                after_pair_restore=open_palette,
-                before_injection=clear_palette,
+    if "palette_filtering" not in not_comparable_actions:
+        open_palette()
+        for index in range(sample_count):
+            query = f"q{index:03d}"
+            groups[f"palette_filtering@{suffix}"].append(
+                _measure_streamed_sample(
+                    stream_pairs,
+                    terminal,
+                    "palette_filtering",
+                    dimension,
+                    index,
+                    query,
+                    lambda text, expected=query: expected in text,
+                    f"palette query {query}",
+                    before_pair_switch=close_palette,
+                    after_pair_restore=open_palette,
+                    before_injection=clear_palette,
+                )
             )
-        )
-    close_palette()
+        close_palette()
 
     for index in range(sample_count):
         groups[f"inspection@{suffix}"].append(
@@ -1500,11 +1661,21 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
     run_started_ns = time.perf_counter_ns()
     output_path = Path(args.output).resolve()
     profile = _build_profile(args)
+    comparison_role = getattr(args, "comparison_role", "final")
+    not_comparable_actions = (
+        BASELINE_NOT_COMPARABLE_ACTIONS if comparison_role == "baseline" else {}
+    )
+    not_comparable_groups = {
+        f"{action}@{columns}x{rows}": reason
+        for rows, columns in DIMENSIONS
+        for action, reason in not_comparable_actions.items()
+    }
     groups: dict[str, list[dict[str, Any]]] = {}
     terminal: TerminalProcess | None = None
     sampler: ProcessTreeRssSampler | None = None
     fixture_server: FixtureServer | None = None
     idle_memory: list[int] = []
+    idle_cpu: dict[str, Any] | None = None
     catalog_load_ms: float | None = None
     history_open_ms: float | None = None
     with ExitStack() as workspace_cleanup:
@@ -1550,8 +1721,9 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             catalog_load_ms = (visible_ns - selected_ns) / 1_000_000
 
             idle_started_ns = time.perf_counter_ns()
-            time.sleep(IDLE_MEMORY_WINDOW_SECONDS)
-            idle_memory = sampler.values_between(idle_started_ns, time.perf_counter_ns())
+            idle_cpu = measure_idle_cpu(terminal.pid)
+            idle_ended_ns = time.perf_counter_ns()
+            idle_memory = sampler.values_between(idle_started_ns, idle_ended_ns)
 
             stream_pairs = ResponsivenessStreamPairManager(
                 terminal,
@@ -1575,7 +1747,14 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                         timeout=3.0,
                     )
                 groups.update(
-                    _measure_dimension(terminal, rows, columns, args.samples, stream_pairs)
+                    _measure_dimension(
+                        terminal,
+                        rows,
+                        columns,
+                        args.samples,
+                        stream_pairs,
+                        not_comparable_actions,
+                    )
                 )
 
             stream_pairs.wait_for_all_pairs()
@@ -1601,25 +1780,53 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
             _decorate_sample_provider_context(
                 groups, fixture_server.fixture, run_started_ns, stream_pairs.pairs
             )
-            summaries = {
-                group: {
+            summaries: dict[str, dict[str, Any]] = {}
+            for group, samples in groups.items():
+                if not samples:
+                    reason = not_comparable_groups.get(group)
+                    if reason is None:
+                        raise RuntimeError(f"responsiveness group {group} collected no samples")
+                    summaries[group] = {"status": "not_comparable", "reason": reason}
+                    continue
+                summaries[group] = {
                     **summarize_latencies(samples),
                     "stream_pair_ids": sorted({sample["stream_pair_id"] for sample in samples}),
                 }
-                for group, samples in groups.items()
-            }
             memory_samples = sampler.all_values() if sampler else []
             if not idle_memory:
                 raise RuntimeError("memory sampler collected no RSS samples during the idle window")
             if not memory_samples:
                 raise RuntimeError("memory sampler collected no process-tree RSS samples")
+            if idle_cpu is None:
+                raise RuntimeError("idle CPU measurement did not run")
+            timings = {
+                "startup_ms": round(startup_ms, 3),
+                "catalog_load_ms": round(catalog_load_ms, 3),
+                "cached_history_open_ms": history_open_ms,
+                "inspector_open_ms": inspector_open_ms,
+            }
+            gates = responsiveness_gates(
+                summaries,
+                timings,
+                float(idle_cpu["average_percent_of_one_logical_cpu"]),
+            )
+            gates["enforced"] = comparison_role == "final"
+            if comparison_role != "final":
+                gates["status"] = "observed"
             report = {
-                "schema": "leg-tui.responsiveness-report/v1",
-                "source_revision": _git_revision(),
+                "schema": "leg-tui.responsiveness-report/v2",
+                "source_revision": getattr(args, "source_revision", None) or _git_revision(),
+                "harness_revision": _git_revision(),
+                "comparison_role": comparison_role,
                 "os": platform.platform(),
                 "cpu": _cpu_model(),
                 "terminal_version": _terminal_version(),
                 "terminal_transport": "Windows ConPTY via pywinpty" if os.name == "nt" else "native Unix PTY",
+                "terminal": {
+                    "backend": "Windows ConPTY via pywinpty" if os.name == "nt" else "native Unix PTY",
+                    "frontend": "none; pywinpty drove the ConPTY API directly" if os.name == "nt" else "none; harness drove the native PTY directly",
+                    "version": _terminal_version(),
+                },
                 "dimensions": [
                     {"rows": rows, "columns": columns}
                     for rows, columns in DIMENSIONS
@@ -1633,11 +1840,14 @@ def run_harness(args: argparse.Namespace) -> dict[str, Any]:
                     "total_history_turns": dataset["total_history_turns"],
                     "stream_pair_pool_size": len(dataset["stream_pair_pool"]),
                 },
-                "timings": {
-                    "startup_ms": round(startup_ms, 3),
-                    "catalog_load_ms": round(catalog_load_ms, 3),
-                    "cached_history_open_ms": round(history_open_ms, 3),
-                    "inspector_open_ms": round(inspector_open_ms, 3),
+                "timings": timings,
+                "gates": gates,
+                "idle_cpu": {
+                    **idle_cpu,
+                    "window_state": "seeded catalog open; no active turn, clock, overlay, or resize",
+                    "limit_percent_of_one_logical_cpu": IDLE_CPU_LIMIT_PERCENT,
+                    "passed": float(idle_cpu["average_percent_of_one_logical_cpu"])
+                    <= IDLE_CPU_LIMIT_PERCENT,
                 },
                 "memory": {
                     "scope": "leg-tui process tree; excludes harness and provider fixture",
@@ -1668,6 +1878,16 @@ def main() -> int:
     parser.add_argument("--supervisor-bin", required=True, help="leg-ui-supervisor executable")
     parser.add_argument("--output", required=True, type=Path, help="path for the JSON report")
     parser.add_argument(
+        "--source-revision",
+        help="revision of the measured binaries (defaults to the harness checkout)",
+    )
+    parser.add_argument(
+        "--comparison-role",
+        choices=("observation", "baseline", "final"),
+        default="observation",
+        help="observation and baseline record gates; final enforces all gates",
+    )
+    parser.add_argument(
         "--build-profile",
         choices=("debug", "release"),
         help="build profile (inferred from binary paths when omitted)",
@@ -1693,15 +1913,22 @@ def main() -> int:
         json.dumps(
             {
                 "source_revision": report["source_revision"],
+                "harness_revision": report["harness_revision"],
+                "comparison_role": report["comparison_role"],
                 "terminal_transport": report["terminal_transport"],
+                "terminal": report["terminal"],
                 "dimensions": report["dimensions"],
                 "groups": report["groups"],
                 "timings": report["timings"],
+                "idle_cpu": report["idle_cpu"],
+                "gates": report["gates"],
                 "memory": report["memory"],
             },
             indent=2,
         )
     )
+    if args.comparison_role == "final" and report["gates"]["status"] != "passed":
+        return 1
     return 0
 
 
