@@ -488,8 +488,9 @@ jobs:
 
       - name: Test Windows process identity reuse guard
         shell: bash
-        run: cargo test --locked --manifest-path companions/Cargo.toml \
-          -p leg-ui-client --lib reused_pid_identity_is_not_terminated
+        run: |
+          cargo test --locked --manifest-path companions/Cargo.toml \
+            -p leg-ui-client --lib reused_pid_identity_is_not_terminated
 
       - name: Build release behavior binaries
         shell: bash

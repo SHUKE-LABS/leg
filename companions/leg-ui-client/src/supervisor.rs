@@ -828,6 +828,7 @@ fn any_observed_alive(observed: &HashSet<ProcessIdentity>) -> bool {
     observed.iter().any(current_identity)
 }
 
+#[cfg(any(windows, test))]
 fn terminate_if_birth_token_matches<R>(
     expected_birth_token: &str,
     actual_birth_token: Option<&str>,
