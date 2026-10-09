@@ -420,17 +420,25 @@ keeps native core/controller failures unmet until fixed or tracked by a linked
 issue. Thresholds, baseline rules, report contents, and the Windows runner's
 lack of a Windows Terminal frontend are documented in
 [`ui-experiments.md`](ui-experiments.md#tui-responsiveness-harness-182).
-Run 37853682089 measured final p95 latency at 32.6–39.7 ms on Linux and
-47.4–54.3 ms on Windows; Windows cached history and inspector opening measured
-46.437 ms and 54.149 ms, with idle CPU at 0.033% on Linux and 0.104% on
-Windows. Baseline cached history/inspector opening measured 8.165/13.216 ms on
-Linux and 11.205/24.704 ms on Windows. The baseline palette result is
-`not_comparable` because that revision has no palette. Timing uses pywinpty
-3.0.5 because pywinpty 2.0.15 adds about 100 ms to ConPTY reads; the Windows
-behavior harness uses 2.0.15, under which multiline Chinese/emoji paste passes.
-The 3.0.5 TUI paste path loses the emoji even though a raw child receives it.
-Windows behavior is driven through ConPTY without a Windows Terminal frontend.
-The Stop failure remains tracked in [#187](https://github.com/SHUKE-LABS/leg/issues/187); do not treat Windows Stop as verified until that check passes.
+Run [37891673575](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575)
+tested CI revision `b921d3f` for PR head `8d0478d`. Final p95 latency across
+the eight comparable action/size groups ranged from 32.722–41.410 ms on Linux
+and 46.255–61.386 ms on Windows; all groups passed. Cached history/inspector
+opening measured 10.281/16.071 ms on the Linux baseline and 33.673/41.203 ms
+on final; Windows measured 13.887/28.258 ms on baseline and 35.414/56.167 ms
+on final. Final idle CPU was 0.100% on Linux and 0.417% on Windows, under the
+1% limit. The baseline palette result is `not_comparable` because it has no
+palette. The full Windows ConPTY report passed all nine checks, including
+Chinese/emoji multiline paste, resize recovery, `NO_COLOR`, clipboard save
+fallback, terminal restoration, Stop process-tree cleanup, background
+switching, retry cancellation, and busy rejection. Stop, retry cancellation,
+and busy rejection each left the fixture request count at one, with no prompt
+replayed. Windows uses pywinpty 3.0.5 for timing and 2.0.15 for behavior; the
+runner has no Windows Terminal frontend.
+
+Reports: [Linux comparison](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599321737),
+[Windows comparison](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11598638324),
+and [full Windows behavior](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599295198).
 
 Command-palette captures are checked in at
 [80x24](../companions/leg-tui/tests/captures/command-palette-80x24.txt) and

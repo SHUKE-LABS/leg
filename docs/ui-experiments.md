@@ -475,16 +475,31 @@ Linux and Windows instead. It builds baseline
 on each same runner, then uploads each report and
 its command logs as `leg-tui-responsiveness-comparison-<os>-*`.
 
-Run 37853682089 recorded these baseline-to-final p95 input latencies (80x24 /
-120x40): Linux draft editing 67.7/77.4 ms, history scrolling 5.9/7.8 ms, and
-inspection 11.2/13.8 ms; Windows draft editing 227/285 ms, history scrolling
-16.4/19.2 ms, and inspection 23.8/25.1 ms. The baseline has no command palette,
-so palette filtering is `not_comparable`. Final p95 across the eight comparable
-action/size groups was 32.6–39.7 ms on Linux and 47.4–54.3 ms on Windows. The
-cached-history / inspector opening times were 8.165/13.216 ms on the Linux
-baseline and 34.412/39.663 ms on the Linux final revision; Windows measured
-11.205/24.704 ms on the baseline and 46.437/54.149 ms on the final revision.
-Final idle CPU was 0.033% of one logical CPU on Linux and 0.104% on Windows.
+Run [37891673575](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575)
+tested CI revision `b921d3f7804c700f600683dcbbaab4747fa8b4e2` for PR head
+`8d0478d4a28ac46f892c2ecfddb12212586f1c40`. Its artifacts contain the paired
+Linux report and raw logs
+([Linux](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599321737)),
+the paired Windows report and raw logs
+([Windows](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11598638324)),
+and the complete Windows behavior report
+([Windows behavior](https://github.com/SHUKE-LABS/leg/actions/runs/37891673575/artifacts/11599295198)).
+Each baseline and final pair ran on the same native host and workload: Linux
+kernel PTY on Linux 6.17.0-1022-azure, and ConPTY on Windows build 26100 with
+pywinpty 3.0.5 for timing.
+
+Baseline p95 input latencies (80x24 / 120x40) were Linux draft editing
+76.053/94.842 ms, history scrolling 6.498/10.096 ms, and inspection
+12.560/16.370 ms; Windows draft editing 223.338/284.979 ms, history scrolling
+17.101/22.576 ms, and inspection 25.627/29.686 ms. The baseline has no command
+palette, so palette filtering is `not_comparable`. Final p95 across all eight
+action/size groups ranged from 32.722–41.410 ms on Linux and 46.255–61.386 ms
+on Windows; each group met the 100 ms limit. Cached-history / inspector opening
+times were 10.281/16.071 ms on the Linux baseline and 33.673/41.203 ms on the
+Linux final revision; Windows measured 13.887/28.258 ms on baseline and
+35.414/56.167 ms on final. Baseline idle CPU was 13.700% on Linux and 14.471%
+on Windows; final idle CPU was 0.100% and 0.417%, respectively, below the 1%
+limit.
 
 The #183 final revision passes only when every action/size group has at least
 100 samples and p95 input-to-visible-output latency is at most 100 ms, cached
@@ -495,14 +510,13 @@ A Windows baseline that cannot run the workload may be recorded with its exact
 failure; a Linux baseline failure fails the gate. A native core/controller
 failure remains an unmet gate: link a separate issue in the PR and docs, and do
 not relax a threshold to pass. The paired job also runs the Windows behavior
-harness for multiline Chinese/emoji paste, resize recovery, `NO_COLOR`, OSC 52
-with F7 save fallback, terminal restoration, Stop process-tree cleanup, session
-switching, retry cancellation, and same-session busy rejection. Its terminal is
-Windows ConPTY with no Windows Terminal frontend; reports identify that setup
-and pywinpty version. The pywinpty 2.0.15 behavior run passes the multiline
-Chinese/emoji paste check. Stop remains unmet: the active catalog reports
-`Ownership unknown`, the TUI says `Active session changed state; nothing was
-stopped`, and the owned Bash/PowerShell process tree remains alive after 10
-seconds. This is tracked by [#187](https://github.com/SHUKE-LABS/leg/issues/187);
-keep the #183 Stop gate unmet until that issue is resolved and the native check
-passes.
+harness under ConPTY with no Windows Terminal frontend, using pywinpty 2.0.15.
+All nine checks passed: Chinese/emoji multiline paste, minimum-size recovery,
+`NO_COLOR`, clipboard denial with F7 save fallback, normal terminal
+restoration, Stop process-tree cleanup, background browsing and session
+switching, retry cancellation, and same-session busy rejection. Stop reported
+the interrupted turn and confirmed the owned Bash/PowerShell process tree was
+gone; Stop, retry cancellation, and busy rejection each recorded only the
+expected fixture request, with no prompt replay. Every check confirmed
+terminal restoration. The report records the direct ConPTY setup and pywinpty
+version.
