@@ -114,6 +114,14 @@ class TrialFixtureChecks(unittest.TestCase):
 
         self.assertTrue(fixture.status()["input_checks"].get("chinese_multiline_prompt"))
 
+    def test_held_tui_pause_marker_creates_a_gate(self) -> None:
+        fixture = Fixture("trial", None, hold_after_first_chunk=True)
+
+        request, occurrence = fixture.advance("TRIAL-PAUSE")
+
+        self.assertEqual((request, occurrence), (1, 1))
+        self.assertEqual(fixture.status()["pause_gates"], {"1": "waiting"})
+
 
 if __name__ == "__main__":
     unittest.main()

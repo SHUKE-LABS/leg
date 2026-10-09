@@ -207,8 +207,15 @@ diagnostics redact inherited credential values.
 
 CI runs the companion suite on native Linux and macOS hosts. Its Stop and
 abrupt-controller cleanup tests check for an interrupted session trail and
-process disappearance on both platforms. Companion dependencies remain in
-`companions/Cargo.lock`; verify the core graph with:
+process disappearance on both platforms. A native Windows ConPTY lane checks
+the TUI Stop path against the owned tool process tree.
+
+The native Windows build 26300 ConPTY behavior run passed, including
+`stop_owned_tool_process_tree`. The harness drives ConPTY directly through
+pywinpty and does not cover Windows Terminal frontend behavior.
+
+Companion dependencies remain in `companions/Cargo.lock`; verify the core
+graph with:
 
 ```sh
 cargo metadata --locked --manifest-path Cargo.toml
@@ -286,9 +293,9 @@ enabled action, and Esc to return to the unchanged composer draft and cursor.
 Palette typing and paste stay out of the prompt. Ctrl-C first stops the viewed
 active turn. If the viewed session is idle while background turns are active,
 Ctrl-C opens a named Stop chooser; Escape cancels, and Enter stops only the
-selected run after its session and turn are rechecked. If no TUI turns are
-active, Ctrl-C saves drafts and exits. An active turn owned by another interface
-disables Exit so it cannot be abandoned silently. External SIGINT and SIGTERM
+selected run while it remains active. If no TUI turns are active, Ctrl-C saves
+drafts and exits. An active turn owned by another interface disables Exit so it
+cannot be abandoned silently. External SIGINT and SIGTERM
 use the shared turn controller to stop an active turn, wait for process
 cleanup, save the draft, and restore the terminal. Editing stays available
 during a turn, but another Ctrl-S is rejected while busy.

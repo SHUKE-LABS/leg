@@ -75,9 +75,13 @@ otherwise it uses an overlay.
 
 Ctrl-C stops the viewed active turn. If the viewed session is idle while other
 TUI turns run, Ctrl-C opens a named Stop chooser: Escape cancels, and Enter
-stops only the selected run after a state check. When no TUI turns are active,
-Ctrl-C saves drafts and exits. Use Ctrl-C in the fixture terminal to stop the
-fake provider.
+stops only the selected run while it remains active. When no TUI turns are
+active, Ctrl-C saves drafts and exits. Use Ctrl-C in the fixture terminal to
+stop the fake provider.
+
+The native Windows build 26300 ConPTY check for `stop_owned_tool_process_tree`
+passed. It drives ConPTY directly via pywinpty; Windows Terminal frontend
+behavior is outside this check.
 
 ## Revisions and human observations
 

@@ -770,18 +770,23 @@ class ProcessTreeRssSampler:
 
 
 class FixtureServer:
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        scenario: str = "responsiveness",
+        hold_after_first_chunk: bool = False,
+    ) -> None:
         self.module = load_fake_provider()
-        self.fixture = self.module.Fixture("responsiveness", workspace)
+        self.fixture = self.module.Fixture(scenario, workspace, hold_after_first_chunk)
         self.fixture.prepare_hook()
-        handler = type("ResponsivenessFixtureHandler", (self.module.Handler,), {"fixture": self.fixture})
+        handler = type("FixtureHandler", (self.module.Handler,), {"fixture": self.fixture})
         self.server = self.module.LoopbackThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.server.daemon_threads = True
         host, port = self.server.server_address
         self.base_url = f"http://{host}:{port}"
         self.thread = threading.Thread(target=self.server.serve_forever, name="leg-tui-fixture", daemon=True)
         self.thread.start()
-        self.environment = self.module.environment(self.base_url, "responsiveness", self.fixture.denial_hook)
+        self.environment = self.module.environment(self.base_url, scenario, self.fixture.denial_hook)
 
     def close(self) -> None:
         self.server.shutdown()
