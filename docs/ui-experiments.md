@@ -67,6 +67,11 @@ python3 companions/trials/fake_provider.py --scenario text-tool-text --workspace
 | `reopen-after-failure` | First request returns 401; the next succeeds. | Reopening and explicitly retrying returns an answer. |
 | `reopen-after-interruption` | First response closes after partial live text; the next succeeds. | Reopening and repeating the prompt returns an answer. |
 
+On Windows, the stalled command is a PowerShell child of Bash. The native
+ConPTY behavior lane passed on build 26300: the captured Bash and PowerShell
+process identities exited after Stop. The harness drives ConPTY directly via
+pywinpty and does not cover Windows Terminal frontend behavior.
+
 The Linux PTY smoke test opts into a fixture gate that holds
 `paused-live-text` after its first chunk until the test releases it. The
 fixture reports the active held request and exposes a release endpoint for

@@ -1,4 +1,4 @@
-//! Unix signal state shared by the CLI, tool loop, and bash process runner.
+//! Interrupt state shared by the CLI, tool loop, and subprocess runner.
 
 use crate::error::{InterruptSignal, LegError, Result};
 
@@ -8,6 +8,8 @@ use std::io::{self, BufRead, Read};
 use std::os::fd::RawFd;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -19,6 +21,10 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static SIGNAL_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 #[cfg(unix)]
 static SIGNAL_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+#[cfg(windows)]
+static CONSOLE_INTERRUPT: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static CONSOLE_HANDLER_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 pub(crate) fn install() -> Result<()> {
@@ -34,9 +40,49 @@ pub(crate) fn install() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn install() -> Result<()> {
+    if CONSOLE_HANDLER_ENABLED.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    // SAFETY: the callback only writes an atomic flag and has static lifetime.
+    if unsafe { SetConsoleCtrlHandler(Some(handle_console_control), 1) } == 0 {
+        CONSOLE_HANDLER_ENABLED.store(false, Ordering::Release);
+        return Err(LegError::Io(format!(
+            "failed to install console control handler: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn install() -> Result<()> {
     Ok(())
+}
+
+#[cfg(windows)]
+const CTRL_C_EVENT: u32 = 0;
+#[cfg(windows)]
+const CTRL_BREAK_EVENT: u32 = 1;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn handle_console_control(event: u32) -> i32 {
+    if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+        CONSOLE_INTERRUPT.store(true, Ordering::Relaxed);
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(unix)]
@@ -157,7 +203,15 @@ pub(crate) fn signal() -> Option<InterruptSignal> {
             _ => None,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if CONSOLE_INTERRUPT.load(Ordering::Relaxed) {
+            Some(InterruptSignal::Interrupt)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }

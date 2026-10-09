@@ -924,7 +924,7 @@ class FixtureServer:
         self.module = load_fake_provider()
         self.fixture = self.module.Fixture(scenario, workspace, hold_after_first_chunk)
         self.fixture.prepare_hook()
-        handler = type("ResponsivenessFixtureHandler", (self.module.Handler,), {"fixture": self.fixture})
+        handler = type("FixtureHandler", (self.module.Handler,), {"fixture": self.fixture})
         self.server = self.module.LoopbackThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.server.daemon_threads = True
         host, port = self.server.server_address
