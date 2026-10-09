@@ -456,7 +456,7 @@ jobs:
         run: cross build --locked --verbose --target "${TARGET}"
 
   tui-windows-stop-behavior:
-    if: ${{ github.event_name == 'pull_request' && (contains(github.event.pull_request.body, 'Closes #187') || contains(github.event.pull_request.body, 'Closes #183') || contains(github.event.pull_request.body, 'Part of #183')) }}
+    if: "${{ github.event_name == 'pull_request' && (contains(github.event.pull_request.body, 'Closes #187') || contains(github.event.pull_request.body, 'Closes #183') || contains(github.event.pull_request.body, 'Part of #183')) }}"
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
