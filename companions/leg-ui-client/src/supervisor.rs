@@ -168,6 +168,11 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -708,7 +713,13 @@ fn begin_stop(
             let _ = libc::kill(leg_pid as libc::pid_t, libc::SIGINT);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if child_running && current_identity(root_identity) {
+            send_windows_ctrl_break(leg_pid);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = leg_pid;
     }
@@ -778,6 +789,17 @@ fn process_group(pid: u32) -> i32 {
     }
 }
 
+#[cfg(windows)]
+fn send_windows_ctrl_break(process_group_id: u32) {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+
+    // SAFETY: `leg` starts in its own console process group; Windows scopes
+    // this control event to that group rather than the TUI's group.
+    unsafe {
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_group_id);
+    }
+}
+
 fn process_identity(pid: u32, process: &sysinfo::Process) -> Option<ProcessIdentity> {
     if process.status() == ProcessStatus::Zombie {
         return None;
@@ -806,6 +828,57 @@ fn any_observed_alive(observed: &HashSet<ProcessIdentity>) -> bool {
     observed.iter().any(current_identity)
 }
 
+fn terminate_if_birth_token_matches<R>(
+    expected_birth_token: &str,
+    actual_birth_token: Option<&str>,
+    terminate: impl FnOnce() -> R,
+) -> Option<R> {
+    (actual_birth_token == Some(expected_birth_token)).then(terminate)
+}
+
+#[cfg(windows)]
+fn terminate_windows_process_if_identity_matches(identity: &ProcessIdentity) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        TerminateProcess,
+    };
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            identity.owner.pid,
+        )
+    };
+    if handle.is_null() {
+        return false;
+    }
+
+    let mut created = unsafe { std::mem::zeroed::<FILETIME>() };
+    let mut exited = unsafe { std::mem::zeroed::<FILETIME>() };
+    let mut kernel = unsafe { std::mem::zeroed::<FILETIME>() };
+    let mut user = unsafe { std::mem::zeroed::<FILETIME>() };
+    let birth_token =
+        (unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }
+            != 0)
+            .then(|| {
+                let created =
+                    (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+                format!("windows:{created}")
+            });
+    let terminated = terminate_if_birth_token_matches(
+        &identity.owner.birth_token,
+        birth_token.as_deref(),
+        || unsafe { TerminateProcess(handle, 1) != 0 },
+    )
+    .unwrap_or(false);
+    unsafe {
+        CloseHandle(handle);
+    }
+    terminated
+}
+
 fn force_owned_tree(observed: &HashSet<ProcessIdentity>, child: &mut Child, child_running: bool) {
     #[cfg(unix)]
     {
@@ -815,6 +888,12 @@ fn force_owned_tree(observed: &HashSet<ProcessIdentity>, child: &mut Child, chil
                     let _ = libc::kill(identity.owner.pid as libc::pid_t, libc::SIGKILL);
                 }
             }
+        }
+    }
+    #[cfg(windows)]
+    {
+        for identity in observed {
+            let _ = terminate_windows_process_if_identity_matches(identity);
         }
     }
     if child_running {
@@ -947,6 +1026,17 @@ mod tests {
             assert!(owner.birth_token.starts_with("linux:"));
             assert_eq!(owner.inspect(), OwnerState::Alive);
         }
+    }
+
+    #[test]
+    fn reused_pid_identity_is_not_terminated() {
+        let mut terminated = false;
+        let result =
+            terminate_if_birth_token_matches("windows:expected", Some("windows:reused"), || {
+                terminated = true
+            });
+        assert_eq!(result, None);
+        assert!(!terminated);
     }
 
     #[cfg(unix)]

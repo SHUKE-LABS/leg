@@ -455,6 +455,73 @@ jobs:
       - name: Cross-build (locked)
         run: cross build --locked --verbose --target "${TARGET}"
 
+  tui-windows-stop-behavior:
+    if: ${{ github.event_name == 'pull_request' && (contains(github.event.pull_request.body, 'Closes #187') || contains(github.event.pull_request.body, 'Closes #183') || contains(github.event.pull_request.body, 'Part of #183')) }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Windows behavior requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_temp="$(cygpath -u "${RUNNER_TEMP}")"
+          behavior_venv="${runner_temp}/leg-tui-stop-behavior-venv"
+          python -m venv "${behavior_venv}"
+          behavior_python="${behavior_venv}/Scripts/python.exe"
+          "${behavior_python}" -m pip install \
+            --requirement companions/leg-tui/tests/requirements.txt
+          # The behavior harness needs pywinpty 2.0.15's complete ConPTY paste
+          # path; the #183 responsiveness lane separately uses 3.0.5 for timing.
+          "${behavior_python}" -m pip install --force-reinstall pywinpty==2.0.15
+          echo "TUI_WINDOWS_BEHAVIOR_PYTHON=${behavior_python}" >>"${GITHUB_ENV}"
+
+      - name: Test Windows process identity reuse guard
+        shell: bash
+        run: cargo test --locked --manifest-path companions/Cargo.toml \
+          -p leg-ui-client --lib reused_pid_identity_is_not_terminated
+
+      - name: Build release behavior binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin leg
+          cargo build --locked --manifest-path companions/Cargo.toml --release \
+            -p leg-ui-client --bin leg-ui-supervisor
+          cargo build --locked --manifest-path companions/Cargo.toml --release -p leg-tui
+
+      - name: Run native Windows Stop behavior checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_temp="$(cygpath -u "${RUNNER_TEMP}")"
+          "${TUI_WINDOWS_BEHAVIOR_PYTHON}" \
+            companions/leg-tui/tests/windows_behavior_harness.py \
+            --tui-bin companions/target/release/leg-tui.exe \
+            --leg-bin target/release/leg.exe \
+            --supervisor-bin companions/target/release/leg-ui-supervisor.exe \
+            --source-revision "${GITHUB_SHA}" \
+            --output "${runner_temp}/leg-tui-windows-behavior.json"
+
+      - name: Upload native Windows behavior report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: leg-tui-windows-behavior-${{ github.sha }}
+          path: ${{ runner.temp }}/leg-tui-windows-behavior.json
+          if-no-files-found: warn
+          retention-days: 14
+
   lint:
     runs-on: ubuntu-latest
     steps:

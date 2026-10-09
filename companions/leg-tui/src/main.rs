@@ -1400,7 +1400,11 @@ impl App {
             PaletteAction::ToggleRail if self.terminal_columns < SESSION_RAIL_MIN_COLUMNS => Some(
                 format!("Available at {SESSION_RAIL_MIN_COLUMNS} columns and wider."),
             ),
-            PaletteAction::Stop if inputs.current_owner_unverified => {
+            PaletteAction::Stop
+                if inputs.current_owner_unverified
+                    && !self.turn_status.is_active()
+                    && inputs.background_stop_targets.is_empty() =>
+            {
                 Some("Session ownership could not be verified.".to_string())
             }
             PaletteAction::Stop if self.turn_status.is_stopping() => {
@@ -2527,28 +2531,6 @@ impl App {
             self.status = "Active turn has no Stop control".to_string();
             return;
         };
-        let Some(record_id) = self.current_record_id().map(str::to_owned) else {
-            self.status = "Could not identify the active session; nothing was stopped".to_string();
-            return;
-        };
-        let current_turn_index = self.transcript.last().and_then(TranscriptTurn::turn_index);
-        let session = match self.catalog.get(&record_id) {
-            Ok(session) => session,
-            Err(error) => {
-                self.status =
-                    format!("Could not verify the active session ({error}); nothing was stopped");
-                return;
-            }
-        };
-        if session.run_state != CatalogRunState::Active
-            || current_turn_index.is_some_and(|turn_index| {
-                session.turns.last().map(|turn| turn.turn_index) != Some(turn_index)
-            })
-        {
-            self.refresh_sessions();
-            self.status = "Active session changed state; nothing was stopped".to_string();
-            return;
-        }
         match handle.stop() {
             Ok(()) => {
                 self.turn_status = TurnStatus::Stopping;
@@ -2601,12 +2583,6 @@ impl App {
             ));
             return;
         }
-        let record_id = view
-            .session_id
-            .as_deref()
-            .or(view.draft_id.as_deref())
-            .unwrap_or(&view.state_key)
-            .to_string();
         let Some(handle) = view.stop_handle.clone() else {
             self.close_stop_chooser(format!(
                 "{} has no Stop control; nothing was stopped",
@@ -2614,29 +2590,6 @@ impl App {
             ));
             return;
         };
-        let current_turn_index = view.transcript.last().and_then(TranscriptTurn::turn_index);
-
-        let session = match self.catalog.get(&record_id) {
-            Ok(session) => session,
-            Err(error) => {
-                self.close_stop_chooser(format!(
-                    "Could not verify {} ({error}); nothing was stopped",
-                    target.title
-                ));
-                return;
-            }
-        };
-        if session.run_state != CatalogRunState::Active
-            || current_turn_index.is_some_and(|turn_index| {
-                session.turns.last().map(|turn| turn.turn_index) != Some(turn_index)
-            })
-        {
-            self.close_stop_chooser(format!(
-                "{} changed state; nothing was stopped",
-                target.title
-            ));
-            return;
-        }
 
         self.stop_chooser_open = false;
         self.stop_targets.clear();
@@ -5521,11 +5474,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        App, PaletteAction, SessionCatalog, SessionCatalogConfig, TranscriptAnchor, TurnStatus,
-        build_transcript_rows, build_transcript_rows_with_focus, find_case_insensitive,
-        find_transcript_anchor_row, response_stop_reason, restored_draft, same_tool_anchor,
-        should_use_color, successful_status, transcript_page_down_start, transcript_page_up_start,
-        truncate_to_width,
+        ActionDisabledInputs, App, PaletteAction, SessionCatalog, SessionCatalogConfig,
+        TranscriptAnchor, TurnStatus, build_transcript_rows, build_transcript_rows_with_focus,
+        find_case_insensitive, find_transcript_anchor_row, response_stop_reason, restored_draft,
+        same_tool_anchor, should_use_color, successful_status, transcript_page_down_start,
+        transcript_page_up_start, truncate_to_width,
     };
     use unicode_width::UnicodeWidthStr;
 
@@ -5584,6 +5537,42 @@ mod tests {
         assert!(!app.quit);
         assert!(!app.stop_chooser_open);
         assert_eq!(app.status, "No active TUI session to stop");
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
+    }
+
+    #[test]
+    fn stop_is_refused_when_owner_is_unverified_and_no_local_control_exists() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!(
+            "leg-tui-unverified-stop-{}-{unique}",
+            std::process::id()
+        ));
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(state_dir.clone()),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("temporary test catalog opens");
+        let app = App::new(catalog);
+        let inputs = ActionDisabledInputs {
+            current_busy: false,
+            current_owner_unverified: true,
+            current_read_only: false,
+            workspace_available: true,
+            has_any_active_session: false,
+            has_unverified_session_owner: true,
+            background_stop_targets: Vec::new(),
+        };
+
+        assert_eq!(
+            app.action_disabled_reason_with_inputs(PaletteAction::Stop, &inputs)
+                .as_deref(),
+            Some("Session ownership could not be verified.")
+        );
+
         drop(app);
         std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
     }
