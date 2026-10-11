@@ -8,7 +8,9 @@
 //! well as what it did on disk. No live provider is contacted; every run gets
 //! its own temp working directory.
 
-use std::io::{BufRead, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::BufRead;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
