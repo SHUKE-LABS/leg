@@ -1222,6 +1222,20 @@ def launch_conversation(
         raise
 
 
+def assert_seeded_trail_parses(leg_bin: str, trail_path: Path) -> None:
+    result = subprocess.run(
+        [str(Path(leg_bin).resolve()), "log", "show", "--file", str(trail_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"leg log show rejected seeded trail {trail_path} "
+            f"(exit {result.returncode}):\n{result.stderr}"
+        )
+
+
 def seed_windowed_catalog(
     state_dir: Path,
     workspace: Path,
@@ -1428,6 +1442,7 @@ def seed_windowed_catalog(
                         "schema": EXCHANGE_SCHEMA,
                         "event": "response_error",
                         "ts_ms": event_ms + 3,
+                        "duration_ms": 1,
                         "kind": "interrupted",
                         "message": "fixture turn interrupted",
                         "session_id": session_id,
@@ -1442,6 +1457,7 @@ def seed_windowed_catalog(
                 "schema": EXCHANGE_SCHEMA,
                 "event": "response_ok",
                 "ts_ms": event_ms + 4,
+                "duration_ms": 1,
                 "reply": f"history fixture reply {index:04d}",
                 "stop_reason": "end_turn",
                 "session_id": session_id,
@@ -1605,6 +1621,7 @@ def seed_catalog_session(
             "schema": EXCHANGE_SCHEMA,
             "event": "response_ok",
             "ts_ms": updated_at_ms + 2,
+            "duration_ms": 1,
             "reply": reply,
             "stop_reason": "end_turn",
             "session_id": session_id,
@@ -2320,9 +2337,10 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
         beta_original_draft = "Beta original draft before replacement"
         alpha_draft = "Alpha edited draft stays with Alpha"
         beta_draft = "Beta edited draft stays with Beta"
+        alpha_session_id = "session-workspace-alpha"
         seed_catalog_session(
             state_dir,
-            "session-workspace-alpha",
+            alpha_session_id,
             "Alpha",
             alpha_workspace,
             alpha_original_draft,
@@ -2330,15 +2348,22 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             "Alpha history reply",
             now_ms,
         )
+        assert_seeded_trail_parses(
+            args.leg_bin, state_dir / "sessions" / f"{alpha_session_id}.jsonl"
+        )
+        beta_session_id = "session-workspace-beta"
         seed_catalog_session(
             state_dir,
-            "session-workspace-beta",
+            beta_session_id,
             "Beta",
             missing_workspace,
             beta_original_draft,
             "Beta transcript marker",
             "Beta history reply",
             now_ms - 1,
+        )
+        assert_seeded_trail_parses(
+            args.leg_bin, state_dir / "sessions" / f"{beta_session_id}.jsonl"
         )
         env = os.environ.copy()
         env.update(
@@ -2477,9 +2502,10 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
         workspace = root / "new-session-workspace"
         workspace.mkdir()
         recovered_draft = "Recovered draft stays untouched"
+        recovered_session_id = "session-recovered-no-workspace"
         seed_catalog_session(
             state_dir,
-            "session-recovered-no-workspace",
+            recovered_session_id,
             "Recovered",
             None,
             recovered_draft,
@@ -2488,6 +2514,10 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             now_ms,
             recovered=True,
             other_drafts={"web": "Existing web draft"},
+        )
+        assert_seeded_trail_parses(
+            args.leg_bin,
+            state_dir / "sessions" / f"{recovered_session_id}.jsonl",
         )
         env = os.environ.copy()
         env.update(
@@ -2929,6 +2959,9 @@ def run_windowed_history_smoke(args: argparse.Namespace) -> None:
         workspace.mkdir()
         state_dir = root / "state"
         session_id = seed_windowed_catalog(state_dir, workspace)
+        assert_seeded_trail_parses(
+            args.leg_bin, state_dir / "sessions" / f"{session_id}.jsonl"
+        )
         env = os.environ.copy()
         env.update(
             {
@@ -3244,11 +3277,14 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
         workspace = root / "workspace"
         workspace.mkdir()
         state_dir = root / "state"
-        seed_windowed_catalog(
+        session_id = seed_windowed_catalog(
             state_dir,
             workspace,
             turn_count=1,
             session_title="Tool summary fixture",
+        )
+        assert_seeded_trail_parses(
+            args.leg_bin, state_dir / "sessions" / f"{session_id}.jsonl"
         )
         env = os.environ.copy()
         env.update(
