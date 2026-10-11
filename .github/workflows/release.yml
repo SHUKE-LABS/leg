@@ -370,7 +370,7 @@ jobs:
           # published so the release can be repaired without guessing.
           published=()
           for tarball in "${npm_tarballs[@]}"; do
-            if npm publish --access public --ignore-scripts "npm-tarballs/${tarball}"; then
+            if npm publish --access public --ignore-scripts "./npm-tarballs/${tarball}"; then
               published+=("${tarball}")
             else
               echo "::error::npm publish failed after ${#published[@]} of ${#npm_tarballs[@]} packages"
