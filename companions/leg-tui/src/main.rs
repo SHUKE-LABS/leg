@@ -4798,7 +4798,7 @@ fn draw_inspector(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     lines.extend(wrap_inspector_value(
         &display,
         width,
-        label.ends_with(" · diff"),
+        transcript::is_tool_diff_label(label),
         app.use_color,
     ));
     frame.render_widget(
@@ -5842,6 +5842,55 @@ mod tests {
             .find(|line| line.to_string() == "+new")
             .unwrap();
         assert_ne!(removed.style.add_modifier, added.style.add_modifier);
+    }
+
+    #[test]
+    fn timestamped_edit_diff_labels_keep_diff_styling() {
+        let diff = "Success\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new";
+        let timestamped_label = "Tool edit · diff (Unix ms 123)";
+        let result_label = "Tool edit · result (Unix ms 123)";
+
+        assert!(super::transcript::is_tool_diff_label("Tool edit · diff"));
+        assert!(super::transcript::is_tool_diff_label(timestamped_label));
+        assert!(super::transcript::is_tool_diff_label(
+            "Tool read · diff (Unix ms 123)"
+        ));
+        assert!(!super::transcript::is_tool_diff_label(result_label));
+        assert!(!super::transcript::is_tool_diff_label(
+            "Tool edit · diff (Unix ms 12x)"
+        ));
+
+        let timestamped_lines = super::wrap_inspector_value(
+            diff,
+            80,
+            super::transcript::is_tool_diff_label(timestamped_label),
+            false,
+        );
+        let removed = timestamped_lines
+            .iter()
+            .find(|line| line.to_string() == "-old")
+            .unwrap();
+        let added = timestamped_lines
+            .iter()
+            .find(|line| line.to_string() == "+new")
+            .unwrap();
+        assert_ne!(removed.style.add_modifier, added.style.add_modifier);
+
+        let result_lines = super::wrap_inspector_value(
+            diff,
+            80,
+            super::transcript::is_tool_diff_label(result_label),
+            false,
+        );
+        let removed = result_lines
+            .iter()
+            .find(|line| line.to_string() == "-old")
+            .unwrap();
+        let added = result_lines
+            .iter()
+            .find(|line| line.to_string() == "+new")
+            .unwrap();
+        assert_eq!(removed.style.add_modifier, added.style.add_modifier);
     }
 
     #[test]

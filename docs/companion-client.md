@@ -407,6 +407,20 @@ measured separately. It uses the pinned Python VT parser in
 `companions/leg-tui/tests/requirements.txt`; install that test-only dependency
 in a virtual environment before running it:
 
+```sh
+python3 -m venv /tmp/leg-pty-test-venv
+/tmp/leg-pty-test-venv/bin/python -m pip install --requirement companions/leg-tui/tests/requirements.txt
+cargo build --locked --bin leg
+cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
+cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui
+cargo build --locked --manifest-path companions/Cargo.toml -p leg-web
+/tmp/leg-pty-test-venv/bin/python companions/leg-tui/tests/pty_smoke.py \
+  --tui-bin companions/target/debug/leg-tui \
+  --leg-bin target/debug/leg \
+  --supervisor-bin companions/target/debug/leg-ui-supervisor \
+  --web-bin companions/target/debug/leg-web
+```
+
 The focused `--tool-summary-only` PTY check covers same-name call pairing,
 decoded and nonzero bash results, truncation and literal fallbacks, edit diff,
 denial, missing results, unknown tools, search, copy/save, and the Escape return
@@ -447,17 +461,3 @@ Command-palette captures are checked in at
 Representative fixture captures are checked in at
 [80x24](../companions/leg-tui/tests/captures/workbench-80x24.txt) and
 [120x40](../companions/leg-tui/tests/captures/workbench-120x40.txt).
-
-```sh
-python3 -m venv /tmp/leg-pty-test-venv
-/tmp/leg-pty-test-venv/bin/python -m pip install --requirement companions/leg-tui/tests/requirements.txt
-cargo build --locked --bin leg
-cargo build --locked --manifest-path companions/Cargo.toml -p leg-ui-client --bin leg-ui-supervisor
-cargo build --locked --manifest-path companions/Cargo.toml -p leg-tui
-cargo build --locked --manifest-path companions/Cargo.toml -p leg-web
-/tmp/leg-pty-test-venv/bin/python companions/leg-tui/tests/pty_smoke.py \
-  --tui-bin companions/target/debug/leg-tui \
-  --leg-bin target/debug/leg \
-  --supervisor-bin companions/target/debug/leg-ui-supervisor \
-  --web-bin companions/target/debug/leg-web
-```
