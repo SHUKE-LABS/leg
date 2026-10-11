@@ -513,6 +513,8 @@ struct ConversationState {
     transcript: Vec<TranscriptTurn>,
     transcript_rows_cache: TranscriptRowsCache,
     status: String,
+    /// Copy of `status` when it was set as a blocked reason; any plain reassignment de-blocks.
+    blocking_status: Option<String>,
     active_tool: Option<String>,
     turn_status: TurnStatus,
     started_at: Option<Instant>,
@@ -585,6 +587,16 @@ struct ActionDisabledInputs {
 }
 
 impl ConversationState {
+    fn set_blocking_status(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.blocking_status = Some(message.clone());
+        self.status = message;
+    }
+
+    fn status_is_blocking(&self) -> bool {
+        self.blocking_status.as_deref() == Some(self.status.as_str())
+    }
+
     fn empty() -> Self {
         Self {
             state_key: String::new(),
@@ -595,6 +607,7 @@ impl ConversationState {
             transcript: Vec::new(),
             transcript_rows_cache: TranscriptRowsCache::default(),
             status: "Choose a workspace".to_string(),
+            blocking_status: None,
             active_tool: None,
             turn_status: TurnStatus::Idle,
             started_at: None,
@@ -656,7 +669,10 @@ impl ConversationState {
         state.external_run_state = format!("{:?}", session.run_state).to_lowercase();
         state.transcript_follow_tail = true;
         state.transcript_scroll = 0;
-        state.status = session_action_status(session);
+        match session_action_status(session) {
+            (status, true) => state.set_blocking_status(status),
+            (status, false) => state.status = status,
+        }
         state
     }
 }
@@ -792,7 +808,9 @@ impl App {
                 }
                 self.rebuild_search_entries();
             }
-            Err(error) => self.status = format!("Could not read session catalog: {error}"),
+            Err(error) => {
+                self.set_blocking_status(format!("Could not read session catalog: {error}"))
+            }
         }
     }
 
@@ -976,7 +994,7 @@ impl App {
             match self.catalog.get(session_id) {
                 Ok(session) => self.sessions.push(session),
                 Err(error) => {
-                    self.status = format!("Could not reopen session: {error}");
+                    self.set_blocking_status(format!("Could not reopen session: {error}"));
                     return false;
                 }
             }
@@ -1005,7 +1023,7 @@ impl App {
             return true;
         }
         if let Err(error) = self.persist_draft() {
-            self.status = format!("Could not save the current draft: {error}");
+            self.set_blocking_status(format!("Could not save the current draft: {error}"));
             self.screen = Screen::Conversation;
             return false;
         }
@@ -1034,12 +1052,16 @@ impl App {
         } else {
             self.focused_tool = None;
         }
-        self.status = if self.turn_status.is_active() {
-            "This session's turn is still running in the background; its stream continues here."
-                .to_string()
+        if self.turn_status.is_active() {
+            self.status =
+                "This session's turn is still running in the background; its stream continues here."
+                    .to_string();
         } else {
-            session_action_status(&session)
-        };
+            match session_action_status(&session) {
+                (status, true) => self.set_blocking_status(status),
+                (status, false) => self.status = status,
+            }
+        }
         true
     }
 
@@ -1141,7 +1163,7 @@ impl App {
             return;
         };
         if let Err(error) = self.persist_draft() {
-            self.status = format!("Could not save the current draft: {error}");
+            self.set_blocking_status(format!("Could not save the current draft: {error}"));
             self.screen = Screen::Conversation;
             return;
         }
@@ -1150,7 +1172,7 @@ impl App {
             .create_draft(SessionInterface::Tui, None, Some(&workspace))
         {
             Ok(session) => self.activate_new_session(session),
-            Err(error) => self.status = format!("Could not create a session: {error}"),
+            Err(error) => self.set_blocking_status(format!("Could not create a session: {error}")),
         }
     }
 
@@ -1690,7 +1712,7 @@ impl App {
                 self.receive_turn_messages(MAX_TURN_MESSAGES_PER_CYCLE);
                 self.refresh_sessions();
                 if let Some(reason) = self.action_disabled_reason(action) {
-                    self.status = reason.clone();
+                    self.set_blocking_status(reason.clone());
                     if let Some(palette) = self.palette.as_mut() {
                         palette.notice = Some(reason);
                     }
@@ -1969,7 +1991,9 @@ impl App {
                         self.status = "Session renamed".to_string();
                         self.screen = Screen::SessionPicker;
                     }
-                    Err(error) => self.status = format!("Could not rename session: {error}"),
+                    Err(error) => {
+                        self.set_blocking_status(format!("Could not rename session: {error}"))
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -2104,7 +2128,7 @@ impl App {
                 self.screen = Screen::Conversation;
             }
             Err(error) => {
-                self.status = format!("Could not save {}: {error}", path.display());
+                self.set_blocking_status(format!("Could not save {}: {error}", path.display()));
                 self.overwrite_export = None;
             }
         }
@@ -2158,16 +2182,16 @@ impl App {
     fn select_workspace(&mut self) {
         let candidate = PathBuf::from(self.workspace_input.trim());
         if !candidate.is_dir() {
-            self.status = format!(
+            self.set_blocking_status(format!(
                 "Workspace is not an existing directory: {}",
                 candidate.display()
-            );
+            ));
             return;
         }
         let canonical = match std::fs::canonicalize(&candidate) {
             Ok(path) => path,
             Err(error) => {
-                self.status = format!("Could not open workspace: {error}");
+                self.set_blocking_status(format!("Could not open workspace: {error}"));
                 return;
             }
         };
@@ -2175,7 +2199,7 @@ impl App {
         if matches!(&flow, WorkspaceFlow::NewSession)
             && let Err(error) = self.persist_draft()
         {
-            self.status = format!("Could not save the current draft: {error}");
+            self.set_blocking_status(format!("Could not save the current draft: {error}"));
             return;
         }
         let result = match &flow {
@@ -2229,7 +2253,9 @@ impl App {
                     self.refresh_sessions();
                 }
             },
-            Err(error) => self.status = format!("Could not create a session draft: {error}"),
+            Err(error) => {
+                self.set_blocking_status(format!("Could not create a session draft: {error}"))
+            }
         }
     }
 
@@ -2536,7 +2562,7 @@ impl App {
                 self.turn_status = TurnStatus::Stopping;
                 self.status.clear();
             }
-            Err(error) => self.status = format!("Stop failed: {error}"),
+            Err(error) => self.set_blocking_status(format!("Stop failed: {error}")),
         }
     }
 
@@ -2583,6 +2609,13 @@ impl App {
             ));
             return;
         }
+        if view.turn_status.is_stopping() {
+            self.close_stop_chooser(format!(
+                "{} is already stopping; nothing was sent",
+                target.title
+            ));
+            return;
+        }
         let Some(handle) = view.stop_handle.clone() else {
             self.close_stop_chooser(format!(
                 "{} has no Stop control; nothing was stopped",
@@ -2601,7 +2634,7 @@ impl App {
                 self.status = format!("Stopping {}", target.title);
             }
             Err(error) => {
-                self.status = format!("Stop failed for {}: {error}", target.title);
+                self.set_blocking_status(format!("Stop failed for {}: {error}", target.title));
             }
         }
     }
@@ -2660,28 +2693,31 @@ impl App {
 
     fn submit(&mut self) {
         if self.terminal_too_small() {
-            self.status = SMALL_TERMINAL_REJECTION.to_string();
+            self.set_blocking_status(SMALL_TERMINAL_REJECTION);
             return;
         }
         if self.turn_status.is_active() {
-            self.status = "Busy: wait for the active turn".to_string();
+            self.set_blocking_status("Busy: wait for the active turn");
             return;
         }
         if self.composer.text().trim().is_empty() {
-            self.status = "Blank prompts are not sent".to_string();
+            self.set_blocking_status("Blank prompts are not sent");
             return;
         }
         if self.draft_id.is_none() {
-            self.status = "Choose a workspace before sending".to_string();
+            self.set_blocking_status("Choose a workspace before sending");
             return;
         }
         if self.read_only {
-            self.status = "This session is read-only. Review its catalog warning or press W to choose a workspace.".to_string();
+            self.set_blocking_status(
+                "This session is read-only. Review its catalog warning or press W to choose a workspace.",
+            );
             return;
         }
         if !self.workspace.as_ref().is_some_and(|path| path.is_dir()) {
-            self.status =
-                "Recorded workspace is unavailable. Press W to choose a replacement.".to_string();
+            self.set_blocking_status(
+                "Recorded workspace is unavailable. Press W to choose a replacement.",
+            );
             return;
         }
         let prompt = self.composer.text().to_string();
@@ -2748,7 +2784,7 @@ impl App {
             return;
         }
         let Some(draft_id) = self.draft_id.as_deref() else {
-            self.status = "Choose a workspace before sending".to_string();
+            self.set_blocking_status("Choose a workspace before sending");
             return;
         };
         let session_id = self.session_id.clone();
@@ -2759,7 +2795,7 @@ impl App {
                 self.catalog
                     .save_draft(record_id, SessionInterface::Tui, prompt.clone())
         {
-            self.status = format!("Could not save the prompt draft: {error}");
+            self.set_blocking_status(format!("Could not save the prompt draft: {error}"));
             return;
         }
         let started = match retry {
@@ -2777,7 +2813,7 @@ impl App {
         let turn = match started {
             Ok(turn) => turn,
             Err(error) => {
-                self.status = format!("Could not start the turn: {error}");
+                self.set_blocking_status(format!("Could not start the turn: {error}"));
                 return;
             }
         };
@@ -2802,7 +2838,7 @@ impl App {
             }
             Err(error) => {
                 let _ = stop_handle.stop();
-                self.status = format!("Could not observe the turn: {error}");
+                self.set_blocking_status(format!("Could not observe the turn: {error}"));
             }
         }
     }
@@ -4477,21 +4513,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             .as_deref()
             .or_else(|| (!app.status.is_empty()).then_some(app.status.as_str()))
             .unwrap_or_default();
-        let blocked_reason = app.terminal_detail.is_some()
-            || [
-                "Busy:",
-                "Send rejected:",
-                "Blank prompts",
-                "Choose a workspace",
-                "This session is",
-                "Recorded workspace",
-                "Workspace is",
-                "Could not",
-                "Stop failed",
-                "Ownership",
-            ]
-            .iter()
-            .any(|prefix| detail.starts_with(prefix));
+        let blocked_reason = app.terminal_detail.is_some() || app.status_is_blocking();
         let background = app.background_activity_text();
         if blocked_reason {
             detail.to_string()
@@ -4853,8 +4875,9 @@ fn session_state_label(session: &CatalogSession) -> &'static str {
     }
 }
 
-fn session_action_status(session: &CatalogSession) -> String {
-    match session.run_state {
+/// Returns the status for a reopened session and whether it is a blocked reason.
+fn session_action_status(session: &CatalogSession) -> (String, bool) {
+    let status = match session.run_state {
         CatalogRunState::Active => {
             "Busy: another interface owns this session. Browse history or wait before sending."
                 .to_string()
@@ -4875,9 +4898,13 @@ fn session_action_status(session: &CatalogSession) -> String {
             .cloned()
             .unwrap_or_else(|| "This session is read-only.".to_string()),
         CatalogRunState::Idle => {
-            "Session reopened. History browsing did not start an exchange.".to_string()
+            return (
+                "Session reopened. History browsing did not start an exchange.".to_string(),
+                false,
+            );
         }
-    }
+    };
+    (status, true)
 }
 
 fn relative_time(timestamp_ms: u64) -> String {
@@ -5461,6 +5488,66 @@ mod responsiveness_tests {
         let second_due_frame = first_due_frame + MIN_RENDER_INTERVAL;
         assert!(!scheduler.is_due_after_batch(second_due_frame, MAX_TURN_MESSAGES_PER_CYCLE));
         assert!(scheduler.is_due_after_batch(second_due_frame, MAX_TURN_MESSAGES_PER_CYCLE));
+    }
+
+    fn insert_background_view(app: &mut App, turn_status: TurnStatus) {
+        let mut view = ConversationState::empty();
+        view.state_key = "session-two".to_string();
+        view.turn_status = turn_status;
+        view.transcript
+            .push(TranscriptTurn::new("background stream"));
+        app.views.insert("session-two".to_string(), view);
+    }
+
+    #[test]
+    fn blocking_status_outranks_background_until_plain_status_replaces_it() {
+        let (mut app, state_dir) = test_app("blocking-footer");
+        insert_background_view(&mut app, TurnStatus::Running);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal opens");
+
+        // No known prefix: blocking comes from the producing site, not the wording.
+        app.set_blocking_status("Reworded rejection without a known prefix");
+        draw_terminal(&mut terminal, &mut app).expect("headless draw succeeds");
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Reworded rejection without a known prefix"));
+        assert!(!screen.contains("Background:"));
+
+        app.status = "Busy: plain status assignment".to_string();
+        draw_terminal(&mut terminal, &mut app).expect("headless draw succeeds");
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Background:"));
+        assert!(!screen.contains("Busy: plain status assignment"));
+
+        drop(terminal);
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
+    }
+
+    #[test]
+    fn background_stop_chooser_does_not_resend_stop_to_stopping_run() {
+        let (mut app, state_dir) = test_app("stopping-chooser");
+        // No Stop handle: reaching the handle would report "has no Stop control" instead.
+        insert_background_view(&mut app, TurnStatus::Stopping);
+        let targets = app.background_stop_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].status, "Stopping");
+        let title = targets[0].title.clone();
+        app.stop_targets = targets;
+        app.stop_picker_index = 0;
+        app.stop_chooser_open = true;
+
+        app.stop_selected_background();
+
+        assert!(!app.stop_chooser_open);
+        assert_eq!(
+            app.status,
+            format!("{title} is already stopping; nothing was sent")
+        );
+        assert_eq!(app.views["session-two"].turn_status, TurnStatus::Stopping);
+        assert_eq!(app.background_stop_targets().len(), 1);
+        assert!(app.background_activity_text().contains("Stopping"));
+        drop(app);
+        std::fs::remove_dir_all(state_dir).expect("temporary test catalog is removed");
     }
 }
 

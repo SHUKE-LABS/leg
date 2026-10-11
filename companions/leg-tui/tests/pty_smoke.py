@@ -3275,8 +3275,15 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "lookup · completed · HIDDEN_UNKNOWN_INPUT")
             os.write(master_fd, b"q")
             read_until(master_fd, child, output, "q")
-            screen_120 = terminal_screen_text(bytes(output.raw), 40, 120)
-            footer_120 = screen_120.rstrip().splitlines()[-1]
+            # The composer echo can land before the rest of the footer row is flushed.
+            footer_hints = ("F2/Ctrl-P actions", "Ctrl-S send", "F8 rail")
+            deadline = time.monotonic() + 8.0
+            while True:
+                screen_120 = terminal_screen_text(bytes(output.raw), 40, 120)
+                footer_120 = screen_120.rstrip().splitlines()[-1]
+                if all(hint in footer_120 for hint in footer_hints) or time.monotonic() >= deadline:
+                    break
+                drain_for(master_fd, output, 0.05, child)
             assert "F2/Ctrl-P actions" in footer_120, footer_120
             assert "Ctrl-S send" in footer_120, footer_120
             assert "F8 rail" in footer_120, footer_120

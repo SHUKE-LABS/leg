@@ -4073,6 +4073,8 @@ fn main() {
                     snapshot["last_submission"]["status"].as_str(),
                     Some("succeeded" | "failed" | "stopped" | "incomplete")
                 )
+                // The worker writes the terminal receipt before clearing the live run.
+                && snapshot["active"].is_null()
             {
                 return snapshot;
             }
