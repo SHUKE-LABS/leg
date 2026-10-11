@@ -355,7 +355,7 @@ def chronological_history_fixture(session_id: str) -> str:
             "result": json.dumps({
                 "status": "exited",
                 "exit_code": 7,
-                "stdout": "fixture result two\n",
+                "stdout": "fixture result two\nsay \"hi\" C:\\tmp\tcol\nnext line\n",
                 "stderr": "fixture stderr\n",
                 "stdout_omitted_bytes": 9,
                 "stderr_omitted_bytes": 0,
@@ -1917,13 +1917,17 @@ async def run_session_navigation(
                 bash_fields = bash_row.locator(".tool-detail-field")
                 assert await bash_fields.nth(0).locator("pre code").inner_text() == "printf 'fixture result two\\n'; printf 'fixture stderr\\n' >&2; exit 7"
                 assert await bash_fields.nth(1).locator("strong").inner_text() == "stdout"
-                assert await bash_fields.nth(1).locator("pre").inner_text() == "fixture result two\n"
+                assert await bash_fields.nth(1).locator("pre").inner_text() == (
+                    "fixture result two\nsay \"hi\" C:\\tmp\tcol\nnext line\n"
+                )
                 assert await bash_fields.nth(2).locator("strong").inner_text() == "stderr"
                 assert await bash_fields.nth(2).locator("pre").inner_text() == "fixture stderr\n"
                 assert "stdout_omitted_bytes: 9 omitted" in await bash_row.locator(".tool-detail-body").inner_text()
                 assert '"exit_code"' not in await bash_row.locator(".tool-detail-body").inner_text()
                 await bash_row.get_by_role("button", name="Copy tool result").click()
-                assert await page.evaluate("() => navigator.clipboard.readText()") == "fixture result two\nfixture stderr\n"
+                assert await page.evaluate("() => navigator.clipboard.readText()") == (
+                    "fixture result two\nsay \"hi\" C:\\tmp\tcol\nnext line\nfixture stderr\n"
+                )
                 await bash_row.get_by_role("button", name="Copy tool input").click()
                 assert await page.evaluate("() => navigator.clipboard.readText()") == json.dumps(
                     snapshot_turn["tools"][1]["input"], indent=2
@@ -1951,21 +1955,45 @@ async def run_session_navigation(
                     and snapshot_layout["replyAboveComposer"]
                 ), snapshot_layout
                 await page.locator("#open-transcript-search").click()
-                await page.locator("#transcript-search").fill("stdout_omitted_bytes")
+                # Bash results are searched as displayed stdout/stderr/omission text, with whitespace collapsed.
+                # "fixture stderr" also appears in the bash command, so its stderr hit is the second match.
+                for query, label, position in (
+                    ("stdout_omitted_bytes", "Output omission", "1/1"),
+                    ('"hi"', "Tool stdout", "1/1"),
+                    ("C:\\tmp", "Tool stdout", "1/1"),
+                    ("tmp col", "Tool stdout", "1/1"),
+                    ("col next line", "Tool stdout", "1/1"),
+                    ("fixture stderr", "Tool stderr", "2/2"),
+                ):
+                    if await bash_button.get_attribute("aria-expanded") == "true":
+                        await bash_button.click()
+                    if await snapshot_group_button.get_attribute("aria-expanded") == "true":
+                        await snapshot_group_button.click()
+                    await page.locator("#transcript-search").fill(query)
+                    if position == "2/2":
+                        await page.wait_for_function(
+                            "() => document.querySelector('#transcript-search-status')?.textContent.startsWith('1/2 · ')"
+                        )
+                        await page.locator("#transcript-search-next").click()
+                    await page.wait_for_function(
+                        "expected => document.querySelector('#transcript-search-status')?.textContent.startsWith(expected)",
+                        arg=f"{position} · {label}: ",
+                    )
+                    await page.wait_for_function(
+                        """() => {
+                          const turn = document.querySelector('#messages .transcript-turn[data-turn-index="0"]');
+                          return turn?.querySelector('.tool-group-disclosure')?.getAttribute('aria-expanded') === 'true' &&
+                            turn?.querySelector('.tool-inspector[data-tool-use-id="call_fixture_tool_two"] .tool-disclosure')
+                              ?.getAttribute('aria-expanded') === 'true';
+                        }"""
+                    )
+                    assert await snapshot_group_button.get_attribute("aria-expanded") == "true", query
+                    assert await bash_button.get_attribute("aria-expanded") == "true", query
+                    assert "fixture result two" in await bash_row.locator(".tool-detail-body").inner_text()
+                await page.locator("#transcript-search").fill('"exit_code"')
                 await page.wait_for_function(
-                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool result')"
+                    "() => document.querySelector('#transcript-search-status')?.textContent === 'No matches found in this transcript.'"
                 )
-                await page.wait_for_function(
-                    """() => {
-                      const turn = document.querySelector('#messages .transcript-turn[data-turn-index="0"]');
-                      return turn?.querySelector('.tool-group-disclosure')?.getAttribute('aria-expanded') === 'true' &&
-                        turn?.querySelector('.tool-inspector[data-tool-use-id="call_fixture_tool_two"] .tool-disclosure')
-                          ?.getAttribute('aria-expanded') === 'true';
-                    }"""
-                )
-                assert await snapshot_group_button.get_attribute("aria-expanded") == "true"
-                assert await bash_button.get_attribute("aria-expanded") == "true"
-                assert "fixture result two" in await bash_row.locator(".tool-detail-body").inner_text()
                 await page.locator("#transcript-search").press("Escape")
                 await page.locator("#open-transcript-search").click()
                 await page.locator("#transcript-search").fill("CHRONO_ROUND_A")
@@ -2392,7 +2420,7 @@ async def run_session_navigation(
                 await page.locator("#transcript-search-next").click()
                 try:
                     await page.wait_for_function(
-                        "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool result') && "
+                        "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool stdout') && "
                         "document.querySelector('#transcript-search-status')?.textContent.includes('HIDDEN_TOOL_SEARCH_SENTINEL_Ω')",
                         timeout=5000,
                     )
@@ -2433,7 +2461,7 @@ async def run_session_navigation(
                         f"snapshot_turns={snapshot_turns}; page errors={page_errors}"
                     ) from error
                 search_status = await page.locator("#transcript-search-status").inner_text()
-                assert "Tool result" in search_status and "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" in search_status
+                assert "Tool stdout" in search_status and "HIDDEN_TOOL_SEARCH_SENTINEL_Ω" in search_status
                 assert await page.locator('#messages [data-key="turn-4-assistant"]').evaluate(
                     "element => element.classList.contains('search-match-current')"
                 )
@@ -2501,7 +2529,7 @@ async def run_session_navigation(
                 )
                 await page.locator("#transcript-search-next").click()
                 await page.wait_for_function(
-                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool result')",
+                    "() => document.querySelector('#transcript-search-status')?.textContent.includes('Tool stdout')",
                     timeout=5000,
                 )
                 await page.locator('#messages [data-key="turn-0-assistant"] .tool-copy-button').filter(

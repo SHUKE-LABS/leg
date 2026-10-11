@@ -163,7 +163,10 @@ Use **Filter by title** in the session rail to narrow the already loaded
 session list. The **Search transcript** header button, or Ctrl/Cmd+Shift+F
 while the conversation has focus, opens the find bar over the transcript. It
 searches the selected snapshot's prompts, replies, failure details, outcomes,
-and tool names, inputs, statuses, results, and errors locally. The bar shows the
+and tool names, inputs, statuses, results, and errors locally. Bash results are
+searched as their displayed stdout, stderr, and output-omission text, not the
+raw result envelope. Matching ignores whitespace differences, including line
+breaks, so a phrase still matches when the output wraps it. The bar shows the
 current match and total as `n/m`; its Previous and Next arrow buttons or Enter
 and Shift+Enter move through matches. Clear removes the query, and a no-match
 message appears when nothing matches. Escape closes and clears the bar, then

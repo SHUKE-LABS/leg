@@ -665,6 +665,13 @@ export function createSharedRenderer(ui, features) {
         add(item.key, item.assistantKey, "Tool name", tool.name, toolIndex);
         if (tool.input !== undefined) add(item.key, item.assistantKey, "Tool input", toolLiteralText(tool.input), toolIndex);
         add(item.key, item.assistantKey, "Tool status", tool.status, toolIndex);
+        const envelope = bashResultEnvelope(tool, tool.error ?? tool.output);
+        if (envelope) {
+          add(item.key, item.assistantKey, "Tool stdout", envelope.stdout === undefined ? "" : String(envelope.stdout), toolIndex);
+          if (envelope.stderr !== undefined) add(item.key, item.assistantKey, "Tool stderr", String(envelope.stderr), toolIndex);
+          add(item.key, item.assistantKey, "Output omission", toolOmissionSummary(tool.output ?? tool.error), toolIndex);
+          continue;
+        }
         if (tool.output !== undefined) add(item.key, item.assistantKey, "Tool result", toolLiteralText(tool.output), toolIndex);
         if (tool.error !== undefined) add(item.key, item.assistantKey, "Tool error", toolLiteralText(tool.error), toolIndex);
       }
@@ -673,16 +680,19 @@ export function createSharedRenderer(ui, features) {
   }
 
   function collectTranscriptMatches(query) {
-    const needle = query.toLocaleLowerCase();
+    // Whitespace runs (including line breaks) compare equal, so phrases match across wrapped output.
+    const collapse = (text) => text.replace(/\s+/g, " ");
+    const needle = collapse(query).toLocaleLowerCase();
     if (!needle) return [];
     const matches = [];
     for (const field of searchableTranscriptFields()) {
-      const haystack = field.text.toLocaleLowerCase();
+      const text = collapse(field.text);
+      const haystack = text.toLocaleLowerCase();
       let from = 0;
       while (from <= haystack.length - needle.length) {
         const start = haystack.indexOf(needle, from);
         if (start < 0) break;
-        matches.push({ ...field, start, end: start + needle.length });
+        matches.push({ ...field, text, start, end: start + needle.length });
         from = start + Math.max(needle.length, 1);
       }
     }
