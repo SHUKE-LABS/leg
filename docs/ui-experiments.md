@@ -497,9 +497,12 @@ action/size groups ranged from 32.722–41.410 ms on Linux and 46.255–61.386 m
 on Windows; each group met the 100 ms limit. Cached-history / inspector opening
 times were 10.281/16.071 ms on the Linux baseline and 33.673/41.203 ms on the
 Linux final revision; Windows measured 13.887/28.258 ms on baseline and
-35.414/56.167 ms on final. Baseline idle CPU was 13.700% on Linux and 14.471%
-on Windows; final idle CPU was 0.100% and 0.417%, respectively, below the 1%
-limit.
+35.414/56.167 ms on final. The increase comes from #184's `RedrawScheduler`
+with `MIN_RENDER_INTERVAL = 34 ms`, which caps draws to one frame every 34 ms.
+Input that arrives within that interval can wait for the next frame, explaining
+the final Linux p95 values around 33–41 ms. The cap also reduced idle CPU from
+13.700%/14.471% to 0.100%/0.417% on Linux/Windows and draft-editing p95 from
+76–285 ms to 33–61 ms.
 
 The #183 final revision passes only when every action/size group has at least
 100 samples and p95 input-to-visible-output latency is at most 100 ms, cached

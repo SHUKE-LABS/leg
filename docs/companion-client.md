@@ -401,11 +401,11 @@ enabled-action footer hints, command-palette captures at 80x24 and 120x40,
 history search and inspection, cross-interface busy rejection, named
 background Stop selection, draft and scroll retention, copy/export
 confirmation, a 1,000-turn history, composer and active-turn workflows, and the
-delayed Stop regression. The history test records open and inspector response
-times against the 200 ms target on the reference machine; catalog loading is
-measured separately. It uses the pinned Python VT parser in
-`companions/leg-tui/tests/requirements.txt`; install that test-only dependency
-in a virtual environment before running it:
+delayed Stop regression. The history test reports open and inspector response
+times without gating them; the 200 ms release gate is in
+`responsiveness_harness.py`. Catalog loading is measured separately. It uses
+the pinned Python VT parser in `companions/leg-tui/tests/requirements.txt`;
+install that test-only dependency in a virtual environment before running it:
 
 ```sh
 python3 -m venv /tmp/leg-pty-test-venv
