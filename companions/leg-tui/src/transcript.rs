@@ -536,12 +536,16 @@ impl TranscriptTurn {
                                 terminal_safe_text(&result_text),
                             ));
                         } else {
-                            let label =
-                                if tool.name == "edit" && contains_unified_diff(&result_text) {
-                                    format!("Tool {name} · diff")
-                                } else {
-                                    result_label
-                                };
+                            let label = if tool.name == "edit"
+                                && contains_unified_diff(&result_text)
+                            {
+                                tool.result_timestamp_ms.map_or_else(
+                                    || format!("Tool {name} · diff"),
+                                    |timestamp| format!("Tool {name} · diff (Unix ms {timestamp})"),
+                                )
+                            } else {
+                                result_label
+                            };
                             fields.push((label, terminal_safe_text(&result_text)));
                         }
                     } else {
@@ -1029,6 +1033,28 @@ fn decoded_bash_result(value: &Value) -> Option<BashResultEnvelope> {
     })
 }
 
+pub(crate) fn is_tool_diff_label(label: &str) -> bool {
+    let Some(without_tool_prefix) = label.strip_prefix("Tool ") else {
+        return false;
+    };
+    let Some((tool_name, suffix)) = without_tool_prefix.rsplit_once(" · ") else {
+        return false;
+    };
+    if tool_name.is_empty() {
+        return false;
+    }
+    if suffix == "diff" {
+        return true;
+    }
+    let Some(timestamp) = suffix
+        .strip_prefix("diff (Unix ms ")
+        .and_then(|timestamp| timestamp.strip_suffix(')'))
+    else {
+        return false;
+    };
+    !timestamp.is_empty() && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn contains_unified_diff(text: &str) -> bool {
     let mut found_old_header = false;
     let mut found_new_header = false;
@@ -1467,9 +1493,34 @@ mod tests {
             "edit",
             Value::String(supplied_diff.to_string()),
         ));
-        assert!(transcript.detail_fields().iter().any(|(label, value)| {
-            label.starts_with("Tool edit · diff") && value == supplied_diff
-        }));
+        let diff_field = transcript
+            .detail_fields()
+            .into_iter()
+            .find(|(label, value)| super::is_tool_diff_label(label) && value == supplied_diff)
+            .expect("timestamped edit diff field");
+        assert!(diff_field.0.starts_with("Tool edit · diff (Unix ms "));
+
+        let mut untimestamped = TranscriptTurn::new("edit file without a result timestamp");
+        untimestamped.observe(&tool_call(0, "edit", "edit", json!({"path":"file"})));
+        untimestamped.observe(&tool_result(
+            0,
+            "edit",
+            "edit",
+            Value::String(supplied_diff.to_string()),
+        ));
+        untimestamped
+            .rounds
+            .get_mut(&0)
+            .and_then(|round| round.tools.get_mut("edit"))
+            .expect("edit activity")
+            .result_timestamp_ms = None;
+        let untimestamped_label = untimestamped
+            .detail_fields()
+            .into_iter()
+            .find(|(_, value)| value == supplied_diff)
+            .map(|(label, _)| label)
+            .expect("untimestamped edit diff field");
+        assert_eq!(untimestamped_label, "Tool edit · diff");
 
         let mut no_patch = TranscriptTurn::new("edit without patch");
         no_patch.observe(&tool_call(0, "no-patch", "edit", json!({"path":"file"})));
