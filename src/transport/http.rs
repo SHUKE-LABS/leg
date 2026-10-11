@@ -12,8 +12,6 @@
 //! failures use distinct variants so only eligible failures are retried.
 
 use std::io::Read;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{LegError, Result};
@@ -145,11 +143,17 @@ impl UreqHttpClient {
             .timeout_recv_response(Some(timeout))
             .build()
             .into();
-        // ureq carries request-phase deadlines into response-body reads. Keep
-        // the streaming agent free of those deadlines and enforce the header
-        // deadline around `send`, so active streams have no total time cap.
+        // Keep the header and send phases bounded while using ureq's per-read
+        // body timeout for streaming idle detection. `timeout_recv_response`
+        // stays unset because ureq counts it from the headers and would cap the
+        // total duration of an otherwise active stream.
         let stream_agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_resolve(Some(timeout))
+            .timeout_connect(Some(timeout))
+            .timeout_send_request(Some(timeout))
+            .timeout_send_body(Some(timeout))
+            .timeout_recv_body(Some(stream_idle_timeout))
             .build()
             .into();
         Self {
@@ -230,33 +234,13 @@ impl HttpClient for UreqHttpClient {
                     request = request.header(name, value);
                 }
 
-                let request = request.config().timeout_recv_body(None).build();
-                let (response_sender, response_receiver) = mpsc::sync_channel(1);
-                thread::Builder::new()
-                    .name("leg-provider-headers".to_string())
-                    .spawn(move || {
-                        let _ = response_sender.send(request.send(&body));
-                    })
-                    .map_err(|error| {
-                        LegError::NonRetryableTransport(format!(
-                            "failed to start provider request: {error}"
-                        ))
-                    })?;
-                let response = match response_receiver.recv_timeout(timeout) {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(error)) => return Err(request_error(error)),
-                    Err(RecvTimeoutError::Timeout) => {
-                        return Err(LegError::NonRetryableTransport(format!(
+                let response = request.send(&body).map_err(|error| match error {
+                    ureq::Error::Timeout(_) => LegError::NonRetryableTransport(format!(
                             "request timed out after {} seconds waiting for response headers (LEG_TIMEOUT_SECS)",
                             timeout.as_secs()
-                        )));
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        return Err(LegError::NonRetryableTransport(
-                            "provider request exited without a response".to_string(),
-                        ));
-                    }
-                };
+                        )),
+                    other => request_error(other),
+                })?;
 
                 let status = response.status().as_u16();
                 let retry_after = response
@@ -265,36 +249,49 @@ impl HttpClient for UreqHttpClient {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
                 if (200..300).contains(&status) {
-                    let reader = response.into_body().into_reader();
-                    read_body_with_timeout(
-                        reader,
-                        stream_idle_timeout,
-                        BodyReadTimeout::Idle,
-                        emit,
-                    )?;
+                    let mut reader = response.into_body().into_reader();
+                    let mut buffer = [0_u8; 8192];
+                    loop {
+                        let length = match reader.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(length) => length,
+                            Err(error) => {
+                                return Err(response_body_read_error(error, stream_idle_timeout));
+                            }
+                        };
+                        emit(buffer[..length].to_vec())?;
+                    }
                     Ok(HttpResponse {
                         status,
                         body: String::new(),
                         retry_after,
                     })
                 } else {
-                    let reader = response.into_body().into_reader();
+                    let mut reader = response.into_body().into_reader();
                     let mut bytes = Vec::new();
-                    read_body_with_timeout(
-                        reader,
-                        timeout,
-                        BodyReadTimeout::Total,
-                        &mut |chunk| {
-                            if bytes.len().saturating_add(chunk.len()) > MAX_BUFFERED_RESPONSE_BODY
-                            {
-                                return Err(LegError::ResponseRead(
-                                    "response body exceeds 10 MB limit".to_string(),
-                                ));
+                    let mut buffer = [0_u8; 8192];
+                    let started = Instant::now();
+                    loop {
+                        if started.elapsed() >= timeout {
+                            return Err(LegError::ResponseRead(format!(
+                                "response body timeout after {} seconds (LEG_TIMEOUT_SECS)",
+                                timeout.as_secs()
+                            )));
+                        }
+                        let length = match reader.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(length) => length,
+                            Err(error) => {
+                                return Err(response_body_read_error(error, stream_idle_timeout));
                             }
-                            bytes.extend_from_slice(&chunk);
-                            Ok(())
-                        },
-                    )?;
+                        };
+                        if bytes.len().saturating_add(length) > MAX_BUFFERED_RESPONSE_BODY {
+                            return Err(LegError::ResponseRead(
+                                "response body exceeds 10 MB limit".to_string(),
+                            ));
+                        }
+                        bytes.extend_from_slice(&buffer[..length]);
+                    }
                     let body = String::from_utf8_lossy(&bytes).into_owned();
                     Ok(HttpResponse {
                         status,
@@ -311,98 +308,20 @@ impl HttpClient for UreqHttpClient {
 
 const MAX_BUFFERED_RESPONSE_BODY: usize = 10 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
-enum BodyReadTimeout {
-    Idle,
-    Total,
-}
-
-enum BodyReadMessage {
-    Chunk(Vec<u8>),
-    End,
-    Error(std::io::Error),
-}
-
-/// Reads from ureq on a helper thread so the caller can enforce a timeout
-/// between received chunks without blocking the provider progress path.
-fn read_body_with_timeout<R>(
-    mut reader: R,
-    timeout: Duration,
-    timeout_kind: BodyReadTimeout,
-    on_chunk: &mut dyn FnMut(Vec<u8>) -> Result<()>,
-) -> Result<()>
-where
-    R: Read + Send + 'static,
-{
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("leg-response-reader".to_string())
-        .spawn(move || {
-            let mut buffer = [0_u8; 8192];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        let _ = sender.send(BodyReadMessage::End);
-                        return;
-                    }
-                    Ok(length) => {
-                        if sender
-                            .send(BodyReadMessage::Chunk(buffer[..length].to_vec()))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(BodyReadMessage::Error(error));
-                        return;
-                    }
-                }
-            }
-        })
-        .map_err(|error| {
-            LegError::ResponseRead(format!("failed to start response body reader: {error}"))
-        })?;
-
-    let started = Instant::now();
-    loop {
-        let wait = match timeout_kind {
-            BodyReadTimeout::Idle => timeout,
-            BodyReadTimeout::Total => timeout.saturating_sub(started.elapsed()),
-        };
-        if wait.is_zero() {
-            return Err(body_timeout_error(timeout, &timeout_kind));
-        }
-        match receiver.recv_timeout(wait) {
-            Ok(BodyReadMessage::Chunk(chunk)) => on_chunk(chunk)?,
-            Ok(BodyReadMessage::End) => return Ok(()),
-            Ok(BodyReadMessage::Error(error)) => {
-                return Err(LegError::ResponseRead(format!(
-                    "failed to read response body: {error}"
-                )));
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                return Err(body_timeout_error(timeout, &timeout_kind));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(LegError::ResponseRead(
-                    "response body reader stopped unexpectedly".to_string(),
-                ));
-            }
-        }
-    }
-}
-
-fn body_timeout_error(timeout: Duration, timeout_kind: &BodyReadTimeout) -> LegError {
-    match timeout_kind {
-        BodyReadTimeout::Idle => LegError::ResponseRead(format!(
+fn response_body_read_error(error: std::io::Error, stream_idle_timeout: Duration) -> LegError {
+    let is_idle_timeout = matches!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ureq::Error>()),
+        Some(ureq::Error::Timeout(_))
+    );
+    if is_idle_timeout {
+        LegError::ResponseRead(format!(
             "response body idle timeout after {} seconds (LEG_STREAM_IDLE_TIMEOUT_SECS)",
-            timeout.as_secs()
-        )),
-        BodyReadTimeout::Total => LegError::ResponseRead(format!(
-            "response body timeout after {} seconds (LEG_TIMEOUT_SECS)",
-            timeout.as_secs()
-        )),
+            stream_idle_timeout.as_secs()
+        ))
+    } else {
+        LegError::ResponseRead(format!("failed to read response body: {error}"))
     }
 }
 
@@ -428,7 +347,12 @@ fn request_error(error: ureq::Error) -> LegError {
 
 #[cfg(test)]
 mod tests {
-    use super::is_retryable_connection_error;
+    use super::{HttpClient, UreqHttpClient, is_retryable_connection_error};
+    use crate::error::LegError;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn classifies_only_connection_level_ureq_errors_as_retryable() {
@@ -444,5 +368,118 @@ mod tests {
         assert!(!is_retryable_connection_error(&ureq::Error::BadUri(
             "missing scheme".to_string()
         )));
+    }
+
+    #[test]
+    fn header_timeout_closes_every_stalled_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake peer");
+        let address = listener.local_addr().expect("fake peer address");
+        let peer = thread::spawn(move || {
+            for _ in 0..10 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("set peer read timeout");
+                read_request(&mut stream);
+                assert_peer_closed(&mut stream);
+            }
+        });
+
+        let client = UreqHttpClient::with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+        let url = format!("http://{address}/");
+        for _ in 0..10 {
+            let call = client.post_json_streaming(&url, &[], "{}", &mut |_| Ok(()));
+            assert_eq!(call.attempts, 1);
+            match call.result.expect_err("header stall should time out") {
+                LegError::NonRetryableTransport(message) => {
+                    assert!(message.contains("LEG_TIMEOUT_SECS"), "{message}");
+                }
+                other => panic!("unexpected header-stall error: {other}"),
+            }
+        }
+        peer.join()
+            .expect("fake peer should see every closed socket");
+    }
+
+    #[test]
+    fn stream_idle_timeout_closes_every_stalled_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake peer");
+        let address = listener.local_addr().expect("fake peer address");
+        let peer = thread::spawn(move || {
+            for _ in 0..10 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("set peer read timeout");
+                read_request(&mut stream);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nx",
+                    )
+                    .expect("send partial response");
+                assert_peer_closed(&mut stream);
+            }
+        });
+
+        let client = UreqHttpClient::with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+        let url = format!("http://{address}/");
+        for _ in 0..10 {
+            let call = client.post_json_streaming(&url, &[], "{}", &mut |_| Ok(()));
+            assert_eq!(call.attempts, 1);
+            match call.result.expect_err("body stall should time out") {
+                LegError::ResponseRead(message) => {
+                    assert!(
+                        message.contains("LEG_STREAM_IDLE_TIMEOUT_SECS"),
+                        "{message}"
+                    );
+                }
+                other => panic!("unexpected body-stall error: {other}"),
+            }
+        }
+        peer.join()
+            .expect("fake peer should see every closed socket");
+    }
+
+    fn read_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let expected_length = loop {
+            let length = stream.read(&mut buffer).expect("read request headers");
+            assert_ne!(length, 0, "client closed before sending its request");
+            request.extend_from_slice(&buffer[..length]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                })
+                .unwrap_or(0);
+            break header_end + content_length;
+        };
+        while request.len() < expected_length {
+            let length = stream.read(&mut buffer).expect("read request body");
+            assert_ne!(length, 0, "client closed before sending its request body");
+            request.extend_from_slice(&buffer[..length]);
+        }
+    }
+
+    fn assert_peer_closed(stream: &mut TcpStream) {
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Ok(length) => panic!("expected socket close, read {length} unexpected byte(s)"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            Err(error) => panic!("peer did not see socket close: {error}"),
+        }
     }
 }
