@@ -1,6 +1,6 @@
 [package]
 name = "leg"
-version = "0.32.9"
+version = "0.32.10"
 edition = "2024"
 rust-version = "1.89"
 description = "leg"
