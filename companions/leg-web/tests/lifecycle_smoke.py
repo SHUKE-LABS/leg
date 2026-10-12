@@ -634,8 +634,15 @@ def run(web_bin: Path, leg_bin: Path, supervisor_bin: Path) -> None:
             assert first_events, "no catch-up event was delivered"
             last_seen = max(int(event["id"]) for event in first_events if event["id"] is not None)
             connection.close()
-            live = snapshot(authority, token, session_id)
-            assert live["active"] and live["active"]["text"], live
+            live = wait_for(
+                lambda: (
+                    value
+                    if (value := snapshot(authority, token, session_id)).get("active")
+                    and value["active"].get("text")
+                    else None
+                ),
+                "streamed TRIAL-PAUSE text",
+            )
             requests_before_busy = fixture_request_count(provider_url)
             busy_status, busy = request(
                 authority,
