@@ -443,20 +443,59 @@ def kill_owned_process_group(child: subprocess.Popen[bytes]) -> None:
         raise AssertionError(f"owned UI child processes survived cleanup: {sorted(pending)}")
 
 
+def last_rendered_status_line(output: TerminalCapture | bytearray) -> str:
+    screen = output.text() if isinstance(output, TerminalCapture) else output_screen_text(output)
+    lines = [line.strip() for line in screen.splitlines() if line.strip()]
+    for marker in (
+        "Cannot exit while",
+        "Choose a background session to stop",
+        "Active turn has no Stop control",
+        "status:",
+    ):
+        for line in reversed(lines):
+            if marker in line:
+                return line[:240]
+    return lines[-1][:240] if lines else "<no rendered status>"
+
+
 def drain_until_exit(
     master_fd: int,
     child: subprocess.Popen[bytes],
     output: TerminalCapture | bytearray,
     timeout: float = 8.0,
+    diagnostic_timeout: float | None = None,
 ) -> int:
-    deadline = time.monotonic() + timeout
+    started_at = time.monotonic()
+    deadline = started_at + timeout
+    observation_deadline = started_at + max(timeout, diagnostic_timeout or timeout)
     while child.poll() is None:
         if isinstance(output, TerminalCapture):
             capture_owned_processes(child)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        now = time.monotonic()
+        timed_out = now >= deadline
+        status_line = last_rendered_status_line(output) if timed_out else ""
+        if any(
+            message in status_line
+            for message in (
+                "Cannot exit while",
+                "Choose a background session to stop",
+                "Active turn has no Stop control",
+            )
+        ):
+            elapsed = now - started_at
             kill_owned_process_group(child)
-            raise AssertionError("TUI did not exit after Ctrl-C")
+            raise AssertionError(
+                f"Ctrl-C was rejected after {elapsed:.3f}s; "
+                f"limit={timeout:.3f}s; final status={status_line!r}"
+            )
+        remaining = (observation_deadline if timed_out else deadline) - now
+        if remaining <= 0:
+            elapsed = now - started_at
+            kill_owned_process_group(child)
+            raise AssertionError(
+                f"TUI did not exit after Ctrl-C; elapsed={elapsed:.3f}s; "
+                f"limit={timeout:.3f}s; final status={status_line or last_rendered_status_line(output)!r}"
+            )
         ready, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
         if ready:
             try:
@@ -465,6 +504,7 @@ def drain_until_exit(
                 chunk = b""
             if chunk:
                 feed_output(output, chunk)
+    observed_exit_at = time.monotonic()
     while True:
         ready, _, _ = select.select([master_fd], [], [], 0)
         if not ready:
@@ -476,7 +516,14 @@ def drain_until_exit(
         if not chunk:
             break
         feed_output(output, chunk)
-    return child.wait(timeout=1)
+    status = child.wait(timeout=1)
+    elapsed = observed_exit_at - started_at
+    if elapsed > timeout and not (diagnostic_timeout and diagnostic_timeout > timeout):
+        raise AssertionError(
+            f"TUI exited after Ctrl-C in {elapsed:.3f}s, exceeding {timeout:.3f}s; "
+            f"exit={status}; final status={last_rendered_status_line(output)!r}"
+        )
+    return status
 
 
 def drain_for(
@@ -1978,11 +2025,34 @@ def drain_until_exit_after_close(
     output: TerminalCapture,
     slave_fd: int,
     initial_termios: list[Any],
+    timeout: float = 8.0,
+    diagnostic_timeout: float | None = None,
+    timing_label: str | None = None,
 ) -> int:
+    started_at = time.monotonic()
     os.write(master_fd, b"\x03")
-    status = drain_until_exit(master_fd, child, output)
+    status = drain_until_exit(
+        master_fd,
+        child,
+        output,
+        timeout=timeout,
+        diagnostic_timeout=diagnostic_timeout,
+    )
+    elapsed = time.monotonic() - started_at
+    if timing_label is not None:
+        print(
+            f"{timing_label} Ctrl-C exit: elapsed={elapsed:.3f}s, exit={status}; "
+            f"final status={last_rendered_status_line(output)!r}",
+            flush=True,
+        )
     termios_fd = master_fd if sys.platform == "darwin" else slave_fd
     assert_terminal_restored(bytes(output.raw), termios_fd, initial_termios, child)
+    if elapsed > timeout:
+        raise AssertionError(
+            f"TUI exited after Ctrl-C in {elapsed:.3f}s, exceeding {timeout:.3f}s; "
+            f"exit={status}; terminal restoration passed; "
+            f"final status={last_rendered_status_line(output)!r}"
+        )
     os.close(master_fd)
     os.close(slave_fd)
     return status
@@ -2256,6 +2326,10 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
                 output,
                 "The reopened session kept its prior tool history and workspace.",
             )
+            # The response reaches the screen before the Finished event can be
+            # processed. Wait for the idle turn status so this Ctrl-C measures
+            # shutdown after navigation, not a stop request for a finishing turn.
+            read_until(master_fd, child, output, "status: Succeeded")
             final_status = request_status(status_url)
             assert final_status["requests"] == 4, final_status
             for check in (
@@ -2266,7 +2340,13 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
                 assert final_status["input_checks"].get(check) is True, final_status
 
             status = drain_until_exit_after_close(
-                master_fd, child, output, slave_fd, initial_termios
+                master_fd,
+                child,
+                output,
+                slave_fd,
+                initial_termios,
+                diagnostic_timeout=30.0,
+                timing_label="session navigation",
             )
             master_fd = slave_fd = None
             child = None
