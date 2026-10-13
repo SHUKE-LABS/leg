@@ -586,8 +586,8 @@ release_generate_changelog() {
 # and validation functions below.
 release_npm_platform_rows() {
     printf '%s\n' \
-        'linux-x64|x86_64-unknown-linux-gnu|linux|x64|tar.gz|leg' \
-        'linux-arm64|aarch64-unknown-linux-gnu|linux|arm64|tar.gz|leg' \
+        'linux-x64|x86_64-unknown-linux-musl|linux|x64|tar.gz|leg' \
+        'linux-arm64|aarch64-unknown-linux-musl|linux|arm64|tar.gz|leg' \
         'linux-arm|armv7-unknown-linux-musleabihf|linux|arm|tar.gz|leg' \
         'darwin-x64|x86_64-apple-darwin|darwin|x64|tar.gz|leg' \
         'darwin-arm64|aarch64-apple-darwin|darwin|arm64|tar.gz|leg' \

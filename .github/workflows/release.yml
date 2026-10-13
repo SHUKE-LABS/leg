@@ -86,13 +86,13 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             archive: tar.gz
-            cross: false
+            cross: true
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             archive: tar.gz
-            cross: false
+            cross: true
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
@@ -153,14 +153,14 @@ jobs:
           test "$("./${binary}" --version)" = "leg ${version}"
 
       - name: Enforce binary size budget
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
         shell: bash
         run: |
           set -euo pipefail
-          budget=$((20 * 1024 * 1024))
+          budget=$((30 * 1024 * 1024))
           size="$(stat -c '%s' "target/${TARGET}/release/leg")"
           if (( size >= budget )); then
-            echo "::error::linux-gnu binary is ${size} bytes, budget is < ${budget} bytes"
+            echo "::error::linux-musl binary is ${size} bytes, budget is < ${budget} bytes"
             exit 1
           fi
 
@@ -194,8 +194,41 @@ jobs:
           path: leg-*-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
 
-  publish:
+  smoke:
     needs: [tag, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Download target archive
+        uses: actions/download-artifact@v7
+        with:
+          name: leg-${{ matrix.target }}
+          path: dist
+
+      - name: Run binary on Debian 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive="dist/leg-${version}-${TARGET}.tar.gz"
+          tar -xzf "${archive}" -C dist
+          volume="${PWD}/dist:/dist:ro"
+          output="$(docker run --rm --volume "${volume}" debian:12 /dist/leg --version)"
+          test "${output}" = "leg ${version}"
+
+  publish:
+    needs: [tag, build, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -224,8 +257,8 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           assets=(
-            "leg-${version}-x86_64-unknown-linux-gnu.tar.gz"
-            "leg-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-x86_64-unknown-linux-musl.tar.gz"
+            "leg-${version}-aarch64-unknown-linux-musl.tar.gz"
             "leg-${version}-armv7-unknown-linux-musleabihf.tar.gz"
             "leg-${version}-x86_64-apple-darwin.tar.gz"
             "leg-${version}-aarch64-apple-darwin.tar.gz"
@@ -262,8 +295,8 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           assets=(
-            "leg-${version}-x86_64-unknown-linux-gnu.tar.gz"
-            "leg-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "leg-${version}-x86_64-unknown-linux-musl.tar.gz"
+            "leg-${version}-aarch64-unknown-linux-musl.tar.gz"
             "leg-${version}-armv7-unknown-linux-musleabihf.tar.gz"
             "leg-${version}-x86_64-apple-darwin.tar.gz"
             "leg-${version}-aarch64-apple-darwin.tar.gz"

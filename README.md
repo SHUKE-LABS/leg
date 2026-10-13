@@ -344,9 +344,11 @@ cargo +1.89.0 clippy --locked --all-targets -- -D warnings
 
 ## CI-supported targets
 
-- x86_64-unknown-linux-gnu
-- aarch64-unknown-linux-gnu
+- x86_64-unknown-linux-musl (static; cross-compiled)
+- aarch64-unknown-linux-musl (static; cross-compiled)
 - x86_64-apple-darwin
 - aarch64-apple-darwin
 - x86_64-pc-windows-msvc
 - armv7-unknown-linux-musleabihf (cross-compiled; build-only, no native runner)
+
+Linux release binaries use musl and do not require a minimum glibc version.
