@@ -187,14 +187,13 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     };
     let leg_pid = child.id();
     let Some(root_identity) = capture_process_identity(leg_pid) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        let (child_code, message) = identity_capture_failure(&mut child);
         write_control(&json!({
             "_supervisor":"error",
-            "message":"could not verify the native leg process identity"
+            "message":message
         }))
         .map_err(|error| error.to_string())?;
-        return Ok(1);
+        return Ok(child_code);
     };
     let child_stdin = child.stdin.take().expect("leg stdin is piped");
     let child_stdout = child.stdout.take().expect("leg stdout is piped");
@@ -449,7 +448,7 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     }
     // `try_wait` reaps on success, but calling wait again is harmless and makes
     // the guard's lifetime visibly extend through process completion.
-    let child_code = status.and_then(exit_code).unwrap_or(1);
+    let child_code = status.as_ref().and_then(exit_code).unwrap_or(1);
     let stderr = stderr_thread.join().unwrap_or_default();
     let stderr = redact_credentials(&String::from_utf8_lossy(&stderr));
     if !stderr.is_empty() {
@@ -965,11 +964,33 @@ fn drain_capped(mut reader: impl Read, limit: usize) -> Vec<u8> {
     }
 }
 
+fn startup_exit_diagnostic(child: &mut Child, status: std::process::ExitStatus) -> (i32, String) {
+    let child_code = exit_code(&status).unwrap_or(1);
+    let stderr = child.stderr.take().expect("leg stderr is piped");
+    let stderr = drain_capped(stderr, crate::client::MAX_DIAGNOSTIC_BYTES);
+    let stderr = redact_credentials(&String::from_utf8_lossy(&stderr));
+    let status = Some(status);
+    let message = crate::client::supervisor_startup_failure_message(&status, stderr.as_bytes());
+    (child_code, message)
+}
+
+fn identity_capture_failure(child: &mut Child) -> (i32, String) {
+    if let Ok(Some(status)) = child.try_wait() {
+        return startup_exit_diagnostic(child, status);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    (
+        1,
+        "could not verify the native leg process identity".to_string(),
+    )
+}
+
 fn redact_credentials(stderr: &str) -> String {
     crate::client::redact_credentials(stderr.to_string())
 }
 
-fn exit_code(status: std::process::ExitStatus) -> Option<i32> {
+fn exit_code(status: &std::process::ExitStatus) -> Option<i32> {
     if let Some(code) = status.code() {
         return Some(code);
     }
@@ -1055,6 +1076,51 @@ mod tests {
         assert!(child.try_wait().expect("inspect child status").is_none());
         child.kill().expect("clean up identity test child");
         let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_child_startup_diagnostic_reports_status_and_bounds_stderr() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "printf 'fixture startup failure: ' >&2; head -c 700 /dev/zero >&2; exit 1",
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start early-exit fixture");
+        let status = child.wait().expect("wait for early-exit fixture");
+        let expected_status = format!("Some({status:?})");
+
+        let (code, message) = startup_exit_diagnostic(&mut child, status);
+
+        assert_eq!(code, 1);
+        assert!(message.contains(&format!(
+            "supervisor exited before startup ({expected_status})"
+        )));
+        assert!(message.contains("fixture startup failure"));
+        assert!(message.ends_with('…'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_child_identity_failure_keeps_identity_error() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start live identity fixture");
+
+        let (code, message) = identity_capture_failure(&mut child);
+
+        assert_eq!(code, 1);
+        assert_eq!(message, "could not verify the native leg process identity");
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect terminated identity fixture")
+                .is_some()
+        );
     }
 
     #[test]

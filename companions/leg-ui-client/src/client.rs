@@ -19,7 +19,7 @@ use crate::resolve::{ResolveError, resolve_leg};
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONTROL_LINE: usize = 64 * 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 static SESSION_ID_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default)]
@@ -274,9 +274,8 @@ impl Client {
         if !has_line {
             let status = child.wait().ok();
             let stderr = join_stderr(stderr_thread);
-            return Err(StartError::Supervisor(format!(
-                "supervisor exited before startup ({status:?}); {}",
-                bounded_text(&stderr)
+            return Err(StartError::Supervisor(supervisor_startup_failure_message(
+                &status, &stderr,
             )));
         }
         let ack: Value = serde_json::from_slice(&ack_line)
@@ -620,6 +619,16 @@ fn disconnect_supervisor_for_cleanup(
         let _ = child.wait();
         let _ = stderr_reader.join();
     });
+}
+
+pub(crate) fn supervisor_startup_failure_message(
+    status: &Option<std::process::ExitStatus>,
+    stderr: &[u8],
+) -> String {
+    format!(
+        "supervisor exited before startup ({status:?}); {}",
+        bounded_text(stderr)
+    )
 }
 
 fn bounded_text(bytes: &[u8]) -> String {
