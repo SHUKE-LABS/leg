@@ -706,6 +706,33 @@ fn directory_is_hidden(entry: &fs::DirEntry, name: &str) -> bool {
     }
 }
 
+fn directory_entries(
+    entries: impl IntoIterator<Item = io::Result<fs::DirEntry>>,
+) -> Vec<(bool, String)> {
+    let mut directories = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_directory = if file_type.is_dir() {
+            true
+        } else if file_type.is_symlink() {
+            fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())
+        } else {
+            false
+        };
+        if !is_directory {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        directories.push((directory_is_hidden(&entry, &name), name));
+    }
+    directories
+}
+
 fn build_router(state: HostState) -> Router {
     let router = Router::new()
         .route("/", get(index))
@@ -918,7 +945,8 @@ async fn list_directories(
     let home = home_directory();
     let requested =
         resolve_workspace_path(&query.path, home.as_deref()).map_err(workspace_path_error)?;
-    let path = fs::canonicalize(&requested).map_err(directory_io_error)?;
+    let canonical_path = fs::canonicalize(&requested).map_err(directory_io_error)?;
+    let path = dunce::simplified(&canonical_path).to_owned();
     let metadata = fs::metadata(&path).map_err(directory_io_error)?;
     if !metadata.is_dir() {
         return Err(api_error(
@@ -928,16 +956,7 @@ async fn list_directories(
     }
 
     let entries = fs::read_dir(&path).map_err(directory_io_error)?;
-    let mut directories = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(directory_io_error)?;
-        let file_type = entry.file_type().map_err(directory_io_error)?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        directories.push((directory_is_hidden(&entry, &name), name));
-    }
+    let mut directories = directory_entries(entries);
     directories.sort_by(|(left_hidden, left), (right_hidden, right)| {
         left_hidden
             .cmp(right_hidden)
@@ -2972,7 +2991,12 @@ mod tests {
         fs::create_dir_all(folder.join("visible")).unwrap();
         fs::create_dir_all(folder.join(".hidden")).unwrap();
         fs::write(folder.join("readme.txt"), "not a directory").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(folder.join("missing"), folder.join("dangling")).unwrap();
         let canonical_folder = folder.canonicalize().unwrap();
+        let expected_folder = dunce::simplified(&canonical_folder);
+        let canonical_parent = temp.path().canonicalize().unwrap();
+        let expected_parent = dunce::simplified(&canonical_parent);
         let router = build_router(host.state.clone());
 
         let missing_auth = HttpRequest::builder()
@@ -2993,15 +3017,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{listing}");
-        assert_eq!(listing["path"], canonical_folder.to_string_lossy().as_ref());
+        assert_eq!(listing["path"], expected_folder.to_string_lossy().as_ref());
         assert_eq!(
             listing["parent"],
-            temp.path()
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .as_ref()
+            expected_parent.to_string_lossy().as_ref()
         );
+        #[cfg(windows)]
+        assert!(!listing["path"].as_str().unwrap().starts_with(r"\\?\"));
         assert_eq!(listing["directories"], json!(["visible", ".hidden"]));
 
         let missing = encode_query_component(&folder.join("missing").to_string_lossy());
@@ -3028,6 +3050,76 @@ mod tests {
             directory_io_error(io::Error::from(io::ErrorKind::PermissionDenied)).1,
             "directory_unreadable"
         );
+    }
+
+    #[test]
+    fn directory_entries_skip_bad_items_and_keep_siblings() {
+        let temp = TempDir::new().unwrap();
+        let folder = temp.path().join("browser-root");
+        fs::create_dir_all(folder.join("alpha")).unwrap();
+        fs::create_dir_all(folder.join("beta")).unwrap();
+        fs::write(folder.join("readme.txt"), "not a directory").unwrap();
+
+        let entries = std::iter::once(Err::<fs::DirEntry, _>(io::Error::other("injected")))
+            .chain(fs::read_dir(&folder).unwrap());
+        let mut names: Vec<_> = directory_entries(entries)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        names.sort();
+
+        assert_eq!(names, ["alpha", "beta"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_entries_follow_directory_symlinks_only() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let folder = temp.path().join("browser-root");
+        let target = folder.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(folder.join("readme.txt"), "not a directory").unwrap();
+        symlink(&target, folder.join("directory-link")).unwrap();
+        symlink(folder.join("readme.txt"), folder.join("file-link")).unwrap();
+        symlink(folder.join("missing"), folder.join("dangling-link")).unwrap();
+
+        let mut names: Vec<_> = directory_entries(fs::read_dir(&folder).unwrap())
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        names.sort();
+
+        assert_eq!(names, ["directory-link", "target"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_entries_follow_directory_junctions() {
+        let temp = TempDir::new().unwrap();
+        let folder = temp.path().join("browser-root");
+        let target = folder.join("target");
+        let junction = folder.join("directory-junction");
+        fs::create_dir_all(&target).unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let names: Vec<_> = directory_entries(fs::read_dir(&folder).unwrap())
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+
+        assert!(names.iter().any(|name| name == "directory-junction"));
     }
 
     #[test]

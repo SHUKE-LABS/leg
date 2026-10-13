@@ -665,8 +665,8 @@ const path = require('node:path');
 
 const [, , thirdPartyDir, bundleTitle, binaryScope, generatedBy, ...metadataPaths] = process.argv;
 const SUPPORTED_LICENSES = new Set([
-  '0BSD', 'Apache-2.0', 'BSD-3-Clause', 'BSL-1.0', 'CDLA-Permissive-2.0', 'ISC', 'MIT',
-  'MIT/Apache-2.0', 'Unicode-3.0', 'Unlicense', 'Zlib',
+  '0BSD', 'Apache-2.0', 'BSD-3-Clause', 'BSL-1.0', 'CC0-1.0', 'CDLA-Permissive-2.0', 'ISC',
+  'MIT', 'MIT-0', 'MIT/Apache-2.0', 'Unicode-3.0', 'Unlicense', 'Zlib',
 ]);
 const SUPPORTED_LICENSE_EXCEPTIONS = new Map([
   ['Apache-2.0', new Set(['LLVM-exception'])],
