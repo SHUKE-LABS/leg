@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 async-stream = "0.3"
 axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+dunce = "1"
 fs2 = "0.4"
 getrandom = "0.3"
 leg-ui-client = { path = "../leg-ui-client" }
