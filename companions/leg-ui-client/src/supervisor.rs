@@ -187,23 +187,13 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     };
     let leg_pid = child.id();
     let Some(root_identity) = capture_process_identity(leg_pid) else {
-        if let Ok(Some(status)) = child.try_wait() {
-            let (child_code, message) = startup_exit_diagnostic(&mut child, status);
-            write_control(&json!({
-                "_supervisor":"error",
-                "message":message
-            }))
-            .map_err(|error| error.to_string())?;
-            return Ok(child_code);
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+        let (child_code, message) = identity_capture_failure(&mut child);
         write_control(&json!({
             "_supervisor":"error",
-            "message":"could not verify the native leg process identity"
+            "message":message
         }))
         .map_err(|error| error.to_string())?;
-        return Ok(1);
+        return Ok(child_code);
     };
     let child_stdin = child.stdin.take().expect("leg stdin is piped");
     let child_stdout = child.stdout.take().expect("leg stdout is piped");
@@ -984,6 +974,18 @@ fn startup_exit_diagnostic(child: &mut Child, status: std::process::ExitStatus) 
     (child_code, message)
 }
 
+fn identity_capture_failure(child: &mut Child) -> (i32, String) {
+    if let Ok(Some(status)) = child.try_wait() {
+        return startup_exit_diagnostic(child, status);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    (
+        1,
+        "could not verify the native leg process identity".to_string(),
+    )
+}
+
 fn redact_credentials(stderr: &str) -> String {
     crate::client::redact_credentials(stderr.to_string())
 }
@@ -1098,6 +1100,27 @@ mod tests {
         )));
         assert!(message.contains("fixture startup failure"));
         assert!(message.ends_with('…'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_child_identity_failure_keeps_identity_error() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start live identity fixture");
+
+        let (code, message) = identity_capture_failure(&mut child);
+
+        assert_eq!(code, 1);
+        assert_eq!(message, "could not verify the native leg process identity");
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect terminated identity fixture")
+                .is_some()
+        );
     }
 
     #[test]

@@ -996,6 +996,10 @@ fn early_native_exit_surfaces_bounded_startup_diagnostic() {
     };
 
     assert!(message.contains("supervisor exited before startup"));
+    assert!(
+        message.contains("unix_wait_status(256)"),
+        "startup diagnostic omitted exit-1 status: {message}"
+    );
     assert!(message.contains("fixture startup failure"));
     assert!(message.contains('…'));
 }
