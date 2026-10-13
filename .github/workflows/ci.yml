@@ -455,6 +455,9 @@ jobs:
       - name: Cross-build (locked)
         run: cross build --locked --verbose --target "${TARGET}"
 
+      - name: Build companion release binaries (locked)
+        run: cross build --locked --release --target "${TARGET}" --manifest-path companions/Cargo.toml --workspace --bins
+
   tui-windows-stop-behavior:
     if: "${{ github.event_name == 'pull_request' && (contains(github.event.pull_request.body, 'Closes #187') || contains(github.event.pull_request.body, 'Closes #183') || contains(github.event.pull_request.body, 'Part of #183')) }}"
     runs-on: windows-latest
