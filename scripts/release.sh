@@ -608,7 +608,16 @@ release_repo_root() {
 }
 
 release_npm_shim_path() {
-    printf '%s/packaging/npm/leg.js\n' "$(release_repo_root)"
+    printf '%s/packaging/npm/%s.js\n' "$(release_repo_root)" "${1:-leg}"
+}
+
+release_npm_commands() {
+    printf '%s\n' leg leg-tui leg-web
+}
+
+release_npm_binary_names() {
+    local suffix="${1:-}"
+    printf '%s\n' "leg${suffix}" "leg-tui${suffix}" "leg-web${suffix}" "leg-ui-supervisor${suffix}"
 }
 
 release_third_party_notices_path() {
@@ -618,7 +627,7 @@ release_third_party_notices_path() {
 # Render THIRD_PARTY_NOTICES.txt from one `cargo metadata` JSON document per
 # release target plus the vendored material under THIRD_PARTY_LICENSES/. The
 # crate set is the union of non-dev (normal and build) dependencies reachable
-# from the workspace root; the root crate itself is proprietary and excluded.
+# from each shipped binary's package; first-party packages are excluded.
 # cargo metadata's resolve can be a superset of what is compiled (it keeps
 # optional deps named only by weak `dep?/feature` entries); over-listing a
 # crate is harmless, missing one is not.
@@ -801,16 +810,26 @@ NODE
 
 release_third_party_notices_generate() {
     local repo_root="${1:-$(release_repo_root)}"
-    local metadata_dir="" package_key target _os _cpu _archive _binary status=0
+    local metadata_dir="" package_key target _os _cpu _archive _binary manifest index status=0
     local -a metadata_paths=()
+    local -a manifests=(
+        "${repo_root}/Cargo.toml"
+        "${repo_root}/companions/leg-ui-client/Cargo.toml"
+        "${repo_root}/companions/leg-tui/Cargo.toml"
+        "${repo_root}/companions/leg-web/Cargo.toml"
+    )
 
     metadata_dir="$(mktemp -d)" || return 1
     while IFS='|' read -r package_key target _os _cpu _archive _binary; do
-        cargo metadata --locked --format-version 1 --filter-platform "${target}" \
-            --manifest-path "${repo_root}/Cargo.toml" \
-            >"${metadata_dir}/${package_key}.json" || status="$?"
+        for index in "${!manifests[@]}"; do
+            manifest="${manifests[index]}"
+            cargo metadata --locked --format-version 1 --filter-platform "${target}" \
+                --manifest-path "${manifest}" \
+                >"${metadata_dir}/${package_key}-${index}.json" || status="$?"
+            (( status == 0 )) || break
+            metadata_paths+=("${metadata_dir}/${package_key}-${index}.json")
+        done
         (( status == 0 )) || break
-        metadata_paths+=("${metadata_dir}/${package_key}.json")
     done < <(release_npm_platform_rows)
     if (( status == 0 )); then
         release_third_party_notices_render "${repo_root}/THIRD_PARTY_LICENSES" \
@@ -842,7 +861,8 @@ release_third_party_notices_check() {
 }
 
 release_web_trial_notices_generate() {
-    local repo_root="$(release_repo_root)" target="${1:-}" metadata_dir="" manifest="" status=0
+    local repo_root target="${1:-}" metadata_dir="" manifest="" status=0
+    repo_root="$(release_repo_root)" || return 1
     local -a metadata_paths=()
     local -a manifests=(
         "${repo_root}/Cargo.toml"
@@ -875,7 +895,8 @@ release_web_trial_notices_generate() {
 }
 
 release_tui_trial_notices_generate() {
-    local repo_root="$(release_repo_root)" target="${1:-}" metadata_dir="" manifest="" status=0
+    local repo_root target="${1:-}" metadata_dir="" manifest="" status=0
+    repo_root="$(release_repo_root)" || return 1
     local -a metadata_paths=()
     local -a manifests=(
         "${repo_root}/Cargo.toml"
@@ -918,7 +939,9 @@ release_npm_write_root_manifest() {
   "description": "Agent-friendly headless agent (ask/session) CLI.",
   "license": "UNLICENSED",
   "bin": {
-    "leg": "bin/leg.js"
+    "leg": "bin/leg.js",
+    "leg-tui": "bin/leg-tui.js",
+    "leg-web": "bin/leg-web.js"
   },
   "files": [
     "bin",
@@ -961,7 +984,7 @@ release_npm_write_platform_manifest() {
 {
   "name": "@shukelabs/leg-${package_key}",
   "version": "${version}",
-  "description": "Native leg binary for ${npm_os}/${npm_cpu}.",
+  "description": "Native leg and UI companion binaries for ${npm_os}/${npm_cpu}.",
   "license": "UNLICENSED",
   "files": [
     "bin",
@@ -1028,7 +1051,9 @@ function sameObject(actual, expected) {
 }
 
 if (kind === 'root') {
-  if (manifest.bin?.leg !== 'bin/leg.js') fail('bin.leg must be bin/leg.js');
+  if (!sameObject(manifest.bin, {
+    leg: 'bin/leg.js', 'leg-tui': 'bin/leg-tui.js', 'leg-web': 'bin/leg-web.js',
+  })) fail('bin must expose exactly leg, leg-tui, and leg-web shims');
   if (JSON.stringify(manifest.os) !== JSON.stringify(['darwin', 'linux', 'win32'])) {
     fail('os matrix is incorrect');
   }
@@ -1047,6 +1072,7 @@ if (kind === 'root') {
     fail('optionalDependencies must list all six platform packages at the release version');
   }
 } else if (kind === 'platform') {
+  if (manifest.bin) fail('platform packages must not expose commands');
   if (JSON.stringify(manifest.os) !== JSON.stringify([expectedOs])) fail(`os must be ${expectedOs}`);
   if (JSON.stringify(manifest.cpu) !== JSON.stringify([expectedCpu])) fail(`cpu must be ${expectedCpu}`);
 } else {
@@ -1067,7 +1093,7 @@ release_npm_validate_notice() {
 release_npm_validate_package_set() {
     local version="${1:-}" package_root="${2:-}"
     local package_key target npm_os npm_cpu archive binary package_dir
-    local entry entry_name file_count
+    local entry entry_name file_count command binary_name suffix
 
     release_validate_version "${version}" || return 1
     [[ -d "${package_root}" ]] || {
@@ -1078,18 +1104,16 @@ release_npm_validate_package_set() {
     package_dir="${package_root}/leg"
     release_npm_validate_manifest "${package_dir}/package.json" \
         '@shukelabs/leg' "${version}" root || return 1
-    [[ -f "${package_dir}/bin/leg.js" ]] || {
-        printf "release: root npm shim not found in '%s'\n" "${package_dir}" >&2
-        return 1
-    }
-    cmp -s "${package_dir}/bin/leg.js" "$(release_npm_shim_path)" || {
-        printf "release: staged npm shim differs from packaging/npm/leg.js\n" >&2
-        return 1
-    }
+    while read -r command; do
+        cmp -s "${package_dir}/bin/${command}.js" "$(release_npm_shim_path "${command}")" || {
+            printf "release: staged npm shim differs from packaging/npm/%s.js\n" "${command}" >&2
+            return 1
+        }
+    done < <(release_npm_commands)
     release_npm_validate_notice "${package_dir}" || return 1
     file_count="$(find "${package_dir}" -type f | wc -l | tr -d ' ')"
-    [[ "${file_count}" == 3 ]] || {
-        printf "release: root npm package must contain exactly package.json, bin/leg.js, and THIRD_PARTY_NOTICES.txt\n" >&2
+    [[ "${file_count}" == 5 ]] || {
+        printf "release: root npm package must contain exactly package.json, three shims, and THIRD_PARTY_NOTICES.txt\n" >&2
         return 1
     }
 
@@ -1098,13 +1122,16 @@ release_npm_validate_package_set() {
         release_npm_validate_manifest "${package_dir}/package.json" \
             "@shukelabs/leg-${package_key}" "${version}" platform \
             "${npm_os}" "${npm_cpu}" || return 1
-        [[ -f "${package_dir}/bin/${binary}" ]] || {
-            printf "release: native binary missing from '%s'\n" "${package_dir}" >&2
-            return 1
-        }
+        suffix="${binary#leg}"
+        while read -r binary_name; do
+            [[ -f "${package_dir}/bin/${binary_name}" ]] || {
+                printf "release: native binary '%s' missing from '%s'\n" "${binary_name}" "${package_dir}" >&2
+                return 1
+            }
+        done < <(release_npm_binary_names "${suffix}")
         release_npm_validate_notice "${package_dir}" || return 1
         file_count="$(find "${package_dir}" -type f | wc -l | tr -d ' ')"
-        [[ "${file_count}" == 3 ]] || {
+        [[ "${file_count}" == 6 ]] || {
             printf "release: npm package '%s' contains unexpected files\n" "${package_dir}" >&2
             return 1
         }
@@ -1129,7 +1156,7 @@ release_npm_validate_package_set() {
 release_npm_stage_packages() {
     local version="${1:-}" archive_dir="${2:-}" output_dir="${3:-}"
     local staging="" package_key target npm_os npm_cpu archive binary
-    local archive_path package_dir extract_dir extracted_binary
+    local archive_path package_dir extract_dir extracted_binary command binary_name suffix
 
     release_validate_version "${version}" || return 1
     [[ -d "${archive_dir}" ]] || {
@@ -1140,10 +1167,12 @@ release_npm_stage_packages() {
         printf "release: npm staging output must be a new path '%s'\n" "${output_dir}" >&2
         return 1
     }
-    [[ -f "$(release_npm_shim_path)" ]] || {
-        printf 'release: npm shim source is missing\n' >&2
-        return 1
-    }
+    while read -r command; do
+        [[ -f "$(release_npm_shim_path "${command}")" ]] || {
+            printf 'release: npm shim source is missing for %s\n' "${command}" >&2
+            return 1
+        }
+    done < <(release_npm_commands)
     [[ -f "$(release_third_party_notices_path)" ]] || {
         printf 'release: THIRD_PARTY_NOTICES.txt is missing\n' >&2
         return 1
@@ -1152,8 +1181,10 @@ release_npm_stage_packages() {
     mkdir -p -- "$(dirname -- "${output_dir}")"
     staging="$(mktemp -d "${output_dir}.XXXXXX")" || return 1
     mkdir -p "${staging}/leg/bin"
-    cp -- "$(release_npm_shim_path)" "${staging}/leg/bin/leg.js"
-    chmod +x "${staging}/leg/bin/leg.js"
+    while read -r command; do
+        cp -- "$(release_npm_shim_path "${command}")" "${staging}/leg/bin/${command}.js"
+        chmod +x "${staging}/leg/bin/${command}.js"
+    done < <(release_npm_commands)
     release_npm_write_root_manifest "${version}" >"${staging}/leg/package.json"
     cp -- "$(release_third_party_notices_path)" "${staging}/leg/THIRD_PARTY_NOTICES.txt"
 
@@ -1180,14 +1211,17 @@ release_npm_stage_packages() {
                 return 1
                 ;;
         esac
-        extracted_binary="${extract_dir}/${binary}"
-        [[ -f "${extracted_binary}" ]] || {
-            printf "release: expected binary '%s' missing from '%s'\n" "${binary}" "${archive_path}" >&2
-            rm -rf -- "${staging}"
-            return 1
-        }
-        cp -- "${extracted_binary}" "${package_dir}/bin/${binary}"
-        [[ "${npm_os}" == 'win32' ]] || chmod +x "${package_dir}/bin/${binary}"
+        suffix="${binary#leg}"
+        while read -r binary_name; do
+            extracted_binary="${extract_dir}/${binary_name}"
+            [[ -f "${extracted_binary}" ]] || {
+                printf "release: expected binary '%s' missing from '%s'\n" "${binary_name}" "${archive_path}" >&2
+                rm -rf -- "${staging}"
+                return 1
+            }
+            cp -- "${extracted_binary}" "${package_dir}/bin/${binary_name}"
+            [[ "${npm_os}" == 'win32' ]] || chmod +x "${package_dir}/bin/${binary_name}"
+        done < <(release_npm_binary_names "${suffix}")
         release_npm_write_platform_manifest "${version}" "${package_key}" \
             "${npm_os}" "${npm_cpu}" >"${package_dir}/package.json"
         cp -- "$(release_third_party_notices_path)" "${package_dir}/THIRD_PARTY_NOTICES.txt"

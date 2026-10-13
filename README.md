@@ -25,6 +25,10 @@ trail holds more than one session, etc).
 npm i -g @shukelabs/leg
 ```
 
+This installs `leg`, `leg-tui`, and `leg-web`. Run `leg-tui` in a terminal or
+`leg-web` to open the local browser interface. Their internal supervisor is
+bundled beside the native binaries; no `LEG_UI_SUPERVISOR_BIN` setting is needed.
+
 or build from source directly:
 
 ```
@@ -37,6 +41,8 @@ companions.
 Per-platform archives for every CI-supported target (`.tar.gz` on
 Unix, `.zip` on Windows) are attached to each
 [GitHub Release](https://github.com/SHUKE-LABS/leg/releases).
+Each archive contains `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`
+(`.exe` on Windows); keep these binaries together when installing them.
 
 Releases are created automatically when changes land on `main`. A
 Conventional Commit subject of type `feat` bumps the minor version; every
@@ -48,8 +54,8 @@ licenses of the bundled third-party Rust crates and vendored material.
 
 ## Experimental TUI trial
 
-The separate terminal interface is experimental and is not part of the regular
-`leg` installation or npm package. Download a `leg-tui-experimental-*` bundle
+The terminal interface is experimental and ships with the npm package.
+For a self-contained trial with fixtures, download a `leg-tui-experimental-*` bundle
 from a Linux or macOS CI run, or build one with the command in the
 [TUI trial quickstart](companions/leg-tui/trial/QUICKSTART.md). Run it with a
 disposable workspace and the local fixture; stop the TUI and remove the
@@ -58,8 +64,8 @@ regular `leg` binary is installed.
 
 ## Experimental Web trial
 
-The separate Web companion is experimental and is not part of the regular
-`leg` installation. Get the Linux or macOS bundle from the CI run's
+The Web companion is experimental and ships with the npm package.
+For a self-contained trial with fixtures, get the Linux or macOS bundle from the CI run's
 `leg-web-experimental-*` artifact, or build one with the command in the
 [Web trial quickstart](companions/leg-web/trial/QUICKSTART.md). The bundle
 embeds its page assets and runs locally; its tools use your OS account, with

@@ -17,6 +17,7 @@ struct Args {
     receipt_limit: Option<usize>,
     no_open: bool,
     help: bool,
+    version: bool,
 }
 
 #[tokio::main]
@@ -29,6 +30,10 @@ async fn main() {
 
 async fn entry() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
+    if args.version {
+        println!("leg-web {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.help {
         print_help();
         return Ok(());
@@ -66,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(argument) = values.next() {
         match argument.to_str() {
             Some("--help" | "-h") => args.help = true,
+            Some("--version" | "-V") => args.version = true,
             Some("--no-open") => args.no_open = true,
             Some("--bind") => {
                 let value = values.next().ok_or("--bind requires an address")?;
@@ -112,6 +118,7 @@ fn print_help() {
          Usage: leg-web [--no-open] [--bind 127.0.0.1:PORT] [--state-dir PATH]\n\
          [--leg-bin PATH] [--supervisor-bin PATH] [--event-buffer N]\n\
          [--receipt-limit N]\n\n\
+         --version prints the package version and exits.\n\n\
          Listens on 127.0.0.1:{DEFAULT_PORT} by default; --bind 127.0.0.1:0 picks\n\
          any free port.\n\n\
          The launch token is printed once in a URL fragment, then moved into\n\

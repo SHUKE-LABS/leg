@@ -71,6 +71,7 @@ struct Args {
 enum ParsedArgs {
     Run(Args),
     Help,
+    Version,
 }
 
 fn main() {
@@ -86,6 +87,10 @@ fn entry() -> Result<(), Box<dyn Error>> {
             print_help();
             Ok(())
         }
+        ParsedArgs::Version => {
+            println!("leg-tui {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         ParsedArgs::Run(args) => run(args),
     }
 }
@@ -97,6 +102,7 @@ fn parse_args() -> Result<ParsedArgs, String> {
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--help" | "-h") => return Ok(ParsedArgs::Help),
+            Some("--version" | "-V") => return Ok(ParsedArgs::Version),
             Some("--leg-bin") => {
                 leg_bin = Some(
                     args.next()
@@ -124,6 +130,7 @@ fn print_help() {
     println!(
         "leg-tui — experimental terminal interface for leg\n\n\
          Usage: leg-tui [--leg-bin PATH] [--supervisor-bin PATH]\n\n\
+         --version prints the package version and exits.\n\n\
          Choose an existing workspace, review the first-run warning, then compose a prompt.\n\
          Ctrl-S sends. Ctrl-C stops an active turn or exits when idle.\n\
          Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox."

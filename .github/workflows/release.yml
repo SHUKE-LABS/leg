@@ -130,14 +130,18 @@ jobs:
         with:
           tool: cross
 
-      - name: Build locked release binary
+      - name: Build locked release binaries
         shell: bash
         run: |
           set -euo pipefail
           if [[ "${{ matrix.cross }}" == "true" ]]; then
             cross build --locked --release --target "${TARGET}"
+            cross build --locked --release --target "${TARGET}" \
+              --manifest-path companions/Cargo.toml --workspace --bins
           else
             cargo build --locked --release --target "${TARGET}"
+            cargo build --locked --release --target "${TARGET}" \
+              --manifest-path companions/Cargo.toml --workspace --bins
           fi
 
       - name: Verify binary version
@@ -151,6 +155,14 @@ jobs:
             binary="${binary}.exe"
           fi
           test "$("./${binary}" --version)" = "leg ${version}"
+          suffix=""
+          if [[ "${TARGET}" == *-windows-* ]]; then
+            suffix=".exe"
+          fi
+          for name in leg-tui leg-web; do
+            output="$("./companions/target/${TARGET}/release/${name}${suffix}" --version)"
+            [[ "${output}" =~ ^${name}\ [0-9]+\.[0-9]+\.[0-9]+$ ]]
+          done
 
       - name: Enforce binary size budget
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
@@ -164,7 +176,7 @@ jobs:
             exit 1
           fi
 
-      - name: Archive Unix binary
+      - name: Archive Unix binaries
         if: ${{ matrix.archive == 'tar.gz' }}
         shell: bash
         run: |
@@ -174,9 +186,12 @@ jobs:
           staging="$(mktemp -d)"
           trap 'rm -rf "${staging}"' EXIT
           cp "target/${TARGET}/release/leg" "${staging}/leg"
-          tar -C "${staging}" -czf "${archive}" leg
+          for name in leg-tui leg-web leg-ui-supervisor; do
+            cp "companions/target/${TARGET}/release/${name}" "${staging}/${name}"
+          done
+          tar -C "${staging}" -czf "${archive}" leg leg-tui leg-web leg-ui-supervisor
 
-      - name: Archive Windows binary
+      - name: Archive Windows binaries
         if: ${{ matrix.archive == 'zip' }}
         shell: pwsh
         run: |
@@ -185,7 +200,13 @@ jobs:
           $staging = Join-Path $env:RUNNER_TEMP "leg-archive-$($env:TARGET)"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "target/$($env:TARGET)/release/leg.exe" (Join-Path $staging "leg.exe")
-          Compress-Archive -LiteralPath (Join-Path $staging "leg.exe") -DestinationPath $archive -Force
+          $files = @((Join-Path $staging "leg.exe"))
+          foreach ($name in @("leg-tui", "leg-web", "leg-ui-supervisor")) {
+            $destination = Join-Path $staging "$name.exe"
+            Copy-Item "companions/target/$($env:TARGET)/release/$name.exe" $destination
+            $files += $destination
+          }
+          Compress-Archive -LiteralPath $files -DestinationPath $archive -Force
 
       - name: Upload target archive
         uses: actions/upload-artifact@v6
@@ -269,10 +290,12 @@ jobs:
             test -f "dist/${asset}"
             case "${asset}" in
               *.tar.gz)
-                test "$(tar -tzf "dist/${asset}")" = "leg"
+                test "$(tar -tzf "dist/${asset}" | LC_ALL=C sort)" = \
+                  "$(printf '%s\n' leg leg-tui leg-web leg-ui-supervisor | LC_ALL=C sort)"
                 ;;
               *.zip)
-                test "$(unzip -Z1 "dist/${asset}")" = "leg.exe"
+                test "$(unzip -Z1 "dist/${asset}" | LC_ALL=C sort)" = \
+                  "$(printf '%s\n' leg.exe leg-tui.exe leg-web.exe leg-ui-supervisor.exe | LC_ALL=C sort)"
                 ;;
             esac
           done
