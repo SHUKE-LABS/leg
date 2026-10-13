@@ -185,6 +185,7 @@ class Fixture:
             "TRIAL-FAILED",
             "TRIAL-CAP",
             "TRIAL-PAUSE",
+            "TRIAL-WORKING",
             "TRIAL-STOP",
             "TRIAL-REOPEN-FAILURE",
             "TRIAL-REOPEN-INTERRUPTION",
@@ -223,7 +224,9 @@ class Fixture:
             self.counts[marker] = self.counts.get(marker, 0) + 1
             self.active_requests.add(request)
             self.request_outcomes[request] = "active"
-            if self.hold_after_first_chunk and marker in ("paused-live-text", "TRIAL-PAUSE"):
+            if marker == "TRIAL-WORKING" or (
+                self.hold_after_first_chunk and marker in ("paused-live-text", "TRIAL-PAUSE")
+            ):
                 self.pause_gates[request] = threading.Event()
                 self.pause_gate_states[request] = "waiting"
             return request, self.counts[marker]
@@ -327,6 +330,7 @@ class Fixture:
         pause_ms: int = 0,
         marker: str = "",
         gate_after_first_chunk: bool = False,
+        gate_before_first_chunk: bool = False,
         chunk_interval_ms: int = 0,
         stream_id: str = "",
     ) -> bool:
@@ -368,6 +372,12 @@ class Fixture:
         handler.send_header("Connection", "close")
         handler.end_headers()
         handler.close_connection = True
+
+        if gate_before_first_chunk:
+            if not self.wait_for_pause_gate(handler, request_number):
+                handler.fixture_response_interrupted = True
+                return False
+            self.set_pause_gate_state(request_number, "released")
 
         def write(data: bytes) -> None:
             handler.wfile.write(data)
@@ -559,6 +569,21 @@ class Fixture:
         if marker == "TRIAL-RETRY" and occurrence == 1:
             self.check("retry_failure_sent")
             self.send_error(handler, 401, "authentication_error", "press the UI's explicit retry action")
+            return
+        if marker == "TRIAL-WORKING":
+            completed = self.send_stream(
+                handler,
+                [{"type": "text", "text": "The first live text is visible. The fixture resumes after its fixed pause."}],
+                pause_ms=BROWSER_PAUSE_MS if self.scenario == "browser" else PAUSE_MS,
+                marker=marker,
+                gate_before_first_chunk=True,
+            )
+            if completed:
+                self.check("working_response_completed")
+                handler.fixture_request_outcome = "completed"
+                self.set_pause_gate_state(request, "completed")
+            else:
+                handler.fixture_request_outcome = "interrupted"
             return
         if marker == "paused-live-text" or marker == "TRIAL-PAUSE":
             pause_ms = BROWSER_PAUSE_MS if self.scenario == "browser" else PAUSE_MS
@@ -974,9 +999,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path.startswith("/__trial/release"):
-            if not self.fixture.hold_after_first_chunk:
-                self.fixture.send_json(self, 404, {"error": "test gate is disabled"})
-                return
             query = parse_qs(urlsplit(self.path).query)
             try:
                 request = int(query.get("request", [""])[0])
