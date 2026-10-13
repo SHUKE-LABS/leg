@@ -760,7 +760,9 @@ for (const metadataPath of metadataPaths) {
   for (const id of seen) {
     const pkg = packages.get(id);
     if (!pkg) fail(`${metadataPath} has no package entry for ${id}`);
-    if (pkg.source === null) continue; // Workspace/path packages are first-party.
+    if (pkg.source === null && (pkg.name === 'leg' || pkg.name.startsWith('leg-'))) {
+      continue; // The leg workspace's own crates are first-party.
+    }
     crates.set(id, pkg);
   }
 }
@@ -775,8 +777,11 @@ for (const pkg of ordered) {
     .filter((name) => LICENSE_FILE.test(name) && fs.statSync(path.join(crateDir, name)).isFile())
     .sort(byCodePoint);
   if (licenseFiles.length === 0) fail(`${pkg.name} ${pkg.version} ships no license file`);
+  const source = pkg.source ?? (pkg.name === 'crossterm'
+    ? `path (vendored crates.io crossterm ${pkg.version}, patched)`
+    : 'path');
   let section = `${RULE}\nCrate: ${pkg.name} ${pkg.version}\nLicense: ${pkg.license}\n` +
-    `Source: ${pkg.source ?? 'path'}\n`;
+    `Source: ${source}\n`;
   for (const name of licenseFiles) {
     section += `\n--- ${pkg.name} ${pkg.version}: ${name} ---\n${readText(path.join(crateDir, name))}`;
   }
