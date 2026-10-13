@@ -1,3 +1,6 @@
 [workspace]
-members = ["leg-ui-client", "leg-tui", "leg-web"]
+members = ["leg-ui-client", "leg-tui", "leg-web", "crossterm"]
 resolver = "3"
+
+[patch.crates-io]
+crossterm = { path = "crossterm" }

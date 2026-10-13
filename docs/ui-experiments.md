@@ -379,9 +379,10 @@ harness uses a separate pywinpty 2.0.15 environment. Version 2.0.15 batches
 ConPTY reads for about 100 ms, so it cannot measure the 100 ms input-latency
 gate accurately. With 3.0.5, `PtyProcess.write()` returns 0 while a raw child
 still receives the complete input, including non-BMP code points; however, the
-TUI's bracketed-paste path drops the emoji under that transport. The same TUI
-paste check passes under 2.0.15, so CI uses 3.0.5 for timing and 2.0.15 for
-behavior checks. Reports identify the pywinpty version, Windows build, and the
+patched TUI paste check reaches the fixture with the emoji, but the TUI does
+not exit during the check's Ctrl-C cleanup, so terminal restoration fails.
+The behavior check passes under 2.0.15, so CI uses 3.0.5 for timing and 2.0.15
+for behavior checks. Reports identify the pywinpty version, Windows build, and the
 direct ConPTY setup; the Windows job also checks that a 3.0.5 write returning
 0 reaches a child as the exact Unicode code points. There is no Windows
 Terminal frontend. The memory sampler uses psutil to sum the `leg-tui` process
@@ -546,12 +547,14 @@ one completed request: `pasted_line_one`,
 `pasted_chinese_line`, `pasted_line_three`, and `chinese_multiline_prompt`
 were true, while `pasted_emoji` and `emoji_paste` were false.
 
-A raw `ReadConsoleInputW` capture recorded U+1F600 as `D83D` key-down, `D83D`
-key-up, `DE00` key-down, `DE00` key-up. In crossterm 0.28.1's Windows parser,
-key-up and key-down records carrying surrogate units are both classified as
-surrogates; the repeated pairs fail UTF-16 decoding and clear the buffer.
-Crossterm 0.29.0 retains this parser behavior. This frontend check is separate
-from the direct ConPTY harness, which does not exercise Windows Terminal.
+Windows Terminal does not produce a crossterm `Event::Paste` for this input;
+its Unicode paste reaches crossterm as key records. A raw `ReadConsoleInputW`
+capture recorded U+1F600 as `D83D` key-down, `D83D` key-up, `DE00` key-down,
+`DE00` key-up. In crossterm 0.28.1's Windows key-record parser, key-up and
+key-down records carrying surrogate units were both classified as surrogates;
+the repeated pairs failed UTF-16 decoding and cleared the buffer. Crossterm
+0.29.0 retains this parser behavior. This frontend check is separate from the
+direct ConPTY harness, which does not exercise Windows Terminal.
 Follow-up issue [#206](https://github.com/SHUKE-LABS/leg/issues/206) tracks the
-parser fix and regression coverage. The pywinpty 3.0.5 timing and 2.0.15
-behavior lanes remain unchanged.
+local crossterm parser fix and regression coverage based on upstream
+[crossterm PR #1073](https://github.com/crossterm-rs/crossterm/pull/1073).
