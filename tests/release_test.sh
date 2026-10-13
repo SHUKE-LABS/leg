@@ -532,10 +532,10 @@ test_npm_staging_rejects_incomplete_archives() (
     version="0.4.25"
     make_npm_archive_fixture "${repo}" "${version}"
     mkdir "${repo}/unpacked"
-    tar -xzf "${repo}/dist/leg-${version}-x86_64-unknown-linux-gnu.tar.gz" -C "${repo}/unpacked"
+    tar -xzf "${repo}/dist/leg-${version}-x86_64-unknown-linux-musl.tar.gz" -C "${repo}/unpacked"
     for name in leg-tui leg-web leg-ui-supervisor; do
         mv "${repo}/unpacked/${name}" "${repo}/binary-backup"
-        tar -C "${repo}/unpacked" -czf "${repo}/dist/leg-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+        tar -C "${repo}/unpacked" -czf "${repo}/dist/leg-${version}-x86_64-unknown-linux-musl.tar.gz" \
             .
         status=0
         output="$(release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages" 2>&1)" || status="$?"
