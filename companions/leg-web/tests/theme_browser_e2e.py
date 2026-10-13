@@ -586,9 +586,23 @@ async def run(
                     await route.abort()
 
                 await page.route("**/submit", drop_accepted_response)
-                await page.locator("#prompt").fill("TRIAL-PAUSE: live turn across theme reload")
+                await page.locator("#prompt").fill("TRIAL-WORKING: live turn across theme reload")
                 await common.send_with_keyboard(page)
-                await page.get_by_text("The first live text is visible", exact=False).wait_for()
+                working_bubble = page.locator("#messages .message-assistant .message-content").last
+                await working_bubble.get_by_text("Working…", exact=True).wait_for()
+                assert await working_bubble.inner_text() == "Working…"
+                working_request = await asyncio.to_thread(
+                    common.wait_until,
+                    lambda: next(
+                        (
+                            int(request)
+                            for request, state in common.fixture_status(provider_authority)["pause_gates"].items()
+                            if state == "held"
+                        ),
+                        None,
+                    ),
+                    "TRIAL-WORKING provider gate",
+                )
                 await snapshot_intercepted.wait()
                 assert accepted_response_dropped
                 draft = "Draft kept during run\nsecond line Ω"
@@ -621,8 +635,16 @@ async def run(
                 assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
                 assert len([item for item in requests if item[1].endswith("/stop")]) == before_active_actions["stop"]
                 snapshot_gate.set()
+                assert await asyncio.to_thread(
+                    common.api_status,
+                    provider_authority,
+                    "POST",
+                    f"/__trial/release?request={working_request}",
+                    {},
+                ) == 200
                 await page.unroute("**/snapshot", hold_snapshot)
                 await page.unroute("**/submit", drop_accepted_response)
+                await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await common.wait_status(page, "Running")
                 assert await page.locator("#stop-turn").is_visible()
                 assert await page.locator("#send").count() == 0
