@@ -558,3 +558,13 @@ direct ConPTY harness, which does not exercise Windows Terminal.
 Follow-up issue [#206](https://github.com/SHUKE-LABS/leg/issues/206) tracks the
 local crossterm parser fix and regression coverage based on upstream
 [crossterm PR #1073](https://github.com/crossterm-rs/crossterm/pull/1073).
+
+The fixed parser is at revision
+`22ef65314b4a991beb4eb20527d4c0b7b664879f`, which was used to build the
+fixture binaries and is unchanged in the final #206 head. On Windows build
+26300 and Windows Terminal 1.24.12741.0, oncall repeated the paste in a real
+WT window with user32 `SendInput` Ctrl+Shift+V. The clipboard held the same
+five LF-delimited lines with no trailing newline; no multiline warning
+appeared, the composer showed 😀, and Ctrl-S succeeded. One fixture request
+completed with `pasted_line_one`, `pasted_chinese_line`, `pasted_line_three`,
+`chinese_multiline_prompt`, `pasted_emoji`, and `emoji_paste` all true.
