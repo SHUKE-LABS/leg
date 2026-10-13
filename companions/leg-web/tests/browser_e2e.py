@@ -1616,6 +1616,153 @@ async def run(
             stop_process(provider, graceful=False)
 
 
+async def run_workspace_browser(
+    web_bin: Path, leg_bin: Path, supervisor_bin: Path, browser_name: str
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="leg-web-workspace-browser-e2e-") as root_string:
+        root = Path(root_string)
+        home = root / "home"
+        child = home / "browse-child"
+        nested = child / "nested"
+        state_dir = root / "state"
+        nested.mkdir(parents=True)
+        state_dir.mkdir()
+
+        host_env = os.environ.copy()
+        host_env["HOME"] = os.fspath(home)
+        if os.name == "nt":
+            host_env["USERPROFILE"] = os.fspath(home)
+        host, host_lines = start_process(
+            [
+                str(web_bin),
+                "--no-open",
+                "--bind",
+                "127.0.0.1:0",
+                "--state-dir",
+                str(state_dir),
+                "--leg-bin",
+                str(leg_bin),
+                "--supervisor-bin",
+                str(supervisor_bin),
+            ],
+            cwd=root,
+            env=host_env,
+        )
+        try:
+            launch_line = read_until(host, host_lines, "Open this one-time launch URL:")
+            launch_url = launch_line.split(": ", 1)[1]
+            authority = urlsplit(launch_url).netloc
+
+            async with async_playwright() as playwright:
+                browser, context, persistent_context = await launch_test_browser_context(
+                    playwright, browser_name, root / "browser-profile"
+                )
+                page = await context.new_page()
+                page_errors: list[str] = []
+                page.on("pageerror", lambda error: page_errors.append(str(error)))
+                await page.goto(launch_url, wait_until="load")
+
+                async def wait_for_browser_path(path: str) -> None:
+                    await page.wait_for_function(
+                        "expected => document.querySelector('#workspace-browser-current-path')?.textContent === expected",
+                        arg=path,
+                        timeout=10000,
+                    )
+
+                await page.locator("#start-workspace-browse").click()
+                await page.locator("#workspace-browser").wait_for(state="visible")
+                await page.wait_for_function(
+                    "() => document.querySelector('#workspace-browser-current-path')?.textContent && "
+                    "document.querySelector('#workspace-browser-current-path').textContent !== 'Loading home folder…'"
+                )
+                home_path = await page.locator("#workspace-browser-current-path").text_content()
+                assert home_path
+
+                async def open_child() -> str:
+                    await page.locator("#workspace-browser-list").get_by_role(
+                        "button", name="browse-child", exact=True
+                    ).click()
+                    separator = "\\" if "\\" in home_path and "/" not in home_path else "/"
+                    child_path = home_path.rstrip("/\\") + separator + "browse-child"
+                    await wait_for_browser_path(child_path)
+                    return child_path
+
+                child_path = await open_child()
+                await page.locator("#workspace-browser-up").click()
+                await wait_for_browser_path(home_path)
+                child_path = await open_child()
+                await page.locator("#workspace-browser-use").click()
+                await page.locator("#workspace-browser").wait_for(state="hidden")
+                assert await page.locator("#workspace-input").input_value() == child_path
+                await page.locator("#workspace-input").fill("~/browse-child")
+                await page.locator("#start-form").get_by_role(
+                    "button", name="Start conversation"
+                ).click()
+                await page.wait_for_function(
+                    "expected => document.querySelector('#workspace-label')?.textContent === expected",
+                    arg=child_path,
+                    timeout=10000,
+                )
+                await page.locator("#new-conversation").click()
+                await page.locator("#welcome").wait_for(state="visible")
+
+                await page.locator("#start-workspace-browse").click()
+                await page.locator("#workspace-browser").wait_for(state="visible")
+                await wait_for_browser_path(home_path)
+                for _ in range(24):
+                    if await page.locator("#workspace-browser-up").is_disabled():
+                        break
+                    before = await page.locator("#workspace-browser-current-path").text_content()
+                    await page.locator("#workspace-browser-up").click()
+                    await page.wait_for_function(
+                        "before => document.querySelector('#workspace-browser-current-path')?.textContent !== before",
+                        arg=before,
+                        timeout=10000,
+                    )
+                root_path = await page.locator("#workspace-browser-current-path").text_content()
+                assert root_path and Path(root_path).anchor == root_path, root_path
+                assert await page.locator("#workspace-browser-up").is_disabled()
+                await page.locator("#workspace-browser-cancel").click()
+
+                token = await page.evaluate("sessionStorage.getItem('leg-web-launch-token')")
+                assert token
+                session = await asyncio.to_thread(create_workspace_less_session, authority, token)
+                session_id = str(session["id"])
+                session_button = page.locator(
+                    f'#session-list .session-select[data-session-id="{session_id}"]'
+                )
+                await session_button.wait_for(timeout=10000)
+                await session_button.click()
+                await page.locator("#session-guidance").get_by_role(
+                    "button", name="Set workspace"
+                ).click()
+                await page.locator("#set-workspace-form").wait_for(state="visible")
+                await page.locator("#recovery-workspace-browse").click()
+                await page.locator("#workspace-browser").wait_for(state="visible")
+                await page.locator("#workspace-browser-list").get_by_role(
+                    "button", name="browse-child", exact=True
+                ).click()
+                await wait_for_browser_path(child_path)
+                await page.locator("#workspace-browser-use").click()
+                assert await page.locator("#recovery-workspace-input").input_value() == child_path
+                await page.locator("#recovery-workspace-input").fill(r"~\browse-child")
+                await page.locator("#set-workspace-form").get_by_role(
+                    "button", name="Set workspace"
+                ).click()
+                await page.wait_for_function(
+                    "expected => document.querySelector('#workspace-label')?.textContent === expected",
+                    arg=child_path,
+                    timeout=10000,
+                )
+                assert not page_errors, page_errors
+
+                await context.close()
+                if not persistent_context:
+                    await browser.close()
+        finally:
+            stop_process(host, graceful=True)
+
+
 async def run_session_navigation(
     web_bin: Path, leg_bin: Path, supervisor_bin: Path, browser_name: str
 ) -> None:
@@ -3239,6 +3386,7 @@ async def main() -> int:
     binaries = tuple(path.resolve() for path in (args.web_bin, args.leg_bin, args.supervisor_bin))
     await run(*binaries, args.browser)
     await run_session_navigation(*binaries, args.browser)
+    await run_workspace_browser(*binaries, args.browser)
     print(f"leg-web {args.browser} browser E2E passed")
     return 0
 

@@ -81,18 +81,22 @@ echo credentials, paths, request bodies, or tokens.
 | Method and path | Purpose |
 | --- | --- |
 | `GET /api/sessions` | List catalog sessions and parsed trail state. |
-| `POST /api/sessions` | Create a draft with optional `name` and absolute `cwd`. |
+| `POST /api/sessions` | Create a draft with optional `name` and an absolute or `~` workspace path. |
+| `GET /api/fs/dirs?path=<abs-or-~>` | List immediate subdirectories at a host path, including the resolved path and parent. |
 | `POST /api/sessions/select` | Select a known session for a `tab_id`; selection is host memory only. |
 | `GET /api/sessions/{id}` | Read one session. |
 | `PATCH /api/sessions/{id}` | Rename or clear a session name. |
-| `PUT /api/sessions/{id}/workspace` | Set an existing absolute workspace while idle. |
+| `PUT /api/sessions/{id}/workspace` | Set an existing workspace from an absolute or `~` path while idle. |
 | `GET /api/sessions/{id}/snapshot` | Read the authoritative session, host turn ID, cursor, next request ID, active provisional state, and last receipt. |
 | `POST /api/sessions/{id}/submit` | Submit `{ "request_id": N, "prompt": "..." }`. |
 | `POST /api/sessions/{id}/stop` | Idempotently stop the host-owned run through the shared driver. |
 | `GET /api/sessions/{id}/events?after=N` | Reconnect to authenticated server-sent events using `fetch`. |
 
-The host never exposes a shell or arbitrary file operation. Workspace selection
-only records a canonical existing directory; leg uses it as its working
+The host never exposes a shell or arbitrary file operation. Workspace input
+accepts absolute paths and leading `~`, `~/`, or `~\` paths; `~user` forms and
+other relative paths are rejected. The directory endpoint returns only
+immediate subdirectory names, with hidden directories sorted last. Workspace
+selection records a canonical existing directory; leg uses it as its working
 directory, not as a sandbox. Session listing, locking, trail parsing, cwd
 validation, and process ownership reuse `leg-ui-client`.
 
@@ -143,12 +147,14 @@ catalog's recoverable prompt, the host uses the shared `prepare_retry` and
 
 Open the one-time launch URL printed by `leg-web`. The page keeps its launch
 token in per-tab session storage and sends no provider credentials. On the
-first screen, enter an absolute path to an existing folder on the host and
-start a conversation. The browser cannot browse the host filesystem. Leg runs
-tools as the host OS user with that folder as its working directory; it is not
-a sandbox. Provider configuration comes from the environment that launched
-`leg-web`, and missing binaries or setup are reported with local recovery
-steps.
+first screen, enter an absolute path or a path such as `~/project` for an
+existing folder on the host, or use **Browse…** to walk host directories from
+your home folder. The browser shows directory names only; **Use this folder**
+fills the workspace path. The same control is available when choosing a
+replacement workspace for a recovered conversation. Leg runs tools as the
+host OS user with that folder as its working directory; it is not a sandbox.
+Provider configuration comes from the environment that launched `leg-web`,
+and missing binaries or setup are reported with local recovery steps.
 
 The transcript shows provisional streamed text and tool activity. The
 effective provider and model appear from leg's `turn_start` metadata; the UI
