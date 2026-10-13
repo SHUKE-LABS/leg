@@ -24,8 +24,12 @@ export function createSharedRenderer(ui, features) {
     "connection-state", "new-conversation", "session-list", "session-list-empty",
     "session-list-no-results", "session-list-error", "rename-form", "rename-input",
     "rename-error", "cancel-rename", "welcome", "start-form", "workspace-input",
+    "start-workspace-browse",
     "setup-error", "conversation", "session-title", "workspace-label", "session-guidance",
-    "set-workspace-form", "recovery-workspace-input", "recovery-error", "cancel-workspace",
+    "set-workspace-form", "recovery-workspace-input", "recovery-workspace-browse",
+    "recovery-error", "cancel-workspace", "workspace-browser", "workspace-browser-up",
+    "workspace-browser-current-path", "workspace-browser-error", "workspace-browser-list",
+    "workspace-browser-empty", "workspace-browser-use", "workspace-browser-cancel",
     "provider-model", "elapsed-time", "turn-status", "active-tool", "stop-turn",
     "workspace-warning", "connection-message", "transcript-warnings", "transcript",
     "messages", "empty-transcript", "new-content", "composer", "prompt",
@@ -54,6 +58,7 @@ export function createSharedRenderer(ui, features) {
     restoreReadingPosition: null, transcriptSessionId: null, renderedSessionSignature: "",
     connectionText: "", reconnecting: false, submitting: false, startBusy: false,
     renamingSessionId: null, draft: "", workspaceDraft: "", recoveryWorkspaceDraft: "",
+    workspaceBrowser: { open: false, target: null, path: "", parent: null, directories: [], busy: false, error: "" },
     renameDraft: "", sessionListError: "", setupError: "", sendError: "",
     renameError: "", recoveryError: "", showRecoveryForm: false, loadingSession: false,
     sessionListFilter: "", status: { text: "Idle", busy: false },
@@ -61,6 +66,7 @@ export function createSharedRenderer(ui, features) {
   };
   let actions = {};
   let elapsedTimer = null;
+  let workspaceBrowserSignature = null;
   const messageRenderState = new WeakMap();
   const toastTimers = new WeakMap();
 
@@ -347,6 +353,7 @@ export function createSharedRenderer(ui, features) {
   function renderAll(options = {}) {
     const session = state.snapshot?.session;
     const hasSession = Boolean(state.sessionId && (session || state.loadingSession));
+    renderWorkspaceBrowser();
     ui.welcome.hidden = hasSession;
     ui.conversation.hidden = !hasSession;
     ui["session-list-error"].textContent = state.sessionListError;
@@ -390,6 +397,41 @@ export function createSharedRenderer(ui, features) {
     renderStatus();
     renderTranscriptWarnings();
     renderTranscript(options);
+  }
+
+  function renderWorkspaceBrowser() {
+    const browser = state.workspaceBrowser;
+    const signature = JSON.stringify({
+      open: browser.open,
+      path: browser.path,
+      parent: browser.parent,
+      directories: browser.directories,
+      busy: browser.busy,
+      error: browser.error,
+    });
+    if (signature !== workspaceBrowserSignature) {
+      ui["workspace-browser-current-path"].textContent = browser.path ||
+        (browser.error ? "Folder unavailable" : "Loading home folder…");
+      ui["workspace-browser-up"].disabled = browser.busy || !browser.parent;
+      ui["workspace-browser-use"].disabled = browser.busy || !browser.path;
+      ui["workspace-browser-error"].textContent = browser.error;
+      ui["workspace-browser-error"].hidden = !browser.error;
+      ui["workspace-browser-list"].setAttribute("aria-busy", String(browser.busy));
+      ui["workspace-browser-list"].replaceChildren();
+      for (const name of browser.directories) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "workspace-browser-entry";
+        button.dataset.directoryName = name;
+        button.textContent = name;
+        button.disabled = browser.busy;
+        ui["workspace-browser-list"].append(button);
+      }
+      ui["workspace-browser-empty"].hidden = browser.busy || Boolean(browser.error) || browser.directories.length > 0;
+      workspaceBrowserSignature = signature;
+    }
+    if (browser.open && !ui["workspace-browser"].open) ui["workspace-browser"].showModal();
+    else if (!browser.open && ui["workspace-browser"].open) ui["workspace-browser"].close();
   }
 
   function showNewContent() {
@@ -1709,6 +1751,7 @@ export function createSharedRenderer(ui, features) {
       sessions: model.sessions, snapshot: model.snapshot, active: model.active, pending: model.pending,
       transcriptItems: model.transcript, draft: model.draft, workspaceDraft: model.workspaceDraft,
       recoveryWorkspaceDraft: model.recoveryWorkspaceDraft, renameDraft: model.renameDraft,
+      workspaceBrowser: model.workspaceBrowser,
       connectionText: model.connection.text, reconnecting: model.connection.reconnecting,
       submitting: model.submitting, startBusy: model.startBusy, renamingSessionId: model.renamingSessionId,
       sessionListError: model.errors.sessionList, setupError: model.errors.setup, sendError: model.errors.send,
@@ -1770,6 +1813,19 @@ export function createSharedRenderer(ui, features) {
   function bind(nextActions) {
     actions = nextActions;
     ui["start-form"].addEventListener("submit", (event) => { event.preventDefault(); actions.startConversation(ui["workspace-input"].value); });
+    ui["start-workspace-browse"].addEventListener("click", () => actions.openWorkspaceBrowser("welcome"));
+    ui["recovery-workspace-browse"].addEventListener("click", () => actions.openWorkspaceBrowser("recovery"));
+    ui["workspace-browser-up"].addEventListener("click", actions.navigateWorkspaceBrowserUp);
+    ui["workspace-browser-list"].addEventListener("click", (event) => {
+      const target = event.target.closest("[data-directory-name]");
+      if (target) actions.navigateWorkspaceBrowser(target.dataset.directoryName);
+    });
+    ui["workspace-browser-use"].addEventListener("click", actions.useWorkspaceBrowserPath);
+    ui["workspace-browser-cancel"].addEventListener("click", actions.closeWorkspaceBrowser);
+    ui["workspace-browser"].addEventListener("cancel", (event) => {
+      event.preventDefault();
+      actions.closeWorkspaceBrowser();
+    });
     ui["new-conversation"].addEventListener("click", actions.openNewConversation);
     ui["session-list"].addEventListener("click", (event) => {
       const target = event.target.closest("[data-session-id][data-action]");

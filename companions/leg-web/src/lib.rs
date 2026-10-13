@@ -532,7 +532,7 @@ struct CreateSession {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    cwd: Option<PathBuf>,
+    cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -544,7 +544,25 @@ struct RenameSession {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetWorkspace {
-    cwd: PathBuf,
+    cwd: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DirectoryQuery {
+    path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DirectoryListing {
+    path: String,
+    parent: Option<String>,
+    directories: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspacePathError {
+    NotAbsolute,
+    HomeUnresolved,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -601,6 +619,93 @@ fn api_error(status: StatusCode, message: &'static str) -> ApiError {
     ApiError(status, message)
 }
 
+fn home_directory() -> Option<PathBuf> {
+    let candidates = if cfg!(windows) {
+        [std::env::var_os("USERPROFILE"), std::env::var_os("HOME")]
+    } else {
+        [std::env::var_os("HOME"), None]
+    };
+    candidates
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute())
+}
+
+fn resolve_workspace_path(value: &str, home: Option<&Path>) -> Result<PathBuf, WorkspacePathError> {
+    let tilde_suffix = if value == "~" {
+        Some("")
+    } else {
+        value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\"))
+    };
+
+    if let Some(suffix) = tilde_suffix {
+        let home = home
+            .filter(|path| path.is_absolute())
+            .ok_or(WorkspacePathError::HomeUnresolved)?;
+        let mut relative = PathBuf::new();
+        for component in suffix.split(['/', '\\']).filter(|part| !part.is_empty()) {
+            relative.push(component);
+        }
+        return Ok(home.join(relative));
+    }
+
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(WorkspacePathError::NotAbsolute)
+    }
+}
+
+fn workspace_path_error(error: WorkspacePathError) -> ApiError {
+    match error {
+        WorkspacePathError::NotAbsolute => {
+            api_error(StatusCode::BAD_REQUEST, "workspace_must_be_absolute")
+        }
+        WorkspacePathError::HomeUnresolved => {
+            api_error(StatusCode::BAD_REQUEST, "workspace_home_unresolved")
+        }
+    }
+}
+
+fn directory_io_error(error: io::Error) -> ApiError {
+    match error.kind() {
+        io::ErrorKind::NotFound => api_error(StatusCode::NOT_FOUND, "directory_not_found"),
+        io::ErrorKind::NotADirectory => {
+            api_error(StatusCode::BAD_REQUEST, "directory_not_a_directory")
+        }
+        io::ErrorKind::PermissionDenied => api_error(StatusCode::FORBIDDEN, "directory_unreadable"),
+        _ => api_error(StatusCode::INTERNAL_SERVER_ERROR, "directory_unreadable"),
+    }
+}
+
+fn directory_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && *parent != path)
+}
+
+fn directory_is_hidden(entry: &fs::DirEntry, name: &str) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return entry
+            .metadata()
+            .is_ok_and(|metadata| metadata.file_attributes() & 0x2 != 0);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = entry;
+        false
+    }
+}
+
 fn build_router(state: HostState) -> Router {
     let router = Router::new()
         .route("/", get(index))
@@ -612,6 +717,7 @@ fn build_router(state: HostState) -> Router {
         .route("/themes/default.css", get(default_theme_css))
         .route("/themes/shared-renderer.js", get(shared_renderer_js))
         .route("/api/sessions", get(list_sessions).post(create_session))
+        .route("/api/fs/dirs", get(list_directories))
         .route("/api/sessions/select", post(select_session))
         .route("/api/sessions/{id}", get(get_session).patch(rename_session))
         .route("/api/sessions/{id}/workspace", put(set_workspace))
@@ -806,23 +912,71 @@ async fn list_sessions(State(state): State<HostState>) -> Result<Json<Value>, Ap
     Ok(Json(json!({"sessions": sessions})))
 }
 
+async fn list_directories(
+    Query(query): Query<DirectoryQuery>,
+) -> Result<Json<DirectoryListing>, ApiError> {
+    let home = home_directory();
+    let requested =
+        resolve_workspace_path(&query.path, home.as_deref()).map_err(workspace_path_error)?;
+    let path = fs::canonicalize(&requested).map_err(directory_io_error)?;
+    let metadata = fs::metadata(&path).map_err(directory_io_error)?;
+    if !metadata.is_dir() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "directory_not_a_directory",
+        ));
+    }
+
+    let entries = fs::read_dir(&path).map_err(directory_io_error)?;
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(directory_io_error)?;
+        let file_type = entry.file_type().map_err(directory_io_error)?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        directories.push((directory_is_hidden(&entry, &name), name));
+    }
+    directories.sort_by(|(left_hidden, left), (right_hidden, right)| {
+        left_hidden
+            .cmp(right_hidden)
+            .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
+            .then_with(|| left.cmp(right))
+    });
+
+    Ok(Json(DirectoryListing {
+        path: path.to_string_lossy().into_owned(),
+        parent: directory_parent(&path).map(|parent| parent.to_string_lossy().into_owned()),
+        directories: directories.into_iter().map(|(_, name)| name).collect(),
+    }))
+}
+
 async fn create_session(
     State(state): State<HostState>,
     Json(body): Json<CreateSession>,
 ) -> Result<(StatusCode, Json<CatalogSession>), ApiError> {
+    create_session_with_home(state, body, home_directory())
+}
+
+fn create_session_with_home(
+    state: HostState,
+    body: CreateSession,
+    home: Option<PathBuf>,
+) -> Result<(StatusCode, Json<CatalogSession>), ApiError> {
     if let Some(name) = body.name.as_deref() {
         validate_name(name)?;
     }
-    if body.cwd.as_ref().is_some_and(|cwd| !cwd.is_absolute()) {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "workspace_must_be_absolute",
-        ));
-    }
+    let cwd = body
+        .cwd
+        .as_deref()
+        .map(|cwd| resolve_workspace_path(cwd, home.as_deref()))
+        .transpose()
+        .map_err(workspace_path_error)?;
     let session = state
         .inner
         .catalog
-        .create_draft(SessionInterface::Web, body.name, body.cwd.as_deref())
+        .create_draft(SessionInterface::Web, body.name, cwd.as_deref())
         .map_err(map_catalog_error)?;
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -873,15 +1027,19 @@ async fn set_workspace(
     RoutePath(id): RoutePath<String>,
     Json(body): Json<SetWorkspace>,
 ) -> Result<StatusCode, ApiError> {
+    set_workspace_with_home(state, id, body, home_directory()).await
+}
+
+async fn set_workspace_with_home(
+    state: HostState,
+    id: String,
+    body: SetWorkspace,
+    home: Option<PathBuf>,
+) -> Result<StatusCode, ApiError> {
     if !valid_session_id(&id) {
         return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
     }
-    if !body.cwd.is_absolute() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "workspace_must_be_absolute",
-        ));
-    }
+    let cwd = resolve_workspace_path(&body.cwd, home.as_deref()).map_err(workspace_path_error)?;
     let ledger_id = state.ledger_id(&id);
     #[cfg(test)]
     state.note_gate_attempt("workspace");
@@ -896,7 +1054,7 @@ async fn set_workspace(
         blocking_state
             .inner
             .catalog
-            .set_workspace(&id, &body.cwd)
+            .set_workspace(&id, &cwd)
             .map_err(map_catalog_error)
     })
     .await
@@ -2615,6 +2773,260 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),
             json!({"error": expected_code})
+        );
+    }
+
+    fn encode_query_component(value: &str) -> String {
+        let mut encoded = String::new();
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                encoded.push(byte as char);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        encoded
+    }
+
+    #[test]
+    fn workspace_tilde_paths_join_components_with_both_separator_styles() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let expected = home.join("dotfiles");
+
+        assert_eq!(
+            resolve_workspace_path("~/dotfiles", Some(home)),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            resolve_workspace_path(r"~\dotfiles", Some(home)),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            resolve_workspace_path("~", Some(home)),
+            Ok(home.to_path_buf())
+        );
+        assert_eq!(
+            resolve_workspace_path("~other/dotfiles", Some(home)),
+            Err(WorkspacePathError::NotAbsolute)
+        );
+        assert_eq!(
+            resolve_workspace_path("relative/dotfiles", Some(home)),
+            Err(WorkspacePathError::NotAbsolute)
+        );
+        assert_eq!(
+            resolve_workspace_path("~/dotfiles", None),
+            Err(WorkspacePathError::HomeUnresolved)
+        );
+        assert_eq!(
+            resolve_workspace_path("~/dotfiles", Some(Path::new("relative-home"))),
+            Err(WorkspacePathError::HomeUnresolved)
+        );
+        assert_eq!(
+            workspace_path_error(WorkspacePathError::HomeUnresolved).1,
+            "workspace_home_unresolved"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_userprofile_expands_both_tilde_separator_styles() {
+        let home = PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE is set"));
+        assert!(home.is_absolute());
+        let expected = home.join("dotfiles");
+        assert_eq!(
+            resolve_workspace_path("~/dotfiles", Some(&home)),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            resolve_workspace_path(r"~\dotfiles", Some(&home)),
+            Ok(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_set_workspace_expand_tilde_paths_and_reject_other_relative_paths() {
+        let (host, temp) = test_host();
+        let home = temp.path().join("home");
+        let dotfiles = home.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let canonical_home = home.canonicalize().unwrap();
+        let canonical_dotfiles = dotfiles.canonicalize().unwrap();
+
+        let (status, created_home) = create_session_with_home(
+            host.state.clone(),
+            CreateSession {
+                name: Some("home path".into()),
+                cwd: Some("~".into()),
+            },
+            Some(home.clone()),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            created_home.0.cwd.as_deref(),
+            Some(canonical_home.as_path())
+        );
+
+        let (status, created) = create_session_with_home(
+            host.state.clone(),
+            CreateSession {
+                name: Some("tilde path".into()),
+                cwd: Some("~/dotfiles".into()),
+            },
+            Some(home.clone()),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.0.cwd.as_deref(), Some(canonical_dotfiles.as_path()));
+
+        let (_, created_backslash) = create_session_with_home(
+            host.state.clone(),
+            CreateSession {
+                name: Some("windows-style path".into()),
+                cwd: Some(r"~\dotfiles".into()),
+            },
+            Some(home.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            created_backslash.0.cwd.as_deref(),
+            Some(canonical_dotfiles.as_path())
+        );
+
+        let result = set_workspace_with_home(
+            host.state.clone(),
+            created.0.id.clone(),
+            SetWorkspace { cwd: "~".into() },
+            Some(home.clone()),
+        )
+        .await;
+        assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+        let stored = host.state.inner.catalog.get(&created.0.id).unwrap();
+        assert_eq!(stored.cwd.as_deref(), Some(canonical_home.as_path()));
+
+        for value in [r"~\dotfiles", "~/dotfiles"] {
+            let result = set_workspace_with_home(
+                host.state.clone(),
+                created.0.id.clone(),
+                SetWorkspace { cwd: value.into() },
+                Some(home.clone()),
+            )
+            .await;
+            assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+            let stored = host.state.inner.catalog.get(&created.0.id).unwrap();
+            assert_eq!(stored.cwd.as_deref(), Some(canonical_dotfiles.as_path()));
+        }
+
+        for value in ["~other/dotfiles", "relative/dotfiles"] {
+            let error = create_session_with_home(
+                host.state.clone(),
+                CreateSession {
+                    name: None,
+                    cwd: Some(value.into()),
+                },
+                Some(home.clone()),
+            )
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(error.1, "workspace_must_be_absolute");
+
+            let error = set_workspace_with_home(
+                host.state.clone(),
+                created.0.id.clone(),
+                SetWorkspace { cwd: value.into() },
+                Some(home.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(error.1, "workspace_must_be_absolute");
+        }
+
+        let error = create_session_with_home(
+            host.state.clone(),
+            CreateSession {
+                name: None,
+                cwd: Some("~".into()),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.1, "workspace_home_unresolved");
+
+        let error = set_workspace_with_home(
+            host.state.clone(),
+            created.0.id.clone(),
+            SetWorkspace { cwd: "~".into() },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.1, "workspace_home_unresolved");
+    }
+
+    #[tokio::test]
+    async fn directory_listing_requires_auth_and_returns_only_directories_with_stable_errors() {
+        let (host, temp) = test_host();
+        let folder = temp.path().join("browser-root");
+        fs::create_dir_all(folder.join("visible")).unwrap();
+        fs::create_dir_all(folder.join(".hidden")).unwrap();
+        fs::write(folder.join("readme.txt"), "not a directory").unwrap();
+        let canonical_folder = folder.canonicalize().unwrap();
+        let router = build_router(host.state.clone());
+
+        let missing_auth = HttpRequest::builder()
+            .uri("/api/fs/dirs?path=%7E")
+            .header(HOST, "127.0.0.1:43127")
+            .header(ORIGIN, "http://127.0.0.1:43127")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(missing_auth).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let path_query = encode_query_component(&folder.to_string_lossy());
+        let (status, listing) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/fs/dirs?path={path_query}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        assert_eq!(listing["path"], canonical_folder.to_string_lossy().as_ref());
+        assert_eq!(
+            listing["parent"],
+            temp.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(listing["directories"], json!(["visible", ".hidden"]));
+
+        let missing = encode_query_component(&folder.join("missing").to_string_lossy());
+        let (status, error) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/fs/dirs?path={missing}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"], "directory_not_found");
+
+        let file = encode_query_component(&folder.join("readme.txt").to_string_lossy());
+        let (status, error) = round_trip_json(
+            &router,
+            api_request(&host, &format!("/api/fs/dirs?path={file}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"], "directory_not_a_directory");
+        assert_eq!(directory_parent(Path::new("/")), None);
+        #[cfg(windows)]
+        assert_eq!(directory_parent(Path::new(r"C:\")), None);
+        assert_eq!(
+            directory_io_error(io::Error::from(io::ErrorKind::PermissionDenied)).1,
+            "directory_unreadable"
         );
     }
 

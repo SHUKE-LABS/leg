@@ -5,6 +5,7 @@ export function startController(view) {
   const workspaceKey = "leg-web-last-workspace";
   const draftPrefix = "leg-web-draft:";
   const pendingPrefix = "leg-web-pending:";
+  const workspacePathHelp = "Enter an absolute path or use ~, ~/path, or ~\\path to choose a folder on the host computer.";
   const bootstrap = window.location.hash.slice(1);
   if (/^[0-9a-f]{64}$/i.test(bootstrap)) {
     window.sessionStorage.setItem(tokenKey, bootstrap);
@@ -40,6 +41,16 @@ export function startController(view) {
     showRecoveryForm: false,
     recoveryWorkspaceDraft: "",
     recoveryError: "",
+    workspaceBrowser: {
+      open: false,
+      target: null,
+      path: "",
+      parent: null,
+      directories: [],
+      busy: false,
+      error: "",
+      generation: 0,
+    },
     setupError: "",
     sendError: "",
     sessionListError: "",
@@ -107,7 +118,11 @@ export function startController(view) {
       host_shutting_down: "The local host is shutting down. Your draft is kept in this tab.",
       session_busy: "This conversation is already running in another tab. Your message is still here.",
       workspace_required: "Choose an existing workspace folder for this session or start a new conversation.",
-      workspace_must_be_absolute: "Enter an absolute path to an existing folder on the host computer.",
+      workspace_must_be_absolute: workspacePathHelp,
+      workspace_home_unresolved: "The host home directory could not be resolved. Enter an absolute path instead.",
+      directory_not_found: "That folder could not be found. Check the path and try again.",
+      directory_not_a_directory: "That path is not a folder.",
+      directory_unreadable: "That folder cannot be read.",
       session_read_only: "This conversation cannot be changed because its saved trail could not be read.",
       submission_id_conflict: "This send ID is already associated with different text. Your draft is preserved; reload the conversation before sending again.",
       submission_id_stale: "This send ID has expired. Your draft is preserved; reload the conversation before sending again.",
@@ -173,7 +188,88 @@ export function startController(view) {
   }
 
   function absoluteWorkspace(value) {
-    return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+    return value === "~" || /^~[\\/]/.test(value) || value.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\");
+  }
+
+  let workspaceBrowserGeneration = 0;
+
+  async function loadWorkspaceDirectory(path) {
+    const generation = state.workspaceBrowser.generation;
+    if (!state.workspaceBrowser.open || state.workspaceBrowser.busy) return;
+    state.workspaceBrowser = { ...state.workspaceBrowser, busy: true, error: "" };
+    publishThemeModel();
+    try {
+      const query = new URLSearchParams({ path });
+      const listing = await api(`/api/fs/dirs?${query}`);
+      if (!state.workspaceBrowser.open || state.workspaceBrowser.generation !== generation) return;
+      state.workspaceBrowser = {
+        ...state.workspaceBrowser,
+        path: String(listing.path || ""),
+        parent: listing.parent || null,
+        directories: Array.isArray(listing.directories) ? listing.directories : [],
+        busy: false,
+      };
+    } catch (error) {
+      if (!state.workspaceBrowser.open || state.workspaceBrowser.generation !== generation) return;
+      state.workspaceBrowser = {
+        ...state.workspaceBrowser,
+        busy: false,
+        error: apiErrorText(error.code || "host_unavailable"),
+      };
+    }
+    publishThemeModel();
+  }
+
+  function openWorkspaceBrowser(target) {
+    if (target !== "welcome" && target !== "recovery") return;
+    const generation = ++workspaceBrowserGeneration;
+    state.workspaceBrowser = {
+      open: true,
+      target,
+      path: "",
+      parent: null,
+      directories: [],
+      busy: false,
+      error: "",
+      generation,
+    };
+    publishThemeModel();
+    void loadWorkspaceDirectory("~");
+  }
+
+  function closeWorkspaceBrowser() {
+    workspaceBrowserGeneration += 1;
+    const target = state.workspaceBrowser.target;
+    state.workspaceBrowser = { ...state.workspaceBrowser, open: false, busy: false };
+    publishThemeModel();
+    view.focus(target === "recovery" ? "recovery" : "workspace");
+  }
+
+  function navigateWorkspaceBrowser(name) {
+    const { path, busy } = state.workspaceBrowser;
+    if (!path || busy) return;
+    const separator = path.includes("\\") && !path.includes("/") ? "\\" : "/";
+    const childPath = /[\\/]$/.test(path) ? `${path}${name}` : `${path}${separator}${name}`;
+    void loadWorkspaceDirectory(childPath);
+  }
+
+  function navigateWorkspaceBrowserUp() {
+    const parent = state.workspaceBrowser.parent;
+    if (parent && !state.workspaceBrowser.busy) void loadWorkspaceDirectory(parent);
+  }
+
+  function useWorkspaceBrowserPath() {
+    const { path, target, busy } = state.workspaceBrowser;
+    if (!path || busy) return;
+    if (target === "recovery") {
+      state.recoveryWorkspaceDraft = path;
+      state.recoveryError = "";
+    } else {
+      state.workspaceDraft = path;
+      state.setupError = "";
+    }
+    closeWorkspaceBrowser();
   }
 
   async function startConversation(workspace) {
@@ -182,7 +278,7 @@ export function startController(view) {
     const cwd = String(workspace ?? state.workspaceDraft).trim();
     state.workspaceDraft = cwd;
     if (!absoluteWorkspace(cwd)) {
-      showStartError("Enter an absolute path, such as /home/name/project or C:\\Users\\name\\project.");
+      showStartError(workspacePathHelp);
       view.focus("workspace");
       return;
     }
@@ -657,6 +753,7 @@ export function startController(view) {
       draft: state.draft,
       workspaceDraft: state.workspaceDraft,
       recoveryWorkspaceDraft: state.recoveryWorkspaceDraft,
+      workspaceBrowser: state.workspaceBrowser,
       renameDraft: state.renameDraft,
       submitting: state.submitting,
       startBusy: state.startBusy,
@@ -1169,7 +1266,7 @@ export function startController(view) {
     const cwd = String(value ?? state.recoveryWorkspaceDraft).trim();
     state.recoveryWorkspaceDraft = cwd;
     if (!absoluteWorkspace(cwd)) {
-      state.recoveryError = "Enter an absolute path to an existing folder on the host computer.";
+      state.recoveryError = workspacePathHelp;
       publishThemeModel();
       view.focus("recovery");
       return;
@@ -1199,6 +1296,11 @@ export function startController(view) {
 
   const viewActions = Object.freeze({
     startConversation: (cwd) => void startConversation(cwd),
+    openWorkspaceBrowser,
+    navigateWorkspaceBrowser,
+    navigateWorkspaceBrowserUp,
+    useWorkspaceBrowserPath,
+    closeWorkspaceBrowser,
     openNewConversation,
     selectSession: (sessionId) => void activateSession(sessionId),
     beginRename(sessionId) {

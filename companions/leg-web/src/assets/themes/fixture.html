@@ -28,7 +28,11 @@
         <p>Leg uses this existing folder when its tools read files or run commands.</p>
         <form id="start-form">
           <label for="workspace-input">Workspace folder path</label>
-          <input id="workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace" required />
+          <div class="workspace-path-row">
+            <input id="workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="~/path/to/workspace" required />
+            <button id="start-workspace-browse" type="button">Browse…</button>
+          </div>
+          <p>Enter an absolute path or use ~, ~/path, or ~\path to choose a folder on the host computer.</p>
           <button type="submit">Start conversation</button>
           <p id="setup-error" role="alert" hidden></p>
         </form>
@@ -50,7 +54,10 @@
       <p id="session-guidance" role="status" hidden></p>
       <form id="set-workspace-form" hidden>
         <label for="recovery-workspace-input">Workspace folder path</label>
-        <input id="recovery-workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace" />
+        <div class="workspace-path-row">
+          <input id="recovery-workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="~/path/to/workspace" />
+          <button id="recovery-workspace-browse" type="button">Browse…</button>
+        </div>
         <button type="submit">Set workspace</button>
         <button id="cancel-workspace" type="button">Cancel workspace change</button>
         <p id="recovery-error" role="alert" hidden></p>
@@ -86,4 +93,18 @@
     </section>
     <p id="live-status" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
   </main>
+  <dialog id="workspace-browser" class="workspace-browser" aria-labelledby="workspace-browser-title">
+    <h2 id="workspace-browser-title">Choose a workspace folder</h2>
+    <div class="workspace-browser-location">
+      <button id="workspace-browser-up" type="button" aria-label="Go to parent folder">Up</button>
+      <p>Current folder: <code id="workspace-browser-current-path" aria-live="polite" aria-atomic="true"></code></p>
+    </div>
+    <p id="workspace-browser-error" class="error-message" role="alert" hidden></p>
+    <div id="workspace-browser-list" class="workspace-browser-list" role="group" aria-label="Subfolders" aria-busy="false"></div>
+    <p id="workspace-browser-empty" hidden>No subfolders in this folder.</p>
+    <div class="workspace-browser-actions">
+      <button id="workspace-browser-use" type="button">Use this folder</button>
+      <button id="workspace-browser-cancel" type="button">Cancel</button>
+    </div>
+  </dialog>
 </div>
