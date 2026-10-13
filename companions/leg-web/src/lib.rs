@@ -3018,7 +3018,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{listing}");
         assert_eq!(listing["path"], expected_folder.to_string_lossy().as_ref());
-        assert_eq!(listing["parent"], expected_parent.to_string_lossy().as_ref());
+        assert_eq!(
+            listing["parent"],
+            expected_parent.to_string_lossy().as_ref()
+        );
         #[cfg(windows)]
         assert!(!listing["path"].as_str().unwrap().starts_with(r"\\?\"));
         assert_eq!(listing["directories"], json!(["visible", ".hidden"]));
