@@ -523,3 +523,35 @@ gone; Stop, retry cancellation, and busy rejection each recorded only the
 expected fixture request, with no prompt replay. Every check confirmed
 terminal restoration. The report records the direct ConPTY setup and pywinpty
 version.
+
+## Windows Terminal frontend: non-BMP paste (#193)
+
+On Windows build 26300, Windows Terminal 1.24.12741.0, and `leg-tui` revision
+`73179bca9b367c58479aaacfdace96ef9bc6abb8`, a native clipboard paste with
+Ctrl+Shift+V lost U+1F600 from this verified five-line prompt:
+
+```text
+TRIAL-CHINESE
+Line one: keep this first.
+第二行：保留中文。
+Line three: keep this third.
+Emoji: 😀
+```
+
+Before submission with Ctrl-S, the composer contained the trigger and all
+non-emoji text, but not U+1F600. Its viewport showed the last four lines and
+ended at `Emoji:` with no glyph; `TRIAL-CHINESE` was above the viewport. The
+submitted transcript retained the trigger and other text. The fixture received
+one completed request: `pasted_line_one`,
+`pasted_chinese_line`, `pasted_line_three`, and `chinese_multiline_prompt`
+were true, while `pasted_emoji` and `emoji_paste` were false.
+
+A raw `ReadConsoleInputW` capture recorded U+1F600 as `D83D` key-down, `D83D`
+key-up, `DE00` key-down, `DE00` key-up. In crossterm 0.28.1's Windows parser,
+key-up and key-down records carrying surrogate units are both classified as
+surrogates; the repeated pairs fail UTF-16 decoding and clear the buffer.
+Crossterm 0.29.0 retains this parser behavior. This frontend check is separate
+from the direct ConPTY harness, which does not exercise Windows Terminal.
+Follow-up issue [#206](https://github.com/SHUKE-LABS/leg/issues/206) tracks the
+parser fix and regression coverage. The pywinpty 3.0.5 timing and 2.0.15
+behavior lanes remain unchanged.
