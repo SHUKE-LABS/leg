@@ -6,6 +6,12 @@ the binary; running it needs no Node runtime, CDN, or external service. The
 experimental interface in #84 can use the API below without adding HTTP
 dependencies to core `leg`.
 
+`npm i -g @shukelabs/leg` provides `leg`, `leg-tui`, and `leg-web`. Run
+`leg-web` to open its browser interface, or `leg-web --no-open` to print the
+launch URL without opening a browser. The platform package bundles the native
+`leg` and supervisor, so no `LEG_UI_SUPERVISOR_BIN` setting is needed.
+`leg-web --version` prints the companion's Cargo package version.
+
 ## Experimental trial bundle
 
 Build a self-contained Linux or macOS bundle from the repository root with
@@ -14,7 +20,8 @@ uses the root and companion lockfiles separately, and includes the compatible
 native binaries, dependency notices, the quickstart, the fixture, and the
 shared task/report materials. CI uploads `leg-web-experimental-<platform>-<revision>`
 artifacts after its Linux/macOS and Chromium/Firefox checks pass. The artifact
-is experimental and does not enter the regular release or npm packages. See
+contains trial fixtures and reporting materials in addition to the Web binary
+also shipped by the regular release and npm packages. See
 the [bundle quickstart](../companions/leg-web/trial/QUICKSTART.md) for
 prerequisites, fixture setup, start/stop, and removal.
 

@@ -115,6 +115,11 @@ let outcome = turn.wait()?;
 
 ## Binary selection
 
+`npm i -g @shukelabs/leg` provides `leg`, `leg-tui`, and `leg-web`. The UI
+launchers run native binaries from the matching platform package, which also
+contains `leg-ui-supervisor` beside them. The helper is selected automatically;
+no `LEG_UI_SUPERVISOR_BIN` setting is needed.
+
 The default resolver finds `leg` on `PATH`. A host UI may set
 `ClientConfig::leg_bin` for its `--leg-bin` option. Direct native source/archive
 installations are used as-is. The published `@shukelabs/leg` npm launcher is
@@ -231,8 +236,9 @@ and execution inspection remain #85.
 
 ## Experimental terminal UI
 
-`leg-tui` is a separate companion package. Build the native `leg` binary and
-the companion supervisor, then launch the UI with their native binary paths:
+After `npm i -g @shukelabs/leg`, run `leg-tui` in a terminal.
+For a source build, build the native `leg` binary and the companion supervisor,
+then launch the UI with their native binary paths:
 
 ```sh
 cargo build --locked --bin leg
@@ -243,7 +249,7 @@ cargo run --locked --manifest-path companions/Cargo.toml -p leg-tui -- \
 ```
 
 The UI inherits provider configuration from its launching environment. It
-requires terminals on both stdin and stdout; `leg-tui --help` also works with
+requires terminals on both stdin and stdout; `leg-tui --help` and `--version` work with
 redirected streams. On first use, choose a workspace directory, review the
 warning and keyboard guide, then compose a prompt. Later starts open the session
 picker when the catalog contains sessions. The first-run warning reads exactly:

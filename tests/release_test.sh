@@ -94,32 +94,40 @@ make_changelog_fixture() {
 
 make_npm_archive_fixture() {
     local repo="${1}" version="${2}" package_key target _npm_os _npm_cpu archive binary
-    local archive_dir staging archive_path source_windows archive_windows
+    local archive_dir staging archive_path source_windows archive_windows name suffix
+    local -a binaries=()
 
     archive_dir="${repo}/dist"
     mkdir -p "${archive_dir}"
     while IFS='|' read -r package_key target _npm_os _npm_cpu archive binary; do
         staging="${repo}/staging-${package_key}"
         mkdir -p "${staging}"
-        if [[ "${binary}" == 'leg' ]]; then
-            printf '#!/bin/sh\nprintf "leg %s\\n"\n' "${version}" >"${staging}/${binary}"
-            chmod +x "${staging}/${binary}"
-        else
-            printf 'fake windows leg %s\n' "${version}" >"${staging}/${binary}"
-        fi
+        suffix="${binary#leg}"
+        binaries=()
+        for name in leg leg-tui leg-web leg-ui-supervisor; do
+            binaries+=("${name}${suffix}")
+            if [[ -z "${suffix}" ]]; then
+                # shellcheck disable=SC2016 # $1 belongs to the generated fixture.
+                printf '#!/bin/sh\ntest "$1" = "--version" || exit 9\nprintf "%s %s\\n"\n' \
+                    "${name}" "${version}" >"${staging}/${name}"
+                chmod +x "${staging}/${name}"
+            else
+                printf 'fake windows %s %s\n' "${name}" "${version}" >"${staging}/${name}${suffix}"
+            fi
+        done
         archive_path="${archive_dir}/leg-${version}-${target}.${archive}"
         case "${archive}" in
             tar.gz)
-                tar -C "${staging}" -czf "${archive_path}" "${binary}"
+                tar -C "${staging}" -czf "${archive_path}" "${binaries[@]}"
                 ;;
             zip)
                 if command -v zip >/dev/null 2>&1; then
-                    (cd "${staging}" && zip -q "${archive_path}" "${binary}")
+                    (cd "${staging}" && zip -q "${archive_path}" "${binaries[@]}")
                 elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
-                    source_windows="$(cygpath -w "${staging}/${binary}")"
+                    source_windows="$(cygpath -w "${staging}")"
                     archive_windows="$(cygpath -w "${archive_path}")"
                     powershell.exe -NoProfile -NonInteractive -Command \
-                        "Compress-Archive -LiteralPath '${source_windows}' -DestinationPath '${archive_windows}' -Force"
+                        "\$files = Get-ChildItem -LiteralPath '${source_windows}' -File; Compress-Archive -LiteralPath \$files.FullName -DestinationPath '${archive_windows}' -Force"
                 else
                     printf 'npm archive fixture requires zip or PowerShell Compress-Archive\n' >&2
                     return 1
@@ -391,7 +399,7 @@ test_changelog_without_release_tags() (
 
 test_npm_platform_matrix_and_staging() (
     set -euo pipefail
-    local repo version expected output status host_platform resolved
+    local repo version expected output status host_platform command
     repo="$(mktemp -d)"
     trap 'rm -rf "${repo}"' EXIT
     version="0.4.25"
@@ -413,6 +421,19 @@ leg-win32-x64"
     assert_eq '@shukelabs/leg' \
         "$(node -e 'console.log(require(process.argv[1]).name)' "${repo}/npm-packages/leg/package.json")" \
         "root npm package name"
+    assert_eq 'leg,leg-tui,leg-web' \
+        "$(node -e 'console.log(Object.keys(require(process.argv[1]).bin).sort().join(","))' "${repo}/npm-packages/leg/package.json")" \
+        "root exposes the three user commands only"
+    local package_key target _npm_os _npm_cpu archive binary suffix name
+    while IFS='|' read -r package_key target _npm_os _npm_cpu archive binary; do
+        suffix="${binary#leg}"
+        for name in leg leg-tui leg-web leg-ui-supervisor; do
+            [[ -f "${repo}/npm-packages/leg-${package_key}/bin/${name}${suffix}" ]] || fail "${package_key} missing ${name}"
+            if [[ -z "${suffix}" ]]; then
+                [[ -x "${repo}/npm-packages/leg-${package_key}/bin/${name}" ]] || fail "${name} must be executable"
+            fi
+        done
+    done < <(release_npm_platform_rows)
     assert_eq "${version}" \
         "$(node -e 'console.log(require(process.argv[1]).version)' "${repo}/npm-packages/leg-linux-arm/package.json")" \
         "linux-arm (armv7 musl) platform npm package version"
@@ -422,57 +443,74 @@ leg-win32-x64"
 
     link_npm_shim_node_modules "${repo}"
     host_platform="$(node -p 'process.platform')"
-    if [[ "${host_platform}" == 'win32' ]]; then
-        # The fixture's leg.exe is intentionally not a PE binary. On Windows
-        # verify the shim's real resolver without trying to execute the text
-        # placeholder; package staging above still covers the win32-x64 row.
-        resolved="$(node - "${repo}/npm-packages/leg/bin/leg.js" <<'NODE'
+    for command in leg leg-tui leg-web; do
+        # Windows fixtures are text, so exercise the real resolver on every
+        # platform and execute the shell fixtures only on Unix hosts.
+        node - "${repo}/npm-packages/leg/bin/${command}.js" "${command}" <<'NODE'
+const assert = require('assert/strict');
 const path = require('path');
 const { resolvePlatformBinary } = require(process.argv[2]);
-const result = resolvePlatformBinary('win32', 'x64');
-console.log(result.packageName);
-console.log(path.basename(result.binaryPath));
-NODE
-)"
-        assert_eq "@shukelabs/leg-win32-x64
-leg.exe" "${resolved}" "Windows npm shim resolves win32-x64 binary"
-    else
-        output="$(node "${repo}/npm-packages/leg/bin/leg.js" --version)"
-        assert_eq "leg ${version}" "${output}" "npm shim forwards to native binary"
-
-        resolved="$(node - "${repo}/npm-packages/leg/bin/leg.js" <<'NODE'
-const { resolvePlatformBinary } = require(process.argv[2]);
-const result = resolvePlatformBinary('linux', 'arm');
-console.log(result.packageName);
-NODE
-)"
-        assert_eq "@shukelabs/leg-linux-arm" "${resolved}" \
-            "linux/arm (armv7 musl) shim resolution"
-    fi
-
-    resolved="$(node - "${repo}/npm-packages/leg/bin/leg.js" <<'NODE'
-const { resolvePlatformBinary } = require(process.argv[2]);
-const unsupported = [['freebsd', 'x64'], ['linux', 'ppc64']];
-for (const [platform, architecture] of unsupported) {
-  const expected = `platform not supported (${platform}/${architecture})`;
-  try {
-    resolvePlatformBinary(platform, architecture);
-    process.exit(1);
-  } catch (error) {
-    if (error.message !== expected) process.exit(1);
-    console.log(error.message);
-  }
+for (const [platform, arch] of [
+  ['linux', 'x64'], ['linux', 'arm64'], ['linux', 'arm'],
+  ['darwin', 'x64'], ['darwin', 'arm64'], ['win32', 'x64'],
+]) {
+  const result = resolvePlatformBinary(platform, arch);
+  assert.equal(result.packageName, `@shukelabs/leg-${platform}-${arch}`);
+  assert.equal(path.basename(result.binaryPath), process.argv[3] + (platform === 'win32' ? '.exe' : ''));
+}
+for (const [platform, arch] of [['freebsd', 'x64'], ['linux', 'ppc64']]) {
+  assert.throws(() => resolvePlatformBinary(platform, arch), {
+    message: `platform not supported (${platform}/${arch})`,
+  });
 }
 NODE
-)"
-    assert_eq "platform not supported (freebsd/x64)
-platform not supported (linux/ppc64)" "${resolved}" \
-        "unsupported npm platforms fail clearly"
+        if [[ "${host_platform}" != 'win32' ]]; then
+            output="$(node "${repo}/npm-packages/leg/bin/${command}.js" --version)"
+            assert_eq "${command} ${version}" "${output}" "${command} npm shim forwards to native binary"
+            status=0
+            node "${repo}/npm-packages/leg/bin/${command}.js" --invalid >/dev/null 2>&1 || status="$?"
+            assert_eq 9 "${status}" "${command} shim forwards argv and native exit status"
+        fi
+    done
 
     # The shim fixture's node_modules would otherwise fail the root package's
     # file count and mask which check rejects the cases below.
     rm -rf "${repo}/npm-packages/leg/node_modules"
     release_npm_validate_package_set "${version}" "${repo}/npm-packages"
+    for command in leg-tui leg-web; do
+        mv "${repo}/npm-packages/leg/bin/${command}.js" "${repo}/shim-backup"
+        status=0
+        release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
+        assert_rc_nonzero "${status}"
+        mv "${repo}/shim-backup" "${repo}/npm-packages/leg/bin/${command}.js"
+    done
+    for name in leg leg-tui leg-web leg-ui-supervisor; do
+        mv "${repo}/npm-packages/leg-win32-x64/bin/${name}.exe" "${repo}/binary-backup"
+        status=0
+        release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
+        assert_rc_nonzero "${status}"
+        mv "${repo}/binary-backup" "${repo}/npm-packages/leg-win32-x64/bin/${name}.exe"
+    done
+    cp "${repo}/npm-packages/leg/package.json" "${repo}/manifest-backup"
+    for command in leg-tui leg-web leg-ui-supervisor; do
+        node - "${repo}/npm-packages/leg/package.json" "${command}" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(file));
+if (process.argv[3] === 'leg-ui-supervisor') manifest.bin['leg-ui-supervisor'] = 'bin/leg-ui-supervisor.js';
+else manifest.bin[process.argv[3]] = 'bin/leg.js';
+fs.writeFileSync(file, JSON.stringify(manifest));
+NODE
+        status=0
+        release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
+        assert_rc_nonzero "${status}"
+        cp "${repo}/manifest-backup" "${repo}/npm-packages/leg/package.json"
+    done
+    printf 'extra\n' >"${repo}/npm-packages/leg-linux-arm/bin/extra"
+    status=0
+    release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    rm "${repo}/npm-packages/leg-linux-arm/bin/extra"
     mv "${repo}/npm-packages/leg-darwin-arm64/THIRD_PARTY_NOTICES.txt" "${repo}/notice-backup"
     status=0
     release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
@@ -486,10 +524,32 @@ platform not supported (linux/ppc64)" "${resolved}" \
     assert_rc_nonzero "${status}"
 )
 
+test_npm_staging_rejects_incomplete_archives() (
+    set -euo pipefail
+    local repo version name output status
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.4.25"
+    make_npm_archive_fixture "${repo}" "${version}"
+    mkdir "${repo}/unpacked"
+    tar -xzf "${repo}/dist/leg-${version}-x86_64-unknown-linux-gnu.tar.gz" -C "${repo}/unpacked"
+    for name in leg-tui leg-web leg-ui-supervisor; do
+        mv "${repo}/unpacked/${name}" "${repo}/binary-backup"
+        tar -C "${repo}/unpacked" -czf "${repo}/dist/leg-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            .
+        status=0
+        output="$(release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages" 2>&1)" || status="$?"
+        assert_rc_nonzero "${status}"
+        [[ "${output}" == *"expected binary '${name}' missing"* ]] || fail "staging must identify missing ${name}: ${output}"
+        [[ ! -e "${repo}/npm-packages" ]] || fail "failed staging must not publish a partial package set"
+        mv "${repo}/binary-backup" "${repo}/unpacked/${name}"
+    done
+)
+
 test_npm_pack_checksums() (
     set -euo pipefail
-    local repo version package_dir tarball package_key target npm_os npm_cpu archive binary
-    local expected actual
+    local repo version package_dir tarball package_key target _npm_os _npm_cpu archive binary
+    local expected actual suffix
     repo="$(mktemp -d)"
     trap 'rm -rf "${repo}"' EXIT
     version="0.4.25"
@@ -510,18 +570,24 @@ test_npm_pack_checksums() (
     expected="$(printf '%s\n' \
         'package/THIRD_PARTY_NOTICES.txt' \
         'package/bin/leg.js' \
+        'package/bin/leg-tui.js' \
+        'package/bin/leg-web.js' \
         'package/package.json' | sort)"
     actual="$(tar -tzf "${tarball}" | sort)"
-    assert_eq "${expected}" "${actual}" "root npm tarball contains only its shim and notice"
-    while IFS='|' read -r package_key target npm_os npm_cpu archive binary; do
+    assert_eq "${expected}" "${actual}" "root npm tarball contains only its three shims, manifest, and notice"
+    while IFS='|' read -r package_key target _npm_os _npm_cpu archive binary; do
         tarball="${repo}/npm-tarballs/shukelabs-leg-${package_key}-${version}.tgz"
+        suffix="${binary#leg}"
         expected="$(printf '%s\n' \
             'package/THIRD_PARTY_NOTICES.txt' \
             "package/bin/${binary}" \
+            "package/bin/leg-tui${suffix}" \
+            "package/bin/leg-web${suffix}" \
+            "package/bin/leg-ui-supervisor${suffix}" \
             'package/package.json' | sort)"
         actual="$(tar -tzf "${tarball}" | sort)"
         assert_eq "${expected}" "${actual}" \
-            "${package_key} npm tarball contains only its native binary and notice"
+            "${package_key} npm tarball contains only its four native binaries, manifest, and notice"
     done < <(release_npm_platform_rows)
 
     release_npm_verify_tarballs "${repo}/npm-tarballs"
@@ -648,7 +714,7 @@ test_third_party_notices_fixture_rendering() (
 
 test_third_party_notices_cover_release_graph() (
     set -euo pipefail
-    local dir target status missing
+    local dir target status missing manifest
     local -a fragments=()
     dir="$(mktemp -d)"
     trap 'rm -rf "${dir}"' EXIT
@@ -664,9 +730,11 @@ test_third_party_notices_cover_release_graph() (
     # (zlib-rs via flate2 today), so the notice may list a few crates that are
     # never compiled.
     while IFS='|' read -r _key target _os _cpu _archive _binary; do
-        cargo tree --locked --manifest-path "${ROOT}/Cargo.toml" -e normal,build \
-            --target "${target}" --prefix none --format '{p}'
-    done < <(release_npm_platform_rows) | awk '$1 != "leg" { sub(/^v/, "", $2); print $1, $2 }' | \
+        for manifest in Cargo.toml companions/leg-ui-client/Cargo.toml companions/leg-tui/Cargo.toml companions/leg-web/Cargo.toml; do
+            cargo tree --locked --manifest-path "${ROOT}/${manifest}" -e normal,build \
+                --target "${target}" --prefix none --format '{p}'
+        done
+    done < <(release_npm_platform_rows) | awk '$1 !~ /^(leg|leg-ui-client|leg-tui|leg-web)$/ { sub(/^v/, "", $2); print $1, $2 }' | \
         sort -u >"${dir}/expected"
     grep '^Crate: ' "${ROOT}/THIRD_PARTY_NOTICES.txt" | sed 's/^Crate: //' | sort -u >"${dir}/actual"
     [[ -s "${dir}/expected" ]] || fail "cargo tree reported release dependencies"
@@ -674,13 +742,15 @@ test_third_party_notices_cover_release_graph() (
         "notice covers every resolved runtime dependency"
 
     cargo metadata --locked --format-version 1 --manifest-path "${ROOT}/Cargo.toml" >"${dir}/metadata.json"
+    cargo metadata --locked --format-version 1 --manifest-path "${ROOT}/companions/Cargo.toml" >"${dir}/companions.json"
     node - "${dir}/metadata.json" "${ROOT}/THIRD_PARTY_NOTICES.txt" "${dir}/actual" \
+        "${dir}/companions.json" \
         >"${dir}/unrendered" <<'NODE' || fail "dependency license text check ran"
 const fs = require('node:fs');
 const path = require('node:path');
-const [, , metadataPath, noticePath, cratesPath] = process.argv;
+const [, , metadataPath, noticePath, cratesPath, companionsPath] = process.argv;
 const notice = fs.readFileSync(noticePath, 'utf8');
-const packages = JSON.parse(fs.readFileSync(metadataPath, 'utf8')).packages;
+const packages = [metadataPath, companionsPath].flatMap(file => JSON.parse(fs.readFileSync(file, 'utf8')).packages);
 let checked = 0;
 for (const line of fs.readFileSync(cratesPath, 'utf8').trim().split('\n')) {
   const [name, version] = line.split(' ');
@@ -763,6 +833,7 @@ tests=(
     test_changelog_writes_idempotently_and_preserves_existing_file_on_error
     test_changelog_without_release_tags
     test_npm_platform_matrix_and_staging
+    test_npm_staging_rejects_incomplete_archives
     test_npm_pack_checksums
     test_third_party_notices_fixture_rendering
     test_third_party_notices_cover_release_graph
