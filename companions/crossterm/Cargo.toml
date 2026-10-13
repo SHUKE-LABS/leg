@@ -1,6 +1,5 @@
 [package]
 edition = "2021"
-rust-version = "1.63.0"
 name = "crossterm"
 version = "0.28.1"
 authors = ["T. Post"]

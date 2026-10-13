@@ -769,6 +769,14 @@ if (checked === 0) throw new Error('no dependency license files were checked');
 NODE
     assert_eq "" "$(cat "${dir}/unrendered")" "every dependency license file is rendered verbatim"
 
+    missing="$(missing_fragments "${ROOT}/THIRD_PARTY_NOTICES.txt" \
+        'Crate: crossterm 0.28.1' \
+        'License: MIT' \
+        'Source: path (vendored crates.io crossterm 0.28.1, patched)' \
+        "$(tr -d '\r' <"${ROOT}/companions/crossterm/LICENSE")")" || \
+        fail "crossterm notice fragment check ran"
+    assert_eq "" "${missing}" "notice includes crossterm 0.28.1 MIT license text"
+
     while IFS= read -r file; do
         fragments+=("Bundled material: ${file#"${ROOT}/"}"$'
 
