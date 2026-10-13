@@ -695,9 +695,9 @@ fn directory_is_hidden(entry: &fs::DirEntry, name: &str) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        return entry
+        entry
             .metadata()
-            .is_ok_and(|metadata| metadata.file_attributes() & 0x2 != 0);
+            .is_ok_and(|metadata| metadata.file_attributes() & 0x2 != 0)
     }
     #[cfg(not(windows))]
     {
@@ -4466,6 +4466,7 @@ fn main() {
         }
     }
 
+    #[cfg(unix)]
     async fn wait_for_receipt(
         host: &Host,
         router: &Router,
