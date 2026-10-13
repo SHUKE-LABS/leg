@@ -911,7 +911,7 @@ export function createSharedRenderer(ui, features) {
     if (item.reply) updateMessageBody(assistant, item.reply);
     else if (item.failureMessage) updateMessageBody(assistant, item.failureMessage, "text");
     else if (item.active?.status === "starting") updateMessageBody(assistant, "Starting this turn…", "text");
-    else if (item.active) updateMessageBody(assistant, "Waiting for Leg's first response…", "text");
+    else if (item.active) updateMessageBody(assistant, "Working…", "text");
     else updateMessageBody(assistant, "No final reply was recorded for this turn.", "text");
 
     const status = item.active?.status === "stopping"
