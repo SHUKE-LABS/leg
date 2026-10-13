@@ -528,6 +528,44 @@ io::stdin().read_to_string(&mut prompt).unwrap();
     );
 }
 
+fn write_early_exit_leg(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_path = path.with_extension("rs");
+    fs::write(
+        &source_path,
+        r#"
+use std::env;
+
+fn main() {
+    match env::args().nth(1).as_deref() {
+        Some("--version") => println!("leg 0.14.0"),
+        Some("--help") => println!("leg exchange --stream-json --new-session-id"),
+        _ => {
+            eprintln!("fixture startup failure: {}", "x".repeat(700));
+            std::process::exit(1);
+        }
+    }
+}
+"#,
+    )
+    .expect("write early-exit fixture source");
+    let compiled = Command::new("rustc")
+        .args(["--edition=2021"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(path)
+        .output()
+        .expect("rustc is available to build the early-exit fixture");
+    assert!(
+        compiled.status.success(),
+        "failed to compile early-exit fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("make early-exit fixture executable");
+}
+
 fn write_supervisor_wrapper(path: &Path, supervisor: &Path, started_file: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -934,6 +972,32 @@ fn assert_success(outcome: TurnOutcome) {
         matches!(outcome, TurnOutcome::Succeeded { .. }),
         "expected a successful turn, got {outcome:?}"
     );
+}
+
+#[test]
+fn early_native_exit_surfaces_bounded_startup_diagnostic() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let cwd = scratch.path().join("cwd");
+    let store = scratch.path().join("store");
+    fs::create_dir_all(&cwd).expect("create working directory");
+    let leg = scratch.path().join("early-exit-leg");
+    write_early_exit_leg(&leg);
+
+    let error = match client(Some(leg), &supervisor_binary(), &store).start(TurnRequest::new(
+        "prompt",
+        cwd,
+        LegSession::New,
+    )) {
+        Err(error) => error,
+        Ok(_) => panic!("early native exit unexpectedly started a turn"),
+    };
+    let StartError::Supervisor(message) = error else {
+        panic!("expected a supervisor startup error, got {error:?}");
+    };
+
+    assert!(message.contains("supervisor exited before startup"));
+    assert!(message.contains("fixture startup failure"));
+    assert!(message.contains('…'));
 }
 
 #[test]
