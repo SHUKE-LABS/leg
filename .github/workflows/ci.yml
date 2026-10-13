@@ -435,15 +435,25 @@ jobs:
 
   cross:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: armv7-unknown-linux-musleabihf
+            smoke: false
+          - target: x86_64-unknown-linux-musl
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            smoke: true
     env:
-      TARGET: armv7-unknown-linux-musleabihf
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.89.0
         with:
-          targets: armv7-unknown-linux-musleabihf
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -453,7 +463,64 @@ jobs:
           tool: cross
 
       - name: Cross-build (locked)
-        run: cross build --locked --verbose --target "${TARGET}"
+        run: cross build --locked --verbose --release --target "${TARGET}"
+
+      - name: Enforce x64 musl release size budget
+        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          budget=$((30 * 1024 * 1024))
+          size="$(stat -c '%s' "target/${TARGET}/release/leg")"
+          if (( size >= budget )); then
+            echo "::error::linux-musl binary is ${size} bytes, budget is < ${budget} bytes"
+            exit 1
+          fi
+
+      - name: Archive Linux binary for Debian smoke
+        if: ${{ matrix.smoke }}
+        shell: bash
+        run: tar -C "target/${TARGET}/release" -czf "leg-${TARGET}.tar.gz" leg
+
+      - name: Upload Linux binary for Debian smoke
+        if: ${{ matrix.smoke }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: leg-${{ matrix.target }}
+          path: leg-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  musl-smoke:
+    needs: cross
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: leg-${{ matrix.target }}
+          path: dist
+
+      - name: Run binary on Debian 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/leg-${TARGET}.tar.gz"
+          tar -xzf "${archive}" -C dist
+          output="$(docker run --rm --volume "${PWD}/dist:/dist:ro" debian:12 /dist/leg --version)"
+          if [[ ! "${output}" =~ ^leg[[:space:]][^[:space:]]+$ ]]; then
+            echo "::error::unexpected version output: ${output}"
+            exit 1
+          fi
 
   tui-windows-stop-behavior:
     if: "${{ github.event_name == 'pull_request' && (contains(github.event.pull_request.body, 'Closes #187') || contains(github.event.pull_request.body, 'Closes #183') || contains(github.event.pull_request.body, 'Part of #183')) }}"

@@ -89,7 +89,7 @@ jobs:
             target: x86_64-unknown-linux-musl
             archive: tar.gz
             cross: true
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-latest
             target: aarch64-unknown-linux-musl
             archive: tar.gz
             cross: true
