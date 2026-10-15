@@ -340,12 +340,17 @@ fn compose_system_prompt(
 /// from the repository root to the nearest directory. A non-repository
 /// working directory contributes only itself.
 fn instruction_directories(cwd: &Path) -> Vec<PathBuf> {
-    let Some(root) = git_root(cwd) else {
-        return vec![cwd.to_path_buf()];
+    // Git for Windows may print a root with different separators, casing, or
+    // a path-prefix form than `current_dir`. Canonicalizing both sides makes
+    // the ancestor comparison semantic instead of dependent on that spelling.
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let Some(root) = git_root(&cwd) else {
+        return vec![cwd];
     };
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
 
     let mut directories = Vec::new();
-    let mut current = cwd;
+    let mut current = cwd.as_path();
     loop {
         directories.push(current.to_path_buf());
         if current == root {
@@ -537,6 +542,36 @@ mod tests {
 
         assert_eq!(prompt, "working directory rules");
         let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn repository_discovery_reaches_the_git_root() {
+        let root = std::env::temp_dir().join(format!(
+            "leg-config-agents-git-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create repository workspace");
+        let git_status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .expect("run git init");
+        assert!(git_status.success(), "git init failed");
+        std::fs::write(root.join("AGENTS.md"), "root rules").expect("write root instructions");
+        std::fs::write(nested.join("AGENTS.md"), "nested rules")
+            .expect("write nested instructions");
+
+        let prompt = compose_system_prompt(None, instruction_directories(&nested))
+            .expect("compose system prompt")
+            .expect("repository prompt exists");
+
+        assert_eq!(prompt, "root rules\n\nnested rules");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
