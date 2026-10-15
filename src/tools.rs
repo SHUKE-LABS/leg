@@ -243,6 +243,12 @@ pub struct ToolLoop<T: Transport> {
     observer: Option<RefCell<ToolObserver>>,
 }
 
+#[derive(Clone, Copy)]
+enum SystemPromptMode<'a> {
+    Configured,
+    Explicit(Option<&'a str>),
+}
+
 impl<T: Transport> ToolLoop<T> {
     /// Wraps `transport`, executing tool calls through `registry`.
     ///
@@ -293,7 +299,30 @@ impl<T: Transport> ToolLoop<T> {
         history: &[Message],
         observe: &mut dyn FnMut(ToolEvent<'_>),
     ) -> TransportCall<TurnOutcome> {
-        self.run_observed_with_optional_stream(history, observe, None, None)
+        self.run_observed_with_optional_stream(
+            history,
+            observe,
+            None,
+            None,
+            SystemPromptMode::Configured,
+        )
+    }
+
+    /// [`ToolLoop::run_observed_with_attempts`] with a system-prompt snapshot
+    /// that applies to the initial provider call and every tool continuation.
+    pub fn run_observed_with_system_prompt_with_attempts(
+        &self,
+        history: &[Message],
+        system_prompt: Option<&str>,
+        observe: &mut dyn FnMut(ToolEvent<'_>),
+    ) -> TransportCall<TurnOutcome> {
+        self.run_observed_with_optional_stream(
+            history,
+            observe,
+            None,
+            None,
+            SystemPromptMode::Explicit(system_prompt),
+        )
     }
 
     /// Runs one user turn while forwarding provider stream events to
@@ -304,7 +333,31 @@ impl<T: Transport> ToolLoop<T> {
         observe: &mut dyn FnMut(ToolEvent<'_>),
         on_stream_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<TurnOutcome> {
-        self.run_observed_with_optional_stream(history, observe, Some(on_stream_event), None)
+        self.run_observed_with_optional_stream(
+            history,
+            observe,
+            Some(on_stream_event),
+            None,
+            SystemPromptMode::Configured,
+        )
+    }
+
+    /// Streaming counterpart to
+    /// [`ToolLoop::run_observed_with_system_prompt_with_attempts`].
+    pub fn run_streaming_observed_with_system_prompt_with_attempts(
+        &self,
+        history: &[Message],
+        system_prompt: Option<&str>,
+        observe: &mut dyn FnMut(ToolEvent<'_>),
+        on_stream_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<TurnOutcome> {
+        self.run_observed_with_optional_stream(
+            history,
+            observe,
+            Some(on_stream_event),
+            None,
+            SystemPromptMode::Explicit(system_prompt),
+        )
     }
 
     /// Streaming counterpart that can stop the loop when observing a tool
@@ -321,6 +374,25 @@ impl<T: Transport> ToolLoop<T> {
             &mut |_| {},
             Some(on_stream_event),
             Some(observe),
+            SystemPromptMode::Configured,
+        )
+    }
+
+    /// Fallible-observer streaming counterpart with a system-prompt snapshot
+    /// shared by the whole turn.
+    pub fn run_streaming_observed_fallible_with_system_prompt_with_attempts(
+        &self,
+        history: &[Message],
+        system_prompt: Option<&str>,
+        observe: &mut dyn FnMut(OwnedToolEvent) -> Result<()>,
+        on_stream_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<TurnOutcome> {
+        self.run_observed_with_optional_stream(
+            history,
+            &mut |_| {},
+            Some(on_stream_event),
+            Some(observe),
+            SystemPromptMode::Explicit(system_prompt),
         )
     }
 
@@ -330,17 +402,26 @@ impl<T: Transport> ToolLoop<T> {
         observe: &mut dyn FnMut(ToolEvent<'_>),
         mut on_stream_event: Option<&mut dyn FnMut(StreamEvent) -> Result<()>>,
         mut observe_fallible: Option<&mut dyn FnMut(OwnedToolEvent) -> Result<()>>,
+        system_prompt: SystemPromptMode<'_>,
     ) -> TransportCall<TurnOutcome> {
         let mut attempts = 0_u64;
         if let Err(error) = interrupt::check() {
             return TransportCall::completed(Err(error), attempts);
         }
         let mut messages = history.to_vec();
-        let call = match on_stream_event.as_mut() {
-            Some(on_event) => self
+        let call = match (system_prompt, on_stream_event.as_mut()) {
+            (SystemPromptMode::Configured, Some(on_event)) => self
                 .transport
                 .send_conversation_streaming_with_attempts(&messages, *on_event),
-            None => self.transport.send_conversation_with_attempts(&messages),
+            (SystemPromptMode::Explicit(prompt), Some(on_event)) => self
+                .transport
+                .send_conversation_streaming_with_system_prompt(&messages, prompt, *on_event),
+            (SystemPromptMode::Configured, None) => {
+                self.transport.send_conversation_with_attempts(&messages)
+            }
+            (SystemPromptMode::Explicit(prompt), None) => self
+                .transport
+                .send_conversation_with_system_prompt(&messages, prompt),
         };
         attempts = attempts.saturating_add(call.attempts);
         if let Err(error) = interrupt::check() {
@@ -438,11 +519,19 @@ impl<T: Transport> ToolLoop<T> {
             messages.push(Message::new(Role::User, results));
             rounds = rounds.saturating_add(1);
 
-            let call = match on_stream_event.as_mut() {
-                Some(on_event) => self
+            let call = match (system_prompt, on_stream_event.as_mut()) {
+                (SystemPromptMode::Configured, Some(on_event)) => self
                     .transport
                     .send_conversation_streaming_with_attempts(&messages, *on_event),
-                None => self.transport.send_conversation_with_attempts(&messages),
+                (SystemPromptMode::Explicit(prompt), Some(on_event)) => self
+                    .transport
+                    .send_conversation_streaming_with_system_prompt(&messages, prompt, *on_event),
+                (SystemPromptMode::Configured, None) => {
+                    self.transport.send_conversation_with_attempts(&messages)
+                }
+                (SystemPromptMode::Explicit(prompt), None) => self
+                    .transport
+                    .send_conversation_with_system_prompt(&messages, prompt),
             };
             attempts = attempts.saturating_add(call.attempts);
             if let Err(error) = interrupt::check() {

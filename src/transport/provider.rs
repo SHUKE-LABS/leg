@@ -51,6 +51,24 @@ impl Transport for ProviderTransport {
         }
     }
 
+    fn send_conversation_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> TransportCall<AssistantReply> {
+        match self {
+            Self::Anthropic(client) => {
+                client.send_conversation_with_system_prompt(messages, system_prompt)
+            }
+            Self::OpenAiChatCompletions(client) => {
+                client.send_conversation_with_system_prompt(messages, system_prompt)
+            }
+            Self::OpenAiResponses(client) => {
+                client.send_conversation_with_system_prompt(messages, system_prompt)
+            }
+        }
+    }
+
     fn send_conversation_streaming_with_attempts(
         &self,
         messages: &[Message],
@@ -66,6 +84,28 @@ impl Transport for ProviderTransport {
             Self::OpenAiResponses(client) => {
                 client.send_conversation_streaming_with_attempts(messages, on_event)
             }
+        }
+    }
+
+    fn send_conversation_streaming_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        match self {
+            Self::Anthropic(client) => client.send_conversation_streaming_with_system_prompt(
+                messages,
+                system_prompt,
+                on_event,
+            ),
+            Self::OpenAiChatCompletions(client) => client
+                .send_conversation_streaming_with_system_prompt(messages, system_prompt, on_event),
+            Self::OpenAiResponses(client) => client.send_conversation_streaming_with_system_prompt(
+                messages,
+                system_prompt,
+                on_event,
+            ),
         }
     }
 }

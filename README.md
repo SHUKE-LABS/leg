@@ -107,6 +107,14 @@ stream may remain silent between received chunks.
 `LEG_MAX_TOKENS` sets the output-token limit requested for each provider reply
 (default `32000`).
 
+At the start of every `ask`, `exchange`, and session turn, leg discovers project
+instructions from `AGENTS.md`. In a git repository it reads files from the
+repository root down to the current working directory, with the nearest file
+last; outside a repository it reads only the current working directory's file.
+The resulting system prompt is `LEG_SYSTEM_PROMPT`'s file content followed by
+those files, separated by blank lines. Discovery is refreshed for every turn
+and is not stored in session history or trails.
+
 Anthropic Messages remains the default provider. OpenAI-compatible endpoints
 can use either streamed wire protocol:
 

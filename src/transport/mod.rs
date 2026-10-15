@@ -124,6 +124,17 @@ pub trait Transport {
         TransportCall::new(self.send_conversation(messages), 1)
     }
 
+    /// Sends `messages` with an explicit system-prompt snapshot for this
+    /// provider call. The default preserves transports that do not expose a
+    /// separate system-prompt field; provider transports override it.
+    fn send_conversation_with_system_prompt(
+        &self,
+        messages: &[Message],
+        _system_prompt: Option<&str>,
+    ) -> TransportCall<AssistantReply> {
+        self.send_conversation_with_attempts(messages)
+    }
+
     /// Streams provider events while assembling the assistant reply.
     ///
     /// The default preserves compatibility with buffered transports: it
@@ -135,6 +146,17 @@ pub trait Transport {
         _on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<AssistantReply> {
         self.send_conversation_with_attempts(messages)
+    }
+
+    /// Streaming counterpart to
+    /// [`Transport::send_conversation_with_system_prompt`].
+    fn send_conversation_streaming_with_system_prompt(
+        &self,
+        messages: &[Message],
+        _system_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        self.send_conversation_streaming_with_attempts(messages, on_event)
     }
 
     /// [`Transport::send_conversation_streaming_with_attempts`] without
@@ -179,11 +201,28 @@ impl<T: Transport + ?Sized> Transport for &T {
         (**self).send_conversation_with_attempts(messages)
     }
 
+    fn send_conversation_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> TransportCall<AssistantReply> {
+        (**self).send_conversation_with_system_prompt(messages, system_prompt)
+    }
+
     fn send_conversation_streaming_with_attempts(
         &self,
         messages: &[Message],
         on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<AssistantReply> {
         (**self).send_conversation_streaming_with_attempts(messages, on_event)
+    }
+
+    fn send_conversation_streaming_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        (**self).send_conversation_streaming_with_system_prompt(messages, system_prompt, on_event)
     }
 }

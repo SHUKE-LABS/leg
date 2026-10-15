@@ -27,7 +27,8 @@ pub(super) fn execute_exchange_stream_json(
 }
 
 fn execute_cold_exchange(in_path: Option<&str>) -> Result<()> {
-    let config = LegConfig::from_env()?;
+    let mut config = LegConfig::from_env()?;
+    config.system_prompt = system_prompt_for_turn(config.system_prompt.as_deref())?;
     let provider = config.provider;
     let meta = exchange_meta(&config);
     let raw = read_exchange_input(in_path)?;
@@ -95,6 +96,7 @@ fn execute_session_exchange(
     };
 
     let config = LegConfig::from_env()?;
+    let base_system_prompt = config.system_prompt.clone();
     let provider = config.provider;
     let meta = exchange_meta(&config);
     let raw = read_exchange_input(in_path)?;
@@ -126,6 +128,7 @@ fn execute_session_exchange(
         &mut resumed,
         Rc::clone(&session_write_error),
         &writer,
+        base_system_prompt.as_deref(),
     );
 
     if let Some(path) = session_id_out {
@@ -260,9 +263,11 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
     resumed: &mut ResumedSession,
     session_write_error: Rc<RefCell<Option<String>>>,
     writer: &Rc<RefCell<StreamJsonWriter<W>>>,
+    base_system_prompt: Option<&str>,
 ) -> Result<()> {
     let session_id = resumed.session_id.clone();
     let turn_index = resumed.next_turn_index;
+    let system_prompt = system_prompt_for_turn(base_system_prompt)?;
     write_turn_start(
         writer,
         request,
@@ -306,8 +311,9 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
             let counters_for_text = &counters;
             let mut observe_stream =
                 |event| write_text_delta(&writer_for_text, counters_for_text, event);
-            transport.run_streaming_observed_fallible_with_attempts(
+            transport.run_streaming_observed_fallible_with_system_prompt_with_attempts(
                 resumed.conversation.messages(),
+                system_prompt.as_deref(),
                 &mut observe_tool,
                 &mut observe_stream,
             )
@@ -920,6 +926,7 @@ mod tests {
             &mut resumed,
             session_write_error,
             &writer,
+            None,
         )
         .unwrap_err();
         drop(writer);

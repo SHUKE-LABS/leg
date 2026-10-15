@@ -56,7 +56,23 @@ impl<H: HttpClient> Transport for OpenAiChatCompletionsClient<H> {
         &self,
         messages: &[Message],
     ) -> TransportCall<AssistantReply> {
-        self.send_conversation_streaming_with_attempts(messages, &mut |_| Ok(()))
+        self.send_conversation_streaming_with_system_prompt(
+            messages,
+            self.config.system_prompt.as_deref(),
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn send_conversation_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> TransportCall<AssistantReply> {
+        self.send_conversation_streaming_with_system_prompt(
+            messages,
+            system_prompt,
+            &mut |_| Ok(()),
+        )
     }
 
     fn send_conversation_streaming_with_attempts(
@@ -64,7 +80,20 @@ impl<H: HttpClient> Transport for OpenAiChatCompletionsClient<H> {
         messages: &[Message],
         on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<AssistantReply> {
-        let body = match build_request_body(&self.config, messages, &self.tools) {
+        self.send_conversation_streaming_with_system_prompt(
+            messages,
+            self.config.system_prompt.as_deref(),
+            on_event,
+        )
+    }
+
+    fn send_conversation_streaming_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        let body = match build_request_body(&self.config, messages, &self.tools, system_prompt) {
             Ok(body) => body,
             Err(error) => return TransportCall::completed(Err(error), 0),
         };
@@ -111,9 +140,10 @@ fn build_request_body(
     config: &LegConfig,
     messages: &[Message],
     tools: &[ToolSpec],
+    system_prompt: Option<&str>,
 ) -> Result<String> {
     let mut api_messages = Vec::new();
-    if let Some(system_prompt) = &config.system_prompt {
+    if let Some(system_prompt) = system_prompt {
         api_messages.push(json!({"role": "system", "content": system_prompt}));
     }
     api_messages.extend(chat_messages(messages)?);
@@ -656,6 +686,31 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn explicit_system_prompt_override_reaches_chat_request() {
+        let http = FakeHttp {
+            body: stream(&[
+                json!({"choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]),
+            request: RefCell::new(None),
+        };
+        let client = OpenAiChatCompletionsClient::with_http(config(), http);
+        client
+            .send_conversation_with_system_prompt(
+                &[Message::user("hi")],
+                Some("caller\n\nroot\n\nnested"),
+            )
+            .result
+            .expect("stream parses");
+
+        let request = client.http.request.borrow();
+        let (_, _, body) = request.as_ref().expect("request captured");
+        let body: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "caller\n\nroot\n\nnested");
     }
 
     #[test]

@@ -80,11 +80,19 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         &self,
         messages: &[Message],
     ) -> TransportCall<AssistantReply> {
+        self.send_conversation_with_system_prompt(messages, self.config.system_prompt.as_deref())
+    }
+
+    fn send_conversation_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> TransportCall<AssistantReply> {
         let body = match build_request_body(
             &self.config.model,
             self.config.max_tokens,
             messages,
-            self.config.system_prompt.as_deref(),
+            system_prompt,
             &self.tools,
         ) {
             Ok(body) => body,
@@ -115,11 +123,24 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         messages: &[Message],
         on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<AssistantReply> {
+        self.send_conversation_streaming_with_system_prompt(
+            messages,
+            self.config.system_prompt.as_deref(),
+            on_event,
+        )
+    }
+
+    fn send_conversation_streaming_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
         let body = match build_request_body_with_stream(
             &self.config.model,
             self.config.max_tokens,
             messages,
-            self.config.system_prompt.as_deref(),
+            system_prompt,
             &self.tools,
             true,
         ) {
@@ -1608,6 +1629,26 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
         assert_eq!(value["system"], "You are a terse agent.");
+    }
+
+    #[test]
+    fn explicit_system_prompt_override_reaches_request_body() {
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, SUCCESS_BODY),
+        );
+        client
+            .send_conversation_with_system_prompt(
+                &[Message::user("hi")],
+                Some("caller\n\nroot\n\nnested"),
+            )
+            .result
+            .expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert_eq!(value["system"], "caller\n\nroot\n\nnested");
     }
 
     #[test]

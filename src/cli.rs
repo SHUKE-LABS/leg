@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::config::LegConfig;
+use crate::config::{LegConfig, system_prompt_for_turn};
 use crate::error::{LegError, Result};
 use crate::events::{
     EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, ToolStatus, WriterSink,
@@ -146,21 +146,24 @@ pub fn run() -> Result<()> {
             match resume {
                 None => {
                     let config = LegConfig::from_env()?;
+                    let base_system_prompt = config.system_prompt.clone();
                     let meta = exchange_meta(&config);
                     let client = build_transport(config);
                     let mut sink = open_event_sink();
                     let session_id = new_session_id();
-                    execute_session(
+                    execute_session_with_system_prompt(
                         &client,
                         sink.as_mut(),
                         &meta,
                         input,
                         stdout.lock(),
                         session_id,
+                        base_system_prompt.as_deref(),
                     )
                 }
                 Some(args) => {
                     let config = LegConfig::from_env()?;
+                    let base_system_prompt = config.system_prompt.clone();
                     let meta = exchange_meta(&config);
                     let client = build_transport(config);
                     // Resume: load + select the prior session *before* opening
@@ -168,13 +171,14 @@ pub fn run() -> Result<()> {
                     // ambiguous trail) exits non-zero having written nothing.
                     let resumed = load_resume(&args.file, args.session_id.as_deref())?;
                     let mut sink = open_append_sink(&args.file);
-                    execute_session_resumed(
+                    execute_session_resumed_with_system_prompt(
                         &client,
                         sink.as_mut(),
                         &meta,
                         input,
                         stdout.lock(),
                         resumed,
+                        base_system_prompt.as_deref(),
                     )
                 }
             }
@@ -618,7 +622,8 @@ fn execute_exchange(
         return execute_exchange_session(in_path, out_path, session, session_id_out);
     }
 
-    let config = LegConfig::from_env()?;
+    let mut config = LegConfig::from_env()?;
+    config.system_prompt = system_prompt_for_turn(config.system_prompt.as_deref())?;
     let meta = exchange_meta(&config);
 
     let raw = read_exchange_input(in_path)?;
@@ -678,6 +683,7 @@ fn execute_exchange_session(
     };
 
     let config = LegConfig::from_env()?;
+    let base_system_prompt = config.system_prompt.clone();
     let meta = exchange_meta(&config);
     let raw = read_exchange_input(in_path)?;
 
@@ -705,6 +711,7 @@ fn execute_exchange_session(
         &mut response_output,
         &mut sink,
         &mut resumed,
+        base_system_prompt.as_deref(),
     );
     let session_write_error = session_write_error.borrow().clone();
 
@@ -758,8 +765,10 @@ fn execute_exchange_session_core(
     output: impl Write,
     sink: &mut dyn EventSink,
     resumed: &mut ResumedSession,
+    base_system_prompt: Option<&str>,
 ) -> Result<()> {
     let (request, mode) = parse_exchange_request(raw);
+    let system_prompt = system_prompt_for_turn(base_system_prompt)?;
     let session_id = resumed.session_id.clone();
     let turn_index = resumed.next_turn_index;
     let request_ts_ms = now_ms();
@@ -779,10 +788,14 @@ fn execute_exchange_session_core(
         },
         &mut warning,
         |sink| {
-            transport.run_observed_with_attempts(resumed.conversation.messages(), &mut |event| {
-                let turn = Some((session_id.as_str(), turn_index));
-                emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
-            })
+            transport.run_observed_with_system_prompt_with_attempts(
+                resumed.conversation.messages(),
+                system_prompt.as_deref(),
+                &mut |event| {
+                    let turn = Some((session_id.as_str(), turn_index));
+                    emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
+                },
+            )
         },
     );
     let attempts = Some(call.attempts);
@@ -964,11 +977,12 @@ fn execute_ask_with_config(config: LegConfig, prompt: &str, output: impl Write) 
 /// The one opened trail is shared between `run_ask` and the tool loop's
 /// observer, so the turn's tool events land between its request and outcome.
 fn execute_ask_with_content(
-    config: LegConfig,
+    mut config: LegConfig,
     prompt: &str,
     content: &[ContentBlock],
     output: impl Write,
 ) -> Result<()> {
+    config.system_prompt = system_prompt_for_turn(config.system_prompt.as_deref())?;
     let meta = exchange_meta(&config);
     let mut sink = Rc::new(RefCell::new(open_event_sink()));
     let transport = build_transport(config).with_observer(tool_trail_observer(sink.clone()));
@@ -1102,6 +1116,7 @@ fn run_ask_inner(
 /// Runs a fresh `leg session`: opens the session boundary on the trail (every
 /// turn's `request` carries `session_id`; the matching `session_end` closes it
 /// on a clean exit) and enters the shared REPL loop.
+#[cfg(test)]
 fn execute_session(
     transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
@@ -1110,11 +1125,26 @@ fn execute_session(
     output: impl Write,
     session_id: String,
 ) -> Result<()> {
+    execute_session_with_system_prompt(transport, sink, meta, input, output, session_id, None)
+}
+
+/// Runs a fresh session with the configured prompt plus a per-turn snapshot of
+/// repository instructions.
+#[allow(clippy::too_many_arguments)]
+fn execute_session_with_system_prompt(
+    transport: &ToolLoop<impl Transport>,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    input: impl BufRead,
+    output: impl Write,
+    session_id: String,
+    base_system_prompt: Option<&str>,
+) -> Result<()> {
     eprintln!(
         "leg session — type a message and press enter; Ctrl-D or {SESSION_EXIT_COMMAND} to quit"
     );
     emit(sink, &ExchangeEvent::session_start(now_ms(), &session_id));
-    run_session_repl(
+    run_session_repl_with_system_prompt(
         transport,
         sink,
         meta,
@@ -1123,6 +1153,7 @@ fn execute_session(
         session_id,
         Conversation::new(),
         0,
+        base_system_prompt,
     )
 }
 
@@ -1132,6 +1163,7 @@ fn execute_session(
 /// original run already opened this session's frame on the trail, and
 /// partitioning keys on `session_id` (see [`crate::log::parse_sessions`]), so
 /// the resumed run reuses that id and continues its `turn_index`.
+#[cfg(test)]
 fn execute_session_resumed(
     transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
@@ -1140,11 +1172,25 @@ fn execute_session_resumed(
     output: impl Write,
     resumed: ResumedSession,
 ) -> Result<()> {
+    execute_session_resumed_with_system_prompt(transport, sink, meta, input, output, resumed, None)
+}
+
+/// Resumes a session with a fresh repository-instruction snapshot per turn.
+#[allow(clippy::too_many_arguments)]
+fn execute_session_resumed_with_system_prompt(
+    transport: &ToolLoop<impl Transport>,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    input: impl BufRead,
+    output: impl Write,
+    resumed: ResumedSession,
+    base_system_prompt: Option<&str>,
+) -> Result<()> {
     eprintln!(
         "leg session — resumed {} ({} prior turn(s)); type a message and press enter, Ctrl-D or {SESSION_EXIT_COMMAND} to quit",
         resumed.session_id, resumed.prior_turns,
     );
-    run_session_repl(
+    run_session_repl_with_system_prompt(
         transport,
         sink,
         meta,
@@ -1153,13 +1199,14 @@ fn execute_session_resumed(
         resumed.session_id,
         resumed.conversation,
         resumed.next_turn_index,
+        base_system_prompt,
     )
 }
 
-/// The shared REPL loop behind [`execute_session`] and
-/// [`execute_session_resumed`].
+/// Shared session loop with the configured prompt and a per-turn instruction
+/// snapshot.
 #[allow(clippy::too_many_arguments)]
-fn run_session_repl(
+fn run_session_repl_with_system_prompt(
     transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
@@ -1168,10 +1215,11 @@ fn run_session_repl(
     session_id: String,
     conversation: Conversation,
     turn_index: u64,
+    base_system_prompt: Option<&str>,
 ) -> Result<()> {
     let stderr = std::io::stderr();
     let mut warning = stderr.lock();
-    run_session_repl_with_warning(
+    run_session_repl_with_warning_and_system_prompt(
         transport,
         sink,
         meta,
@@ -1181,6 +1229,7 @@ fn run_session_repl(
         conversation,
         turn_index,
         &mut warning,
+        base_system_prompt,
     )
 }
 
@@ -1201,7 +1250,37 @@ fn run_session_repl(
 /// turns, which the Messages API rejects. Each turn still emits a `request`
 /// plus one `response_ok`/`response_error` event, exactly like `ask`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_session_repl_with_warning(
+    transport: &ToolLoop<impl Transport>,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    input: impl BufRead,
+    output: impl Write,
+    session_id: String,
+    conversation: Conversation,
+    turn_index: u64,
+    warning: &mut dyn Write,
+) -> Result<()> {
+    run_session_repl_with_warning_and_system_prompt(
+        transport,
+        sink,
+        meta,
+        input,
+        output,
+        session_id,
+        conversation,
+        turn_index,
+        warning,
+        None,
+    )
+}
+
+/// Testable session loop with an explicit base system prompt. Repository
+/// instructions are discovered immediately before each non-blank turn and
+/// are not appended to `conversation`.
+#[allow(clippy::too_many_arguments)]
+fn run_session_repl_with_warning_and_system_prompt(
     transport: &ToolLoop<impl Transport>,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
@@ -1211,6 +1290,7 @@ fn run_session_repl_with_warning(
     mut conversation: Conversation,
     mut turn_index: u64,
     warning: &mut dyn Write,
+    base_system_prompt: Option<&str>,
 ) -> Result<()> {
     for line in input.lines() {
         let line = match line {
@@ -1226,6 +1306,7 @@ fn run_session_repl_with_warning(
             break;
         }
 
+        let system_prompt = system_prompt_for_turn(base_system_prompt)?;
         conversation.push_user(line.as_str());
         let mut streamed_text = false;
         let call = timed_session_exchange(
@@ -1239,8 +1320,9 @@ fn run_session_repl_with_warning(
             },
             warning,
             |sink| {
-                transport.run_streaming_observed_with_attempts(
+                transport.run_streaming_observed_with_system_prompt_with_attempts(
                     conversation.messages(),
+                    system_prompt.as_deref(),
                     &mut |event| {
                         let turn = Some((session_id.as_str(), turn_index));
                         emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
