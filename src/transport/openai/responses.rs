@@ -56,7 +56,23 @@ impl<H: HttpClient> Transport for OpenAiResponsesClient<H> {
         &self,
         messages: &[Message],
     ) -> TransportCall<AssistantReply> {
-        self.send_conversation_streaming_with_attempts(messages, &mut |_| Ok(()))
+        self.send_conversation_streaming_with_system_prompt(
+            messages,
+            self.config.system_prompt.as_deref(),
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn send_conversation_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> TransportCall<AssistantReply> {
+        self.send_conversation_streaming_with_system_prompt(
+            messages,
+            system_prompt,
+            &mut |_| Ok(()),
+        )
     }
 
     fn send_conversation_streaming_with_attempts(
@@ -64,7 +80,20 @@ impl<H: HttpClient> Transport for OpenAiResponsesClient<H> {
         messages: &[Message],
         on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<AssistantReply> {
-        let body = match build_request_body(&self.config, messages, &self.tools) {
+        self.send_conversation_streaming_with_system_prompt(
+            messages,
+            self.config.system_prompt.as_deref(),
+            on_event,
+        )
+    }
+
+    fn send_conversation_streaming_with_system_prompt(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        let body = match build_request_body(&self.config, messages, &self.tools, system_prompt) {
             Ok(body) => body,
             Err(error) => return TransportCall::completed(Err(error), 0),
         };
@@ -111,6 +140,7 @@ fn build_request_body(
     config: &LegConfig,
     messages: &[Message],
     tools: &[ToolSpec],
+    system_prompt: Option<&str>,
 ) -> Result<String> {
     let mut request = json!({
         "model": config.model,
@@ -118,8 +148,8 @@ fn build_request_body(
         "max_output_tokens": config.max_tokens,
         "stream": true
     });
-    if let Some(instructions) = &config.system_prompt {
-        request["instructions"] = Value::String(instructions.clone());
+    if let Some(instructions) = system_prompt {
+        request["instructions"] = Value::String(instructions.to_string());
     }
     if !tools.is_empty() {
         request["tools"] = Value::Array(
@@ -799,6 +829,43 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["input"][1]["type"], "function_call");
         assert_eq!(body["input"][2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn explicit_system_prompt_override_reaches_responses_request() {
+        let response = json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+            "usage":{"input_tokens":1,"output_tokens":1}
+        });
+        let body = [
+            event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_override"}}),
+            ),
+            event(
+                "response.completed",
+                json!({"type":"response.completed","response":response}),
+            ),
+        ]
+        .join("");
+        let http = FakeHttp {
+            body,
+            request: RefCell::new(None),
+        };
+        let client = OpenAiResponsesClient::with_http(config(), http);
+        client
+            .send_conversation_with_system_prompt(
+                &[Message::user("hi")],
+                Some("caller\n\nroot\n\nnested"),
+            )
+            .result
+            .expect("response parses");
+
+        let request = client.http.request.borrow();
+        let (_, _, body) = request.as_ref().expect("request captured");
+        let body: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["instructions"], "caller\n\nroot\n\nnested");
     }
 
     #[test]

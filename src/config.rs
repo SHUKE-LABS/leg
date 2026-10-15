@@ -9,7 +9,8 @@
 //! API-key/OAuth precedence, while both OpenAI wire protocols share
 //! `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use crate::error::{LegError, Result};
@@ -110,9 +111,11 @@ pub struct LegConfig {
     /// unset or blank means unbounded, while a configured value must be a
     /// positive integer.
     pub max_tool_rounds: Option<usize>,
-    /// Optional system prompt. When `LEG_SYSTEM_PROMPT` names a readable file,
-    /// this holds its content; the transport sends it in the provider's system
-    /// prompt field. Unset or blank leaves this `None` and omits the field.
+    /// Optional caller-provided system prompt. When `LEG_SYSTEM_PROMPT` names a
+    /// readable file, this holds its content; the CLI appends the current
+    /// project instructions before sending each provider turn. Unset or blank
+    /// leaves this `None` and omits the field when no project instructions are
+    /// present.
     pub system_prompt: Option<String>,
     /// Optional executable run before every tool dispatch. From
     /// `LEG_PRETOOL_HOOK`; unset or blank disables the hook.
@@ -290,6 +293,98 @@ fn resolve_system_prompt(path: Option<String>) -> Result<Option<String>> {
     })
 }
 
+/// Builds the system prompt for one provider turn.
+///
+/// The configured `LEG_SYSTEM_PROMPT` content is followed by repository
+/// instructions discovered from the git root down to the current directory.
+/// Discovery is deliberately performed for every turn so a resumed session
+/// sees the files that exist now rather than a copy from its earlier run.
+pub(crate) fn system_prompt_for_turn(base: Option<&str>) -> Result<Option<String>> {
+    let cwd = std::env::current_dir().map_err(|err| {
+        LegError::Config(format!(
+            "failed to resolve the current working directory: {err}"
+        ))
+    })?;
+    compose_system_prompt(base, instruction_directories(&cwd))
+}
+
+/// Composes a base prompt with the contents of the supplied instruction
+/// directories. Keeping this separate makes ordering and empty-input behavior
+/// testable without changing the process working directory.
+fn compose_system_prompt(
+    base: Option<&str>,
+    directories: impl IntoIterator<Item = PathBuf>,
+) -> Result<Option<String>> {
+    let mut parts = Vec::new();
+    if let Some(base) = base {
+        parts.push(base.to_string());
+    }
+
+    for directory in directories {
+        let path = directory.join("AGENTS.md");
+        if !path.is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).map_err(|err| {
+            LegError::Config(format!(
+                "failed to read project instructions {path:?}: {err}"
+            ))
+        })?;
+        parts.push(content);
+    }
+
+    Ok((!parts.is_empty()).then(|| parts.join("\n\n")))
+}
+
+/// Returns the directories whose `AGENTS.md` files apply to `cwd`, ordered
+/// from the repository root to the nearest directory. A non-repository
+/// working directory contributes only itself.
+fn instruction_directories(cwd: &Path) -> Vec<PathBuf> {
+    let Some(root) = git_root(cwd) else {
+        return vec![cwd.to_path_buf()];
+    };
+
+    let mut directories = Vec::new();
+    let mut current = cwd;
+    loop {
+        directories.push(current.to_path_buf());
+        if current == root {
+            directories.reverse();
+            return directories;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+
+    // A defensive fallback for an unexpected path representation from git:
+    // never inspect directories outside the caller's working tree.
+    vec![cwd.to_path_buf()]
+}
+
+/// Resolves the git root for `cwd`. A failed git probe means that `cwd` is
+/// outside a repository, which is the normal fallback for temporary workspaces
+/// and callers that do not have git installed.
+fn git_root(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let root = PathBuf::from(raw.trim());
+    if root.is_absolute() {
+        Some(root)
+    } else {
+        Some(cwd.join(root))
+    }
+}
+
 /// Resolves the provider credential with the documented precedence.
 ///
 /// Iterates the candidate `(variable, variant)` pairs in order; the first
@@ -389,6 +484,42 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key: &str| map.get(key).cloned()
+    }
+
+    #[test]
+    fn composes_system_prompt_in_root_to_nearest_order() {
+        let root = std::env::temp_dir().join(format!(
+            "leg-config-agents-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create instruction directories");
+        std::fs::write(root.join("AGENTS.md"), "root rules").expect("write root instructions");
+        std::fs::write(nested.join("AGENTS.md"), "nested rules")
+            .expect("write nested instructions");
+
+        let prompt = compose_system_prompt(Some("caller rules"), [root.clone(), nested.clone()])
+            .expect("compose system prompt")
+            .expect("prompt exists");
+
+        assert_eq!(prompt, "caller rules\n\nroot rules\n\nnested rules");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_agents_preserves_base_or_omits_system_prompt() {
+        assert_eq!(
+            compose_system_prompt(None, Vec::<PathBuf>::new()).unwrap(),
+            None
+        );
+        assert_eq!(
+            compose_system_prompt(Some("caller rules"), Vec::<PathBuf>::new()).unwrap(),
+            Some("caller rules".to_string())
+        );
     }
 
     #[test]

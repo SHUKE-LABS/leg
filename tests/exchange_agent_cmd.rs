@@ -12,6 +12,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,8 +24,18 @@ use std::time::Duration;
 /// writing its request body aborts the write on some platforms (observed on
 /// Windows/ureq), so the full body must be consumed first.
 fn spawn_mock_server(status: u16, body: &'static str) -> String {
+    spawn_mock_server_with_capture(status, body).0
+}
+
+/// Starts the same one-shot mock while retaining the provider request body.
+fn spawn_mock_server_with_capture(
+    status: u16,
+    body: &'static str,
+) -> (String, Arc<Mutex<Option<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let addr = listener.local_addr().expect("local addr");
+    let captured = Arc::new(Mutex::new(None));
+    let captured_for_thread = Arc::clone(&captured);
 
     thread::spawn(move || {
         let Ok((mut stream, _)) = listener.accept() else {
@@ -56,13 +67,16 @@ fn spawn_mock_server(status: u16, body: &'static str) -> String {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
 
-        let mut body_read = received.len() - header_end;
-        while body_read < content_length {
+        let mut request_body = received[header_end..].to_vec();
+        while request_body.len() < content_length {
             match stream.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => body_read += n,
+                Ok(n) => request_body.extend_from_slice(&buf[..n]),
             }
         }
+        request_body.truncate(content_length);
+        *captured_for_thread.lock().expect("capture mutex") =
+            Some(String::from_utf8_lossy(&request_body).into_owned());
 
         let reason = if status == 200 { "OK" } else { "Error" };
         let response = format!(
@@ -73,7 +87,7 @@ fn spawn_mock_server(status: u16, body: &'static str) -> String {
         let _ = stream.flush();
     });
 
-    format!("http://{addr}")
+    (format!("http://{addr}"), captured)
 }
 
 /// Spawns `leg exchange` against `base_url`, feeds `stdin_body` on stdin
@@ -156,6 +170,54 @@ fn run_leg_exchange_files(
 
     (
         output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Runs one exchange in a caller-selected workspace and session store.
+fn run_leg_exchange_in_dir(
+    base_url: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    session_dir: &std::path::Path,
+    system_prompt: Option<&std::path::Path>,
+    stdin_body: &str,
+) -> (bool, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leg"));
+    command
+        .args(args)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("LEG_MODEL", "claude-test-model")
+        .env("LEG_TIMEOUT_SECS", "5")
+        .env("LEG_SESSION_DIR", session_dir)
+        .env_remove("LEG_EVENT_LOG")
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match system_prompt {
+        Some(path) => {
+            command.env("LEG_SYSTEM_PROMPT", path);
+        }
+        None => {
+            command.env_remove("LEG_SYSTEM_PROMPT");
+        }
+    }
+    let mut child = command.spawn().expect("spawn leg exchange");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin_body.as_bytes())
+        .expect("write stdin");
+
+    let output = child
+        .wait_timeout_or_kill(Duration::from_secs(10))
+        .expect("child did not hang");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
@@ -343,6 +405,95 @@ fn envelope_mode_round_trips_through_in_and_out_files() {
         response["exchange"]["exchange"]["outcome"]["event"],
         "response_ok"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resumed_exchange_rebuilds_current_agents_prompt_without_persisting_it() {
+    let dir = unique_scratch_dir("agents-resume");
+    let nested = dir.join("nested");
+    let sessions = dir.join("sessions");
+    std::fs::create_dir_all(&nested).expect("create nested workspace");
+    std::fs::create_dir_all(&sessions).expect("create session store");
+    let git_status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .expect("run git init");
+    assert!(git_status.success(), "git init failed");
+
+    let system_prompt = dir.join("caller-system.md");
+    std::fs::write(&system_prompt, "caller rules").expect("write caller prompt");
+    let root_agents = dir.join("AGENTS.md");
+    let nested_agents = nested.join("AGENTS.md");
+    std::fs::write(&root_agents, "root rules old").expect("write root instructions");
+    std::fs::write(&nested_agents, "nested rules old").expect("write nested instructions");
+
+    let first_url = spawn_mock_server_with_capture(
+        200,
+        r#"{"content":[{"type":"text","text":"first"}],"stop_reason":"end_turn"}"#,
+    );
+    let (first_url, first_capture) = first_url;
+    let (first_success, first_stdout, first_stderr) = run_leg_exchange_in_dir(
+        &first_url,
+        &["exchange", "--new-session-id", "sess-219-1"],
+        &nested,
+        &sessions,
+        Some(&system_prompt),
+        "first turn",
+    );
+    assert!(first_success, "first exchange failed: {first_stderr}");
+    assert_eq!(first_stdout, "first\n");
+    let first_body = first_capture
+        .lock()
+        .expect("first capture mutex")
+        .clone()
+        .expect("first request body");
+    let first_json: serde_json::Value =
+        serde_json::from_str(&first_body).expect("first request JSON");
+    assert_eq!(
+        first_json["system"],
+        "caller rules\n\nroot rules old\n\nnested rules old"
+    );
+
+    std::fs::write(&root_agents, "root rules new").expect("update root instructions");
+    std::fs::write(&nested_agents, "nested rules new").expect("update nested instructions");
+
+    let second_url = spawn_mock_server_with_capture(
+        200,
+        r#"{"content":[{"type":"text","text":"second"}],"stop_reason":"end_turn"}"#,
+    );
+    let (second_url, second_capture) = second_url;
+    let (second_success, second_stdout, second_stderr) = run_leg_exchange_in_dir(
+        &second_url,
+        &["exchange", "--session", "sess-219-1"],
+        &nested,
+        &sessions,
+        Some(&system_prompt),
+        "second turn",
+    );
+    assert!(second_success, "resumed exchange failed: {second_stderr}");
+    assert_eq!(second_stdout, "second\n");
+    let second_body = second_capture
+        .lock()
+        .expect("second capture mutex")
+        .clone()
+        .expect("second request body");
+    let second_json: serde_json::Value =
+        serde_json::from_str(&second_body).expect("second request JSON");
+    assert_eq!(
+        second_json["system"],
+        "caller rules\n\nroot rules new\n\nnested rules new"
+    );
+
+    let trail =
+        std::fs::read_to_string(sessions.join("sess-219-1.jsonl")).expect("read session trail");
+    assert!(!trail.contains("caller rules"));
+    assert!(!trail.contains("root rules old"));
+    assert!(!trail.contains("nested rules old"));
+    assert!(!trail.contains("root rules new"));
+    assert!(!trail.contains("nested rules new"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
