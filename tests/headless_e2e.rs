@@ -2397,6 +2397,56 @@ fn exchange_stream_json_flushes_a_text_delta_before_provider_completion() {
     std::fs::remove_dir_all(&cwd).ok();
 }
 
+#[test]
+fn exchange_stream_json_snapshots_agents_prompt_across_tool_continuation() {
+    let cwd = fixture_dir("stream-agents-tool-continuation");
+    std::fs::write(cwd.join("AGENTS.md"), "stream rules before tool\n")
+        .expect("write stream instructions");
+    let (base_url, requests) = spawn_sse_sequence_server(vec![
+        sse_tool_use_reply(
+            "toolu_stream_agents",
+            "bash",
+            &serde_json::json!({
+                "command": "printf 'stream rules after tool\\n' > AGENTS.md"
+            }),
+        ),
+        sse_text_reply("stream complete"),
+    ]);
+    let mut command = leg(&cwd, &base_url);
+    command.arg("exchange").arg("--stream-json");
+    let output = run(command, Some("run the stream tool\n"));
+    assert!(
+        output.status.success(),
+        "stream exchange failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("AGENTS.md")).expect("read updated instructions"),
+        "stream rules after tool\n"
+    );
+
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("stream request is JSON"))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        2,
+        "initial stream request plus tool continuation"
+    );
+    for request in &requests {
+        assert_eq!(request["system"], "stream rules before tool\n");
+    }
+    assert_eq!(
+        requests[1]["messages"].as_array().unwrap().last().unwrap()["content"][0]["type"],
+        "tool_result"
+    );
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
 // On Apple targets, pipe creation and close-on-exec setup can race with child
 // processes spawned by parallel tests, making this broken-pipe timing flaky.
 #[cfg(target_os = "linux")]
@@ -3028,6 +3078,59 @@ fn exchange_stream_json_new_and_named_sessions_restore_successful_history() {
     assert_eq!(history[0]["content"], "remember this");
     assert_eq!(history[1]["content"], "first remembered");
     assert_eq!(history[2]["content"], "continue from memory");
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn session_stream_json_snapshots_agents_prompt_across_tool_continuation() {
+    let cwd = fixture_dir("session-stream-agents-tool-continuation");
+    let store = cwd.join("sessions");
+    std::fs::write(cwd.join("AGENTS.md"), "session stream rules before tool\n")
+        .expect("write session instructions");
+    let (base_url, requests) = spawn_sse_sequence_server(vec![
+        sse_tool_use_reply(
+            "toolu_session_stream_agents",
+            "bash",
+            &serde_json::json!({
+                "command": "printf 'session stream rules after tool\\n' > AGENTS.md"
+            }),
+        ),
+        sse_text_reply("session stream complete"),
+    ]);
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_SESSION_DIR", &store)
+        .args(["exchange", "--new-session", "--stream-json"]);
+    let output = run(command, Some("run the session stream tool\n"));
+    assert!(
+        output.status.success(),
+        "session stream exchange failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("AGENTS.md")).expect("read updated instructions"),
+        "session stream rules after tool\n"
+    );
+
+    let requests: Vec<Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("session stream request is JSON"))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        2,
+        "initial session request plus tool continuation"
+    );
+    for request in &requests {
+        assert_eq!(request["system"], "session stream rules before tool\n");
+    }
+    assert_eq!(
+        requests[1]["messages"].as_array().unwrap().last().unwrap()["content"][0]["type"],
+        "tool_result"
+    );
+
     std::fs::remove_dir_all(&cwd).ok();
 }
 

@@ -511,6 +511,35 @@ mod tests {
     }
 
     #[test]
+    fn non_repository_discovery_reads_only_the_working_directory() {
+        let parent = std::env::temp_dir().join(format!(
+            "leg-config-agents-nongit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let cwd = parent.join("workspace");
+        std::fs::create_dir_all(&cwd).expect("create non-repository workspace");
+        std::fs::write(parent.join("AGENTS.md"), "parent rules")
+            .expect("write parent instructions");
+        std::fs::write(cwd.join("AGENTS.md"), "working directory rules")
+            .expect("write working-directory instructions");
+
+        assert!(
+            git_root(&cwd).is_none(),
+            "temporary workspace must be non-git"
+        );
+        let prompt = compose_system_prompt(None, instruction_directories(&cwd))
+            .expect("compose system prompt")
+            .expect("working-directory prompt exists");
+
+        assert_eq!(prompt, "working directory rules");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
     fn no_agents_preserves_base_or_omits_system_prompt() {
         assert_eq!(
             compose_system_prompt(None, Vec::<PathBuf>::new()).unwrap(),
