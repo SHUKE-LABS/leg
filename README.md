@@ -147,7 +147,10 @@ repository root down to the current working directory, with the nearest file
 last; outside a repository it reads only the current working directory's file.
 The resulting system prompt is `LEG_SYSTEM_PROMPT`'s file content followed by
 those files, separated by blank lines. Discovery is refreshed for every turn
-and is not stored in session history or trails.
+and is not stored in session history or trails. The [Skills v1
+contract](docs/skills-v1.md) defines the separate selectable Skills layer:
+`AGENTS.md` is always-on project instruction, while a Skill is loaded only
+after explicit selection and never replaces project instructions.
 
 Anthropic Messages remains the default provider. OpenAI-compatible endpoints
 can use either streamed wire protocol:

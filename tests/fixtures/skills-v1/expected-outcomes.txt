@@ -1,0 +1,11 @@
+# Contract expectations; check.sh verifies these markers only.
+valid.catalog=fixture-valid
+valid.activation=body-only
+valid.resource=references/guide.md-on-demand
+valid.script=not-auto-run
+malformed.catalog=empty
+malformed.warning=invalid-package
+malformed.activation=unavailable
+duplicate.catalog=fixture-duplicate
+duplicate.winner=duplicate/project/.agents/skills/fixture-duplicate
+duplicate.loser-warning=duplicate/user/.agents/skills/fixture-duplicate
