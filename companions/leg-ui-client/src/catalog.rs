@@ -505,7 +505,9 @@ impl SessionCatalog {
 
     /// Starts a new leg session from a saved draft. Catalog-managed sessions
     /// always pass this catalog's sessions directory as LEG_SESSION_DIR,
-    /// regardless of an inherited LEG_SESSION_DIR value.
+    /// regardless of an inherited LEG_SESSION_DIR value. The launched leg
+    /// process inherits its environment and requires an explicit
+    /// LEG_CONTEXT_WINDOW_TOKENS for the selected model.
     pub fn start_new(
         &self,
         draft_id: &str,

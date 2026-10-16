@@ -3383,6 +3383,9 @@ async def main() -> int:
     parser.add_argument("leg_bin", type=Path)
     parser.add_argument("supervisor_bin", type=Path)
     args = parser.parse_args()
+    os.environ["LEG_CONTEXT_WINDOW_TOKENS"] = "200000"
+    os.environ.pop("LEG_CONTEXT_RESERVE_TOKENS", None)
+    os.environ.pop("LEG_CONTEXT_KEEP_RECENT_TOKENS", None)
     binaries = tuple(path.resolve() for path in (args.web_bin, args.leg_bin, args.supervisor_bin))
     await run(*binaries, args.browser)
     await run_session_navigation(*binaries, args.browser)

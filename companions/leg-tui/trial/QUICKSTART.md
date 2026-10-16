@@ -52,9 +52,13 @@ The fixture prints environment settings for its loopback provider. In a second
 terminal, change to the extracted bundle directory, apply the printed settings
 to that shell, and launch the TUI with a disposable catalog:
 
+Session-backed leg calls require an explicit `LEG_CONTEXT_WINDOW_TOKENS`. For
+this short fake-provider trial, use `200000`; when using a real model, set its
+documented context window.
+
 ```sh
 bundle_dir=$PWD
-LEG_UI_STATE_DIR="$PWD/.trial-state" ./start-tui.sh
+LEG_CONTEXT_WINDOW_TOKENS=200000 LEG_UI_STATE_DIR="$PWD/.trial-state" ./start-tui.sh
 ```
 
 Select the printed disposable workspace path when prompted. Follow the shared

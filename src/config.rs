@@ -40,7 +40,7 @@ pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 /// Default `max_tokens` requested per reply when `LEG_MAX_TOKENS` is unset.
 pub const DEFAULT_MAX_TOKENS: u32 = 32000;
 
-/// Maximum provider context window when explicitly configured.
+/// Upper cap for the default recent-history token allowance.
 pub const DEFAULT_CONTEXT_KEEP_RECENT_TOKENS_CAP: u64 = 8192;
 
 /// Input and output allowances used by context-window management.

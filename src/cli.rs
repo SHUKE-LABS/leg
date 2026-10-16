@@ -18,8 +18,8 @@ use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant, build_response_envelope};
 use crate::tools::{
-    BashTool, ContextCompaction, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver, ToolRegistry,
-    TurnOutcome, WriteTool, tool_round_limit_warning,
+    BashTool, ContextCompaction, ContextTurn, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver,
+    ToolRegistry, TurnOutcome, WriteTool, tool_round_limit_warning,
 };
 use crate::transport::provider::ProviderTransport;
 use crate::transport::{StreamEvent, Transport, TransportCall};
@@ -820,8 +820,7 @@ fn execute_exchange_session_core(
             transport.run_observed_with_system_prompt_and_context_with_attempts(
                 resumed.conversation.messages(),
                 system_prompt.as_deref(),
-                &session_id,
-                turn_index,
+                ContextTurn::new(&session_id, turn_index),
                 &mut observe_tool,
                 &mut observe_compaction,
             )
@@ -1374,8 +1373,7 @@ fn run_session_repl_with_warning_and_system_prompt(
                 transport.run_streaming_observed_with_system_prompt_and_context_with_attempts(
                     conversation.messages(),
                     system_prompt.as_deref(),
-                    &session_id,
-                    turn_index,
+                    ContextTurn::new(&session_id, turn_index),
                     &mut observe_tool,
                     &mut observe_compaction,
                     &mut |event| {

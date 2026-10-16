@@ -2300,10 +2300,13 @@ fn companion_controller_contract_and_cleanup() {
     let mut environment = EnvGuard::new();
     environment.set("ANTHROPIC_API_KEY", sentinel);
     environment.set("LEG_MODEL", "claude-controller-fixture");
+    environment.set("LEG_CONTEXT_WINDOW_TOKENS", "200000");
     environment.set("LEG_TIMEOUT_SECS", "15");
     environment.set("LEG_BASH_TIMEOUT_SECS", "60");
     environment.set("LEG_MAX_RETRIES", "0");
     environment.remove("LEG_MAX_TOOL_ROUNDS");
+    environment.remove("LEG_CONTEXT_RESERVE_TOKENS");
+    environment.remove("LEG_CONTEXT_KEEP_RECENT_TOKENS");
 
     let (launcher, global_entry, npm_binary) =
         create_npm_fixture(&scratch.path().join("npm"), &leg);

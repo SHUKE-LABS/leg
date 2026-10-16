@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use super::*;
 use crate::config::Provider;
 use crate::events::{RequestRecord, trail_content};
-use crate::tools::OwnedToolEvent;
+use crate::tools::{ContextTurn, OwnedToolEvent};
 use crate::transport::Transport;
 
 const STREAM_SCHEMA: &str = "leg.exchange.stream/v1";
@@ -334,8 +334,7 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
             transport.run_streaming_observed_fallible_with_system_prompt_and_context_with_attempts(
                 resumed.conversation.messages(),
                 system_prompt.as_deref(),
-                &session_id,
-                turn_index,
+                ContextTurn::new(&session_id, turn_index),
                 &mut observe_tool,
                 &mut observe_compaction,
                 &mut observe_stream,

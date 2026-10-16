@@ -985,10 +985,13 @@ fn leg(cwd: &Path, base_url: &str) -> Command {
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("LEG_MODEL", "claude-test-model")
+        .env("LEG_CONTEXT_WINDOW_TOKENS", "200000")
         .env("LEG_TIMEOUT_SECS", "5")
         .env_remove("LEG_EVENT_LOG")
         .env_remove("LEG_SYSTEM_PROMPT")
-        .env_remove("LEG_PRETOOL_HOOK");
+        .env_remove("LEG_PRETOOL_HOOK")
+        .env_remove("LEG_CONTEXT_RESERVE_TOKENS")
+        .env_remove("LEG_CONTEXT_KEEP_RECENT_TOKENS");
     cmd
 }
 

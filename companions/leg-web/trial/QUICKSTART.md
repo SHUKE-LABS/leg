@@ -63,9 +63,13 @@ second terminal, change to the bundle directory shown by `pwd` above, save its
 path for cleanup, apply the printed settings to that shell, then start the Web
 host:
 
+Session-backed leg calls require an explicit `LEG_CONTEXT_WINDOW_TOKENS`. For
+this short fake-provider trial, use `200000`; when using a real model, set its
+documented context window.
+
 ```sh
 bundle_dir=$PWD
-./start-web.sh --no-open --state-dir "$PWD/.trial-state"
+LEG_CONTEXT_WINDOW_TOKENS=200000 ./start-web.sh --no-open --state-dir "$PWD/.trial-state"
 ```
 
 Open the one-time URL printed by the host. Keep both terminals open while

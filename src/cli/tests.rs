@@ -2053,28 +2053,29 @@ fn session_compacts_before_a_normal_turn_without_an_extra_trail_pair_or_turn_ind
     let transport =
         crate::tools::tests::BudgetTransport::new(vec![Ok(AssistantReply::new("current answer"))]);
     let tool_loop = ToolLoop::new(transport, ToolRegistry::new(), None)
-        .with_context_budget(Some(crate::tools::tests::context_budget(500, 100, 200)));
+        .with_context_budget(Some(crate::tools::tests::context_budget(2_000, 200, 200)));
     let mut trail = Vec::new();
-    let mut sink = WriterSink::new(&mut trail);
     let mut warning = Vec::new();
     let mut history = Conversation::new();
-    history.push_user("old context ".repeat(120));
+    history.push_user("old context ".repeat(1_000));
     history.push_assistant("old answer");
 
-    run_session_repl_with_warning_and_system_prompt(
-        &tool_loop,
-        &mut sink,
-        &meta(),
-        std::io::Cursor::new("next turn\n/exit\n"),
-        Vec::new(),
-        "sess-summary".to_string(),
-        history,
-        1,
-        &mut warning,
-        None,
-    )
-    .expect("session turn completes after compaction");
-    drop(sink);
+    {
+        let mut sink = WriterSink::new(&mut trail);
+        run_session_repl_with_warning_and_system_prompt(
+            &tool_loop,
+            &mut sink,
+            &meta(),
+            std::io::Cursor::new("next turn\n/exit\n"),
+            Vec::new(),
+            "sess-summary".to_string(),
+            history,
+            1,
+            &mut warning,
+            None,
+        )
+        .expect("session turn completes after compaction");
+    }
 
     let values = String::from_utf8(trail)
         .expect("trail is UTF-8")
