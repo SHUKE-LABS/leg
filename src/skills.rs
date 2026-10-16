@@ -40,6 +40,7 @@ impl SkillCatalog {
         serde_json::to_string(self).expect("Skills catalog fields always serialize to JSON")
     }
 
+    #[allow(dead_code)] // Used by activation in #231.
     pub(crate) fn package_binding(&self, name: &str) -> Option<(&Path, &PackageIdentity)> {
         self.skills
             .iter()
@@ -68,6 +69,7 @@ pub struct SkillEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<BTreeMap<String, String>>,
     #[serde(skip)]
+    #[allow(dead_code)] // Used by activation in #231.
     binding: PackageBinding,
 }
 
@@ -153,24 +155,40 @@ pub fn discover_skill_catalog(
         skills: Vec::new(),
         warnings,
     };
-    let mut budget_warning_added = false;
-    for candidate in winners {
-        let entry = candidate.into_entry(catalog.skills.len(), &catalog.snapshot_id);
-        catalog.skills.push(entry);
-        if catalog.to_json().len() > catalog_budget_bytes {
-            catalog.skills.pop();
-            if !budget_warning_added {
-                catalog.warnings.push(SkillWarning {
-                    code: "catalog_budget_exceeded".to_string(),
-                    message: "One or more complete skill entries were omitted because the catalog budget was exceeded."
-                        .to_string(),
-                });
-                budget_warning_added = true;
-            }
-        }
+    if fit_catalog_entries(&mut catalog, &winners, catalog_budget_bytes) {
+        catalog.warnings.push(catalog_budget_warning());
+        catalog.skills.clear();
+        fit_catalog_entries(&mut catalog, &winners, catalog_budget_bytes);
     }
 
     catalog
+}
+
+fn fit_catalog_entries(
+    catalog: &mut SkillCatalog,
+    candidates: &[PackageCandidate],
+    catalog_budget_bytes: usize,
+) -> bool {
+    let mut omitted_any = false;
+    for candidate in candidates {
+        let entry = candidate
+            .clone()
+            .into_entry(catalog.skills.len(), &catalog.snapshot_id);
+        catalog.skills.push(entry);
+        if catalog.to_json().len() > catalog_budget_bytes {
+            catalog.skills.pop();
+            omitted_any = true;
+        }
+    }
+    omitted_any
+}
+
+fn catalog_budget_warning() -> SkillWarning {
+    SkillWarning {
+        code: "catalog_budget_exceeded".to_string(),
+        message: "One or more complete skill entries were omitted because the catalog budget was exceeded."
+            .to_string(),
+    }
 }
 
 /// Discover using the process working directory and standard home variables.
@@ -327,7 +345,9 @@ struct SkillMetadata {
 
 #[derive(Clone, Debug)]
 struct PackageBinding {
+    #[allow(dead_code)] // Used by activation in #231.
     skill_file_path: PathBuf,
+    #[allow(dead_code)] // Used by activation in #231.
     identity: PackageIdentity,
 }
 
@@ -466,7 +486,11 @@ fn scan_root(
             Ok(entries) => entries,
             Err(error) => {
                 warnings.push(warning(
-                    "unreadable_root",
+                    if is_root {
+                        "unreadable_root"
+                    } else {
+                        "unreadable_path"
+                    },
                     format!(
                         "Could not read '{}' under {}: {}.",
                         display_relative(&root.path, &directory),
@@ -921,7 +945,7 @@ fn valid_license(license: &str) -> bool {
         return false;
     }
     let components = license.split(['/', '\\']).collect::<Vec<_>>();
-    !components.iter().any(|component| *component == "..")
+    !components.contains(&"..")
         && components
             .last()
             .is_some_and(|component| !component.is_empty() && *component != ".")
@@ -1371,20 +1395,25 @@ mod tests {
         let one_root = cwd.join("one/.agents/skills");
         skill(&one_root, "skill-a", "same body");
         let one_catalog = discover_skill_catalog(
-            &one_root.parent().unwrap().parent().unwrap(),
+            one_root.parent().unwrap().parent().unwrap(),
             None,
             None,
             usize::MAX,
         );
-        let one_entry_bytes = one_catalog.to_json().len();
+        let mut one_entry_and_warning = one_catalog.clone();
+        one_entry_and_warning
+            .warnings
+            .push(catalog_budget_warning());
+        let catalog_budget_bytes = one_entry_and_warning.to_json().len();
 
         let root = cwd.join(".agents/skills");
         skill(&root, "skill-a", "same body");
         skill(&root, "skill-b", "same body");
-        let catalog = discover_skill_catalog(&cwd, None, None, one_entry_bytes);
+        let catalog = discover_skill_catalog(&cwd, None, None, catalog_budget_bytes);
 
         assert_eq!(names(&catalog), vec!["skill-a"]);
         assert!(warning_codes(&catalog).contains(&"catalog_budget_exceeded"));
+        assert!(catalog.to_json().len() <= catalog_budget_bytes);
     }
 
     #[test]

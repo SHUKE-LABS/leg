@@ -155,8 +155,9 @@ contract](docs/skills-v1.md) defines the separate selectable Skills layer:
 after explicit selection and never replaces project instructions.
 
 The Skills v1 catalog discovers packages from project `.agents/skills`,
-`.codex/skills`, `.claude/skills`, and `.pi/skills` roots, checking the current
-directory and then its ancestors; all project roots precede user roots. User
+`.codex/skills`, `.claude/skills`, and `.pi/skills` roots, walking from the
+current directory up to the repository root; without a repository, only the
+current directory is checked. All project roots precede user roots. User
 roots are `~/.agents/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`),
 `~/.claude/skills`, and `~/.pi/agent/skills`. The nearest project directory
 wins, followed by that root-kind order. Within a root, normalized relative
