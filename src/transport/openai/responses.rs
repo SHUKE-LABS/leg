@@ -1113,6 +1113,48 @@ mod tests {
     }
 
     #[test]
+    fn max_thinking_clamps_to_high_and_completes_responses_turn() {
+        let response = json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+            "usage":{"input_tokens":1,"output_tokens":1}
+        });
+        let event_body = [
+            event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_max"}}),
+            ),
+            event(
+                "response.completed",
+                json!({"type":"response.completed","response":response}),
+            ),
+        ]
+        .join("");
+        let mut config = config();
+        config.model = "o3-mini".to_string();
+        config.thinking = crate::thinking::ThinkingConfig::resolve(
+            Provider::OpenAiResponses,
+            &config.model,
+            Some("max".to_string()),
+            None,
+        )
+        .expect("thinking config");
+        let http = FakeHttp {
+            body: event_body,
+            request: RefCell::new(None),
+        };
+        let client = OpenAiResponsesClient::with_http(config, http);
+        client
+            .send_conversation(&[Message::user("hi")])
+            .expect("max-clamped response parses");
+
+        let request = client.http.request.borrow();
+        let (_, _, body) = request.as_ref().expect("request captured");
+        let body: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
     fn thinking_override_and_off_are_reflected_in_responses_body() {
         let response = json!({
             "status":"completed",

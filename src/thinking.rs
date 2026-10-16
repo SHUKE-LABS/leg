@@ -122,6 +122,10 @@ impl ThinkingConfig {
     ) -> Result<Self> {
         let requested = ThinkingLevel::parse(raw_level.as_deref().unwrap_or("high"))?;
         let overrides = parse_map(raw_map)?;
+        let capability = capability_for(provider, model);
+        if capability.is_some_and(|capability| capability.encoding == ThinkingEncoding::Budget) {
+            validate_budget_overrides(&overrides)?;
+        }
         if !requested.is_enabled() {
             return Ok(Self {
                 requested,
@@ -131,7 +135,6 @@ impl ThinkingConfig {
             });
         }
 
-        let capability = capability_for(provider, model);
         let has_override_value = overrides.values().any(Option::is_some);
         let encoding = capability
             .map(|capability| capability.encoding)
@@ -218,6 +221,12 @@ const CLAUDE_EFFORT_LEVELS: &[ThinkingLevel] = &[
     ThinkingLevel::XHigh,
     ThinkingLevel::Max,
 ];
+const CLAUDE_4_6_EFFORT_LEVELS: &[ThinkingLevel] = &[
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+    ThinkingLevel::Max,
+];
 const OPENAI_EFFORT_LEVELS: &[ThinkingLevel] = &[
     ThinkingLevel::Minimal,
     ThinkingLevel::Low,
@@ -258,36 +267,18 @@ const MODEL_CAPABILITIES: &[ModelCapability] = &[
         provider: Provider::Anthropic,
         prefix: "claude-opus-4-6",
         encoding: ThinkingEncoding::Effort,
-        supported: CLAUDE_EFFORT_LEVELS,
+        supported: CLAUDE_4_6_EFFORT_LEVELS,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-sonnet-4-6",
         encoding: ThinkingEncoding::Effort,
-        supported: CLAUDE_EFFORT_LEVELS,
+        supported: CLAUDE_4_6_EFFORT_LEVELS,
     },
     // Older Claude models use the extended-thinking budget shape.
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-3-7-sonnet",
-        encoding: ThinkingEncoding::Budget,
-        supported: BUDGET_LEVELS,
-    },
-    ModelCapability {
-        provider: Provider::Anthropic,
-        prefix: "claude-3-5",
-        encoding: ThinkingEncoding::Budget,
-        supported: BUDGET_LEVELS,
-    },
-    ModelCapability {
-        provider: Provider::Anthropic,
-        prefix: "claude-3-opus",
-        encoding: ThinkingEncoding::Budget,
-        supported: BUDGET_LEVELS,
-    },
-    ModelCapability {
-        provider: Provider::Anthropic,
-        prefix: "claude-3-haiku",
         encoding: ThinkingEncoding::Budget,
         supported: BUDGET_LEVELS,
     },
@@ -378,6 +369,27 @@ fn capability_for(provider: Provider, model: &str) -> Option<&'static ModelCapab
         .find(|capability| capability.provider == provider && model.starts_with(capability.prefix))
 }
 
+fn validate_budget_overrides(overrides: &BTreeMap<ThinkingLevel, Option<String>>) -> Result<()> {
+    for (level, value) in overrides {
+        let Some(value) = value else {
+            continue;
+        };
+        let budget = value.parse::<u32>().map_err(|_| {
+            LegError::Config(format!(
+                "LEG_THINKING_MAP value for {:?} must be a decimal budget of at least {MIN_ANSWER_TOKENS} for budget-style models",
+                level.as_str()
+            ))
+        })?;
+        if budget < MIN_ANSWER_TOKENS {
+            return Err(LegError::Config(format!(
+                "LEG_THINKING_MAP value for {:?} must be a decimal budget of at least {MIN_ANSWER_TOKENS} for budget-style models",
+                level.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn parse_map(raw: Option<String>) -> Result<BTreeMap<ThinkingLevel, Option<String>>> {
     let Some(raw) = raw else {
         return Ok(BTreeMap::new());
@@ -440,6 +452,24 @@ mod tests {
     }
 
     #[test]
+    fn xhigh_clamps_to_high_for_claude_4_6_models() {
+        for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+            let config = ThinkingConfig::resolve(
+                Provider::Anthropic,
+                model,
+                Some("xhigh".to_string()),
+                None,
+            )
+            .expect("thinking config");
+            assert_eq!(
+                config.request(32_000),
+                Some(ThinkingRequest::Effort("high".to_string())),
+                "model: {model}"
+            );
+        }
+    }
+
+    #[test]
     fn clamps_max_to_high_for_openai_effort_models() {
         let config = ThinkingConfig::resolve(
             Provider::OpenAiResponses,
@@ -464,6 +494,18 @@ mod tests {
         )
         .expect("thinking config");
         assert_eq!(config.request(4096), Some(ThinkingRequest::Budget(3072)));
+    }
+
+    #[test]
+    fn unsupported_legacy_claude_model_does_not_enable_thinking() {
+        let config = ThinkingConfig::resolve(
+            Provider::Anthropic,
+            "claude-3-5-sonnet-20241022",
+            Some("high".to_string()),
+            None,
+        )
+        .expect("thinking config");
+        assert_eq!(config.request(32_000), None);
     }
 
     #[test]

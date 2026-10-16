@@ -1059,6 +1059,19 @@ mod tests {
     }
 
     #[test]
+    fn invalid_budget_thinking_override_is_rejected() {
+        let invalid = LegConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("LEG_MODEL", "claude-3-7-sonnet-20250219"),
+            ("LEG_THINKING_MAP", r#"{"high":"not-a-budget"}"#),
+        ]))
+        .unwrap_err();
+        assert!(matches!(invalid, LegError::Config(_)));
+        assert!(invalid.to_string().contains("LEG_THINKING_MAP"));
+        assert!(invalid.to_string().contains("high"));
+    }
+
+    #[test]
     fn retry_count_zero_is_valid_and_invalid_values_are_rejected() {
         let cfg = LegConfig::from_lookup(lookup_from(&[
             ("ANTHROPIC_API_KEY", "secret"),

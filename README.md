@@ -123,7 +123,9 @@ models, at least 1,024 output tokens remain available for the visible answer.
 values, for example `{"high":"medium"}`; `null` marks a level unsupported.
 This is useful for model ids not in the built-in table. An unknown model with
 no usable override omits the thinking parameter and emits one warning naming
-the model and `LEG_THINKING_MAP`.
+the model and `LEG_THINKING_MAP`. For budget-style models, non-null values must
+be decimal budgets of at least 1,024; invalid values fail configuration
+loading.
 
 ### Context-window budgeting
 
