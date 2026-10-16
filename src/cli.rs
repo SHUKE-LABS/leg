@@ -13,13 +13,15 @@ use crate::events::{
     EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, ToolStatus, WriterSink,
     now_ms, trail_content,
 };
+use crate::hooks::HookEvent;
 use crate::interrupt;
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant, build_response_envelope};
 use crate::tools::{
-    BashTool, ContextCompaction, ContextTurn, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver,
-    ToolRegistry, TurnOutcome, WriteTool, tool_round_limit_warning,
+    BashTool, ContextCompaction, ContextTurn, EditTool, HookContext, ReadSet, ReadTool, ToolLoop,
+    ToolObserver, ToolRegistry, TurnOutcome, WriteTool, report_hook_failures,
+    tool_round_limit_warning,
 };
 use crate::transport::provider::ProviderTransport;
 use crate::transport::{StreamEvent, Transport, TransportCall};
@@ -1171,6 +1173,11 @@ fn execute_session_with_system_prompt(
     eprintln!(
         "leg session — type a message and press enter; Ctrl-D or {SESSION_EXIT_COMMAND} to quit"
     );
+    transport.run_lifecycle_hooks(
+        HookEvent::SessionStart,
+        HookContext::new(Some(&session_id), None),
+        serde_json::json!({}),
+    );
     emit(sink, &ExchangeEvent::session_start(now_ms(), &session_id));
     run_session_repl_with_system_prompt(
         transport,
@@ -1428,6 +1435,11 @@ fn run_session_repl_with_warning_and_system_prompt(
     // killed mid-run never reaches here, so its trail carries a
     // `session_start` and turns but no `session_end` — partitioning keys on
     // `session_id`, not on a matched pair (see `crate::log::parse_sessions`).
+    transport.run_lifecycle_hooks(
+        HookEvent::SessionEnd,
+        HookContext::new(Some(&session_id), None),
+        serde_json::json!({ "turns": turn_index }),
+    );
     emit(
         sink,
         &ExchangeEvent::session_end(now_ms(), &session_id, turn_index),
@@ -1597,7 +1609,9 @@ fn build_transport(config: LegConfig) -> ToolLoop<ProviderTransport> {
     let context_budget = config.context_budget;
     let registry = build_tool_registry(&config);
     let client = ProviderTransport::from_config(config, registry.specs());
-    ToolLoop::new(client, registry, max_tool_rounds).with_context_budget(context_budget)
+    ToolLoop::new(client, registry, max_tool_rounds)
+        .with_context_budget(context_budget)
+        .with_hook_observer(|outcome| report_hook_failures(std::slice::from_ref(outcome)))
 }
 
 /// Registers the synchronous tools. `read` and `write` share one read-set
@@ -1605,10 +1619,8 @@ fn build_transport(config: LegConfig) -> ToolLoop<ProviderTransport> {
 /// overwrites on it.
 fn build_tool_registry(config: &LegConfig) -> ToolRegistry {
     let reads = ReadSet::new();
-    let mut registry = ToolRegistry::new();
-    if let Some(path) = &config.pre_tool_hook {
-        registry = registry.with_pre_tool_hook(path.clone());
-    }
+    let mut registry =
+        ToolRegistry::new().with_hook_config(config.hooks.clone(), config.pre_tool_hook.clone());
     registry.register(ReadTool::spec(), Box::new(ReadTool::new(reads.clone())));
     registry.register(WriteTool::spec(), Box::new(WriteTool::new(reads)));
     registry.register(EditTool::spec(), Box::new(EditTool::new()));

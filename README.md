@@ -210,19 +210,22 @@ configuration. The full v1 schema, event list, platform paths, precedence,
 validation rules, and legacy compatibility are documented in
 [docs/hooks-v1.md](docs/hooks-v1.md). Project discovery is relative to the
 current working directory and does not walk upward to the Git root. Project
-hook files are trusted as-is; once hook execution is provided, commands run
-with the operating-system permissions of the user running leg.
+hook files are trusted as-is. Hook commands run with the operating-system
+permissions of the user running leg.
 
 `LEG_PRETOOL_HOOK` remains usable as a single pre-tool executable. It receives
-this JSON object on stdin:
-`{"hook_event_name":"PreToolUse","tool_name":"<name>","tool_input":{...},"cwd":"<cwd>"}`.
+the `PreToolUse` JSON payload on stdin, including `hook_event_name`, `cwd`,
+`tool_name`, and `tool_input`; `session_id` and `turn_index` are included when
+the call belongs to a session turn.
 Exit 0 with empty or whitespace-only stdout, or `{"decision":"allow"}`,
 allows the call. Exit 0 with
 `{"decision":"deny","reason":"..."}` denies it and returns that reason to the
-model. A non-zero exit, spawn failure, 30-second timeout, or invalid output
-denies with a generic reason. Hook denials are recorded in the trail with
-`status: "denied"`. Declarative entries are loaded and selected, but their
-command and lifecycle dispatch are not part of this configuration slice.
+model. A non-zero exit, spawn failure, malformed, truncated, or invalid UTF-8
+output, 30-second timeout, or cancellation denies with a generic reason.
+Declarative hooks run sequentially for the six documented events;
+`PreToolUse` is fail-closed, while other event failures are reported to stderr
+without changing the operation result. See [docs/hooks-v1.md](docs/hooks-v1.md)
+for payloads, ordering, and session-resume behavior.
 
 ### Tools
 
