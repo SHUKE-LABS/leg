@@ -1173,7 +1173,7 @@ fn execute_session_with_system_prompt(
     eprintln!(
         "leg session — type a message and press enter; Ctrl-D or {SESSION_EXIT_COMMAND} to quit"
     );
-    let _outcomes = transport.run_lifecycle_hooks(
+    transport.run_lifecycle_hooks(
         HookEvent::SessionStart,
         HookContext::new(Some(&session_id), None),
         serde_json::json!({}),
@@ -1435,7 +1435,7 @@ fn run_session_repl_with_warning_and_system_prompt(
     // killed mid-run never reaches here, so its trail carries a
     // `session_start` and turns but no `session_end` — partitioning keys on
     // `session_id`, not on a matched pair (see `crate::log::parse_sessions`).
-    let _outcomes = transport.run_lifecycle_hooks(
+    transport.run_lifecycle_hooks(
         HookEvent::SessionEnd,
         HookContext::new(Some(&session_id), None),
         serde_json::json!({ "turns": turn_index }),

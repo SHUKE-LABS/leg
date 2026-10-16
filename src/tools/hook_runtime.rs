@@ -1,6 +1,7 @@
 //! Bounded execution for configured lifecycle hooks.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -9,9 +10,7 @@ use crate::events::ToolStatus;
 use crate::hooks::{HookEvent, HookSet};
 use crate::interrupt;
 
-use super::pretool::{
-    GENERIC_DENIAL, HOOK_TIMEOUT, PreToolDecision, PreToolHook, parse_decision_kind,
-};
+use super::pretool::{GENERIC_DENIAL, HOOK_TIMEOUT, PreToolDecision, parse_decision_kind};
 use super::process;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,10 +44,17 @@ pub(crate) struct HookOutcome {
     pub(crate) kind: HookOutcomeKind,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct HookRuntime {
     hooks: HookSet,
     legacy_pre_tool: Option<PathBuf>,
+    timeout: Duration,
+}
+
+impl Default for HookRuntime {
+    fn default() -> Self {
+        Self::new(HookSet::default(), None)
+    }
 }
 
 impl HookRuntime {
@@ -56,7 +62,14 @@ impl HookRuntime {
         Self {
             hooks,
             legacy_pre_tool,
+            timeout: HOOK_TIMEOUT,
         }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub(super) fn authorize_tool(
@@ -100,8 +113,7 @@ impl HookRuntime {
                     ));
                 }
             };
-            let runner = PreToolHook::new(command.clone());
-            let output = match runner.run_payload(payload) {
+            let output = match process::run_executable(command.as_os_str(), payload, self.timeout) {
                 Ok(output) => output,
                 Err(error) => {
                     return Err(pre_tool_denial(
@@ -135,7 +147,12 @@ impl HookRuntime {
                 || !output.stdout.valid_utf8
             {
                 let reason = if output.status != "exited" || output.exit_code != 0 {
-                    process_failure_reason(output.status, output.exit_code, &output.stderr.text)
+                    process_failure_reason(
+                        output.status,
+                        output.exit_code,
+                        &output.stderr.text,
+                        self.timeout,
+                    )
                 } else {
                     "hook returned truncated or invalid UTF-8 stdout".to_string()
                 };
@@ -221,24 +238,18 @@ impl HookRuntime {
                 let outcome = match process::run_executable(
                     hook.command.as_os_str(),
                     payload,
-                    HOOK_TIMEOUT,
+                    self.timeout,
                 ) {
                     Err(error) => HookOutcomeKind::Failed(format!("could not start hook: {error}")),
                     Ok(_output) if interrupt::is_signaled() => {
                         HookOutcomeKind::Failed("hook cancelled".to_string())
                     }
-                    Ok(output) if output.status != "exited" => {
+                    Ok(output) if output.status != "exited" || output.exit_code != 0 => {
                         HookOutcomeKind::Failed(process_failure_reason(
                             output.status,
                             output.exit_code,
                             &output.stderr.text,
-                        ))
-                    }
-                    Ok(output) if output.exit_code != 0 => {
-                        HookOutcomeKind::Failed(process_failure_reason(
-                            output.status,
-                            output.exit_code,
-                            &output.stderr.text,
+                            self.timeout,
                         ))
                     }
                     Ok(output) => HookOutcomeKind::Succeeded {
@@ -336,9 +347,9 @@ pub(crate) fn report_hook_failures(outcomes: &[HookOutcome]) {
     }
 }
 
-fn process_failure_reason(status: &str, exit_code: i32, stderr: &str) -> String {
+fn process_failure_reason(status: &str, exit_code: i32, stderr: &str, timeout: Duration) -> String {
     if status == "timed_out" {
-        return format!("hook timed out after {} seconds", HOOK_TIMEOUT.as_secs());
+        return format!("hook timed out after {} seconds", timeout.as_secs_f64());
     }
     let detail: String = stderr
         .lines()
@@ -366,6 +377,16 @@ pub(crate) fn tool_status_name(status: ToolStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_uses_the_fixed_production_timeout_by_default() {
+        assert_eq!(HOOK_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(HookRuntime::default().timeout, HOOK_TIMEOUT);
+        assert_eq!(
+            HookRuntime::new(HookSet::default(), None).timeout,
+            HOOK_TIMEOUT
+        );
+    }
 
     #[test]
     fn payload_has_common_identity_and_event_specific_fields() {
@@ -454,6 +475,136 @@ mod tests {
 
         fn quote(path: &Path) -> String {
             format!("'{}'", path.display())
+        }
+
+        #[test]
+        fn legacy_pretool_payload_and_allow_use_the_runtime_path() {
+            let dir = TempDir::new();
+            let payload_path = dir.0.join("legacy-payload.json");
+            let legacy = dir.executable(
+                "legacy-hook",
+                &format!(
+                    "payload=\"$(cat)\"\nprintf '%s' \"$payload\" > {}\nprintf '%s' '{{\"decision\":\"allow\"}}'",
+                    quote(&payload_path)
+                ),
+            );
+            let runtime = HookRuntime::new(HookSet::default(), Some(legacy));
+            let context = HookContext::new(Some("sess-9"), Some(4));
+            let input = serde_json::json!({ "command": "echo hi" });
+
+            let outcomes = runtime
+                .authorize_tool("bash", &input, &context)
+                .expect("legacy allow permits tool dispatch");
+
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].hook_id, None);
+            assert_eq!(outcomes[0].kind, HookOutcomeKind::Allowed);
+            let payload: Value =
+                serde_json::from_slice(&std::fs::read(payload_path).unwrap()).unwrap();
+            assert_eq!(payload["hook_event_name"], "PreToolUse");
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(payload["cwd"], cwd);
+            assert_eq!(payload["session_id"], "sess-9");
+            assert_eq!(payload["turn_index"], 4);
+            assert_eq!(payload["tool_name"], "bash");
+            assert_eq!(payload["tool_input"], input);
+
+            let empty = dir.executable("legacy-empty", "cat >/dev/null");
+            let outcomes = HookRuntime::new(HookSet::default(), Some(empty))
+                .authorize_tool("bash", &Value::Null, &HookContext::default())
+                .expect("legacy empty stdout remains an allow decision");
+            assert_eq!(outcomes[0].kind, HookOutcomeKind::Allowed);
+        }
+
+        #[test]
+        fn legacy_pretool_deny_preserves_its_reason_on_the_runtime_path() {
+            let dir = TempDir::new();
+            let legacy = dir.executable(
+                "legacy-deny",
+                "cat >/dev/null\nprintf '%s' '{\"decision\":\"deny\",\"reason\":\"bash is forbidden\"}'",
+            );
+            let runtime = HookRuntime::new(HookSet::default(), Some(legacy));
+
+            let denial = runtime
+                .authorize_tool("bash", &Value::Null, &HookContext::default())
+                .expect_err("legacy deny prevents tool dispatch");
+
+            assert_eq!(denial.message, "denied by pre-tool hook: bash is forbidden");
+            assert_eq!(denial.outcomes.len(), 1);
+            assert_eq!(
+                denial.outcomes[0].kind,
+                HookOutcomeKind::Denied("bash is forbidden".to_string())
+            );
+        }
+
+        #[test]
+        fn legacy_pretool_process_failures_fail_closed_on_the_runtime_path() {
+            let dir = TempDir::new();
+            let nonzero = dir.executable(
+                "nonzero",
+                "cat >/dev/null\nprintf '%s' '{\"decision\":\"allow\"}'\nexit 1",
+            );
+            let malformed = dir.executable("malformed", "cat >/dev/null\nprintf '%s' garbage");
+            let invalid_utf8 = dir.executable(
+                "invalid-utf8",
+                r#"cat >/dev/null
+printf '{"decision":"allow","extra":"\377"}'
+"#,
+            );
+            let missing = dir.0.join("missing-hook");
+
+            for path in [nonzero, malformed, invalid_utf8, missing] {
+                let denial = HookRuntime::new(HookSet::default(), Some(path))
+                    .authorize_tool("bash", &Value::Null, &HookContext::default())
+                    .expect_err("legacy process failure fails closed");
+
+                assert_eq!(denial.message, GENERIC_DENIAL);
+                assert_eq!(denial.outcomes.len(), 1);
+                assert!(matches!(
+                    &denial.outcomes[0].kind,
+                    HookOutcomeKind::Failed(_)
+                ));
+            }
+        }
+
+        #[test]
+        fn legacy_pretool_timeout_stops_and_reaps_the_runtime_child() {
+            let dir = TempDir::new();
+            let child_pid = dir.0.join("hook-pid");
+            let finished = dir.0.join("finished");
+            let legacy = dir.executable(
+                "hanging-hook",
+                &format!(
+                    "printf '%s' \"$$\" > {}\nsleep 30\nprintf '%s' finished > {}",
+                    quote(&child_pid),
+                    quote(&finished)
+                ),
+            );
+            let runtime = HookRuntime::new(HookSet::default(), Some(legacy))
+                .with_timeout(Duration::from_millis(250));
+
+            let denial = runtime
+                .authorize_tool("bash", &Value::Null, &HookContext::default())
+                .expect_err("timed out legacy hook fails closed");
+
+            assert_eq!(denial.message, GENERIC_DENIAL);
+            assert!(matches!(
+                &denial.outcomes[0].kind,
+                HookOutcomeKind::Failed(reason) if reason.contains("timed out")
+            ));
+            assert!(!finished.exists(), "timed-out hook continued running");
+            let pid = std::fs::read_to_string(child_pid)
+                .expect("hook pid file")
+                .parse::<libc::pid_t>()
+                .expect("hook pid");
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "timed-out hook child was not reaped"
+            );
         }
 
         #[test]

@@ -292,6 +292,7 @@ impl OwnedToolEvent {
 
 /// A callback receiving each [`ToolEvent`] as it happens.
 pub type ToolObserver = Box<dyn FnMut(ToolEvent<'_>)>;
+type HookOutcomeObserver = Box<dyn FnMut(&HookOutcome)>;
 
 /// A [`Transport`] that iterates on `tool_use` replies, executing tools via a
 /// [`ToolRegistry`].
@@ -300,7 +301,7 @@ pub struct ToolLoop<T: Transport> {
     registry: ToolRegistry,
     max_tool_rounds: Option<usize>,
     observer: Option<RefCell<ToolObserver>>,
-    hook_observer: Option<RefCell<Box<dyn FnMut(&HookOutcome)>>>,
+    hook_observer: Option<RefCell<HookOutcomeObserver>>,
     context_budget: Option<ContextBudget>,
     context_state: RefCell<ContextState>,
 }
@@ -2578,6 +2579,8 @@ pub(crate) mod tests {
     #[cfg(unix)]
     mod hook_runtime_tests {
         use super::*;
+        use crate::events::ExchangeEvent;
+        use serde_json::Value;
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::sync::atomic::{AtomicU64, Ordering};
