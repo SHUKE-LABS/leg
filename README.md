@@ -154,6 +154,22 @@ contract](docs/skills-v1.md) defines the separate selectable Skills layer:
 `AGENTS.md` is always-on project instruction, while a Skill is loaded only
 after explicit selection and never replaces project instructions.
 
+The Skills v1 catalog discovers packages from project `.agents/skills`,
+`.codex/skills`, `.claude/skills`, and `.pi/skills` roots, walking from the
+current directory up to the repository root; without a repository, only the
+current directory is checked. All project roots precede user roots. User
+roots are `~/.agents/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`),
+`~/.claude/skills`, and `~/.pi/agent/skills`. The nearest project directory
+wins, followed by that root-kind order. Within a root, normalized relative
+paths decide duplicate winners. Catalog warnings use `invalid_package`,
+`unreadable_root`, `unreadable_path`, `unreadable_skill`, `invalid_root`,
+`path_escape`, `package_changed_during_discovery`, `duplicate_skill`, and
+`catalog_budget_exceeded`; missing roots are skipped. Discovery reads only the
+bounded YAML frontmatter, never the Skill body or package resources. Catalog
+entries are omitted whole to fit the supplied serialized JSON byte budget;
+diagnostics remain visible and may exceed a very small budget. Per-turn prompt
+integration and explicit activation remain separate work.
+
 Anthropic Messages remains the default provider. OpenAI-compatible endpoints
 can use either streamed wire protocol:
 
