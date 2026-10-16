@@ -369,9 +369,11 @@ fn lifecycle_hooks_are_consistent_across_cli_entrypoints() {
             .collect::<Vec<_>>(),
         ["TurnStart", "TurnEnd"]
     );
-    assert!(records
-        .iter()
-        .all(|(_, p)| p.get("session_id").is_none() && p.get("turn_index").is_none()));
+    assert!(
+        records
+            .iter()
+            .all(|(_, p)| p.get("session_id").is_none() && p.get("turn_index").is_none())
+    );
 
     fs::write(&hook_log, "").expect("clear hook log before session");
     let (session_url, _) = spawn_provider(vec![ProviderReply::json(200, text_reply("session ok"))]);
@@ -398,12 +400,16 @@ fn lifecycle_hooks_are_consistent_across_cli_entrypoints() {
     assert_eq!(records[2].1["turn_index"], 0);
     assert_eq!(records[3].1["turns"], 1);
     let session_events = read_events(&session_trail);
-    assert!(session_events
-        .iter()
-        .any(|event| event["event"] == "session_start"));
-    assert!(session_events
-        .iter()
-        .any(|event| event["event"] == "session_end"));
+    assert!(
+        session_events
+            .iter()
+            .any(|event| event["event"] == "session_start")
+    );
+    assert!(
+        session_events
+            .iter()
+            .any(|event| event["event"] == "session_end")
+    );
 
     fs::write(&hook_log, "").expect("clear hook log before cold exchange");
     let (exchange_url, _) =
@@ -425,12 +431,16 @@ fn lifecycle_hooks_are_consistent_across_cli_entrypoints() {
             .collect::<Vec<_>>(),
         ["TurnStart", "TurnEnd"]
     );
-    assert!(records
-        .iter()
-        .all(|(_, p)| p.get("session_id").is_none() && p.get("turn_index").is_none()));
-    assert!(read_events(&exchange_trail)
-        .iter()
-        .any(|event| event["event"] == "response_ok"));
+    assert!(
+        records
+            .iter()
+            .all(|(_, p)| p.get("session_id").is_none() && p.get("turn_index").is_none())
+    );
+    assert!(
+        read_events(&exchange_trail)
+            .iter()
+            .any(|event| event["event"] == "response_ok")
+    );
 
     fs::write(&hook_log, "").expect("clear hook log before stream exchange");
     let (stream_url, _) = spawn_provider(vec![ProviderReply::stream(sse_text_reply("stream ok"))]);
@@ -452,9 +462,11 @@ fn lifecycle_hooks_are_consistent_across_cli_entrypoints() {
         ["TurnStart", "TurnEnd"]
     );
     assert!(String::from_utf8_lossy(&stream_output.stdout).contains("\"event\":\"turn_end\""));
-    assert!(read_events(&stream_trail)
-        .iter()
-        .any(|event| event["event"] == "response_ok"));
+    assert!(
+        read_events(&stream_trail)
+            .iter()
+            .any(|event| event["event"] == "response_ok")
+    );
 }
 
 #[test]
@@ -584,13 +596,15 @@ fn exchange_hooks_keep_identity_through_retry_and_tool_continuation() {
     let mut command = leg(cwd, &base_url, &hooks, &hook_log, &trail);
     command
         .env("LEG_SESSION_DIR", &store)
-        .env("LEG_MAX_RETRIES", "1")
+        // Local connection failures can consume retry slots before the scripted 503.
+        .env("LEG_MAX_RETRIES", "3")
         .env("LEG_RETRY_BASE_DELAY_MS", "0")
         .args(["exchange", "--new-session-id", session_id]);
     let output = run(command, Some("read notes.txt"));
     assert!(
         output.status.success(),
-        "exchange failed: {}",
+        "exchange failed after {} provider request(s): {}",
+        requests.lock().unwrap().len(),
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -809,7 +823,9 @@ fn observational_hook_timeout_does_not_change_turn_result() {
     let records = read_hook_records(&hook_log);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1["hook_event_name"], "TurnStart");
-    assert!(read_events(&trail)
-        .iter()
-        .any(|event| event["event"] == "response_ok"));
+    assert!(
+        read_events(&trail)
+            .iter()
+            .any(|event| event["event"] == "response_ok")
+    );
 }
