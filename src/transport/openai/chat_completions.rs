@@ -753,6 +753,7 @@ mod tests {
             max_tool_rounds: None,
             system_prompt: Some("be concise".to_string()),
             pre_tool_hook: None,
+            hooks: crate::hooks::HookSet::default(),
         }
     }
 

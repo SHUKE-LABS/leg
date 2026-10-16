@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -982,6 +982,7 @@ fn write_pretool_hook(cwd: &Path, body: &str) -> PathBuf {
 fn leg(cwd: &Path, base_url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_leg"));
     cmd.current_dir(cwd)
+        .env("LEG_HOOKS_CONFIG", empty_hooks_config_path())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("LEG_MODEL", "claude-test-model")
@@ -993,6 +994,20 @@ fn leg(cwd: &Path, base_url: &str) -> Command {
         .env_remove("LEG_CONTEXT_RESERVE_TOKENS")
         .env_remove("LEG_CONTEXT_KEEP_RECENT_TOKENS");
     cmd
+}
+
+/// An explicit empty config keeps subprocess tests independent of a developer's
+/// project or per-user hook files. Hook-specific tests can override this env var.
+fn empty_hooks_config_path() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path =
+            std::env::temp_dir().join(format!("leg-e2e-empty-hooks-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"version":1,"hooks":[]}"#)
+            .expect("write isolated empty hooks config");
+        path
+    })
+    .clone()
 }
 
 fn openai_leg(cwd: &Path, base_url: &str, provider: &str) -> Command {
@@ -1561,6 +1576,24 @@ fn unset_pretool_hook_preserves_normal_tool_dispatch() {
     assert!(cwd.join("unguarded.txt").is_file());
     assert_eq!(requests.lock().unwrap().len(), 2);
 
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn missing_explicit_hooks_config_fails_before_provider_call() {
+    let cwd = fixture_dir("missing-hooks-config");
+    let missing = cwd.join("does-not-exist.json");
+    let mut cmd = leg(&cwd, "http://127.0.0.1:1");
+    cmd.env("LEG_HOOKS_CONFIG", &missing)
+        .args(["ask", "must not call a provider"]);
+
+    let output = run(cmd, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not read hooks config"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     std::fs::remove_dir_all(&cwd).ok();
 }
 

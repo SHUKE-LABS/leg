@@ -88,7 +88,8 @@ image request.
 Prints the assistant reply on success. A provider or delivery failure
 (bad credentials, unreachable base URL, etc.) leaves stdout empty, reports an
 error including `kind: error` on stderr, and exits non-zero. Configuration
-failures (missing/malformed env vars) also exit non-zero.
+failures (missing or malformed environment values or hook config files) also
+exit non-zero.
 Also accepts `ANTHROPIC_AUTH_TOKEN` for bearer keys of Anthropic-compatible
 endpoints, and `CLAUDE_CODE_OAUTH_TOKEN`. Claude subscription OAuth tokens
 (including `claude setup-token`) are unsupported outside Claude Code; use an
@@ -98,7 +99,8 @@ include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_CONTEXT_WINDOW_TOKENS`, `LEG_CONTEXT_RESERVE_TOKENS`,
 `LEG_CONTEXT_KEEP_RECENT_TOKENS`,
 `LEG_MAX_TOOL_ROUNDS`, `LEG_MAX_RETRIES`, `LEG_RETRY_BASE_DELAY_MS`,
-`LEG_PRETOOL_HOOK`, `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
+`LEG_HOOKS_CONFIG`, `LEG_PRETOOL_HOOK`, `LEG_SYSTEM_PROMPT`, and
+`LEG_EVENT_LOG`.
 
 `LEG_TIMEOUT_SECS` defaults to 60 and bounds DNS lookup, connection setup,
 request sending, response headers, and the total body read for non-streaming
@@ -198,16 +200,29 @@ readable. `stop_reason` is present on `response_ok` when known and on
 `response_error` when a reply hit its token limit; error records preserve the
 provider's raw reason. It is absent in older records and when unknown.
 
-`LEG_PRETOOL_HOOK` optionally names an executable to run before every tool
-dispatch; unset or blank leaves dispatch unchanged. The hook receives this
-JSON object on stdin:
+`LEG_HOOKS_CONFIG` optionally names a hooks v1 JSON file. Otherwise leg checks
+`.leg/hooks.json` in the current working directory, then the per-user config
+file. The first available file wins; files are not merged. Each JSON entry has
+an ID, one event, an executable path, and optional `enabled` and tool matcher
+fields. Exact tool names and `*` are supported; selected entries keep file
+order, and disabled entries are skipped. Invalid selected files fail
+configuration. The full v1 schema, event list, platform paths, precedence,
+validation rules, and legacy compatibility are documented in
+[docs/hooks-v1.md](docs/hooks-v1.md). Project discovery is relative to the
+current working directory and does not walk upward to the Git root. Project
+hook files are trusted as-is; once hook execution is provided, commands run
+with the operating-system permissions of the user running leg.
+
+`LEG_PRETOOL_HOOK` remains usable as a single pre-tool executable. It receives
+this JSON object on stdin:
 `{"hook_event_name":"PreToolUse","tool_name":"<name>","tool_input":{...},"cwd":"<cwd>"}`.
 Exit 0 with empty or whitespace-only stdout, or `{"decision":"allow"}`,
 allows the call. Exit 0 with
 `{"decision":"deny","reason":"..."}` denies it and returns that reason to the
 model. A non-zero exit, spawn failure, 30-second timeout, or invalid output
 denies with a generic reason. Hook denials are recorded in the trail with
-`status: "denied"`.
+`status: "denied"`. Declarative entries are loaded and selected, but their
+command and lifecycle dispatch are not part of this configuration slice.
 
 ### Tools
 

@@ -12,7 +12,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -96,6 +96,7 @@ fn spawn_mock_server_with_capture(
 fn run_leg_exchange(base_url: &str, stdin_body: &str) -> (bool, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_leg"))
         .arg("exchange")
+        .env("LEG_HOOKS_CONFIG", empty_hooks_config_path())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("LEG_MODEL", "claude-test-model")
@@ -154,6 +155,7 @@ fn run_leg_exchange_files(
         .arg(in_path)
         .arg("--out")
         .arg(out_path)
+        .env("LEG_HOOKS_CONFIG", empty_hooks_config_path())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("LEG_MODEL", "claude-test-model")
@@ -186,6 +188,7 @@ fn run_leg_exchange_in_dir(
     let mut command = Command::new(env!("CARGO_BIN_EXE_leg"));
     command
         .args(args)
+        .env("LEG_HOOKS_CONFIG", empty_hooks_config_path())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("LEG_MODEL", "claude-test-model")
@@ -221,6 +224,22 @@ fn run_leg_exchange_in_dir(
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// An explicit empty config keeps subprocess tests independent of a developer's
+/// project or per-user hook files. Hook-specific tests can override this env var.
+fn empty_hooks_config_path() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!(
+            "leg-exchange-empty-hooks-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, r#"{"version":1,"hooks":[]}"#)
+            .expect("write isolated empty hooks config");
+        path
+    })
+    .clone()
 }
 
 /// Minimal `wait-with-timeout`: `std::process::Child` has no built-in

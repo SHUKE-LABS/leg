@@ -24,6 +24,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod events;
+pub mod hooks;
 mod image_input;
 mod interrupt;
 pub mod log;
