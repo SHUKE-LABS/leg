@@ -357,6 +357,7 @@ struct ChatAssembler {
     stopped: bool,
     next_index: usize,
     text_index: Option<usize>,
+    reasoning_index: Option<usize>,
     text: String,
     refusal: bool,
     tool_calls: BTreeMap<usize, PartialToolCall>,
@@ -420,6 +421,9 @@ impl ChatAssembler {
             })?;
         if let Some(choice) = choices.first() {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
+            if chat_reasoning_present(delta) {
+                self.accept_reasoning(delta, &data, on_event)?;
+            }
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 self.accept_text(text, &data, on_event)?;
             }
@@ -445,6 +449,32 @@ impl ChatAssembler {
             on_event(StreamEvent::MessageDelta { data: data.clone() })?;
         }
         Ok(())
+    }
+
+    fn accept_reasoning(
+        &mut self,
+        _delta: &Value,
+        event_data: &Value,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> Result<()> {
+        let index = match self.reasoning_index {
+            Some(index) => index,
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.reasoning_index = Some(index);
+                self.open_blocks.push(index);
+                on_event(StreamEvent::ContentBlockStart {
+                    index,
+                    content_block: json!({"type": "reasoning"}),
+                })?;
+                index
+            }
+        };
+        on_event(StreamEvent::ContentBlockDelta {
+            index,
+            delta: event_data.clone(),
+        })
     }
 
     fn ensure_started(
@@ -652,6 +682,22 @@ impl ChatAssembler {
     }
 }
 
+fn chat_reasoning_present(delta: &Value) -> bool {
+    [
+        "reasoning_content",
+        "reasoning",
+        "reasoning_summary",
+        "reasoning_details",
+        "encrypted_content",
+    ]
+    .iter()
+    .any(|field| {
+        delta
+            .get(*field)
+            .is_some_and(|value| !value.is_null() && !value.as_array().is_some_and(Vec::is_empty))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +808,54 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn streams_chat_reasoning_content_before_the_assistant_text() {
+        let http = FakeHttp {
+            body: stream(&[
+                json!({"choices":[{"delta":{"role":"assistant","reasoning_content":"plan "},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"reasoning_content":"first"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"content":"answer"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]),
+            request: RefCell::new(None),
+        };
+        let client = OpenAiChatCompletionsClient::with_http(config(), http);
+        let mut events = Vec::new();
+        let reply = client
+            .send_conversation_streaming_with_attempts(&[Message::user("think")], &mut |event| {
+                events.push(event);
+                Ok(())
+            })
+            .result
+            .expect("reasoning stream parses");
+
+        assert_eq!(reply.text, "answer");
+        let reasoning: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta { delta, .. } => delta
+                    .pointer("/choices/0/delta/reasoning_content")
+                    .and_then(Value::as_str),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, ["plan ", "first"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart {
+                content_block,
+                ..
+            } if content_block["type"] == "reasoning"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta { delta, .. }
+                if delta.pointer("/choices/0/delta/content")
+                    .and_then(Value::as_str)
+                    == Some("answer")
+        )));
     }
 
     #[test]

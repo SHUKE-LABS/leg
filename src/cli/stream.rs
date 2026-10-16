@@ -1,6 +1,7 @@
 //! The opt-in `leg exchange --stream-json` wire format.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::rc::Rc;
 use std::time::Instant;
@@ -330,7 +331,7 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
             let writer_for_text = Rc::clone(writer);
             let counters_for_text = &counters;
             let mut observe_stream =
-                |event| write_text_delta(&writer_for_text, counters_for_text, event);
+                |event| write_stream_event(&writer_for_text, counters_for_text, event);
             transport.run_streaming_observed_fallible_with_system_prompt_and_context_with_attempts(
                 resumed.conversation.messages(),
                 system_prompt.as_deref(),
@@ -464,7 +465,7 @@ fn run_streaming_turn<T: Transport, W: Write>(
         write_tool_event(&writer_for_tools, &counters, event)
     };
     let writer_for_text = Rc::clone(writer);
-    let mut observe_stream = |event| write_text_delta(&writer_for_text, &counters, event);
+    let mut observe_stream = |event| write_stream_event(&writer_for_text, &counters, event);
     transport.run_streaming_observed_fallible_with_attempts(
         history,
         &mut observe_tool,
@@ -476,6 +477,14 @@ fn run_streaming_turn<T: Transport, W: Write>(
 struct StreamRoundCounters {
     provider_round: Cell<u64>,
     tool_round: Cell<u64>,
+    block_kinds: RefCell<BTreeMap<(u64, u64), bool>>,
+    reasoning_blocks: RefCell<BTreeMap<(u64, u64), ReasoningBlockState>>,
+}
+
+#[derive(Default)]
+struct ReasoningBlockState {
+    text_emitted: bool,
+    marker_emitted: bool,
 }
 
 fn write_tool_event<W: Write>(
@@ -526,31 +535,257 @@ fn write_tool_event<W: Write>(
     }
 }
 
-fn write_text_delta<W: Write>(
+fn write_stream_event<W: Write>(
     writer: &Rc<RefCell<StreamJsonWriter<W>>>,
     counters: &StreamRoundCounters,
     event: StreamEvent,
 ) -> Result<()> {
-    let Some((block_index, text)) = stream_delta_text(&event) else {
-        return Ok(());
-    };
-    if text.is_empty() {
-        return Ok(());
+    match event {
+        StreamEvent::ContentBlockStart {
+            index,
+            content_block,
+        } => {
+            let key = (counters.provider_round.get(), index as u64);
+            let reasoning = is_reasoning_block(&content_block);
+            counters.block_kinds.borrow_mut().insert(key, reasoning);
+            if !reasoning {
+                counters.reasoning_blocks.borrow_mut().remove(&key);
+                return Ok(());
+            }
+            let emit_marker = {
+                let mut blocks = counters.reasoning_blocks.borrow_mut();
+                let state = blocks.entry(key).or_default();
+                if is_textless_reasoning_block(&content_block) {
+                    state.marker_emitted = true;
+                    true
+                } else {
+                    *state = ReasoningBlockState::default();
+                    false
+                }
+            };
+            if emit_marker {
+                writer.borrow_mut().write_event(
+                    "thinking",
+                    json!({
+                        "round_index": key.0,
+                        "block_index": key.1,
+                    }),
+                )?;
+            }
+            Ok(())
+        }
+        StreamEvent::ContentBlockDelta { index, delta } => {
+            let round_index = counters.provider_round.get();
+            let key = (round_index, index as u64);
+            let block_kind = counters.block_kinds.borrow().get(&key).copied();
+            let mut reasoning_block = counters.reasoning_blocks.borrow().contains_key(&key);
+            if block_kind != Some(false)
+                && let Some(reasoning) = stream_delta_thinking(&delta)
+            {
+                let text = match reasoning {
+                    ReasoningDelta::Text(text) => text,
+                    ReasoningDelta::Marker => String::new(),
+                };
+                if !text.is_empty() {
+                    counters
+                        .reasoning_blocks
+                        .borrow_mut()
+                        .entry(key)
+                        .or_default()
+                        .text_emitted = true;
+                    writer.borrow_mut().write_event(
+                        "thinking_delta",
+                        json!({
+                            "round_index": round_index,
+                            "block_index": index,
+                            "text": text,
+                        }),
+                    )?;
+                } else {
+                    counters
+                        .reasoning_blocks
+                        .borrow_mut()
+                        .entry(key)
+                        .or_default();
+                }
+                reasoning_block = true;
+            }
+
+            if !reasoning_block
+                && let Some(text) = stream_delta_text(&delta)
+                && !text.is_empty()
+            {
+                writer.borrow_mut().write_event(
+                    "text_delta",
+                    json!({
+                        "round_index": round_index,
+                        "block_index": index,
+                        "text": text,
+                    }),
+                )?;
+            }
+            Ok(())
+        }
+        StreamEvent::ContentBlockStop { index } => {
+            let key = (counters.provider_round.get(), index as u64);
+            let emit_marker = {
+                let mut blocks = counters.reasoning_blocks.borrow_mut();
+                let Some(state) = blocks.get_mut(&key) else {
+                    return Ok(());
+                };
+                if state.text_emitted || state.marker_emitted {
+                    false
+                } else {
+                    state.marker_emitted = true;
+                    true
+                }
+            };
+            if emit_marker {
+                writer.borrow_mut().write_event(
+                    "thinking",
+                    json!({
+                        "round_index": key.0,
+                        "block_index": key.1,
+                    }),
+                )?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
-    writer.borrow_mut().write_event(
-        "text_delta",
-        json!({
-            "round_index": counters.provider_round.get(),
-            "block_index": block_index,
-            "text": text,
-        }),
-    )
 }
 
-fn stream_delta_text(event: &StreamEvent) -> Option<(u64, &str)> {
-    let StreamEvent::ContentBlockDelta { index, delta } = event else {
+enum ReasoningDelta {
+    Text(String),
+    Marker,
+}
+
+fn is_reasoning_block(content_block: &Value) -> bool {
+    matches!(
+        content_block.get("type").and_then(Value::as_str),
+        Some(
+            "thinking"
+                | "redacted_thinking"
+                | "reasoning"
+                | "reasoning_summary"
+                | "reasoning_content"
+                | "encrypted_reasoning"
+        )
+    ) || content_block
+        .get("encrypted_content")
+        .is_some_and(|value| !value.is_null())
+}
+
+fn is_textless_reasoning_block(content_block: &Value) -> bool {
+    matches!(
+        content_block.get("type").and_then(Value::as_str),
+        Some("redacted_thinking" | "encrypted_reasoning")
+    ) || content_block
+        .get("encrypted_content")
+        .is_some_and(|value| !value.is_null())
+        || content_block
+            .get("redacted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn stream_delta_thinking(delta: &Value) -> Option<ReasoningDelta> {
+    let delta_type = delta.get("type").and_then(Value::as_str);
+    match delta_type {
+        Some("thinking_delta") => Some(ReasoningDelta::Text(
+            delta
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        Some(
+            "reasoning_delta"
+            | "reasoning_content_delta"
+            | "reasoning_summary_delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary.delta",
+        ) => Some(reasoning_delta_value(delta)),
+        Some(event_type)
+            if event_type.starts_with("response.reasoning") && event_type.ends_with(".delta") =>
+        {
+            Some(reasoning_delta_value(delta))
+        }
+        _ => chat_reasoning_delta(delta),
+    }
+}
+
+fn reasoning_delta_value(delta: &Value) -> ReasoningDelta {
+    let mut text = String::new();
+    for field in ["thinking", "text", "delta", "reasoning", "summary"] {
+        if let Some(value) = delta.get(field) {
+            append_reasoning_text(&mut text, value);
+        }
+    }
+    if text.is_empty() {
+        ReasoningDelta::Marker
+    } else {
+        ReasoningDelta::Text(text)
+    }
+}
+
+fn chat_reasoning_delta(delta: &Value) -> Option<ReasoningDelta> {
+    let delta = delta.pointer("/choices/0/delta")?;
+    let mut found = false;
+    let mut text = String::new();
+    for field in [
+        "reasoning_content",
+        "reasoning",
+        "reasoning_summary",
+        "reasoning_details",
+    ] {
+        let Some(value) = delta.get(field) else {
+            continue;
+        };
+        if value.is_null() || (value.is_array() && value.as_array().is_some_and(Vec::is_empty)) {
+            continue;
+        }
+        found = true;
+        append_reasoning_text(&mut text, value);
+    }
+    if !found {
         return None;
-    };
+    }
+    if text.is_empty() {
+        Some(ReasoningDelta::Marker)
+    } else {
+        Some(ReasoningDelta::Text(text))
+    }
+}
+
+fn append_reasoning_text(output: &mut String, value: &Value) {
+    match value {
+        Value::String(text) => output.push_str(text),
+        Value::Array(values) => {
+            for value in values {
+                append_reasoning_text(output, value);
+            }
+        }
+        Value::Object(object) => {
+            for field in [
+                "text",
+                "content",
+                "summary",
+                "delta",
+                "reasoning",
+                "reasoning_content",
+            ] {
+                if let Some(value) = object.get(field) {
+                    append_reasoning_text(output, value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stream_delta_text(delta: &Value) -> Option<&str> {
     let delta_type = delta.get("type").and_then(Value::as_str);
     let text = match delta_type {
         Some("text_delta") => delta.get("text").and_then(Value::as_str),
@@ -566,7 +801,7 @@ fn stream_delta_text(event: &StreamEvent) -> Option<(u64, &str)> {
                     .and_then(Value::as_str)
             }),
     }?;
-    Some((*index as u64, text))
+    Some(text)
 }
 
 fn write_turn_start<W: Write>(
@@ -753,6 +988,18 @@ mod tests {
             .collect()
     }
 
+    fn stream_records(events: impl IntoIterator<Item = StreamEvent>) -> Vec<Value> {
+        let counters = StreamRoundCounters::default();
+        let mut bytes = Vec::new();
+        {
+            let writer = Rc::new(RefCell::new(StreamJsonWriter::new(&mut bytes)));
+            for event in events {
+                write_stream_event(&writer, &counters, event).expect("stream event writes");
+            }
+        }
+        parse_records(&bytes)
+    }
+
     fn jsonl_code_block(source: &str) -> Vec<Value> {
         let mut inside = false;
         let mut records = Vec::new();
@@ -778,6 +1025,154 @@ mod tests {
             assert_eq!(record["seq"], seq as u64);
             assert!(record["event"].is_string());
         }
+    }
+
+    #[test]
+    fn anthropic_thinking_deltas_precede_following_text() {
+        let records = stream_records([
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: json!({"type": "thinking", "thinking": ""}),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: json!({"type": "thinking_delta", "thinking": "private "}),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: json!({"type": "thinking_delta", "thinking": "plan"}),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: json!({"type": "text", "text": ""}),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: json!({"type": "text_delta", "text": "answer"}),
+            },
+            StreamEvent::ContentBlockStop { index: 1 },
+        ]);
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["thinking_delta", "thinking_delta", "text_delta"]
+        );
+        assert_eq!(records[0]["round_index"], 0);
+        assert_eq!(records[0]["block_index"], 0);
+        assert_eq!(records[0]["text"], "private ");
+        assert_eq!(records[1]["text"], "plan");
+        assert_eq!(records[2]["block_index"], 1);
+    }
+
+    #[test]
+    fn textless_reasoning_blocks_emit_one_marker_each() {
+        let records = stream_records([
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: json!({"type": "redacted_thinking", "data": "cipher"}),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: json!({
+                    "type": "reasoning",
+                    "encrypted_content": "ciphertext"
+                }),
+            },
+            StreamEvent::ContentBlockStop { index: 1 },
+        ]);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "thinking");
+        assert_eq!(records[0]["round_index"], 0);
+        assert_eq!(records[0]["block_index"], 0);
+        assert!(!records[0].as_object().unwrap().contains_key("text"));
+        assert_eq!(records[1]["event"], "thinking");
+        assert_eq!(records[1]["block_index"], 1);
+        assert!(!records[1].as_object().unwrap().contains_key("text"));
+    }
+
+    #[test]
+    fn openai_reasoning_and_summary_deltas_use_thinking_delta_records() {
+        let records = stream_records([
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: json!({"type": "reasoning"}),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: json!({
+                    "choices": [{"delta": {"reasoning_content": "chat plan"}}]
+                }),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: json!({"type": "reasoning"}),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "summary"
+                }),
+            },
+            StreamEvent::ContentBlockStop { index: 1 },
+        ]);
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["thinking_delta", "thinking_delta"]
+        );
+        assert_eq!(records[0]["block_index"], 0);
+        assert_eq!(records[0]["text"], "chat plan");
+        assert_eq!(records[1]["block_index"], 1);
+        assert_eq!(records[1]["text"], "summary");
+    }
+
+    #[test]
+    fn chat_reasoning_and_text_in_one_chunk_are_not_duplicated() {
+        let chunk = json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "plan",
+                    "content": "answer"
+                }
+            }]
+        });
+        let records = stream_records([
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: json!({"type": "reasoning"}),
+            },
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: json!({"type": "text", "text": ""}),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: chunk.clone(),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: chunk,
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStop { index: 1 },
+        ]);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "thinking_delta");
+        assert_eq!(records[0]["block_index"], 0);
+        assert_eq!(records[1]["event"], "text_delta");
+        assert_eq!(records[1]["block_index"], 1);
     }
 
     #[test]
