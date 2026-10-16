@@ -96,6 +96,7 @@ endpoints, and `CLAUDE_CODE_OAUTH_TOKEN`. Claude subscription OAuth tokens
 Anthropic Console API key with `ANTHROPIC_API_KEY` instead. Other settings
 include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_STREAM_IDLE_TIMEOUT_SECS`, `LEG_BASH_TIMEOUT_SECS`, `LEG_MAX_TOKENS`,
+`LEG_THINKING`, `LEG_THINKING_MAP`,
 `LEG_CONTEXT_WINDOW_TOKENS`, `LEG_CONTEXT_RESERVE_TOKENS`,
 `LEG_CONTEXT_KEEP_RECENT_TOKENS`,
 `LEG_MAX_TOOL_ROUNDS`, `LEG_MAX_RETRIES`, `LEG_RETRY_BASE_DELAY_MS`,
@@ -112,6 +113,21 @@ remain silent between received chunks.
 
 `LEG_MAX_TOKENS` sets the output-token limit requested for each provider reply
 (default `32000`).
+
+`LEG_THINKING` selects the provider-neutral reasoning level
+(`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`), defaulting to
+`high`. Leg maps the level through a built-in model capability table and
+clamps unsupported levels down to the nearest supported level; it never raises
+the requested level. `off` omits thinking/reasoning fields. For budget-style
+models, at least 1,024 output tokens remain available for the visible answer.
+
+`LEG_THINKING_MAP` optionally supplies a JSON object mapping levels to provider
+values, for example `{"high":"medium"}`; `null` marks a level unsupported.
+This is useful for model ids not in the built-in table. An unknown model with
+no usable override omits the thinking parameter and emits one warning naming
+the model and `LEG_THINKING_MAP`. For budget-style models, non-null values must
+be decimal budgets of at least 1,024; invalid values fail configuration
+loading.
 
 ### Context-window budgeting
 

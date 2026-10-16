@@ -17,6 +17,7 @@ use crate::image_input::{MAX_IMAGE_REQUEST_BYTES, validate_message_image_limits}
 use crate::model::{
     AssistantReply, ContentBlock, Message, StopReason, TokenUsage, ToolSpec, as_single_text,
 };
+use crate::thinking::{ThinkingConfig, ThinkingRequest};
 use crate::transport::http::{HttpClient, UreqHttpClient};
 use crate::transport::sse::{SseDecoder, SseEvent};
 use crate::transport::{RetryPolicy, RetryingHttpClient, StreamEvent, Transport, TransportCall};
@@ -92,12 +93,14 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         messages: &[Message],
         system_prompt: Option<&str>,
     ) -> TransportCall<AssistantReply> {
-        let body = match build_request_body(
+        let body = match build_request_body_with_stream_and_thinking(
             &self.config.model,
             self.config.max_tokens,
             messages,
             system_prompt,
             &self.tools,
+            Some(&self.config.thinking),
+            false,
         ) {
             Ok(body) => body,
             Err(error) => return TransportCall::completed(Err(error), 0),
@@ -140,12 +143,13 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         system_prompt: Option<&str>,
         on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<AssistantReply> {
-        let body = match build_request_body_with_stream(
+        let body = match build_request_body_with_stream_and_thinking(
             &self.config.model,
             self.config.max_tokens,
             messages,
             system_prompt,
             &self.tools,
+            Some(&self.config.thinking),
             true,
         ) {
             Ok(body) => body,
@@ -192,12 +196,13 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         system_prompt: Option<&str>,
         streaming: bool,
     ) -> Result<usize> {
-        build_request_body_with_stream(
+        build_request_body_with_stream_and_thinking(
             &self.config.model,
             self.config.max_tokens,
             messages,
             system_prompt,
             &self.tools,
+            Some(&self.config.thinking),
             streaming,
         )
         .map(|body| body.len())
@@ -209,12 +214,13 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         system_prompt: Option<&str>,
         max_output_tokens: u32,
     ) -> Result<usize> {
-        build_request_body_with_stream(
+        build_request_body_with_stream_and_thinking(
             &self.config.model,
             max_output_tokens,
             messages,
             system_prompt,
             &[],
+            Some(&self.config.thinking),
             false,
         )
         .map(|body| body.len())
@@ -226,12 +232,13 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
         system_prompt: Option<&str>,
         max_output_tokens: u32,
     ) -> TransportCall<AssistantReply> {
-        let body = match build_request_body_with_stream(
+        let body = match build_request_body_with_stream_and_thinking(
             &self.config.model,
             max_output_tokens,
             messages,
             system_prompt,
             &[],
+            Some(&self.config.thinking),
             false,
         ) {
             Ok(body) => body,
@@ -285,6 +292,7 @@ fn auth_header(credential: &Credential) -> (&'static str, String) {
 /// `None` omits the field entirely. Likewise `tools` is emitted only when
 /// non-empty, so a tool-less request is byte-identical to one built before tool
 /// declarations existed.
+#[cfg(test)]
 fn build_request_body(
     model: &str,
     max_tokens: u32,
@@ -292,15 +300,24 @@ fn build_request_body(
     system_prompt: Option<&str>,
     tools: &[ToolSpec],
 ) -> Result<String> {
-    build_request_body_with_stream(model, max_tokens, messages, system_prompt, tools, false)
+    build_request_body_with_stream_and_thinking(
+        model,
+        max_tokens,
+        messages,
+        system_prompt,
+        tools,
+        None,
+        false,
+    )
 }
 
-fn build_request_body_with_stream(
+fn build_request_body_with_stream_and_thinking(
     model: &str,
     max_tokens: u32,
     messages: &[Message],
     system_prompt: Option<&str>,
     tools: &[ToolSpec],
+    thinking_config: Option<&ThinkingConfig>,
     stream: bool,
 ) -> Result<String> {
     validate_message_image_limits(messages)?;
@@ -310,10 +327,30 @@ fn build_request_body_with_stream(
             .iter()
             .any(|block| matches!(block, ContentBlock::Image { .. }))
     });
+    let (thinking, output_config) =
+        match thinking_config.and_then(|config| config.request(max_tokens)) {
+            Some(ThinkingRequest::Effort(effort)) => (
+                Some(ThinkingBlock {
+                    kind: "adaptive",
+                    budget_tokens: None,
+                }),
+                Some(OutputConfig { effort }),
+            ),
+            Some(ThinkingRequest::Budget(budget_tokens)) => (
+                Some(ThinkingBlock {
+                    kind: "enabled",
+                    budget_tokens: Some(budget_tokens),
+                }),
+                None,
+            ),
+            None => (None, None),
+        };
     let request = MessagesRequest {
         model,
         max_tokens,
         system: system_prompt,
+        thinking,
+        output_config,
         messages: messages
             .iter()
             .map(|message| RequestMessage {
@@ -813,11 +850,28 @@ struct MessagesRequest<'a> {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
     messages: Vec<RequestMessage<'a>>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     tools: &'a [ToolSpec],
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ThinkingBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct OutputConfig {
+    effort: String,
 }
 
 #[derive(Serialize)]
@@ -1011,6 +1065,7 @@ mod tests {
             stream_idle_timeout: Duration::from_secs(120),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            thinking: crate::thinking::ThinkingConfig::disabled(),
             context_budget: None,
             max_retries: crate::config::DEFAULT_MAX_RETRIES,
             retry_base_delay: Duration::from_millis(crate::config::DEFAULT_RETRY_BASE_DELAY_MS),
@@ -1645,6 +1700,70 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
         assert_eq!(value["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn request_carries_adaptive_effort_for_known_claude_model() {
+        let mut config = config_with("https://api.anthropic.com", "claude-sonnet-4-6");
+        config.thinking = crate::thinking::ThinkingConfig::resolve(
+            crate::config::Provider::Anthropic,
+            &config.model,
+            None,
+            None,
+        )
+        .expect("thinking config");
+        let client = ClaudeClient::with_http(config, FakeHttp::new(200, SUCCESS_BODY));
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert_eq!(value["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(value["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn budget_style_thinking_keeps_answer_room() {
+        let mut config = config_with("https://api.anthropic.com", "claude-3-7-sonnet-20250219");
+        config.max_tokens = 4096;
+        config.thinking = crate::thinking::ThinkingConfig::resolve(
+            crate::config::Provider::Anthropic,
+            &config.model,
+            Some("high".to_string()),
+            None,
+        )
+        .expect("thinking config");
+        let client = ClaudeClient::with_http(config, FakeHttp::new(200, SUCCESS_BODY));
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 3072})
+        );
+        assert!(value.get("output_config").is_none());
+    }
+
+    #[test]
+    fn off_omits_claude_thinking_fields() {
+        let mut config = config_with("https://api.anthropic.com", "claude-sonnet-4-6");
+        config.thinking = crate::thinking::ThinkingConfig::resolve(
+            crate::config::Provider::Anthropic,
+            &config.model,
+            Some("off".to_string()),
+            None,
+        )
+        .expect("thinking config");
+        let client = ClaudeClient::with_http(config, FakeHttp::new(200, SUCCESS_BODY));
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("output_config").is_none());
     }
 
     #[test]
