@@ -1056,6 +1056,7 @@ def environment(base_url: str, scenario: str, hook: Path | None) -> dict[str, st
         "ANTHROPIC_API_KEY": "trial-only-not-a-secret",
         "LEG_MODEL": "trial-fixture",
         "LEG_MAX_RETRIES": "0",
+        "LEG_CONTEXT_WINDOW_TOKENS": "200000",
     }
     if scenario in ("trial", "browser", "capped-tool-loop"):
         values["LEG_MAX_TOOL_ROUNDS"] = "2"

@@ -21,9 +21,10 @@ The runner binds to `127.0.0.1` on the selected port, prints Bash/zsh and PowerS
 environment blocks, and stays open until Ctrl-C. Copy the block for the shell
 that launches the UI. It sets `ANTHROPIC_BASE_URL`, a fake-only
 `ANTHROPIC_API_KEY`, `LEG_PROVIDER`, `LEG_MODEL`, disabled provider retries,
-and the trial's tool-round, bash-timeout, and deny-hook settings. No real key is
-needed. The `--workspace` directory must be the same directory selected in the
-UI; the status endpoint checks expected files there.
+`LEG_CONTEXT_WINDOW_TOKENS=200000`, and the trial's tool-round, bash-timeout,
+and deny-hook settings. No real key is needed. The `--workspace` directory
+must be the same directory selected in the UI; the status endpoint checks
+expected files there.
 
 The combined `trial` scenario sets `LEG_BASH_TIMEOUT_SECS=600`, twice the
 task's 300-second deadline, so Bash cannot auto-stop before the manual Stop
