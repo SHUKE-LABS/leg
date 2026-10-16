@@ -952,10 +952,13 @@ def _build_harness_environment(
     environment.update(
         {
             "TERM": "xterm-256color",
+            "LEG_CONTEXT_WINDOW_TOKENS": "200000",
             "LEG_UI_STATE_DIR": str(state_dir),
             "LEG_UI_SUPERVISOR_BIN": str(supervisor_bin.resolve()),
         }
     )
+    environment.pop("LEG_CONTEXT_RESERVE_TOKENS", None)
+    environment.pop("LEG_CONTEXT_KEEP_RECENT_TOKENS", None)
     return environment
 
 

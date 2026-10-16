@@ -9,7 +9,7 @@ export ANTHROPIC_API_KEY=sk-...
 
 leg ask "hello"
 
-LEG_EVENT_LOG=trail.jsonl leg session
+LEG_CONTEXT_WINDOW_TOKENS=200000 LEG_EVENT_LOG=trail.jsonl leg session
 # type a message, then Ctrl-D or /exit to end the session and create trail.jsonl
 
 leg session --resume trail.jsonl
@@ -95,6 +95,8 @@ endpoints, and `CLAUDE_CODE_OAUTH_TOKEN`. Claude subscription OAuth tokens
 Anthropic Console API key with `ANTHROPIC_API_KEY` instead. Other settings
 include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 `LEG_STREAM_IDLE_TIMEOUT_SECS`, `LEG_BASH_TIMEOUT_SECS`, `LEG_MAX_TOKENS`,
+`LEG_CONTEXT_WINDOW_TOKENS`, `LEG_CONTEXT_RESERVE_TOKENS`,
+`LEG_CONTEXT_KEEP_RECENT_TOKENS`,
 `LEG_MAX_TOOL_ROUNDS`, `LEG_MAX_RETRIES`, `LEG_RETRY_BASE_DELAY_MS`,
 `LEG_PRETOOL_HOOK`, `LEG_SYSTEM_PROMPT`, and `LEG_EVENT_LOG`.
 
@@ -106,6 +108,38 @@ stream may remain silent between received chunks.
 
 `LEG_MAX_TOKENS` sets the output-token limit requested for each provider reply
 (default `32000`).
+
+### Context-window budgeting
+
+`LEG_CONTEXT_WINDOW_TOKENS` is the model's context window, in tokens. Set it
+explicitly for `leg session` and session-backed `leg exchange`; leg does not
+infer model limits. A missing or invalid window fails before a provider call.
+`LEG_CONTEXT_RESERVE_TOKENS` defaults to `LEG_MAX_TOKENS`. The usable input
+budget is `window - reserve`, and reserve must be positive and smaller than the
+window. `LEG_CONTEXT_KEEP_RECENT_TOKENS` defaults to
+`min(8192, (window - reserve) / 2)` and must be positive and smaller than the
+usable input budget.
+
+Before each provider request, leg estimates the complete serialized request
+(system prompt, tool declarations, messages, and protocol framing) as
+`ceil(UTF-8 bytes / 3)`. Provider-reported `input_tokens` calibrate later
+estimates conservatively; missing usage never disables the guard. When a
+session crosses its budget, leg summarizes dropped complete turns and keeps a
+recent suffix, preserving the active user turn and any complete tool chain.
+The internal summary call has no tools and may return at most
+`min(4096, LEG_CONTEXT_RESERVE_TOKENS)` tokens. Leg injects that summary as a
+system-context prefix. A provider context-window rejection triggers at most one
+compact-and-retry; an active turn that still cannot fit returns
+`kind: context_window`.
+
+Tool results sent to a provider or internal summary are capped at 2,000 source
+characters followed by `\n[tool result truncated by leg]`; the complete result
+remains in the append-only session trail. Each compaction adds a
+`baton.exchange/v1` `compaction` event before the request that uses it. Resume
+uses the latest summary and retained suffix without rewriting earlier trail
+lines. Older trails without compaction events remain readable and compact on
+demand. Stateless calls keep their one-turn result format; if context settings
+are supplied, their tool continuations still use the budget guard.
 
 At the start of every `ask`, `exchange`, and session turn, leg discovers project
 instructions from `AGENTS.md`. In a git repository it reads files from the
@@ -240,11 +274,11 @@ keeps its default console-control behavior.
 ### Sessions
 
 ```
-LEG_EVENT_LOG=trail.jsonl ANTHROPIC_API_KEY=sk-... leg session
+LEG_CONTEXT_WINDOW_TOKENS=200000 LEG_EVENT_LOG=trail.jsonl ANTHROPIC_API_KEY=sk-... leg session
 ```
 
-Runs an interactive multi-turn REPL: each line typed is sent with the full
-prior conversation, and assistant text is flushed as it streams. Ctrl-D or a
+Runs an interactive multi-turn REPL: each line typed is sent with the retained
+conversation context, and assistant text is flushed as it streams. Ctrl-D or a
 lone `/exit` line ends the session cleanly. Every turn (and, with
 `LEG_EVENT_LOG` set, the session's start/end) is appended to the JSONL trail,
 keyed by a `session_id` minted for the run.
@@ -253,9 +287,10 @@ keyed by a `session_id` minted for the run.
 leg session --resume trail.jsonl [--session <id>]
 ```
 
-Reopens a prior session's trail, rehydrates its conversation history —
+Reopens a prior session's trail, rehydrates its retained conversation history —
 including each turn's tool rounds — and continues appending new turns to the
-same file. `--session <id>` selects
+same file. A compacted trail restores its latest summary and retained suffix.
+`--session <id>` selects
 which session to resume when the trail holds more than one; it is required
 in that case and otherwise optional.
 

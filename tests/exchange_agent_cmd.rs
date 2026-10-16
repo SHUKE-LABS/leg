@@ -190,6 +190,7 @@ fn run_leg_exchange_in_dir(
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("LEG_MODEL", "claude-test-model")
         .env("LEG_TIMEOUT_SECS", "5")
+        .env("LEG_CONTEXT_WINDOW_TOKENS", "200000")
         .env("LEG_SESSION_DIR", session_dir)
         .env_remove("LEG_EVENT_LOG")
         .current_dir(cwd)

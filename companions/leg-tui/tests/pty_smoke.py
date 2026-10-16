@@ -4167,6 +4167,9 @@ def main() -> None:
         help="rewrite the checked-in 80x24 and 120x40 screen captures",
     )
     args = parser.parse_args()
+    os.environ["LEG_CONTEXT_WINDOW_TOKENS"] = "200000"
+    os.environ.pop("LEG_CONTEXT_RESERVE_TOKENS", None)
+    os.environ.pop("LEG_CONTEXT_KEEP_RECENT_TOKENS", None)
     if args.tool_summary_only:
         run_tool_summary_smoke(args)
         print("leg-tui compact tool summary PTY checks passed")

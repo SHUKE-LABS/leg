@@ -32,6 +32,14 @@ impl ProviderTransport {
 }
 
 impl Transport for ProviderTransport {
+    fn configured_system_prompt(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(client) => client.configured_system_prompt(),
+            Self::OpenAiChatCompletions(client) => client.configured_system_prompt(),
+            Self::OpenAiResponses(client) => client.configured_system_prompt(),
+        }
+    }
+
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
         match self {
             Self::Anthropic(client) => client.send_conversation(messages),
@@ -65,6 +73,63 @@ impl Transport for ProviderTransport {
             }
             Self::OpenAiResponses(client) => {
                 client.send_conversation_with_system_prompt(messages, system_prompt)
+            }
+        }
+    }
+
+    fn estimate_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        streaming: bool,
+    ) -> Result<usize> {
+        match self {
+            Self::Anthropic(client) => {
+                client.estimate_input_bytes(messages, system_prompt, streaming)
+            }
+            Self::OpenAiChatCompletions(client) => {
+                client.estimate_input_bytes(messages, system_prompt, streaming)
+            }
+            Self::OpenAiResponses(client) => {
+                client.estimate_input_bytes(messages, system_prompt, streaming)
+            }
+        }
+    }
+
+    fn estimate_summary_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> Result<usize> {
+        match self {
+            Self::Anthropic(client) => {
+                client.estimate_summary_input_bytes(messages, system_prompt, max_output_tokens)
+            }
+            Self::OpenAiChatCompletions(client) => {
+                client.estimate_summary_input_bytes(messages, system_prompt, max_output_tokens)
+            }
+            Self::OpenAiResponses(client) => {
+                client.estimate_summary_input_bytes(messages, system_prompt, max_output_tokens)
+            }
+        }
+    }
+
+    fn send_context_summary(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> TransportCall<AssistantReply> {
+        match self {
+            Self::Anthropic(client) => {
+                client.send_context_summary(messages, system_prompt, max_output_tokens)
+            }
+            Self::OpenAiChatCompletions(client) => {
+                client.send_context_summary(messages, system_prompt, max_output_tokens)
+            }
+            Self::OpenAiResponses(client) => {
+                client.send_context_summary(messages, system_prompt, max_output_tokens)
             }
         }
     }

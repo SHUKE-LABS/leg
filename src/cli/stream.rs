@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use super::*;
 use crate::config::Provider;
 use crate::events::{RequestRecord, trail_content};
-use crate::tools::OwnedToolEvent;
+use crate::tools::{ContextTurn, OwnedToolEvent};
 use crate::transport::Transport;
 
 const STREAM_SCHEMA: &str = "leg.exchange.stream/v1";
@@ -74,6 +74,8 @@ fn execute_session_exchange(
                     conversation: Conversation::new(),
                     prior_turns: 0,
                     next_turn_index: 0,
+                    summary: None,
+                    history_turn_indices: Vec::new(),
                 },
                 path,
                 true,
@@ -88,6 +90,8 @@ fn execute_session_exchange(
                     conversation: Conversation::new(),
                     prior_turns: 0,
                     next_turn_index: 0,
+                    summary: None,
+                    history_turn_indices: Vec::new(),
                 },
                 path,
                 true,
@@ -96,6 +100,7 @@ fn execute_session_exchange(
     };
 
     let config = LegConfig::from_env()?;
+    config.require_context_budget()?;
     let base_system_prompt = config.system_prompt.clone();
     let provider = config.provider;
     let meta = exchange_meta(&config);
@@ -117,6 +122,8 @@ fn execute_session_exchange(
     } = open_session_event_sink(&session_path, create_new)?;
     let mut sink = sink;
     let transport = build_transport(config);
+    transport.set_context_summary(resumed.summary.clone());
+    transport.set_context_history_turn_indices(resumed.history_turn_indices.clone());
     let stdout = std::io::stdout();
     let writer = Rc::new(RefCell::new(StreamJsonWriter::new(stdout.lock())));
     let result = execute_session_exchange_core(
@@ -293,12 +300,13 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
         },
         &mut warning,
         |sink| {
+            let sink = RefCell::new(sink);
             let writer_for_tools = Rc::clone(writer);
             let counters_for_tools = &counters;
             let mut observe_tool = |event: OwnedToolEvent| {
                 let trail_event = event.as_tool_event();
                 emit(
-                    sink,
+                    &mut **sink.borrow_mut(),
                     &ExchangeEvent::from_tool_event(
                         now_ms(),
                         trail_event,
@@ -307,14 +315,28 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
                 );
                 write_tool_event(&writer_for_tools, counters_for_tools, event)
             };
+            let mut observe_compaction = |compaction: crate::tools::ContextCompaction| {
+                emit(
+                    &mut **sink.borrow_mut(),
+                    &ExchangeEvent::compaction(
+                        now_ms(),
+                        &session_id,
+                        turn_index,
+                        compaction.retained_from_turn_index,
+                        &compaction.summary,
+                    ),
+                );
+            };
             let writer_for_text = Rc::clone(writer);
             let counters_for_text = &counters;
             let mut observe_stream =
                 |event| write_text_delta(&writer_for_text, counters_for_text, event);
-            transport.run_streaming_observed_fallible_with_system_prompt_with_attempts(
+            transport.run_streaming_observed_fallible_with_system_prompt_and_context_with_attempts(
                 resumed.conversation.messages(),
                 system_prompt.as_deref(),
+                ContextTurn::new(&session_id, turn_index),
                 &mut observe_tool,
+                &mut observe_compaction,
                 &mut observe_stream,
             )
         },
@@ -911,6 +933,8 @@ mod tests {
             conversation: Conversation::new(),
             prior_turns: 0,
             next_turn_index: 0,
+            summary: None,
+            history_turn_indices: Vec::new(),
         };
         let mut bytes = Vec::new();
         let writer = Rc::new(RefCell::new(StreamJsonWriter::new(&mut bytes)));

@@ -1416,6 +1416,80 @@ fn session_resume_rehydrates_tool_rounds_exactly_as_the_live_history() {
 }
 
 #[test]
+fn session_resume_keeps_full_tool_result_in_trail_and_caps_its_provider_projection() {
+    let full_result = "x".repeat(2_501);
+    let first_transport = crate::tools::tests::BudgetTransport::new(vec![
+        Ok(crate::tools::tests::tool_use_reply("toolu_large", "read")),
+        Ok(AssistantReply::new("first done")),
+    ]);
+    let first_loop = ToolLoop::new(
+        &first_transport,
+        crate::tools::tests::large_result_registry(full_result.clone()),
+        None,
+    )
+    .with_context_budget(Some(crate::tools::tests::context_budget(
+        100_000, 1_000, 2_000,
+    )));
+    let mut trail = Vec::new();
+    append_session_run(&first_loop, &mut trail, "sess-large-result", b"read file\n");
+
+    let report = crate::log::parse_sessions(std::io::Cursor::new(trail))
+        .expect("parses full tool result from the session trail");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(
+        report.sessions[0].turns[0].tools[0]
+            .result
+            .as_ref()
+            .and_then(|result| result.result.as_deref()),
+        Some(full_result.as_str())
+    );
+    let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates session");
+    assert!(resumed.conversation.messages().iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { content, .. } if content == &full_result)
+        })
+    }));
+
+    let next_transport =
+        crate::tools::tests::BudgetTransport::new(vec![Ok(AssistantReply::new("next done"))]);
+    let next_loop = ToolLoop::new(&next_transport, ToolRegistry::new(), None).with_context_budget(
+        Some(crate::tools::tests::context_budget(100_000, 1_000, 2_000)),
+    );
+    let mut resumed_trail = Vec::new();
+    {
+        let mut sink = WriterSink::new(&mut resumed_trail);
+        execute_session_resumed(
+            &next_loop,
+            &mut sink,
+            &meta(),
+            std::io::Cursor::new(b"next turn\n".to_vec()),
+            Vec::new(),
+            resumed,
+        )
+        .expect("resumed turn completes");
+    }
+
+    let requests = next_transport.requests.borrow();
+    let projected_result = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .expect("resumed provider request carries the prior tool result");
+    assert_eq!(
+        projected_result,
+        &format!(
+            "{}{}",
+            "x".repeat(2_000),
+            crate::context::TOOL_RESULT_TRUNCATION_MARKER
+        )
+    );
+}
+
+#[test]
 fn session_resume_echoes_thinking_signature_on_the_next_tool_continuation() {
     let first_thinking = ContentBlock::Thinking {
         thinking: "first private reasoning\npreserved exactly".to_string(),
@@ -1804,6 +1878,7 @@ fn select_and_rehydrate_restores_conversation_and_next_turn_index() {
         started: true,
         ended: true,
         declared_turns: Some(2),
+        compactions: vec![],
         turns: vec![
             crate::log::SessionTurn {
                 request: crate::events::RequestRecord {
@@ -1855,6 +1930,181 @@ fn select_and_rehydrate_restores_conversation_and_next_turn_index() {
 }
 
 #[test]
+fn select_and_rehydrate_uses_latest_compaction_summary_and_retained_suffix() {
+    let turn = |index: u64, prompt: &str, reply: &str| crate::log::SessionTurn {
+        request: crate::events::RequestRecord {
+            ts_ms: index * 10 + 1,
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+            prompt: prompt.to_string(),
+            content: None,
+            session_id: Some("sess-compact".to_string()),
+            turn_index: Some(index),
+        },
+        rounds: vec![],
+        tools: vec![],
+        outcome: Some(Outcome::Ok {
+            ts_ms: index * 10 + 2,
+            duration_ms: 1,
+            reply: reply.to_string(),
+            content: None,
+            input_tokens: None,
+            output_tokens: None,
+            stop_reason: None,
+            attempts: None,
+            session_id: Some("sess-compact".to_string()),
+            turn_index: Some(index),
+        }),
+    };
+    let resumed = select_and_rehydrate(
+        vec![crate::log::SessionRecord {
+            session_id: "sess-compact".to_string(),
+            started: true,
+            ended: false,
+            declared_turns: None,
+            turns: vec![turn(0, "discarded", "old"), turn(1, "retained", "kept")],
+            compactions: vec![crate::events::CompactionRecord {
+                ts_ms: 25,
+                session_id: "sess-compact".to_string(),
+                turn_index: 1,
+                retained_from_turn_index: 1,
+                summary: "summary of turn zero".to_string(),
+            }],
+        }],
+        None,
+    )
+    .expect("resumes compacted session");
+
+    assert_eq!(resumed.summary.as_deref(), Some("summary of turn zero"));
+    assert_eq!(resumed.history_turn_indices, [1]);
+    assert_eq!(resumed.next_turn_index, 2);
+    assert_eq!(
+        resumed.conversation.messages(),
+        [Message::user("retained"), Message::assistant("kept")]
+    );
+}
+
+#[test]
+fn mid_turn_compaction_resume_keeps_tool_pairs_written_before_the_compaction_line() {
+    let trail = concat!(
+        "{\"event\":\"session_start\",\"ts_ms\":1,\"session_id\":\"sess-mid\"}\n",
+        "{\"event\":\"request\",\"ts_ms\":2,\"model\":\"m\",\"base_url\":\"u\",\"prompt\":\"old\",\"session_id\":\"sess-mid\",\"turn_index\":0}\n",
+        "{\"event\":\"response_ok\",\"ts_ms\":3,\"duration_ms\":1,\"reply\":\"old done\",\"session_id\":\"sess-mid\",\"turn_index\":0}\n",
+        "{\"event\":\"request\",\"ts_ms\":4,\"model\":\"m\",\"base_url\":\"u\",\"prompt\":\"active\",\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"event\":\"tool_round\",\"ts_ms\":5,\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read\",\"input\":{}}],\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"event\":\"tool_call\",\"ts_ms\":6,\"tool_use_id\":\"t1\",\"tool_name\":\"read\",\"input\":{},\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"event\":\"tool_result\",\"ts_ms\":7,\"tool_use_id\":\"t1\",\"tool_name\":\"read\",\"status\":\"completed\",\"result\":\"one\",\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"schema\":\"baton.exchange/v1\",\"event\":\"compaction\",\"ts_ms\":8,\"session_id\":\"sess-mid\",\"turn_index\":1,\"retained_from_turn_index\":1,\"summary\":\"earlier context\"}\n",
+        "{\"event\":\"tool_round\",\"ts_ms\":9,\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"read\",\"input\":{}}],\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"event\":\"tool_call\",\"ts_ms\":10,\"tool_use_id\":\"t2\",\"tool_name\":\"read\",\"input\":{},\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"event\":\"tool_result\",\"ts_ms\":11,\"tool_use_id\":\"t2\",\"tool_name\":\"read\",\"status\":\"completed\",\"result\":\"two\",\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"event\":\"response_ok\",\"ts_ms\":12,\"duration_ms\":1,\"reply\":\"done\",\"session_id\":\"sess-mid\",\"turn_index\":1}\n",
+        "{\"event\":\"request\""
+    );
+    let report = crate::log::parse_sessions(std::io::Cursor::new(trail))
+        .expect("parses complete turns before a partial tail");
+    assert_eq!(report.warnings.len(), 1);
+    let resumed = select_and_rehydrate(report.sessions, None).expect("rehydrates active turn");
+
+    assert_eq!(resumed.history_turn_indices, [1]);
+    assert_eq!(
+        resumed.conversation.messages(),
+        [
+            Message::user("active"),
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({}),
+                }]
+            ),
+            Message::new(
+                Role::User,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: "one".to_string(),
+                    is_error: None,
+                }]
+            ),
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse {
+                    id: "t2".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({}),
+                }]
+            ),
+            Message::new(
+                Role::User,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "t2".to_string(),
+                    content: "two".to_string(),
+                    is_error: None,
+                }]
+            ),
+            Message::assistant("done"),
+        ]
+    );
+}
+
+#[test]
+fn session_compacts_before_a_normal_turn_without_an_extra_trail_pair_or_turn_index() {
+    let transport =
+        crate::tools::tests::BudgetTransport::new(vec![Ok(AssistantReply::new("current answer"))]);
+    let tool_loop = ToolLoop::new(transport, ToolRegistry::new(), None)
+        .with_context_budget(Some(crate::tools::tests::context_budget(2_000, 200, 200)));
+    let mut trail = Vec::new();
+    let mut warning = Vec::new();
+    let mut history = Conversation::new();
+    history.push_user("old context ".repeat(1_000));
+    history.push_assistant("old answer");
+
+    {
+        let mut sink = WriterSink::new(&mut trail);
+        run_session_repl_with_warning_and_system_prompt(
+            &tool_loop,
+            &mut sink,
+            &meta(),
+            std::io::Cursor::new("next turn\n/exit\n"),
+            Vec::new(),
+            "sess-summary".to_string(),
+            history,
+            1,
+            &mut warning,
+            None,
+        )
+        .expect("session turn completes after compaction");
+    }
+
+    let values = String::from_utf8(trail)
+        .expect("trail is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid trail event"))
+        .collect::<Vec<_>>();
+    let requests = values
+        .iter()
+        .filter(|event| event["event"] == "request")
+        .collect::<Vec<_>>();
+    let responses = values
+        .iter()
+        .filter(|event| event["event"] == "response_ok")
+        .collect::<Vec<_>>();
+    let compactions = values
+        .iter()
+        .filter(|event| event["event"] == "compaction")
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(compactions.len(), 1);
+    assert_eq!(requests[0]["turn_index"], 1);
+    assert_eq!(responses[0]["turn_index"], 1);
+    assert_eq!(compactions[0]["turn_index"], 1);
+    assert_eq!(values.last().unwrap()["turns"], 2);
+    assert!(!values.iter().any(|event| event["turn_index"] == 2));
+}
+
+#[test]
 fn select_and_rehydrate_requires_session_id_when_ambiguous() {
     let sessions = vec![
         crate::log::SessionRecord {
@@ -1863,6 +2113,7 @@ fn select_and_rehydrate_requires_session_id_when_ambiguous() {
             ended: true,
             declared_turns: Some(0),
             turns: vec![],
+            compactions: vec![],
         },
         crate::log::SessionRecord {
             session_id: "sess-2".to_string(),
@@ -1870,6 +2121,7 @@ fn select_and_rehydrate_requires_session_id_when_ambiguous() {
             ended: true,
             declared_turns: Some(0),
             turns: vec![],
+            compactions: vec![],
         },
     ];
     assert!(matches!(

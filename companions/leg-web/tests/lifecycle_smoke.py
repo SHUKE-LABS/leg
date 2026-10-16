@@ -823,6 +823,9 @@ def main() -> int:
     if len(sys.argv) != 4:
         print("usage: lifecycle_smoke.py LEG_WEB_BIN LEG_BIN SUPERVISOR_BIN", file=sys.stderr)
         return 2
+    os.environ["LEG_CONTEXT_WINDOW_TOKENS"] = "200000"
+    os.environ.pop("LEG_CONTEXT_RESERVE_TOKENS", None)
+    os.environ.pop("LEG_CONTEXT_KEEP_RECENT_TOKENS", None)
     run(*(Path(value).resolve() for value in sys.argv[1:]))
     print("leg-web lifecycle smoke passed")
     return 0

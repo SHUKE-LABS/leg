@@ -45,9 +45,69 @@ impl<H: HttpClient> OpenAiResponsesClient<H> {
         self.tools = tools;
         self
     }
+
+    fn send_with_options(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+        tools: &[ToolSpec],
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> TransportCall<AssistantReply> {
+        let body = match build_request_body_with_max_tokens(
+            &self.config,
+            messages,
+            tools,
+            system_prompt,
+            max_output_tokens,
+        ) {
+            Ok(body) => body,
+            Err(error) => return TransportCall::completed(Err(error), 0),
+        };
+        let token = match common::bearer_token(&self.config.credential) {
+            Ok(token) => token,
+            Err(error) => return TransportCall::completed(Err(error), 0),
+        };
+        let auth_value = format!("Bearer {token}");
+        let headers = [
+            ("Authorization", auth_value.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let url = common::endpoint(&self.config.base_url, "responses");
+
+        let mut decoder = SseDecoder::default();
+        let mut assembler = ResponsesAssembler {
+            max_tokens: max_output_tokens,
+            ..ResponsesAssembler::default()
+        };
+        let call = {
+            let mut accept_event = |event| assembler.accept(event, on_event);
+            self.http
+                .post_json_streaming(&url, &headers, &body, &mut |chunk| {
+                    decoder.push(chunk, &mut accept_event)
+                })
+        };
+        let attempts = call.attempts;
+        let result = match call.result {
+            Err(error) => Err(error),
+            Ok(response) if (200..300).contains(&response.status) => {
+                let result = {
+                    let mut accept_event = |event| assembler.accept(event, on_event);
+                    decoder.finish(&mut accept_event)
+                };
+                result.and_then(|()| assembler.finish())
+            }
+            Ok(response) => Err(common::api_error(response.status, &response.body)),
+        };
+        TransportCall::new(result, attempts)
+    }
 }
 
 impl<H: HttpClient> Transport for OpenAiResponsesClient<H> {
+    fn configured_system_prompt(&self) -> Option<&str> {
+        self.config.system_prompt.as_deref()
+    }
+
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
         self.send_conversation_with_attempts(messages).result
     }
@@ -93,46 +153,50 @@ impl<H: HttpClient> Transport for OpenAiResponsesClient<H> {
         system_prompt: Option<&str>,
         on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
     ) -> TransportCall<AssistantReply> {
-        let body = match build_request_body(&self.config, messages, &self.tools, system_prompt) {
-            Ok(body) => body,
-            Err(error) => return TransportCall::completed(Err(error), 0),
-        };
-        let token = match common::bearer_token(&self.config.credential) {
-            Ok(token) => token,
-            Err(error) => return TransportCall::completed(Err(error), 0),
-        };
-        let auth_value = format!("Bearer {token}");
-        let headers = [
-            ("Authorization", auth_value.as_str()),
-            ("content-type", "application/json"),
-        ];
-        let url = common::endpoint(&self.config.base_url, "responses");
+        self.send_with_options(
+            messages,
+            system_prompt,
+            self.config.max_tokens,
+            &self.tools,
+            on_event,
+        )
+    }
 
-        let mut decoder = SseDecoder::default();
-        let mut assembler = ResponsesAssembler {
-            max_tokens: self.config.max_tokens,
-            ..ResponsesAssembler::default()
-        };
-        let call = {
-            let mut accept_event = |event| assembler.accept(event, on_event);
-            self.http
-                .post_json_streaming(&url, &headers, &body, &mut |chunk| {
-                    decoder.push(chunk, &mut accept_event)
-                })
-        };
-        let attempts = call.attempts;
-        let result = match call.result {
-            Err(error) => Err(error),
-            Ok(response) if (200..300).contains(&response.status) => {
-                let result = {
-                    let mut accept_event = |event| assembler.accept(event, on_event);
-                    decoder.finish(&mut accept_event)
-                };
-                result.and_then(|()| assembler.finish())
-            }
-            Ok(response) => Err(common::api_error(response.status, &response.body)),
-        };
-        TransportCall::new(result, attempts)
+    fn estimate_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        _streaming: bool,
+    ) -> Result<usize> {
+        build_request_body(&self.config, messages, &self.tools, system_prompt)
+            .map(|body| body.len())
+    }
+
+    fn estimate_summary_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> Result<usize> {
+        build_request_body_with_max_tokens(
+            &self.config,
+            messages,
+            &[],
+            system_prompt,
+            max_output_tokens,
+        )
+        .map(|body| body.len())
+    }
+
+    fn send_context_summary(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> TransportCall<AssistantReply> {
+        self.send_with_options(messages, system_prompt, max_output_tokens, &[], &mut |_| {
+            Ok(())
+        })
     }
 }
 
@@ -142,10 +206,20 @@ fn build_request_body(
     tools: &[ToolSpec],
     system_prompt: Option<&str>,
 ) -> Result<String> {
+    build_request_body_with_max_tokens(config, messages, tools, system_prompt, config.max_tokens)
+}
+
+fn build_request_body_with_max_tokens(
+    config: &LegConfig,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    system_prompt: Option<&str>,
+    max_output_tokens: u32,
+) -> Result<String> {
     let mut request = json!({
         "model": config.model,
         "input": responses_input(messages)?,
-        "max_output_tokens": config.max_tokens,
+        "max_output_tokens": max_output_tokens,
         "stream": true
     });
     if let Some(instructions) = system_prompt {
@@ -715,6 +789,7 @@ mod tests {
             stream_idle_timeout: Duration::from_secs(120),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            context_budget: None,
             max_retries: 0,
             retry_base_delay: Duration::ZERO,
             max_tool_rounds: None,

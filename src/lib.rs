@@ -21,6 +21,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod events;
 mod image_input;

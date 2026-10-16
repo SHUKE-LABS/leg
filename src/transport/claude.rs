@@ -72,6 +72,10 @@ impl<H: HttpClient> ClaudeClient<H> {
 }
 
 impl<H: HttpClient> Transport for ClaudeClient<H> {
+    fn configured_system_prompt(&self) -> Option<&str> {
+        self.config.system_prompt.as_deref()
+    }
+
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
         self.send_conversation_with_attempts(messages).result
     }
@@ -179,6 +183,73 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
             }
             Ok(response) => parse_response(response.status, &response.body, self.config.max_tokens),
         };
+        TransportCall::new(result, attempts)
+    }
+
+    fn estimate_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        streaming: bool,
+    ) -> Result<usize> {
+        build_request_body_with_stream(
+            &self.config.model,
+            self.config.max_tokens,
+            messages,
+            system_prompt,
+            &self.tools,
+            streaming,
+        )
+        .map(|body| body.len())
+    }
+
+    fn estimate_summary_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> Result<usize> {
+        build_request_body_with_stream(
+            &self.config.model,
+            max_output_tokens,
+            messages,
+            system_prompt,
+            &[],
+            false,
+        )
+        .map(|body| body.len())
+    }
+
+    fn send_context_summary(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> TransportCall<AssistantReply> {
+        let body = match build_request_body_with_stream(
+            &self.config.model,
+            max_output_tokens,
+            messages,
+            system_prompt,
+            &[],
+            false,
+        ) {
+            Ok(body) => body,
+            Err(error) => return TransportCall::completed(Err(error), 0),
+        };
+        let (auth_name, auth_value) = auth_header(&self.config.credential);
+        let headers = [
+            (auth_name, auth_value.as_str()),
+            ("anthropic-version", ANTHROPIC_VERSION),
+            ("content-type", "application/json"),
+        ];
+        let call = self
+            .http
+            .post_json_with_attempts(&self.endpoint(), &headers, &body);
+        let attempts = call.attempts;
+        let result = call.result.and_then(|response| {
+            parse_response(response.status, &response.body, max_output_tokens)
+        });
         TransportCall::new(result, attempts)
     }
 }
@@ -940,6 +1011,7 @@ mod tests {
             stream_idle_timeout: Duration::from_secs(120),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            context_budget: None,
             max_retries: crate::config::DEFAULT_MAX_RETRIES,
             retry_base_delay: Duration::from_millis(crate::config::DEFAULT_RETRY_BASE_DELAY_MS),
             max_tool_rounds: None,

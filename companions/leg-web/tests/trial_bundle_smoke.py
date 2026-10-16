@@ -175,6 +175,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle-dir", type=Path, required=True)
     args = parser.parse_args()
+    os.environ["LEG_CONTEXT_WINDOW_TOKENS"] = "200000"
+    os.environ.pop("LEG_CONTEXT_RESERVE_TOKENS", None)
+    os.environ.pop("LEG_CONTEXT_KEEP_RECENT_TOKENS", None)
     smoke_bundle(args.bundle_dir)
     print("unpacked Web bundle smoke passed: launcher, page, assets, and authenticated API")
     return 0
