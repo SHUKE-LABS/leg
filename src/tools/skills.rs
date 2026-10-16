@@ -46,7 +46,12 @@ impl ToolHandler for ActivateSkillTool {
         let name = input["name"]
             .as_str()
             .ok_or("activate_skill: `name` must be a string")?;
-        self.state.activate(snapshot_id, name)
+        let result = self.state.activate(snapshot_id, name);
+        match &result {
+            Ok(_) => eprintln!("skills activation: loaded '{name}' for this turn"),
+            Err(error) => eprintln!("skills activation failed: {error}"),
+        }
+        result
     }
 }
 
@@ -96,6 +101,11 @@ impl ToolHandler for ReadSkillResourceTool {
         let relative_path = input["relative_path"]
             .as_str()
             .ok_or("read_skill_resource: `relative_path` must be a string")?;
-        self.state.read_resource(snapshot_id, name, relative_path)
+        let result = self.state.read_resource(snapshot_id, name, relative_path);
+        match &result {
+            Ok(_) => eprintln!("skills resource: loaded for '{name}' in this turn"),
+            Err(error) => eprintln!("skills resource failed: {error}"),
+        }
+        result
     }
 }

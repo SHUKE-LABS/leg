@@ -181,6 +181,34 @@ documents path confinement and context-budget behavior. When context settings
 are supplied, Skill metadata and loaded content count toward the input budget;
 an activation or resource read that cannot fit fails before adding content.
 
+For example, add a package to a workspace and request it by name:
+
+```text
+.agents/skills/release-notes/SKILL.md
+```
+
+```markdown
+---
+name: release-notes
+description: Draft concise release notes from a change list.
+---
+Group changes by user-visible effect. Call out breaking changes separately.
+```
+
+```sh
+leg ask "Use the release-notes Skill to summarize these changes: ..."
+```
+
+Leg first sends the package's metadata, then loads its instructions only after
+the model calls `activate_skill` with the current snapshot and exact name.
+Each new turn, including a resumed session, discovers a fresh snapshot and
+starts with no activated body or resources. Precedence is configured
+`LEG_SYSTEM_PROMPT`, project `AGENTS.md`, the caller's request, then activated
+Skill instructions and resources. Bodies and resources do not enter session
+history or trails; catalog metadata and activation outcomes are shown on
+stderr, and tool calls and acknowledgements appear in a trail when recording
+is enabled.
+
 Anthropic Messages remains the default provider. OpenAI-compatible endpoints
 can use either streamed wire protocol:
 

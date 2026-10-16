@@ -137,6 +137,7 @@ impl SkillTurnState {
             .unwrap_or_else(|| discover_skill_catalog_from_env(SKILL_CATALOG_PROMPT_BUDGET_BYTES));
         #[cfg(not(test))]
         let catalog = discover_skill_catalog_from_env(SKILL_CATALOG_PROMPT_BUDGET_BYTES);
+        report_catalog(&catalog);
         self.begin_turn_with_catalog(catalog);
     }
 
@@ -296,6 +297,17 @@ impl SkillTurnState {
                 "Skill unavailable: name is missing or not in the current catalog.".to_string()
             })
     }
+}
+
+/// Reports the provider-facing metadata catalog without reading or printing
+/// any Skill body or package resource. The source labels are stable scope
+/// labels, so this diagnostic does not reveal configured filesystem paths or
+/// environment values.
+fn report_catalog(catalog: &SkillCatalog) {
+    if catalog.skills.is_empty() && catalog.warnings.is_empty() {
+        return;
+    }
+    eprintln!("skills catalog: {}", catalog.to_json());
 }
 
 fn reserve_tool_context(

@@ -157,6 +157,43 @@ Missing binaries, npm platform packages, Node.js, or stream support produce
 recoverable setup errors before a paid request. The private helper can be
 installed beside the UI binary or selected with `LEG_UI_SUPERVISOR_BIN`.
 
+## Skills in companion turns
+
+The supervisor launches the native binary in the selected workspace with the
+same stream entry point for every companion turn:
+
+```text
+leg exchange --stream-json --new-session-id <reserved-session-id>
+leg exchange --stream-json --session <session-id>
+```
+
+The first command creates a session and the second resumes it. The supervisor
+sends the prompt on stdin and keeps provider output on the JSON event stream;
+Leg performs Skill discovery and activation inside that turn.
+
+For example, a workspace can contain
+`.agents/skills/release-notes/SKILL.md`:
+
+```markdown
+---
+name: release-notes
+description: Draft concise release notes from a change list.
+---
+Group changes by user-visible effect. Call out breaking changes separately.
+```
+
+Start a companion turn with a prompt such as `Use the release-notes Skill to
+summarize these changes: ...`. Leg discovers metadata from project Skill roots
+and the configured user roots described in the [Skills v1 contract](skills-v1.md).
+The provider sees that catalog first and loads the body only after an explicit
+`activate_skill(snapshot_id, name)` call. A new or resumed turn gets a fresh
+catalog; activation and resources do not carry over. Precedence is configured
+`LEG_SYSTEM_PROMPT`, project `AGENTS.md`, the caller's request, then activated
+Skill instructions and resources. Those bodies and resources stay out of
+session history and trail records. The catalog summary and activation status
+are visible on stderr; tool calls and acknowledgements are recorded in the
+session trail without the loaded content.
+
 ## Ownership and outcomes
 
 The companion supervisor holds a kernel-released exclusive lock in the
