@@ -235,7 +235,7 @@ impl HttpClient for UreqHttpClient {
                 }
 
                 let response = request.send(&body).map_err(|error| match error {
-                    ureq::Error::Timeout(_) => LegError::NonRetryableTransport(format!(
+                    ureq::Error::Timeout(_) => LegError::Transport(format!(
                             "request timed out after {} seconds waiting for response headers (LEG_TIMEOUT_SECS)",
                             timeout.as_secs()
                         )),
@@ -391,7 +391,7 @@ mod tests {
             let call = client.post_json_streaming(&url, &[], "{}", &mut |_| Ok(()));
             assert_eq!(call.attempts, 1);
             match call.result.expect_err("header stall should time out") {
-                LegError::NonRetryableTransport(message) => {
+                LegError::Transport(message) => {
                     assert!(message.contains("LEG_TIMEOUT_SECS"), "{message}");
                 }
                 other => panic!("unexpected header-stall error: {other}"),
