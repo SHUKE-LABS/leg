@@ -235,7 +235,7 @@ impl HttpClient for UreqHttpClient {
                 }
 
                 let response = request.send(&body).map_err(|error| match error {
-                    ureq::Error::Timeout(_) => LegError::NonRetryableTransport(format!(
+                    ureq::Error::Timeout(_) => LegError::Transport(format!(
                             "request timed out after {} seconds waiting for response headers (LEG_TIMEOUT_SECS)",
                             timeout.as_secs()
                         )),
