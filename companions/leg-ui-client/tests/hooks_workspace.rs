@@ -187,6 +187,9 @@ fn spawn_provider(reply: String) -> (String, thread::JoinHandle<String>) {
                     Err(error) => panic!("accept fake provider request: {error}"),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .expect("set accepted fake provider stream blocking");
             if let Some(request) = read_request_body(&mut stream) {
                 break (stream, request);
             }

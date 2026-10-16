@@ -85,6 +85,9 @@ fn spawn_provider(replies: Vec<ProviderReply>) -> (String, Arc<Mutex<Vec<String>
                         Err(_) => return,
                     }
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("set accepted fake provider stream blocking");
                 if let Some(body) = read_request_body(&mut stream) {
                     break (stream, body);
                 }
@@ -596,8 +599,7 @@ fn exchange_hooks_keep_identity_through_retry_and_tool_continuation() {
     let mut command = leg(cwd, &base_url, &hooks, &hook_log, &trail);
     command
         .env("LEG_SESSION_DIR", &store)
-        // Local connection failures can consume retry slots before the scripted 503.
-        .env("LEG_MAX_RETRIES", "3")
+        .env("LEG_MAX_RETRIES", "1")
         .env("LEG_RETRY_BASE_DELAY_MS", "0")
         .args(["exchange", "--new-session-id", session_id]);
     let output = run(command, Some("read notes.txt"));
