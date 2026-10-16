@@ -1,9 +1,8 @@
 # Leg Skills v1 contract
 
-Status: normative contract for issue #229. This document freezes the package
-and activation semantics that later discovery, catalog, and integration work
-must implement. It does not implement a parser, catalog, activation API, or
-provider integration.
+Status: normative v1 contract for issue #229. This document freezes package,
+catalog, activation, resource, refresh, and budget semantics implemented by
+Leg's Skills discovery and provider integration.
 
 `AGENTS.md` and Skills are deliberately different layers. `AGENTS.md` is
 always-on project instruction discovered for every turn. A Skill is a named,
@@ -142,10 +141,13 @@ activate_skill(snapshot_id, name)
 ```
 
 The caller must explicitly select an exact catalog name from the current
-snapshot. On success, the operation loads exactly that package's complete
-`SKILL.md` body and returns the selected name, body, and an opaque resource
-handle. It does not load another Skill, scan a neighboring package, or run a
-script. UI and CLI spellings may wrap this operation, but fuzzy matching,
+snapshot. On success, the host binds that catalog entry to its private package
+identity and loads exactly that package's complete `SKILL.md` body. The
+provider tool spelling is `activate_skill(snapshot_id, name)`: both values
+must match the current catalog, and the selected package must still match its
+discovered identity. The tool result is a short acknowledgement; the body is
+available only in the next composed provider request. It does not load another
+Skill, scan a neighboring package, or run a script. Fuzzy matching,
 prompt-triggered implicit activation, and path-based activation are not v1
 behavior.
 
@@ -159,8 +161,12 @@ read_skill_resource(snapshot_id, name, relative_path)
 root. Absolute paths, empty paths, `..` traversal, alternate separators that
 escape the root, non-regular files, and symlinks whose target leaves the
 package root are rejected. Resources are read only when requested by the
-activated instructions. A script remains a file; activation never executes it
-and frontmatter never grants a tool permission.
+activated instructions. The provider tool spelling is
+`read_skill_resource(snapshot_id, name, relative_path)` and requires that the
+Skill be activated in the current turn. Its result is also an acknowledgement;
+resource text is available only in the next composed provider request. A
+script remains a file; activation never executes it and frontmatter never
+grants a tool permission.
 
 Activation fails without injecting partial instructions when the name is
 missing, the snapshot is stale, the selected package changed after the
@@ -174,13 +180,26 @@ fallback to a different package.
   catalog and selected-package identity are one immutable snapshot across all
   provider calls and tool rounds in that turn.
 - The next turn creates a fresh snapshot, so added, removed, or changed Skills
-  take effect then. A refresh command may discard the current snapshot before
-  a new turn, but cannot mutate an active tool continuation.
-- Catalog metadata, the activated body, and on-demand resources consume the
-  host's context budget. The host must account for the complete content before
-  injection and fail closed on overflow; it must never silently truncate
-  instructions or resources. The integration supplies the concrete budget
-  units and remaining capacity.
+  take effect then. Activations do not carry across turns or resumed sessions;
+  the model must activate again against the fresh catalog snapshot. A refresh
+  command may discard the current snapshot before a new turn, but cannot mutate
+  an active tool continuation.
+- The prompt catalog is capped at 16 KiB of serialized metadata. A complete
+  `SKILL.md` is capped at 64 KiB, each resource at 64 KiB, and resource paths
+  at 512 bytes. Combined activated instructions and resources are capped at
+  256 KiB per turn. Larger content fails with a bounded tool diagnostic and is
+  never partly injected.
+- When a context window is configured, catalog metadata, the activated body,
+  and on-demand resources consume the host's context budget. Leg estimates
+  input tokens as the ceiling of serialized provider-request bytes divided by
+  three, then applies its observed calibration factor. At activation or
+  resource-read time it reserves the complete added content plus the tool call
+  response tokens and acknowledgement against the remaining input allowance;
+  reported response usage is used when available, otherwise the response is
+  estimated from its serialized content. Overflow returns a bounded tool error
+  before state changes; the pre-dispatch request guard remains the backstop for
+  the complete composed prompt. Without a configured context window, the fixed
+  byte limits above still apply.
 - Injected Skill bodies, catalog entries, and resource contents are not copied
   into session history or trail records as hidden instructions. Explicit tool
   calls and their ordinary results remain subject to the existing trail rules.
@@ -219,12 +238,12 @@ The contract-level expected outcomes are:
 | `malformed/fixture-malformed` | No catalog entry; one invalid-package warning. | Activation is unavailable because invalid packages are never catalogued. |
 | `duplicate/project/.../fixture-duplicate` plus `duplicate/user/.../fixture-duplicate` | One `fixture-duplicate` entry; the project package wins and the user package is named in a duplicate warning. | Activation returns the project marker; the user body is never loaded. |
 
-The fixture self-check is deliberately weaker than the future runtime tests.
-Later implementation slices must test actual discovery, catalog, activation,
-resource confinement, refresh, and budget behavior against this corpus.
+The fixture self-check remains deliberately weaker than the runtime tests.
+Rust tests exercise discovery, activation, resource confinement, refresh, and
+budget behavior against these fixtures and temporary package trees.
 
 ## Non-goals
 
-This issue does not implement the parser, catalog, activation path, provider
-integration, hooks, subagents, plugins, marketplace behavior, automatic script
-execution, or changes to `AGENTS.md` semantics.
+Skills v1 does not add hooks, subagents, plugins, marketplace behavior,
+automatic script execution, or changes to `AGENTS.md` semantics. Frontmatter
+does not grant tools or permissions.

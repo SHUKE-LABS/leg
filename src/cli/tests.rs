@@ -645,7 +645,11 @@ fn configured_bash_timeout_flows_through_registry_to_spec_and_handler() {
     }
 
     let default_timeout_secs = if cfg!(windows) {
-        let probe_registry = build_tool_registry(&config_with_bash_timeout(1));
+        let probe_config = config_with_bash_timeout(1);
+        let probe_registry = build_tool_registry(
+            &probe_config,
+            crate::skills::SkillTurnState::new(probe_config.context_budget),
+        );
         let probe_result = probe_registry.dispatch(
             "toolu_probe",
             "bash",
@@ -666,9 +670,14 @@ fn configured_bash_timeout_flows_through_registry_to_spec_and_handler() {
         1
     };
     let config = config_with_bash_timeout(default_timeout_secs);
-    let registry = build_tool_registry(&config);
-    let bash_spec = registry
-        .specs()
+    let registry = build_tool_registry(
+        &config,
+        crate::skills::SkillTurnState::new(config.context_budget),
+    );
+    let specs = registry.specs();
+    assert!(specs.iter().any(|spec| spec.name == "activate_skill"));
+    assert!(specs.iter().any(|spec| spec.name == "read_skill_resource"));
+    let bash_spec = specs
         .into_iter()
         .find(|spec| spec.name == "bash")
         .expect("bash spec is registered");
@@ -1120,6 +1129,104 @@ fn run_ask_records_tool_events_between_request_and_outcome() {
     assert_eq!(events[3]["result"], "echo: hi");
     assert!(events[1].get("session_id").is_none());
     assert!(events[2].get("session_id").is_none());
+}
+
+#[test]
+fn activated_skill_body_and_resource_are_not_written_to_the_tool_trail() {
+    use crate::skills::{SkillTurnState, discover_skill_catalog};
+    use crate::tools::{ActivateSkillTool, ReadSkillResourceTool, ToolRegistry};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tree = std::env::temp_dir().join(format!("leg-skill-trail-{}-{stamp}", std::process::id()));
+    let cwd = tree.join("workspace");
+    let package = cwd.join(".agents/skills/writer");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("SKILL.md"),
+        "---\nname: writer\ndescription: A writing Skill.\n---\nPRIVATE_TRAIL_BODY_MARKER",
+    )
+    .unwrap();
+    fs::create_dir_all(package.join("references")).unwrap();
+    fs::write(
+        package.join("references/guide.md"),
+        "PRIVATE_TRAIL_RESOURCE_MARKER",
+    )
+    .unwrap();
+    let catalog = discover_skill_catalog(&cwd, None, None, usize::MAX);
+    let snapshot_id = catalog.snapshot_id.clone();
+    let state = SkillTurnState::new(None);
+    state.use_catalog_for_next_turn(catalog);
+    let activation_reply = AssistantReply::from_blocks(
+        vec![crate::model::ContentBlock::ToolUse {
+            id: "activate-trail".into(),
+            name: "activate_skill".into(),
+            input: serde_json::json!({"snapshot_id": snapshot_id, "name": "writer"}),
+        }],
+        crate::model::TokenUsage {
+            input_tokens: Some(8),
+            output_tokens: Some(4),
+        },
+        Some(crate::model::StopReason::ToolUse),
+    );
+    let resource_reply = AssistantReply::from_blocks(
+        vec![crate::model::ContentBlock::ToolUse {
+            id: "resource-trail".into(),
+            name: "read_skill_resource".into(),
+            input: serde_json::json!({
+                "snapshot_id": snapshot_id,
+                "name": "writer",
+                "relative_path": "references/guide.md"
+            }),
+        }],
+        crate::model::TokenUsage {
+            input_tokens: Some(12),
+            output_tokens: Some(4),
+        },
+        Some(crate::model::StopReason::ToolUse),
+    );
+    let transport = crate::tools::tests::BudgetTransport::new(vec![
+        Ok(activation_reply),
+        Ok(resource_reply),
+        Ok(AssistantReply::new("done")),
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(
+        ActivateSkillTool::spec(),
+        Box::new(ActivateSkillTool::new(state.clone())),
+    );
+    registry.register(
+        ReadSkillResourceTool::spec(),
+        Box::new(ReadSkillResourceTool::new(state.clone())),
+    );
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut sink = Rc::new(RefCell::new(
+        Box::new(CollectingSink(events.clone())) as Box<dyn EventSink>
+    ));
+    let tool_loop = ToolLoop::new(transport, registry, None)
+        .with_skill_state(state)
+        .with_observer(tool_trail_observer(sink.clone()));
+    let participant = LocalParticipant::new(tool_loop, meta());
+    let mut output = Vec::new();
+    run_ask(&participant, &meta(), "Use writer", &mut output, &mut sink).unwrap();
+
+    let events = events.borrow();
+    let results: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results[0]["result"].as_str().unwrap().contains("activated"));
+    assert!(results[1]["result"].as_str().unwrap().contains("loaded"));
+    let trail = serde_json::to_string(&*events).unwrap();
+    assert!(!trail.contains("PRIVATE_TRAIL_BODY_MARKER"));
+    assert!(!trail.contains("PRIVATE_TRAIL_RESOURCE_MARKER"));
+    drop(events);
+    fs::remove_dir_all(tree).unwrap();
 }
 
 #[test]

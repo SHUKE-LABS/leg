@@ -167,8 +167,19 @@ paths decide duplicate winners. Catalog warnings use `invalid_package`,
 `catalog_budget_exceeded`; missing roots are skipped. Discovery reads only the
 bounded YAML frontmatter, never the Skill body or package resources. Catalog
 entries are omitted whole to fit the supplied serialized JSON byte budget;
-diagnostics remain visible and may exceed a very small budget. Per-turn prompt
-integration and explicit activation remain separate work.
+diagnostics remain visible and may exceed a very small budget. Models can call
+`activate_skill(snapshot_id, name)` to load an exact catalog entry, then
+`read_skill_resource(snapshot_id, name, relative_path)` for a package resource.
+Successful calls return acknowledgements only; loaded content reaches the model
+through the next provider request, while failures return bounded diagnostics.
+Activations are turn-local and do not carry into a
+later turn or resumed session, so the model must activate again against the
+fresh catalog. Complete `SKILL.md` and resource files are limited to 64 KiB;
+resource paths are limited to 512 bytes, and combined loaded Skill content is
+limited to 256 KiB per turn. The [Skills v1 contract](docs/skills-v1.md)
+documents path confinement and context-budget behavior. When context settings
+are supplied, Skill metadata and loaded content count toward the input budget;
+an activation or resource read that cannot fit fails before adding content.
 
 Anthropic Messages remains the default provider. OpenAI-compatible endpoints
 can use either streamed wire protocol:
