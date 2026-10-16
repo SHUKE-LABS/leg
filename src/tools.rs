@@ -9,7 +9,8 @@
 //! [`Transport`], so every driver (`ask`, `session`, `exchange`) shares it.
 //!
 //! Registered tools are [`ReadTool`] (`read`), [`WriteTool`] (`write`),
-//! [`EditTool`] (`edit`), and [`BashTool`] (`bash`).
+//! [`EditTool`] (`edit`), [`BashTool`] (`bash`), [`ActivateSkillTool`]
+//! (`activate_skill`), and [`ReadSkillResourceTool`] (`read_skill_resource`).
 
 use std::cell::RefCell;
 
@@ -56,11 +57,13 @@ mod hook_runtime;
 mod pretool;
 mod process;
 mod read;
+mod skills;
 mod write;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use read::{ReadSet, ReadTool};
+pub(crate) use skills::{ActivateSkillTool, ReadSkillResourceTool};
 pub use write::WriteTool;
 
 /// Formats the warning surfaced when a turn stops at a configured round limit.
@@ -304,6 +307,7 @@ pub struct ToolLoop<T: Transport> {
     hook_observer: Option<RefCell<HookOutcomeObserver>>,
     context_budget: Option<ContextBudget>,
     context_state: RefCell<ContextState>,
+    skill_state: Option<crate::skills::SkillTurnState>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -382,12 +386,19 @@ impl<T: Transport> ToolLoop<T> {
             hook_observer: None,
             context_budget: None,
             context_state: RefCell::new(ContextState::default()),
+            skill_state: None,
         }
     }
 
     /// Enables the configured context-window guard for every provider call.
     pub fn with_context_budget(mut self, budget: Option<ContextBudget>) -> Self {
         self.context_budget = budget;
+        self
+    }
+
+    /// Shares per-turn Skill state with the registered activation tools.
+    pub(crate) fn with_skill_state(mut self, state: crate::skills::SkillTurnState) -> Self {
+        self.skill_state = Some(state);
         self
     }
 
@@ -663,6 +674,9 @@ impl<T: Transport> ToolLoop<T> {
         system_prompt: SystemPromptMode<'_>,
         context_call: Option<ContextCall<'_>>,
     ) -> TransportCall<TurnOutcome> {
+        if let Some(skill_state) = &self.skill_state {
+            skill_state.begin_turn();
+        }
         let prompt = hook_prompt(history);
         let hook_context = context_call
             .as_ref()
@@ -890,6 +904,12 @@ impl<T: Transport> ToolLoop<T> {
             SystemPromptMode::Configured => self.transport.configured_system_prompt(),
             SystemPromptMode::Explicit(prompt) => prompt,
         };
+        let composed_prompt = self
+            .skill_state
+            .as_ref()
+            .map(|state| state.compose_prompt(base_prompt))
+            .unwrap_or_else(|| base_prompt.map(str::to_string));
+        let base_prompt = composed_prompt.as_deref();
         let allow_compaction = context
             .call
             .as_ref()
@@ -982,6 +1002,21 @@ impl<T: Transport> ToolLoop<T> {
                 .calibration_factor
                 .max((reported as f64 / prepared.baseline_tokens as f64).max(1.0));
         }
+        if let Some(skill_state) = &self.skill_state
+            && let Ok(reply) = &call.result
+        {
+            let response_tokens = reply.usage.output_tokens.unwrap_or_else(|| {
+                let bytes = serde_json::to_vec(&reply.content)
+                    .map(|content| content.len())
+                    .unwrap_or_default();
+                calibrated_tokens(baseline_tokens(bytes), context.state.calibration_factor)
+            });
+            skill_state.set_remaining_context_tokens(
+                prepared.baseline_tokens,
+                response_tokens,
+                context.state.calibration_factor,
+            );
+        }
         TransportCall::completed(call.result, attempts)
     }
 
@@ -1007,7 +1042,9 @@ impl<T: Transport> ToolLoop<T> {
             return Ok(PreparedContext {
                 messages: projection,
                 system_prompt: original_prompt,
-                use_configured_prompt: configured_mode && state.summary.is_none(),
+                use_configured_prompt: configured_mode
+                    && self.skill_state.is_none()
+                    && state.summary.is_none(),
                 baseline_tokens: 0,
                 cut: 0,
                 dropped_groups: 0,
@@ -1025,7 +1062,9 @@ impl<T: Transport> ToolLoop<T> {
             return Ok(PreparedContext {
                 messages: projection,
                 system_prompt: original_prompt,
-                use_configured_prompt: configured_mode && state.summary.is_none(),
+                use_configured_prompt: configured_mode
+                    && self.skill_state.is_none()
+                    && state.summary.is_none(),
                 baseline_tokens: baseline,
                 cut: 0,
                 dropped_groups: 0,
@@ -1620,6 +1659,246 @@ pub(crate) mod tests {
             },
             Some(StopReason::ToolUse),
         )
+    }
+
+    #[test]
+    fn activation_changes_the_next_provider_call_and_does_not_survive_resume() {
+        use crate::skills::{SkillTurnState, discover_skill_catalog};
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tree = std::env::temp_dir().join(format!(
+            "leg-tool-skill-turn-{}-{stamp}",
+            std::process::id()
+        ));
+        let cwd = tree.join("workspace");
+        let package = cwd.join(".agents/skills/writer");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("SKILL.md"),
+            "---\nname: writer\ndescription: A writing Skill.\n---\nPRIVATE_SKILL_BODY_MARKER",
+        )
+        .unwrap();
+        fs::create_dir_all(package.join("references")).unwrap();
+        fs::write(
+            package.join("references/guide.md"),
+            "PRIVATE_RESOURCE_MARKER",
+        )
+        .unwrap();
+        let catalog = discover_skill_catalog(&cwd, None, None, usize::MAX);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let state = SkillTurnState::new(None);
+        state.use_catalog_for_next_turn(catalog);
+
+        let activation = AssistantReply::from_blocks(
+            vec![ContentBlock::ToolUse {
+                id: "activate-1".into(),
+                name: "activate_skill".into(),
+                input: serde_json::json!({
+                    "snapshot_id": snapshot_id,
+                    "name": "writer"
+                }),
+            }],
+            TokenUsage {
+                input_tokens: Some(8),
+                output_tokens: Some(4),
+            },
+            Some(StopReason::ToolUse),
+        );
+        let read_resource = AssistantReply::from_blocks(
+            vec![ContentBlock::ToolUse {
+                id: "resource-1".into(),
+                name: "read_skill_resource".into(),
+                input: serde_json::json!({
+                    "snapshot_id": snapshot_id,
+                    "name": "writer",
+                    "relative_path": "references/guide.md"
+                }),
+            }],
+            TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(4),
+            },
+            Some(StopReason::ToolUse),
+        );
+        let transport = BudgetTransport::new(vec![
+            Ok(activation),
+            Ok(read_resource),
+            Ok(AssistantReply::new("done")),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            ActivateSkillTool::spec(),
+            Box::new(ActivateSkillTool::new(state.clone())),
+        );
+        registry.register(
+            ReadSkillResourceTool::spec(),
+            Box::new(ReadSkillResourceTool::new(state.clone())),
+        );
+        let tool_loop = ToolLoop::new(transport, registry, None).with_skill_state(state);
+        let first_turn = tool_loop
+            .run(&[Message::user("Use the writer Skill")])
+            .expect("activation tool continuation completes");
+        let first_transcript = format!("{:?}", first_turn.transcript);
+        assert!(first_transcript.contains("activated for this turn"));
+        assert!(first_transcript.contains("loaded for Skill"));
+        assert!(!first_transcript.contains("PRIVATE_SKILL_BODY_MARKER"));
+        assert!(!first_transcript.contains("PRIVATE_RESOURCE_MARKER"));
+
+        let transport = tool_loop.transport;
+        let requests = transport.requests.borrow();
+        assert!(
+            !requests[0]
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("PRIVATE_SKILL_BODY_MARKER")
+        );
+        assert!(
+            requests[1]
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("PRIVATE_SKILL_BODY_MARKER")
+        );
+        assert!(
+            !requests[1]
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("PRIVATE_RESOURCE_MARKER")
+        );
+        assert!(
+            requests[2]
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("PRIVATE_SKILL_BODY_MARKER")
+        );
+        assert!(
+            requests[2]
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("PRIVATE_RESOURCE_MARKER")
+        );
+        drop(requests);
+
+        // A resumed process receives the old activation call and acknowledgement
+        // as ordinary history, but its new snapshot starts with no loaded body.
+        let fresh_catalog = discover_skill_catalog(&cwd, None, None, usize::MAX);
+        let fresh_snapshot_id = fresh_catalog.snapshot_id.clone();
+        assert_ne!(fresh_snapshot_id, snapshot_id);
+        let resumed_state = SkillTurnState::new(None);
+        resumed_state.use_catalog_for_next_turn(fresh_catalog);
+        let resumed_transport = BudgetTransport::new(vec![Ok(AssistantReply::new("fresh turn"))]);
+        let mut resumed_registry = ToolRegistry::new();
+        resumed_registry.register(
+            ActivateSkillTool::spec(),
+            Box::new(ActivateSkillTool::new(resumed_state.clone())),
+        );
+        let resumed_loop = ToolLoop::new(resumed_transport, resumed_registry, None)
+            .with_skill_state(resumed_state);
+        let mut resumed_history = vec![Message::user("Use the writer Skill")];
+        resumed_history.extend(first_turn.transcript);
+        resumed_history.push(Message::assistant(first_turn.reply.text));
+        resumed_history.push(Message::user("Continue this work"));
+        resumed_loop
+            .run(&resumed_history)
+            .expect("resumed turn completes");
+        let requests = resumed_loop.transport.requests.borrow();
+        let prompt = requests[0].system_prompt.as_deref().unwrap();
+        assert!(prompt.contains(&fresh_snapshot_id));
+        assert!(!prompt.contains("PRIVATE_SKILL_BODY_MARKER"));
+        let persisted_history = format!("{:?}", requests[0].messages);
+        assert!(!persisted_history.contains("PRIVATE_SKILL_BODY_MARKER"));
+
+        fs::remove_dir_all(tree).unwrap();
+    }
+
+    #[test]
+    fn activation_budget_overflow_is_a_bounded_tool_error_before_injection() {
+        use crate::skills::{SkillTurnState, discover_skill_catalog};
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tree = std::env::temp_dir().join(format!(
+            "leg-tool-skill-budget-{}-{stamp}",
+            std::process::id()
+        ));
+        let package = tree.join("workspace/.agents/skills/writer");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("SKILL.md"),
+            format!(
+                "---\nname: writer\ndescription: A writing Skill.\n---\nPRIVATE_BUDGET_BODY_MARKER{}",
+                "x".repeat(3_000)
+            ),
+        )
+        .unwrap();
+        let catalog = discover_skill_catalog(&tree.join("workspace"), None, None, usize::MAX);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let budget = context_budget(1_200, 200, 400);
+        let state = SkillTurnState::new(Some(budget));
+        state.use_catalog_for_next_turn(catalog);
+        let activation = AssistantReply::from_blocks(
+            vec![ContentBlock::ToolUse {
+                id: "activate-budget".into(),
+                name: "activate_skill".into(),
+                input: serde_json::json!({"snapshot_id": snapshot_id, "name": "writer"}),
+            }],
+            TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(150),
+            },
+            Some(StopReason::ToolUse),
+        );
+        let transport = BudgetTransport::new(vec![Ok(activation), Ok(AssistantReply::new("done"))]);
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            ActivateSkillTool::spec(),
+            Box::new(ActivateSkillTool::new(state.clone())),
+        );
+        let tool_loop = ToolLoop::new(transport, registry, None)
+            .with_context_budget(Some(budget))
+            .with_skill_state(state);
+        let outcome = tool_loop
+            .run(&[Message::user("Use writer")])
+            .expect("the bounded activation error is sent to the model");
+        let result = outcome
+            .transcript
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content,
+                    is_error: Some(true),
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .expect("activation overflow is represented as a tool error");
+        assert!(result.contains("remaining context budget"));
+        assert!(result.len() < 128);
+        assert!(!result.contains("PRIVATE_BUDGET_BODY_MARKER"));
+        let transport = tool_loop.transport;
+        let requests = transport.requests.borrow();
+        assert!(
+            !requests[1]
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("PRIVATE_BUDGET_BODY_MARKER")
+        );
+        fs::remove_dir_all(tree).unwrap();
     }
 
     #[test]

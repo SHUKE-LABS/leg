@@ -981,7 +981,12 @@ fn write_pretool_hook(cwd: &Path, body: &str) -> PathBuf {
 /// A `leg` command running in `cwd` against the fake provider at `base_url`.
 fn leg(cwd: &Path, base_url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_leg"));
+    // Avoid inheriting developer-installed Skills into prompt assertions.
+    let isolated_home = cwd.join(".test-home");
     cmd.current_dir(cwd)
+        .env("HOME", &isolated_home)
+        .env("USERPROFILE", &isolated_home)
+        .env("CODEX_HOME", isolated_home.join(".codex"))
         .env("LEG_HOOKS_CONFIG", empty_hooks_config_path())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
@@ -1273,7 +1278,17 @@ fn assert_chain_effects(cwd: &Path, requests: &Mutex<Vec<String>>) {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
     tools.sort_unstable();
-    assert_eq!(tools, ["bash", "edit", "read", "write"]);
+    assert_eq!(
+        tools,
+        [
+            "activate_skill",
+            "bash",
+            "edit",
+            "read",
+            "read_skill_resource",
+            "write"
+        ]
+    );
 
     for (round, (id, expect)) in [
         ("toolu_1", "TODO"),
@@ -1891,6 +1906,7 @@ fn exchange_new_session_resolves_store_directory_precedence() {
 
         let mut cmd = leg(&cwd, &base_url);
         cmd.env("HOME", &home)
+            .env("USERPROFILE", &home)
             .env("XDG_STATE_HOME", &xdg_state)
             .arg("exchange")
             .arg("--new-session")

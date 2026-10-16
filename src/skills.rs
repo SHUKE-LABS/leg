@@ -4,23 +4,40 @@
 //! and its private file identity stay on the in-process entry for later
 //! activation code; neither is serialized into the provider-facing catalog.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::config::instruction_directories;
+use crate::config::{ContextBudget, instruction_directories};
+use crate::context::{baseline_tokens, calibrated_tokens};
 
 pub const SKILLS_CATALOG_SCHEMA: &str = "leg.skills.catalog/v1";
 
 /// Maximum bytes read from one `SKILL.md` while discovering its metadata.
 /// The closing delimiter must occur within this prefix; the body is not read.
 pub const MAX_SKILL_FRONTMATTER_BYTES: usize = 16 * 1024;
+
+/// Maximum complete `SKILL.md` size loaded by explicit activation.
+pub const MAX_SKILL_FILE_BYTES: usize = 64 * 1024;
+
+/// Maximum size of one explicitly requested package resource.
+pub const MAX_SKILL_RESOURCE_BYTES: usize = 64 * 1024;
+
+/// Maximum combined instructions and resources loaded into one turn.
+pub const MAX_ACTIVE_SKILL_CONTENT_BYTES: usize = 256 * 1024;
+
+/// Maximum serialized catalog metadata included in a turn prompt.
+pub const SKILL_CATALOG_PROMPT_BUDGET_BYTES: usize = 16 * 1024;
+
+const TOOL_CONTEXT_FRAME_OVERHEAD_BYTES: usize = 256;
 
 static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -40,7 +57,7 @@ impl SkillCatalog {
         serde_json::to_string(self).expect("Skills catalog fields always serialize to JSON")
     }
 
-    #[allow(dead_code)] // Used by activation in #231.
+    #[allow(dead_code)] // Tests inspect private package bindings across snapshots.
     pub(crate) fn package_binding(&self, name: &str) -> Option<(&Path, &PackageIdentity)> {
         self.skills
             .iter()
@@ -69,7 +86,6 @@ pub struct SkillEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<BTreeMap<String, String>>,
     #[serde(skip)]
-    #[allow(dead_code)] // Used by activation in #231.
     binding: PackageBinding,
 }
 
@@ -79,6 +95,423 @@ pub struct SkillEntry {
 pub struct SkillWarning {
     pub code: String,
     pub message: String,
+}
+
+/// The mutable Skill selection for one provider turn. Tool handlers and the
+/// shared tool loop hold clones of the same handle; `begin_turn` replaces the
+/// snapshot and clears loaded instructions before every fresh user turn.
+#[derive(Clone, Default)]
+pub(crate) struct SkillTurnState(Rc<RefCell<SkillTurn>>);
+
+#[derive(Default)]
+struct SkillTurn {
+    catalog: Option<SkillCatalog>,
+    active: BTreeMap<String, ActiveSkill>,
+    context_budget: Option<ContextBudget>,
+    remaining_context_tokens: Option<u64>,
+    #[cfg(test)]
+    next_test_catalog: Option<SkillCatalog>,
+}
+
+#[derive(Clone, Default)]
+struct ActiveSkill {
+    body: String,
+    resources: BTreeMap<String, String>,
+}
+
+impl SkillTurnState {
+    pub(crate) fn new(context_budget: Option<ContextBudget>) -> Self {
+        Self(Rc::new(RefCell::new(SkillTurn {
+            context_budget,
+            ..SkillTurn::default()
+        })))
+    }
+
+    /// Starts a fresh snapshot for a user turn. Session history may contain an
+    /// earlier activation tool call, but that call never restores its body.
+    pub(crate) fn begin_turn(&self) {
+        #[cfg(test)]
+        let test_catalog = self.0.borrow_mut().next_test_catalog.take();
+        #[cfg(test)]
+        let catalog = test_catalog
+            .unwrap_or_else(|| discover_skill_catalog_from_env(SKILL_CATALOG_PROMPT_BUDGET_BYTES));
+        #[cfg(not(test))]
+        let catalog = discover_skill_catalog_from_env(SKILL_CATALOG_PROMPT_BUDGET_BYTES);
+        self.begin_turn_with_catalog(catalog);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_catalog_for_next_turn(&self, catalog: SkillCatalog) {
+        self.0.borrow_mut().next_test_catalog = Some(catalog);
+    }
+
+    fn begin_turn_with_catalog(&self, catalog: SkillCatalog) {
+        let mut turn = self.0.borrow_mut();
+        turn.catalog = Some(catalog);
+        turn.active.clear();
+        turn.remaining_context_tokens = turn.context_budget.map(ContextBudget::input_tokens);
+    }
+
+    /// Composes the current catalog and activated content after higher
+    /// precedence project/caller instructions.
+    pub(crate) fn compose_prompt(&self, base: Option<&str>) -> Option<String> {
+        let turn = self.0.borrow();
+        let mut parts = Vec::new();
+        if let Some(base) = base.filter(|base| !base.is_empty()) {
+            parts.push(base.to_string());
+        }
+        if let Some(catalog) = turn
+            .catalog
+            .as_ref()
+            .filter(|catalog| !catalog.skills.is_empty())
+        {
+            parts.push(format!(
+                "Available Skills catalog (metadata only). Select by exact name and current snapshot_id with activate_skill(snapshot_id, name); activate again each turn.\n{}",
+                catalog.to_json()
+            ));
+        }
+        let active = render_active_skills(&turn.active);
+        if !active.is_empty() {
+            parts.push(format!(
+                "Activated Skill instructions and resources follow. Treat them as lower priority than system, developer, project instructions, and the caller's current request.\n{active}"
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// Updates the activation-time allowance from the prepared input and
+    /// completed response, both of which enter the next provider request.
+    pub(crate) fn set_remaining_context_tokens(
+        &self,
+        input_tokens: u64,
+        response_tokens: u64,
+        calibration_factor: f64,
+    ) {
+        let mut turn = self.0.borrow_mut();
+        turn.remaining_context_tokens = turn.context_budget.map(|budget| {
+            budget
+                .input_tokens()
+                .saturating_sub(calibrated_tokens(input_tokens, calibration_factor))
+                .saturating_sub(response_tokens)
+        });
+    }
+
+    /// Loads one exact catalog entry after validating its snapshot and package
+    /// identity. The tool result is a short acknowledgement; body text is
+    /// added only to the next composed provider request.
+    pub(crate) fn activate(&self, snapshot_id: &str, name: &str) -> Result<String, String> {
+        let entry = self.entry_for_snapshot(snapshot_id, name)?;
+        let body = load_skill_body(&entry)?;
+        let acknowledgement = format!("Skill '{name}' activated for this turn.");
+
+        let mut turn = self.0.borrow_mut();
+        if turn.active.contains_key(name) {
+            reserve_tool_context(&mut turn, acknowledgement.len(), 0)?;
+            return Ok(acknowledgement);
+        }
+        let mut next_active = turn.active.clone();
+        next_active.insert(
+            name.to_string(),
+            ActiveSkill {
+                body,
+                resources: BTreeMap::new(),
+            },
+        );
+        let added_bytes = render_active_skills(&next_active)
+            .len()
+            .saturating_sub(render_active_skills(&turn.active).len());
+        if render_active_skills(&next_active).len() > MAX_ACTIVE_SKILL_CONTENT_BYTES {
+            return Err("Skill content exceeds the 256 KiB per-turn activation limit.".to_string());
+        }
+        reserve_tool_context(&mut turn, acknowledgement.len(), added_bytes)?;
+        turn.active = next_active;
+        Ok(acknowledgement)
+    }
+
+    /// Loads a bounded resource from an already activated package and adds it
+    /// to the next provider request without returning its contents.
+    pub(crate) fn read_resource(
+        &self,
+        snapshot_id: &str,
+        name: &str,
+        relative_path: &str,
+    ) -> Result<String, String> {
+        let entry = self.entry_for_snapshot(snapshot_id, name)?;
+        {
+            let turn = self.0.borrow();
+            if !turn.active.contains_key(name) {
+                return Err(
+                    "Skill resource unavailable: activate the Skill in this turn first."
+                        .to_string(),
+                );
+            }
+        }
+        let normalized_path = normalize_resource_path(relative_path)?;
+        let content = load_skill_resource(&entry, &normalized_path)?;
+        let acknowledgement = format!("A resource was loaded for Skill '{name}' this turn.");
+
+        let mut turn = self.0.borrow_mut();
+        let active = turn.active.get(name).ok_or_else(|| {
+            "Skill resource unavailable: activate the Skill in this turn first.".to_string()
+        })?;
+        if active.resources.contains_key(&normalized_path) {
+            reserve_tool_context(&mut turn, acknowledgement.len(), 0)?;
+            return Ok(acknowledgement);
+        }
+        let mut next_active = turn.active.clone();
+        next_active
+            .get_mut(name)
+            .expect("active Skill checked above")
+            .resources
+            .insert(normalized_path, content);
+        let added_bytes = render_active_skills(&next_active)
+            .len()
+            .saturating_sub(render_active_skills(&turn.active).len());
+        if render_active_skills(&next_active).len() > MAX_ACTIVE_SKILL_CONTENT_BYTES {
+            return Err("Skill content exceeds the 256 KiB per-turn activation limit.".to_string());
+        }
+        reserve_tool_context(&mut turn, acknowledgement.len(), added_bytes)?;
+        turn.active = next_active;
+        Ok(acknowledgement)
+    }
+
+    fn entry_for_snapshot(&self, snapshot_id: &str, name: &str) -> Result<SkillEntry, String> {
+        let turn = self.0.borrow();
+        let catalog = turn
+            .catalog
+            .as_ref()
+            .ok_or_else(|| "Skill unavailable: no active catalog snapshot.".to_string())?;
+        if catalog.snapshot_id != snapshot_id {
+            return Err(
+                "Skill unavailable: snapshot is stale; select from the current catalog."
+                    .to_string(),
+            );
+        }
+        catalog
+            .skills
+            .iter()
+            .find(|entry| entry.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                "Skill unavailable: name is missing or not in the current catalog.".to_string()
+            })
+    }
+}
+
+fn reserve_tool_context(
+    turn: &mut SkillTurn,
+    acknowledgement_bytes: usize,
+    added_content_bytes: usize,
+) -> Result<(), String> {
+    let Some(remaining) = turn.remaining_context_tokens else {
+        return Ok(());
+    };
+    let added_bytes = acknowledgement_bytes
+        .saturating_add(added_content_bytes)
+        .saturating_add(TOOL_CONTEXT_FRAME_OVERHEAD_BYTES);
+    let required = baseline_tokens(added_bytes);
+    if required > remaining {
+        return Err("Skill content exceeds the remaining context budget.".to_string());
+    }
+    turn.remaining_context_tokens = Some(remaining.saturating_sub(required));
+    Ok(())
+}
+
+fn render_active_skills(active: &BTreeMap<String, ActiveSkill>) -> String {
+    let mut output = String::new();
+    for (name, skill) in active {
+        output.push_str("\n## Skill: ");
+        output.push_str(name);
+        output.push('\n');
+        output.push_str(&skill.body);
+        for (path, content) in &skill.resources {
+            output.push_str("\n\n### Resource: ");
+            output.push_str(path);
+            output.push('\n');
+            output.push_str(content);
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn load_skill_body(entry: &SkillEntry) -> Result<String, String> {
+    let identity = &entry.binding.identity;
+    let package_path = fs::canonicalize(&identity.canonical_package_path)
+        .map_err(|_| "Skill unavailable: package changed or cannot be read.".to_string())?;
+    let skill_file_path = fs::canonicalize(&entry.binding.skill_file_path)
+        .map_err(|_| "Skill unavailable: package changed or cannot be read.".to_string())?;
+    if package_path != identity.canonical_package_path
+        || skill_file_path != identity.canonical_skill_file_path
+        || !is_within_root(&package_path, &skill_file_path)
+    {
+        return Err("Skill unavailable: package changed after catalog discovery.".to_string());
+    }
+
+    let mut file = File::open(&skill_file_path)
+        .map_err(|_| "Skill unavailable: package changed or cannot be read.".to_string())?;
+    let before = file
+        .metadata()
+        .map_err(|_| "Skill unavailable: package changed or cannot be read.".to_string())?;
+    if !before.is_file() || before.len() > MAX_SKILL_FILE_BYTES as u64 {
+        return Err("Skill unavailable: SKILL.md exceeds the 64 KiB activation limit.".to_string());
+    }
+    let (metadata, frontmatter) = read_skill_frontmatter(&mut file)
+        .map_err(|_| "Skill unavailable: SKILL.md is malformed or unavailable.".to_string())?;
+    if metadata.name != entry.name || frontmatter != identity.frontmatter {
+        return Err("Skill unavailable: package changed after catalog discovery.".to_string());
+    }
+    let mut body = String::new();
+    file.by_ref()
+        .take((MAX_SKILL_FILE_BYTES + 1) as u64)
+        .read_to_string(&mut body)
+        .map_err(|_| "Skill unavailable: SKILL.md is malformed or unavailable.".to_string())?;
+    let after = file
+        .metadata()
+        .map_err(|_| "Skill unavailable: package changed or cannot be read.".to_string())?;
+    if body.len().saturating_add(frontmatter.len()) > MAX_SKILL_FILE_BYTES
+        || !same_file_version(&before, &after)
+        || before.len() != identity.file_len
+        || modified_nanos(&before) != identity.modified_nanos
+    {
+        return Err("Skill unavailable: package changed after catalog discovery.".to_string());
+    }
+    Ok(body)
+}
+
+fn normalize_resource_path(relative_path: &str) -> Result<String, String> {
+    if relative_path.is_empty()
+        || relative_path.len() > 512
+        || relative_path.starts_with('/')
+        || relative_path.starts_with('\\')
+        || relative_path.contains('\\')
+        || relative_path.chars().any(char::is_control)
+    {
+        return Err(
+            "Skill resource rejected: expected a normalized relative path of at most 512 bytes."
+                .to_string(),
+        );
+    }
+    let path = Path::new(relative_path);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            ) || matches!(component, Component::CurDir)
+        })
+        || relative_path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+        || relative_path
+            .split('/')
+            .next()
+            .is_some_and(|component| component.as_bytes().get(1) == Some(&b':'))
+    {
+        return Err(
+            "Skill resource rejected: expected a normalized relative path of at most 512 bytes."
+                .to_string(),
+        );
+    }
+    Ok(relative_path.to_string())
+}
+
+fn load_skill_resource(entry: &SkillEntry, relative_path: &str) -> Result<String, String> {
+    validate_package_identity(entry)?;
+    let package_path =
+        fs::canonicalize(&entry.binding.identity.canonical_package_path).map_err(|_| {
+            "Skill resource unavailable: package changed or cannot be read.".to_string()
+        })?;
+    if package_path != entry.binding.identity.canonical_package_path {
+        return Err(
+            "Skill resource unavailable: package changed after catalog discovery.".to_string(),
+        );
+    }
+    let candidate = package_path.join(relative_path);
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
+    if !is_within_root(&package_path, &canonical) {
+        return Err("Skill resource rejected: path leaves the selected package.".to_string());
+    }
+    let path_metadata = fs::metadata(&canonical)
+        .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
+    if !path_metadata.is_file() {
+        return Err("Skill resource rejected: path is not a regular file.".to_string());
+    }
+    let mut file = File::open(&canonical)
+        .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
+    let before = file
+        .metadata()
+        .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
+    if !before.is_file() {
+        return Err("Skill resource rejected: path is not a regular file.".to_string());
+    }
+    if before.len() > MAX_SKILL_RESOURCE_BYTES as u64 {
+        return Err("Skill resource rejected: file exceeds the 64 KiB resource limit.".to_string());
+    }
+    let mut content = Vec::new();
+    file.by_ref()
+        .take((MAX_SKILL_RESOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut content)
+        .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
+    let after = file
+        .metadata()
+        .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
+    if content.len() > MAX_SKILL_RESOURCE_BYTES || !same_file_version(&before, &after) {
+        return Err(
+            "Skill resource rejected: file changed or exceeds the 64 KiB resource limit."
+                .to_string(),
+        );
+    }
+    String::from_utf8(content)
+        .map_err(|_| "Skill resource rejected: file is not valid UTF-8 text.".to_string())
+}
+
+fn validate_package_identity(entry: &SkillEntry) -> Result<(), String> {
+    let identity = &entry.binding.identity;
+    let package_path = fs::canonicalize(&identity.canonical_package_path).map_err(|_| {
+        "Skill resource unavailable: package changed or cannot be read.".to_string()
+    })?;
+    let skill_file_path = fs::canonicalize(&entry.binding.skill_file_path).map_err(|_| {
+        "Skill resource unavailable: package changed or cannot be read.".to_string()
+    })?;
+    if package_path != identity.canonical_package_path
+        || skill_file_path != identity.canonical_skill_file_path
+        || !is_within_root(&package_path, &skill_file_path)
+    {
+        return Err(
+            "Skill resource unavailable: package changed after catalog discovery.".to_string(),
+        );
+    }
+    let mut file = File::open(&skill_file_path).map_err(|_| {
+        "Skill resource unavailable: package changed or cannot be read.".to_string()
+    })?;
+    let before = file.metadata().map_err(|_| {
+        "Skill resource unavailable: package changed or cannot be read.".to_string()
+    })?;
+    if !before.is_file()
+        || before.len() != identity.file_len
+        || modified_nanos(&before) != identity.modified_nanos
+    {
+        return Err(
+            "Skill resource unavailable: package changed after catalog discovery.".to_string(),
+        );
+    }
+    let (metadata, frontmatter) = read_skill_frontmatter(&mut file).map_err(|_| {
+        "Skill resource unavailable: package is malformed or unreadable.".to_string()
+    })?;
+    let after = file.metadata().map_err(|_| {
+        "Skill resource unavailable: package changed or cannot be read.".to_string()
+    })?;
+    if metadata.name != entry.name
+        || frontmatter != identity.frontmatter
+        || !same_file_version(&before, &after)
+    {
+        return Err(
+            "Skill resource unavailable: package changed after catalog discovery.".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Discover the documented project and user roots and build one catalog.
@@ -345,15 +778,13 @@ struct SkillMetadata {
 
 #[derive(Clone, Debug)]
 struct PackageBinding {
-    #[allow(dead_code)] // Used by activation in #231.
     skill_file_path: PathBuf,
-    #[allow(dead_code)] // Used by activation in #231.
     identity: PackageIdentity,
 }
 
-/// Private change detector retained for a future activation call. Discovery
-/// combines the canonical path, frontmatter bytes, size, and modification
-/// time without reading the Markdown body.
+/// Private change detector retained for activation. Discovery combines the
+/// canonical path, frontmatter bytes, size, and modification time without
+/// reading the Markdown body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PackageIdentity {
     canonical_package_path: PathBuf,
@@ -1587,6 +2018,342 @@ mod tests {
                 .to_json()
                 .contains("This body is loaded only after explicit activation")
         );
+    }
+
+    #[test]
+    fn empty_skill_catalog_preserves_the_base_prompt_exactly() {
+        let tree = TempTree::new("empty-catalog-prompt");
+        let cwd = tree.path().join("workspace");
+        let catalog = discover(&cwd, None, None);
+        assert!(catalog.skills.is_empty());
+
+        let state = SkillTurnState::new(None);
+        state.begin_turn_with_catalog(catalog);
+
+        assert_eq!(
+            state.compose_prompt(Some("PROJECT_POLICY")),
+            Some("PROJECT_POLICY".to_string())
+        );
+        assert_eq!(state.compose_prompt(None), None);
+    }
+
+    #[test]
+    fn activation_and_resource_content_only_enter_the_composed_prompt() {
+        let tree = TempTree::new("activation");
+        let cwd = tree.path().join("workspace");
+        let package = skill(
+            &cwd.join(".agents/skills"),
+            "writer",
+            "PRIVATE_SKILL_BODY_MARKER",
+        );
+        fs::create_dir_all(package.join("references")).unwrap();
+        fs::write(
+            package.join("references/guide.md"),
+            "PRIVATE_RESOURCE_MARKER",
+        )
+        .unwrap();
+        let catalog = discover(&cwd, None, None);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let state = SkillTurnState::new(None);
+        state.begin_turn_with_catalog(catalog);
+
+        let activation = state
+            .activate(&snapshot_id, "writer")
+            .expect("activate exact catalog entry");
+        assert!(activation.contains("activated"));
+        assert!(!activation.contains("PRIVATE_SKILL_BODY_MARKER"));
+        let repeated = state
+            .activate(&snapshot_id, "writer")
+            .expect("duplicate activation remains idempotent");
+        assert!(repeated.contains("activated"));
+
+        let resource = state
+            .read_resource(&snapshot_id, "writer", "references/guide.md")
+            .expect("read selected package resource");
+        assert!(resource.contains("loaded"));
+        assert!(!resource.contains("PRIVATE_RESOURCE_MARKER"));
+
+        let prompt = state.compose_prompt(Some("PROJECT_POLICY")).unwrap();
+        assert!(prompt.contains("PROJECT_POLICY"));
+        assert!(prompt.contains("PRIVATE_SKILL_BODY_MARKER"));
+        assert!(prompt.contains("PRIVATE_RESOURCE_MARKER"));
+    }
+
+    #[test]
+    fn activation_rejects_unknown_stale_changed_and_oversized_packages() {
+        let tree = TempTree::new("activation-errors");
+        let cwd = tree.path().join("workspace");
+        let root = cwd.join(".agents/skills");
+        let changed_package = skill(&root, "changed", "before");
+        skill(&root, "oversized", &"x".repeat(MAX_SKILL_FILE_BYTES));
+        let malformed_body = skill(&root, "bad-body", "");
+        let mut malformed_body_bytes =
+            b"---\nname: bad-body\ndescription: A malformed body skill.\n---\n".to_vec();
+        malformed_body_bytes.push(0xff);
+        fs::write(malformed_body.join("SKILL.md"), malformed_body_bytes).unwrap();
+        skill_with_frontmatter(
+            &root,
+            "malformed",
+            "---\nname: malformed\ndescription: [bad\n---\nbody",
+        );
+        let catalog = discover(&cwd, None, None);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let state = SkillTurnState::new(None);
+        state.begin_turn_with_catalog(catalog.clone());
+
+        assert!(
+            state
+                .activate(&snapshot_id, "missing")
+                .unwrap_err()
+                .contains("not in the current catalog")
+        );
+        assert!(
+            state
+                .activate(&snapshot_id, "malformed")
+                .unwrap_err()
+                .contains("not in the current catalog")
+        );
+        assert!(
+            state
+                .activate(&snapshot_id, "oversized")
+                .unwrap_err()
+                .contains("64 KiB")
+        );
+        assert!(
+            state
+                .activate(&snapshot_id, "bad-body")
+                .unwrap_err()
+                .contains("malformed or unavailable")
+        );
+
+        fs::write(
+            changed_package.join("SKILL.md"),
+            "---\nname: changed\ndescription: A useful changed skill.\n---\nafter",
+        )
+        .unwrap();
+        assert!(
+            state
+                .activate(&snapshot_id, "changed")
+                .unwrap_err()
+                .contains("changed after catalog discovery")
+        );
+
+        let refreshed = discover(&cwd, None, None);
+        state.begin_turn_with_catalog(refreshed.clone());
+        assert!(
+            state
+                .activate(&snapshot_id, "changed")
+                .unwrap_err()
+                .contains("snapshot is stale")
+        );
+        assert!(!state.compose_prompt(None).unwrap().contains("after"));
+    }
+
+    #[test]
+    fn resource_reads_reject_missing_oversized_traversal_and_symlink_escape() {
+        let tree = TempTree::new("resource-errors");
+        let cwd = tree.path().join("workspace");
+        let package = skill(
+            &cwd.join(".agents/skills"),
+            "reader",
+            "PRIVATE_SKILL_BODY_MARKER",
+        );
+        fs::create_dir_all(package.join("references")).unwrap();
+        fs::write(
+            package.join("references/large.md"),
+            "x".repeat(MAX_SKILL_RESOURCE_BYTES + 1),
+        )
+        .unwrap();
+        fs::create_dir_all(package.join("references/directory")).unwrap();
+        let outside = tree.path().join("outside.md");
+        fs::write(&outside, "PRIVATE_OUTSIDE_MARKER").unwrap();
+        symlink_file(&outside, &package.join("references/escape.md"));
+
+        let catalog = discover(&cwd, None, None);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let state = SkillTurnState::new(None);
+        state.begin_turn_with_catalog(catalog);
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "references/large.md")
+                .unwrap_err()
+                .contains("activate the Skill in this turn first")
+        );
+        state.activate(&snapshot_id, "reader").unwrap();
+
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "missing.md")
+                .unwrap_err()
+                .contains("missing or unreadable")
+        );
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "references/large.md")
+                .unwrap_err()
+                .contains("64 KiB")
+        );
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "references/directory")
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "../outside.md")
+                .unwrap_err()
+                .contains("normalized relative path")
+        );
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "/outside.md")
+                .unwrap_err()
+                .contains("normalized relative path")
+        );
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "C:/outside.md")
+                .unwrap_err()
+                .contains("normalized relative path")
+        );
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "references/escape.md")
+                .unwrap_err()
+                .contains("leaves the selected package")
+        );
+        assert!(
+            !state
+                .compose_prompt(None)
+                .unwrap()
+                .contains("PRIVATE_OUTSIDE_MARKER")
+        );
+        fs::write(
+            package.join("SKILL.md"),
+            "---\nname: reader\ndescription: A useful reader skill.\n---\nchanged after discovery",
+        )
+        .unwrap();
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "references/large.md")
+                .unwrap_err()
+                .contains("package changed after catalog discovery")
+        );
+    }
+
+    #[test]
+    fn activation_fails_at_call_time_when_content_exceeds_remaining_budget() {
+        let tree = TempTree::new("activation-budget");
+        let cwd = tree.path().join("workspace");
+        skill(
+            &cwd.join(".agents/skills"),
+            "budgeted",
+            &"large content ".repeat(50),
+        );
+        let catalog = discover(&cwd, None, None);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let state = SkillTurnState::new(Some(ContextBudget {
+            window_tokens: 100,
+            reserve_tokens: 50,
+            keep_recent_tokens: 10,
+        }));
+        state.begin_turn_with_catalog(catalog);
+        state.set_remaining_context_tokens(50, 0, 1.0);
+
+        let error = state
+            .activate(&snapshot_id, "budgeted")
+            .expect_err("body does not fit the remaining input allowance");
+        assert!(error.contains("remaining context budget"));
+        assert!(
+            !state
+                .compose_prompt(None)
+                .unwrap()
+                .contains("large content")
+        );
+    }
+
+    #[test]
+    fn resource_fails_at_call_time_when_it_exceeds_remaining_budget() {
+        let tree = TempTree::new("resource-budget");
+        let cwd = tree.path().join("workspace");
+        let package = skill(
+            &cwd.join(".agents/skills"),
+            "budgeted",
+            "small instructions",
+        );
+        fs::create_dir_all(package.join("references")).unwrap();
+        fs::write(
+            package.join("references/guide.md"),
+            "PRIVATE_RESOURCE_BUDGET_MARKER",
+        )
+        .unwrap();
+        let catalog = discover(&cwd, None, None);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let state = SkillTurnState::new(Some(ContextBudget {
+            window_tokens: 1000,
+            reserve_tokens: 100,
+            keep_recent_tokens: 100,
+        }));
+        state.begin_turn_with_catalog(catalog);
+        state.activate(&snapshot_id, "budgeted").unwrap();
+        state.set_remaining_context_tokens(900, 0, 1.0);
+
+        let error = state
+            .read_resource(&snapshot_id, "budgeted", "references/guide.md")
+            .expect_err("resource does not fit the remaining input allowance");
+        assert!(error.contains("remaining context budget"));
+        assert!(
+            !state
+                .compose_prompt(None)
+                .unwrap()
+                .contains("PRIVATE_RESOURCE_BUDGET_MARKER")
+        );
+    }
+
+    #[test]
+    fn combined_active_skill_content_has_a_per_turn_byte_limit() {
+        let tree = TempTree::new("combined-active-limit");
+        let cwd = tree.path().join("workspace");
+        let package = skill(&cwd.join(".agents/skills"), "large", "small body");
+        let references = package.join("references");
+        fs::create_dir_all(&references).unwrap();
+        for index in 0..3 {
+            fs::write(
+                references.join(format!("resource-{index}.md")),
+                "x".repeat(MAX_SKILL_RESOURCE_BYTES),
+            )
+            .unwrap();
+        }
+        let fourth_marker = "PRIVATE_FOURTH_RESOURCE_MARKER";
+        fs::write(
+            references.join("resource-3.md"),
+            format!(
+                "{fourth_marker}{}",
+                "x".repeat(MAX_SKILL_RESOURCE_BYTES - fourth_marker.len())
+            ),
+        )
+        .unwrap();
+        let catalog = discover(&cwd, None, None);
+        let snapshot_id = catalog.snapshot_id.clone();
+        let state = SkillTurnState::new(None);
+        state.begin_turn_with_catalog(catalog);
+        state.activate(&snapshot_id, "large").unwrap();
+        for index in 0..3 {
+            state
+                .read_resource(
+                    &snapshot_id,
+                    "large",
+                    &format!("references/resource-{index}.md"),
+                )
+                .expect("combined resources remain below the per-turn cap");
+        }
+
+        let error = state
+            .read_resource(&snapshot_id, "large", "references/resource-3.md")
+            .expect_err("four complete resources exceed the per-turn cap");
+        assert!(error.contains("256 KiB per-turn activation limit"));
+        assert!(!state.compose_prompt(None).unwrap().contains(fourth_marker));
     }
 
     #[test]

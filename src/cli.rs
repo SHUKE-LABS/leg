@@ -1607,17 +1607,22 @@ const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]"
 fn build_transport(config: LegConfig) -> ToolLoop<ProviderTransport> {
     let max_tool_rounds = config.max_tool_rounds;
     let context_budget = config.context_budget;
-    let registry = build_tool_registry(&config);
+    let skill_state = crate::skills::SkillTurnState::new(context_budget);
+    let registry = build_tool_registry(&config, skill_state.clone());
     let client = ProviderTransport::from_config(config, registry.specs());
     ToolLoop::new(client, registry, max_tool_rounds)
         .with_context_budget(context_budget)
+        .with_skill_state(skill_state)
         .with_hook_observer(|outcome| report_hook_failures(std::slice::from_ref(outcome)))
 }
 
 /// Registers the synchronous tools. `read` and `write` share one read-set
 /// that lives for this process: `read` records into it and `write` gates
 /// overwrites on it.
-fn build_tool_registry(config: &LegConfig) -> ToolRegistry {
+fn build_tool_registry(
+    config: &LegConfig,
+    skill_state: crate::skills::SkillTurnState,
+) -> ToolRegistry {
     let reads = ReadSet::new();
     let mut registry =
         ToolRegistry::new().with_hook_config(config.hooks.clone(), config.pre_tool_hook.clone());
@@ -1629,6 +1634,14 @@ fn build_tool_registry(config: &LegConfig) -> ToolRegistry {
         Box::new(BashTool::with_default_timeout_secs(
             config.bash_timeout_secs,
         )),
+    );
+    registry.register(
+        crate::tools::ActivateSkillTool::spec(),
+        Box::new(crate::tools::ActivateSkillTool::new(skill_state.clone())),
+    );
+    registry.register(
+        crate::tools::ReadSkillResourceTool::spec(),
+        Box::new(crate::tools::ReadSkillResourceTool::new(skill_state)),
     );
     registry
 }
