@@ -2825,7 +2825,7 @@ pub(crate) mod tests {
                     .borrow_mut()
                     .push((outcome.event, outcome.hook_id.clone()));
             });
-            let mut observe = |_| {};
+            let mut observe = |_: ToolEvent<'_>| {};
             let mut compaction = |_| {};
 
             let outcome = tool_loop
