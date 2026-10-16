@@ -54,6 +54,11 @@ an error and does not fall through.
 created. A configuration error fails commands that construct `LegConfig`;
 commands that do not construct it do not read hook configuration.
 
+Each process invocation resolves the configuration again. A resumed
+`exchange` therefore uses the file selected for that invocation and does not
+restore hook definitions from the session trail. Hook commands and inherited
+environment values are not written to the trail.
+
 ## Events and selection
 
 `event` must be one of these exact names:

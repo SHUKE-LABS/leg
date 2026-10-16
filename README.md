@@ -213,6 +213,25 @@ current working directory and does not walk upward to the Git root. Project
 hook files are trusted as-is. Hook commands run with the operating-system
 permissions of the user running leg.
 
+For example, this project hook runs before each turn:
+
+```json
+{
+  "version": 1,
+  "hooks": [
+    { "id": "audit-turn", "event": "TurnStart", "command": "hooks/audit-turn" }
+  ]
+}
+```
+
+Hooks receive one JSON payload on stdin. Turn and tool payloads include the
+event name and working directory; session turns also include their session ID
+and turn index. A `TurnStart` payload looks like:
+
+```json
+{"hook_event_name":"TurnStart","cwd":"/workspace/project","session_id":"sess-123","turn_index":2,"prompt":"Review the change"}
+```
+
 `LEG_PRETOOL_HOOK` remains usable as a single pre-tool executable. It receives
 the `PreToolUse` JSON payload on stdin, including `hook_event_name`, `cwd`,
 `tool_name`, and `tool_input`; `session_id` and `turn_index` are included when
