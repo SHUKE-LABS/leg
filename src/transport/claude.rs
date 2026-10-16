@@ -1017,6 +1017,7 @@ mod tests {
             max_tool_rounds: None,
             system_prompt: None,
             pre_tool_hook: None,
+            hooks: crate::hooks::HookSet::default(),
         }
     }
 

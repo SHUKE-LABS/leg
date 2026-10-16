@@ -14,6 +14,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::error::{LegError, Result};
+use crate::hooks::{HookEvent, HookSet, SelectedHook, discover_hook_config_paths, load_hook_set};
 
 /// Default base URL for the Claude-compatible Messages API.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -144,6 +145,8 @@ pub struct LegConfig {
     /// Optional executable run before every tool dispatch. From
     /// `LEG_PRETOOL_HOOK`; unset or blank disables the hook.
     pub pre_tool_hook: Option<PathBuf>,
+    /// Declarative hooks loaded from the highest-precedence v1 configuration.
+    pub hooks: HookSet,
 }
 
 impl LegConfig {
@@ -158,13 +161,23 @@ impl LegConfig {
 
     /// Loads configuration from the process environment.
     pub fn from_env() -> Result<Self> {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        let mut config = Self::from_lookup(process_env_lookup)?;
+        let cwd = std::env::current_dir().map_err(|error| {
+            LegError::Config(format!(
+                "could not determine current directory for hooks config: {error}"
+            ))
+        })?;
+        let paths = discover_hook_config_paths(&cwd, process_env_lookup);
+        config.hooks = load_hook_set(&paths, read_hook_config_file)?;
+        Ok(config)
     }
 
     /// Loads configuration from an arbitrary key lookup.
     ///
     /// `lookup` returns the value for a variable name, or `None` when it is
-    /// unset. This is the testable core behind [`LegConfig::from_env`].
+    /// unset. This is the pure environment-parsing core behind
+    /// [`LegConfig::from_env`]; hook file discovery is tested through the
+    /// injectable loader in [`crate::hooks`].
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let provider = parse_provider(non_empty(lookup("LEG_PROVIDER")))?;
         let (credential, base_url, default_model) = match provider {
@@ -346,8 +359,37 @@ impl LegConfig {
             max_tool_rounds,
             system_prompt,
             pre_tool_hook,
+            hooks: HookSet::default(),
         })
     }
+
+    /// Selects the hooks matching an event and optional tool name.
+    ///
+    /// When selecting `PreToolUse`, the legacy `LEG_PRETOOL_HOOK` candidate
+    /// comes first, followed by matching declarative entries in file order.
+    pub fn select_hooks(&self, event: HookEvent, tool: Option<&str>) -> Vec<SelectedHook<'_>> {
+        let mut selected = Vec::new();
+        if event == HookEvent::PreToolUse
+            && let Some(path) = self.pre_tool_hook.as_deref()
+        {
+            selected.push(SelectedHook::LegacyPreTool(path));
+        }
+        selected.extend(
+            self.hooks
+                .select(event, tool)
+                .into_iter()
+                .map(SelectedHook::Declarative),
+        );
+        selected
+    }
+}
+
+fn process_env_lookup(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+fn read_hook_config_file(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
 }
 
 fn parse_optional_positive_u64(name: &str, raw: Option<String>) -> Result<Option<u64>> {
