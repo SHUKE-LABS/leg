@@ -129,6 +129,127 @@ fn spawn_sse_sequence_server(rounds: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
     (format!("http://{addr}"), requests)
 }
 
+enum SkillServerStep {
+    Activate,
+    ReadResource,
+    Text(&'static str),
+}
+
+enum SkillJsonServerStep {
+    Activate,
+    Text(&'static str),
+}
+
+fn spawn_skill_json_server(steps: Vec<SkillJsonServerStep>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Skill server");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+
+    thread::spawn(move || {
+        for (index, step) in steps.into_iter().enumerate() {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let Some(body) = read_request_body(&mut stream) else {
+                return;
+            };
+            captured.lock().unwrap().push(body.clone());
+            let request: Value = serde_json::from_str(&body).expect("provider request is JSON");
+            let reply = match step {
+                SkillJsonServerStep::Activate => serde_json::json!({
+                    "content": [{
+                        "type": "tool_use",
+                        "id": format!("skill-activate-{index}"),
+                        "name": "activate_skill",
+                        "input": {
+                            "snapshot_id": catalog_snapshot_id(
+                                request["system"].as_str().expect("Anthropic system prompt")
+                            ),
+                            "name": "writer"
+                        }
+                    }],
+                    "stop_reason": "tool_use"
+                }),
+                SkillJsonServerStep::Text(text) => serde_json::json!({
+                    "content": [{"type": "text", "text": text}],
+                    "stop_reason": "end_turn"
+                }),
+            };
+            let response_body = serde_json::to_string(&reply).expect("serialize provider reply");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (format!("http://{addr}"), requests)
+}
+
+/// Serves Skill tool calls using the snapshot id from the actual provider
+/// request, so these cases exercise the complete CLI-to-provider path.
+fn spawn_skill_sse_server(
+    provider: &'static str,
+    steps: Vec<SkillServerStep>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Skill server");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+
+    thread::spawn(move || {
+        for (index, step) in steps.into_iter().enumerate() {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let Some(body) = read_request_body(&mut stream) else {
+                return;
+            };
+            captured.lock().unwrap().push(body.clone());
+            let request: Value = serde_json::from_str(&body).expect("provider request is JSON");
+            let system_prompt = provider_system_prompt(provider, &request);
+            let snapshot_line = system_prompt
+                .split_once("Available Skills catalog (metadata only). Select by exact name and current snapshot_id with activate_skill(snapshot_id, name); activate again each turn.\n")
+                .map(|(_, rest)| rest.lines().next().expect("catalog JSON line"))
+                .expect("catalog in system prompt");
+            let snapshot: Value = serde_json::from_str(snapshot_line).expect("catalog is JSON");
+            let snapshot_id = snapshot["snapshot_id"]
+                .as_str()
+                .expect("catalog snapshot id");
+            let reply = match step {
+                SkillServerStep::Activate => streaming_tool_reply(
+                    provider,
+                    &format!("skill-activate-{index}"),
+                    "activate_skill",
+                    &serde_json::json!({"snapshot_id": snapshot_id, "name": "writer"}),
+                ),
+                SkillServerStep::ReadResource => streaming_tool_reply(
+                    provider,
+                    &format!("skill-resource-{index}"),
+                    "read_skill_resource",
+                    &serde_json::json!({
+                        "snapshot_id": snapshot_id,
+                        "name": "writer",
+                        "relative_path": "references/guide.md"
+                    }),
+                ),
+                SkillServerStep::Text(text) => streaming_text_reply(provider, text),
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_paced_sse_server(
     reply: String,
     event_count: usize,
@@ -524,6 +645,15 @@ fn chat_sse_data(data: Value) -> String {
 }
 
 fn chat_tool_call_reply() -> String {
+    chat_tool_call_reply_with(
+        "call_read",
+        "read",
+        &serde_json::json!({"path":"notes.txt"}),
+    )
+}
+
+fn chat_tool_call_reply_with(id: &str, name: &str, input: &Value) -> String {
+    let arguments = serde_json::to_string(input).expect("serialize tool arguments");
     let mut reply = chat_sse_data(serde_json::json!({
         "choices": [{
             "index": 0,
@@ -531,11 +661,11 @@ fn chat_tool_call_reply() -> String {
                 "role": "assistant",
                 "tool_calls": [{
                     "index": 0,
-                    "id": "call_read",
+                    "id": id,
                     "type": "function",
                     "function": {
-                        "name": "read",
-                        "arguments": "{\"path\":\"notes.txt\"}"
+                        "name": name,
+                        "arguments": arguments
                     }
                 }]
             },
@@ -597,22 +727,33 @@ fn chat_text_reply(text: &str) -> String {
 }
 
 fn responses_tool_call_reply() -> String {
+    responses_tool_call_reply_with(
+        "call_read",
+        "read",
+        &serde_json::json!({"path":"notes.txt"}),
+    )
+}
+
+fn responses_tool_call_reply_with(id: &str, name: &str, input: &Value) -> String {
+    let item_id = format!("fc_{id}");
+    let response_id = format!("resp_{id}");
+    let arguments = serde_json::to_string(input).expect("serialize tool arguments");
     let call = serde_json::json!({
         "type": "function_call",
-        "id": "fc_read",
-        "call_id": "call_read",
-        "name": "read",
-        "arguments": "{\"path\":\"notes.txt\"}"
+        "id": item_id,
+        "call_id": id,
+        "name": name,
+        "arguments": arguments
     });
     let response = serde_json::json!({
-        "id": "resp_tool",
+        "id": response_id,
         "status": "completed",
         "output": [call],
         "usage": {"input_tokens": 4, "output_tokens": 2}
     });
     let mut reply = sse_event(
         "response.created",
-        serde_json::json!({"type": "response.created", "response": {"id": "resp_tool"}}),
+        serde_json::json!({"type": "response.created", "response": {"id": response_id}}),
     );
     reply.push_str(&sse_event(
         "response.output_item.added",
@@ -621,9 +762,9 @@ fn responses_tool_call_reply() -> String {
             "output_index": 0,
             "item": {
                 "type": "function_call",
-                "id": "fc_read",
-                "call_id": "call_read",
-                "name": "read",
+                "id": item_id,
+                "call_id": id,
+                "name": name,
                 "arguments": ""
             }
         }),
@@ -632,9 +773,9 @@ fn responses_tool_call_reply() -> String {
         "response.function_call_arguments.delta",
         serde_json::json!({
             "type": "response.function_call_arguments.delta",
-            "item_id": "fc_read",
+            "item_id": item_id,
             "output_index": 0,
-            "delta": "{\"path\":\"notes.txt\"}"
+            "delta": arguments
         }),
     ));
     reply.push_str(&sse_event(
@@ -809,6 +950,54 @@ fn responses_text_reply(text: &str) -> String {
     reply
 }
 
+fn streaming_tool_reply(provider: &str, id: &str, name: &str, input: &Value) -> String {
+    match provider {
+        "anthropic" => sse_tool_use_reply(id, name, input),
+        "openai-chat-completions" => chat_tool_call_reply_with(id, name, input),
+        "openai-responses" => responses_tool_call_reply_with(id, name, input),
+        _ => panic!("unknown streaming provider {provider}"),
+    }
+}
+
+fn streaming_text_reply(provider: &str, text: &str) -> String {
+    match provider {
+        "anthropic" => sse_text_reply(text),
+        "openai-chat-completions" => chat_text_reply(text),
+        "openai-responses" => responses_text_reply(text),
+        _ => panic!("unknown streaming provider {provider}"),
+    }
+}
+
+fn provider_system_prompt(provider: &str, request: &Value) -> String {
+    match provider {
+        "anthropic" => request["system"].as_str().expect("Anthropic system prompt"),
+        "openai-chat-completions" => request["messages"]
+            .as_array()
+            .expect("Chat Completions messages")
+            .iter()
+            .find(|message| message["role"] == "system")
+            .and_then(|message| message["content"].as_str())
+            .expect("Chat Completions system prompt"),
+        "openai-responses" => request["instructions"]
+            .as_str()
+            .expect("Responses instructions"),
+        _ => panic!("unknown streaming provider {provider}"),
+    }
+    .to_string()
+}
+
+fn catalog_snapshot_id(system_prompt: &str) -> String {
+    let catalog_line = system_prompt
+        .split_once("Available Skills catalog (metadata only). Select by exact name and current snapshot_id with activate_skill(snapshot_id, name); activate again each turn.\n")
+        .map(|(_, rest)| rest.lines().next().expect("catalog JSON line"))
+        .expect("catalog in system prompt");
+    let catalog: Value = serde_json::from_str(catalog_line).expect("catalog is JSON");
+    catalog["snapshot_id"]
+        .as_str()
+        .expect("snapshot id")
+        .to_string()
+}
+
 /// Starts a one-shot fake provider that rejects the request with bad credentials.
 fn spawn_auth_failure_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
@@ -868,6 +1057,46 @@ fn spawn_response_sequence_server(
         }
     });
 
+    (format!("http://{addr}"), requests)
+}
+
+fn spawn_skill_mutation_retry_server(package: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    thread::spawn(move || {
+        for attempt in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let Some(body) = read_request_body(&mut stream) else {
+                return;
+            };
+            captured.lock().unwrap().push(body);
+            let (status, reason, response_body, retry_after) = if attempt == 0 {
+                std::fs::write(
+                    package.join("SKILL.md"),
+                    "---\nname: writer\ndescription: CHANGED_RETRY_METADATA_MARKER\n---\nPRIVATE_RETRY_MUTATED_BODY_MARKER",
+                )
+                .expect("mutate Skill between provider attempts");
+                (
+                    503,
+                    "Service Unavailable",
+                    r#"{"type":"error","error":{"type":"overloaded_error","message":"try again"}}"#,
+                    "Retry-After: 0\r\n",
+                )
+            } else {
+                (200, "OK", ONE_TEXT_REPLY[0], "")
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
     (format!("http://{addr}"), requests)
 }
 
@@ -962,6 +1191,18 @@ fn fixture_dir(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create fixture dir");
     std::fs::write(dir.join("notes.txt"), "TODO\n").expect("write fixture file");
     dir
+}
+
+fn write_skill_package(cwd: &Path, description: &str, body: &str, resource: &str) -> PathBuf {
+    let package = cwd.join(".agents/skills/writer");
+    std::fs::create_dir_all(package.join("references")).expect("create Skill package");
+    std::fs::write(
+        package.join("SKILL.md"),
+        format!("---\nname: writer\ndescription: {description}\n---\n{body}"),
+    )
+    .expect("write Skill instructions");
+    std::fs::write(package.join("references/guide.md"), resource).expect("write Skill resource");
+    package
 }
 
 #[cfg(unix)]
@@ -1671,6 +1912,73 @@ fn ask_retries_transient_provider_failure_and_records_attempts() {
     let events = read_events(&trail);
     assert_eq!(events.last().expect("outcome")["event"], "response_ok");
     assert_eq!(events.last().expect("outcome")["attempts"], 2);
+
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn skill_snapshot_survives_provider_retry_and_refreshes_on_the_next_turn() {
+    let cwd = fixture_dir("skill-retry-snapshot");
+    let package = write_skill_package(
+        &cwd,
+        "INITIAL_RETRY_METADATA_MARKER",
+        "PRIVATE_RETRY_INITIAL_BODY_MARKER",
+        "PRIVATE_RETRY_RESOURCE_MARKER",
+    );
+    let (base_url, retry_requests) = spawn_skill_mutation_retry_server(package);
+    let mut first = leg(&cwd, &base_url);
+    first
+        .env("LEG_MAX_RETRIES", "1")
+        .env("LEG_RETRY_BASE_DELAY_MS", "0")
+        .arg("ask")
+        .arg("hello");
+    let first_output = run(first, None);
+    assert!(
+        first_output.status.success(),
+        "retry turn failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let retry_requests: Vec<Value> = retry_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("retry request is JSON"))
+        .collect();
+    assert_eq!(retry_requests.len(), 2);
+    let first_prompt = provider_system_prompt("anthropic", &retry_requests[0]);
+    let retry_prompt = provider_system_prompt("anthropic", &retry_requests[1]);
+    assert_eq!(
+        first_prompt, retry_prompt,
+        "retry must reuse its prepared snapshot"
+    );
+    assert!(retry_prompt.contains("INITIAL_RETRY_METADATA_MARKER"));
+    assert!(!retry_prompt.contains("CHANGED_RETRY_METADATA_MARKER"));
+    assert!(!retry_prompt.contains("PRIVATE_RETRY_MUTATED_BODY_MARKER"));
+
+    let (next_base_url, next_requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
+    let mut next = leg(&cwd, &next_base_url);
+    next.arg("ask").arg("hello again");
+    let next_output = run(next, None);
+    assert!(
+        next_output.status.success(),
+        "fresh turn failed: {}",
+        String::from_utf8_lossy(&next_output.stderr)
+    );
+    let next_requests: Vec<Value> = next_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("fresh request is JSON"))
+        .collect();
+    assert_eq!(next_requests.len(), 1);
+    let next_prompt = provider_system_prompt("anthropic", &next_requests[0]);
+    assert!(next_prompt.contains("CHANGED_RETRY_METADATA_MARKER"));
+    assert!(!next_prompt.contains("INITIAL_RETRY_METADATA_MARKER"));
+    assert_ne!(
+        catalog_snapshot_id(&first_prompt),
+        catalog_snapshot_id(&next_prompt),
+        "a new user turn must create a fresh catalog snapshot"
+    );
 
     std::fs::remove_dir_all(&cwd).ok();
 }
@@ -2497,6 +2805,288 @@ fn exchange_stream_json_snapshots_agents_prompt_across_tool_continuation() {
     );
 
     std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn skills_catalog_activation_and_precedence_are_shared_by_streaming_providers() {
+    for provider in ["anthropic", "openai-chat-completions", "openai-responses"] {
+        let cwd = fixture_dir(&format!("skills-stream-{provider}"));
+        write_skill_package(
+            &cwd,
+            "VISIBLE_SKILL_DESCRIPTION",
+            "PRIVATE_SKILL_BODY_MARKER",
+            "PRIVATE_SKILL_RESOURCE_MARKER",
+        );
+        std::fs::write(cwd.join("AGENTS.md"), "PROJECT_AGENT_MARKER")
+            .expect("write project instructions");
+        let system_prompt = cwd.join("system-prompt.txt");
+        std::fs::write(&system_prompt, "BASE_SYSTEM_MARKER").expect("write caller instructions");
+
+        let (base_url, requests) = spawn_skill_sse_server(
+            provider,
+            vec![SkillServerStep::Activate, SkillServerStep::Text("done")],
+        );
+        let mut command = if provider == "anthropic" {
+            leg(&cwd, &base_url)
+        } else {
+            openai_leg(&cwd, &base_url, provider)
+        };
+        command
+            .env("LEG_SYSTEM_PROMPT", &system_prompt)
+            .env("SKILL_TEST_SECRET_ENV", "PRIVATE_ENV_SECRET_MARKER")
+            .arg("exchange")
+            .arg("--stream-json");
+        let output = run(command, Some("Use the writer Skill\n"));
+        assert!(
+            output.status.success(),
+            "{provider} Skill exchange failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let requests: Vec<Value> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("provider request is JSON"))
+            .collect();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one activation continuation for {provider}"
+        );
+        let first_prompt = provider_system_prompt(provider, &requests[0]);
+        let catalog_index = first_prompt
+            .find("VISIBLE_SKILL_DESCRIPTION")
+            .expect("catalog metadata in first request");
+        assert!(
+            first_prompt.find("BASE_SYSTEM_MARKER").unwrap()
+                < first_prompt.find("PROJECT_AGENT_MARKER").unwrap()
+                && first_prompt.find("PROJECT_AGENT_MARKER").unwrap() < catalog_index,
+            "incorrect instruction order for {provider}: {first_prompt}"
+        );
+        assert!(!first_prompt.contains("PRIVATE_SKILL_BODY_MARKER"));
+        assert!(!first_prompt.contains("PRIVATE_SKILL_RESOURCE_MARKER"));
+
+        let continued_prompt = provider_system_prompt(provider, &requests[1]);
+        let body_index = continued_prompt
+            .find("PRIVATE_SKILL_BODY_MARKER")
+            .expect("activated body in tool continuation");
+        assert!(
+            continued_prompt.find("BASE_SYSTEM_MARKER").unwrap()
+                < continued_prompt.find("PROJECT_AGENT_MARKER").unwrap()
+                && continued_prompt.find("PROJECT_AGENT_MARKER").unwrap()
+                    < continued_prompt.find("VISIBLE_SKILL_DESCRIPTION").unwrap()
+                && continued_prompt.find("VISIBLE_SKILL_DESCRIPTION").unwrap() < body_index,
+            "incorrect activated instruction order for {provider}: {continued_prompt}"
+        );
+        assert!(!continued_prompt.contains("PRIVATE_SKILL_RESOURCE_MARKER"));
+        assert!(
+            serde_json::to_string(&requests[1])
+                .unwrap()
+                .contains("activated for this turn"),
+            "tool continuation must carry the activation acknowledgement for {provider}"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("skills catalog"),
+            "catalog diagnostic missing: {stderr}"
+        );
+        assert!(stderr.contains("VISIBLE_SKILL_DESCRIPTION"));
+        assert!(stderr.contains("skills activation: loaded 'writer'"));
+        assert!(!stderr.contains("PRIVATE_SKILL_BODY_MARKER"));
+        assert!(!stderr.contains("PRIVATE_SKILL_RESOURCE_MARKER"));
+        assert!(!stderr.contains("PRIVATE_ENV_SECRET_MARKER"));
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+}
+
+#[test]
+fn ask_and_cold_exchange_activate_the_catalogued_skill() {
+    for mode in ["ask", "cold-exchange"] {
+        let cwd = fixture_dir(&format!("skills-{mode}"));
+        write_skill_package(
+            &cwd,
+            "VISIBLE_NONSTREAM_SKILL_DESCRIPTION",
+            "PRIVATE_NONSTREAM_SKILL_BODY_MARKER",
+            "PRIVATE_NONSTREAM_RESOURCE_MARKER",
+        );
+        let (base_url, requests) = spawn_skill_json_server(vec![
+            SkillJsonServerStep::Activate,
+            SkillJsonServerStep::Text("done"),
+        ]);
+        let mut command = leg(&cwd, &base_url);
+        if mode == "ask" {
+            command.args(["ask", "Use writer"]);
+        } else {
+            command.arg("exchange");
+        }
+        let output = run(command, (mode == "cold-exchange").then_some("Use writer\n"));
+        assert!(
+            output.status.success(),
+            "{mode} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let requests: Vec<Value> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("provider request is JSON"))
+            .collect();
+        assert_eq!(requests.len(), 2, "activation continuation for {mode}");
+        let first_prompt = provider_system_prompt("anthropic", &requests[0]);
+        assert!(first_prompt.contains("VISIBLE_NONSTREAM_SKILL_DESCRIPTION"));
+        assert!(!first_prompt.contains("PRIVATE_NONSTREAM_SKILL_BODY_MARKER"));
+        assert!(!first_prompt.contains("PRIVATE_NONSTREAM_RESOURCE_MARKER"));
+        let continuation_prompt = provider_system_prompt("anthropic", &requests[1]);
+        assert!(continuation_prompt.contains("PRIVATE_NONSTREAM_SKILL_BODY_MARKER"));
+        assert!(!continuation_prompt.contains("PRIVATE_NONSTREAM_RESOURCE_MARKER"));
+        assert!(
+            serde_json::to_string(&requests[1])
+                .unwrap()
+                .contains("activated for this turn")
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+}
+
+#[test]
+fn activated_skill_content_stays_out_of_session_history_and_resumed_trails() {
+    for mode in ["session", "named-exchange"] {
+        let cwd = fixture_dir(&format!("skills-persistence-{mode}"));
+        write_skill_package(
+            &cwd,
+            "writer metadata before resume",
+            "PRIVATE_SESSION_SKILL_BODY_MARKER",
+            "PRIVATE_SESSION_RESOURCE_MARKER",
+        );
+        let (base_url, requests) = spawn_skill_sse_server(
+            "anthropic",
+            vec![
+                SkillServerStep::Activate,
+                SkillServerStep::ReadResource,
+                SkillServerStep::Text("first turn complete"),
+                SkillServerStep::Text("resumed turn complete"),
+            ],
+        );
+
+        let (trail, store, first_args, first_input, resume_args, resume_input) =
+            if mode == "session" {
+                let trail = cwd.join("session.jsonl");
+                (
+                    trail,
+                    None,
+                    vec!["session".to_string()],
+                    "first session turn\n/exit\n".to_string(),
+                    vec!["session".to_string(), "--resume".to_string()],
+                    "continue this work\n/exit\n".to_string(),
+                )
+            } else {
+                let store = cwd.join("sessions");
+                let trail = store.join("sess-232-1.jsonl");
+                (
+                    trail,
+                    Some(store),
+                    vec![
+                        "exchange".to_string(),
+                        "--new-session-id".to_string(),
+                        "sess-232-1".to_string(),
+                        "--stream-json".to_string(),
+                    ],
+                    "first named exchange turn\n".to_string(),
+                    vec![
+                        "exchange".to_string(),
+                        "--session".to_string(),
+                        "sess-232-1".to_string(),
+                        "--stream-json".to_string(),
+                    ],
+                    "continue this work\n".to_string(),
+                )
+            };
+
+        let mut first = leg(&cwd, &base_url);
+        first.args(first_args).env("LEG_EVENT_LOG", &trail);
+        if let Some(store) = &store {
+            first.env("LEG_SESSION_DIR", store);
+        }
+        let first_output = run(first, Some(&first_input));
+        assert!(
+            first_output.status.success(),
+            "{mode} first turn failed: {}",
+            String::from_utf8_lossy(&first_output.stderr)
+        );
+
+        write_skill_package(
+            &cwd,
+            "CHANGED_SKILL_METADATA_MARKER",
+            "PRIVATE_CHANGED_SKILL_BODY_MARKER",
+            "PRIVATE_CHANGED_SKILL_RESOURCE_MARKER",
+        );
+        let mut resume = leg(&cwd, &base_url);
+        resume.args(resume_args);
+        if mode == "session" {
+            resume.arg(&trail);
+        } else if let Some(store) = &store {
+            resume.env("LEG_SESSION_DIR", store);
+        }
+        let resumed_output = run(resume, Some(&resume_input));
+        assert!(
+            resumed_output.status.success(),
+            "{mode} resumed turn failed: {}",
+            String::from_utf8_lossy(&resumed_output.stderr)
+        );
+
+        let requests: Vec<Value> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("provider request is JSON"))
+            .collect();
+        assert_eq!(
+            requests.len(),
+            4,
+            "activation, resource, reply, resumed reply"
+        );
+        let first_prompt = provider_system_prompt("anthropic", &requests[0]);
+        assert!(!first_prompt.contains("PRIVATE_SESSION_SKILL_BODY_MARKER"));
+        assert!(!first_prompt.contains("PRIVATE_SESSION_RESOURCE_MARKER"));
+        let activated_prompt = provider_system_prompt("anthropic", &requests[1]);
+        assert!(activated_prompt.contains("PRIVATE_SESSION_SKILL_BODY_MARKER"));
+        assert!(!activated_prompt.contains("PRIVATE_SESSION_RESOURCE_MARKER"));
+        let resource_prompt = provider_system_prompt("anthropic", &requests[2]);
+        assert!(resource_prompt.contains("PRIVATE_SESSION_SKILL_BODY_MARKER"));
+        assert!(resource_prompt.contains("PRIVATE_SESSION_RESOURCE_MARKER"));
+        let resumed_prompt = provider_system_prompt("anthropic", &requests[3]);
+        assert!(resumed_prompt.contains("CHANGED_SKILL_METADATA_MARKER"));
+        assert!(!resumed_prompt.contains("PRIVATE_SESSION_SKILL_BODY_MARKER"));
+        assert!(!resumed_prompt.contains("PRIVATE_SESSION_RESOURCE_MARKER"));
+        assert!(!resumed_prompt.contains("PRIVATE_CHANGED_SKILL_BODY_MARKER"));
+        assert!(!resumed_prompt.contains("PRIVATE_CHANGED_SKILL_RESOURCE_MARKER"));
+        let resumed_history = serde_json::to_string(&requests[3]["messages"]).unwrap();
+        for marker in [
+            "PRIVATE_SESSION_SKILL_BODY_MARKER",
+            "PRIVATE_SESSION_RESOURCE_MARKER",
+            "PRIVATE_CHANGED_SKILL_BODY_MARKER",
+            "PRIVATE_CHANGED_SKILL_RESOURCE_MARKER",
+        ] {
+            assert!(
+                !resumed_history.contains(marker),
+                "history contains {marker}"
+            );
+        }
+        let trail_text = std::fs::read_to_string(&trail).expect("session trail is written");
+        for marker in [
+            "PRIVATE_SESSION_SKILL_BODY_MARKER",
+            "PRIVATE_SESSION_RESOURCE_MARKER",
+            "PRIVATE_CHANGED_SKILL_BODY_MARKER",
+            "PRIVATE_CHANGED_SKILL_RESOURCE_MARKER",
+        ] {
+            assert!(!trail_text.contains(marker), "trail contains {marker}");
+        }
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
 }
 
 // On Apple targets, pipe creation and close-on-exec setup can race with child
