@@ -28,6 +28,8 @@ The event-specific fields are:
 | --- | --- |
 | `turn_start` | `request`: full correlated `baton.message/v1` request envelope; `provider`; resolved `model`; optional `session_id` and `turn_index` |
 | `text_delta` | `round_index`, `block_index`, and the UTF-8 `text` fragment |
+| `thinking_delta` | `round_index`, `block_index`, and the UTF-8 visible reasoning `text` fragment |
+| `thinking` | `round_index` and `block_index` for one reasoning block whose text is redacted or encrypted; this record has no `text` field |
 | `tool_round` | `round_index` and the ordered `content` blocks from the provider's tool-use reply |
 | `tool_call` | `round_index`, `tool_use_id`, `tool_name`, and JSON `input` |
 | `tool_result` | `round_index`, `tool_use_id`, `tool_name`, `status`, and `output` |
@@ -42,8 +44,11 @@ in `turn_start`, even when the first provider turn fails.
 `tool_call` and `tool_result` records use that same index. `block_index` is the
 zero-based content-block index assigned by the provider stream assembler.
 Multiple text blocks keep their separate indices. Text is emitted from stream
-deltas only, never again from the final response. A buffered transport can
-therefore produce a start and terminal record without any `text_delta`.
+deltas only, never again from the final response. Visible reasoning is emitted
+as `thinking_delta` in provider order before later content-block records. A
+textless redacted or encrypted reasoning block emits exactly one `thinking`
+marker. A buffered transport can therefore produce a start and terminal record
+without any `text_delta` or `thinking_delta`.
 
 Tool records preserve provider block order and call ids. `tool_round.content`
 contains the complete ordered block list, including text and tool calls.
@@ -61,9 +66,9 @@ required session-trail write fails, the terminal response reports an error
 instead of advertising the provider reply as committed.
 
 `turn_end.response` is authoritative. Deltas are provisional, including text
-emitted before a provider stream later fails. Consumers must treat EOF without
-`turn_end` as an incomplete exchange, never as success. A successful terminal
-record is the final record; no records follow it.
+and reasoning emitted before a provider stream later fails. Consumers must
+treat EOF without `turn_end` as an incomplete exchange, never as success. A
+successful terminal record is the final record; no records follow it.
 
 `capped` is true only when `LEG_MAX_TOOL_ROUNDS` ends the turn while the
 provider still requests tools. In that case the final response envelope

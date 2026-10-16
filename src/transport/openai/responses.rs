@@ -332,6 +332,7 @@ struct ResponsesAssembler {
     next_index: usize,
     text_indexes: BTreeMap<(usize, usize), usize>,
     tool_indexes: BTreeMap<String, usize>,
+    reasoning_indexes: BTreeMap<String, usize>,
     open_blocks: BTreeSet<usize>,
     reply: Option<AssistantReply>,
     max_tokens: u32,
@@ -375,7 +376,7 @@ impl ResponsesAssembler {
         match event_type {
             "response.created" | "response.in_progress" => {}
             "response.output_item.added" => {
-                self.start_function_call(&data, on_event)?;
+                self.start_output_item(&data, on_event)?;
             }
             "response.content_part.added" => {
                 self.start_text_block(&data, on_event)?;
@@ -401,6 +402,38 @@ impl ResponsesAssembler {
                     delta: data.clone(),
                 })?;
             }
+            "response.reasoning_summary_part.added" => {
+                self.ensure_reasoning_block(&data, on_event)?;
+            }
+            "response.reasoning_summary_text.delta" => {
+                let index = self.ensure_reasoning_block(&data, on_event)?;
+                let delta = data.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                    LegError::Decode(
+                        "response.reasoning_summary_text.delta omitted delta".to_string(),
+                    )
+                })?;
+                if !delta.is_empty() {
+                    on_event(StreamEvent::ContentBlockDelta {
+                        index,
+                        delta: data.clone(),
+                    })?;
+                }
+            }
+            "response.reasoning_text.delta" => {
+                let index = self.ensure_reasoning_block(&data, on_event)?;
+                let delta = data.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                    LegError::Decode("response.reasoning_text.delta omitted delta".to_string())
+                })?;
+                if !delta.is_empty() {
+                    on_event(StreamEvent::ContentBlockDelta {
+                        index,
+                        delta: data.clone(),
+                    })?;
+                }
+            }
+            "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done" => {}
             "response.content_part.done" => {
                 if let Some(index) = self.text_index(&data) {
                     self.close_block(index, on_event)?;
@@ -408,6 +441,8 @@ impl ResponsesAssembler {
             }
             "response.output_item.done" => {
                 if let Some(index) = self.tool_index(&data) {
+                    self.close_block(index, on_event)?;
+                } else if let Some(index) = self.reasoning_index(&data) {
                     self.close_block(index, on_event)?;
                 }
             }
@@ -438,7 +473,7 @@ impl ResponsesAssembler {
         Ok(())
     }
 
-    fn start_function_call(
+    fn start_output_item(
         &mut self,
         data: &Value,
         on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
@@ -448,8 +483,10 @@ impl ResponsesAssembler {
                 "response.output_item.added omitted item".to_string(),
             ));
         };
-        if item.get("type").and_then(Value::as_str) != Some("function_call") {
-            return Ok(());
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => return self.start_reasoning(data, item, on_event),
+            Some("function_call") => {}
+            _ => return Ok(()),
         }
         let key = item
             .get("id")
@@ -475,6 +512,56 @@ impl ResponsesAssembler {
             index,
             content_block,
         })
+    }
+
+    fn start_reasoning(
+        &mut self,
+        data: &Value,
+        item: &Value,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> Result<()> {
+        let key = reasoning_key(data).ok_or_else(|| {
+            LegError::Decode("Responses reasoning item omitted id or output_index".to_string())
+        })?;
+        if self.reasoning_indexes.contains_key(&key) {
+            return Err(LegError::Decode(format!(
+                "duplicate Responses reasoning item {key:?}"
+            )));
+        }
+        let index = self.allocate_block();
+        self.reasoning_indexes.insert(key, index);
+        if let Some(output_key) = reasoning_output_key(data) {
+            self.reasoning_indexes.insert(output_key, index);
+        }
+        on_event(StreamEvent::ContentBlockStart {
+            index,
+            content_block: item.clone(),
+        })
+    }
+
+    fn ensure_reasoning_block(
+        &mut self,
+        data: &Value,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<()>,
+    ) -> Result<usize> {
+        let key = reasoning_key(data).ok_or_else(|| {
+            LegError::Decode(
+                "Responses reasoning event omitted item_id or output_index".to_string(),
+            )
+        })?;
+        if let Some(index) = self.reasoning_index_for_event(data) {
+            return Ok(index);
+        }
+        let index = self.allocate_block();
+        self.reasoning_indexes.insert(key, index);
+        if let Some(output_key) = reasoning_output_key(data) {
+            self.reasoning_indexes.insert(output_key, index);
+        }
+        on_event(StreamEvent::ContentBlockStart {
+            index,
+            content_block: json!({"type": "reasoning"}),
+        })?;
+        Ok(index)
     }
 
     fn start_text_block(
@@ -561,6 +648,22 @@ impl ResponsesAssembler {
         self.tool_indexes.get(key).copied()
     }
 
+    fn reasoning_index(&self, data: &Value) -> Option<usize> {
+        let item = data.get("item")?;
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return None;
+        }
+        self.reasoning_index_for_event(data)
+    }
+
+    fn reasoning_index_for_event(&self, data: &Value) -> Option<usize> {
+        reasoning_key(data)
+            .and_then(|key| self.reasoning_indexes.get(&key).copied())
+            .or_else(|| {
+                reasoning_output_key(data).and_then(|key| self.reasoning_indexes.get(&key).copied())
+            })
+    }
+
     fn allocate_block(&mut self) -> usize {
         let index = self.next_index;
         self.next_index += 1;
@@ -622,6 +725,24 @@ impl ResponsesAssembler {
             LegError::Decode("Responses stream ended without an assembled reply".to_string())
         })
     }
+}
+
+fn reasoning_key(data: &Value) -> Option<String> {
+    data.get("item_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            data.get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .or_else(|| reasoning_output_key(data))
+}
+
+fn reasoning_output_key(data: &Value) -> Option<String> {
+    data.get("output_index")
+        .and_then(Value::as_u64)
+        .map(|index| format!("output:{index}"))
 }
 
 fn output_content_index(data: &Value) -> Result<(usize, usize)> {
@@ -1022,6 +1143,122 @@ mod tests {
             body["input"][0]["content"][1]["image_url"],
             "data:image/jpeg;base64,aGVsbG8="
         );
+    }
+
+    #[test]
+    fn streams_reasoning_summary_deltas_before_output_text() {
+        let response = json!({
+            "status":"completed",
+            "output":[
+                {
+                    "type":"reasoning",
+                    "id":"rs_1",
+                    "summary":[{"type":"summary_text","text":"plan"}],
+                    "content":[{"type":"reasoning_text","text":"private"}]
+                },
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"answer"}]
+                }
+            ],
+            "usage":{"input_tokens":3,"output_tokens":2}
+        });
+        let body = [
+            event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_reasoning"}}),
+            ),
+            event(
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":0,"item":{
+                    "type":"reasoning","id":"rs_1","summary":[]
+                }}),
+            ),
+            event(
+                "response.reasoning_text.delta",
+                json!({"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"private"}),
+            ),
+            event(
+                "response.reasoning_text.done",
+                json!({"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":0,"text":"private"}),
+            ),
+            event(
+                "response.reasoning_summary_part.added",
+                json!({"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":0,"part":{
+                    "type":"summary_text","text":""
+                }}),
+            ),
+            event(
+                "response.reasoning_summary_text.delta",
+                json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"plan"}),
+            ),
+            event(
+                "response.reasoning_summary_text.done",
+                json!({"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"text":"plan"}),
+            ),
+            event(
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":0,"item":{
+                    "type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"plan"}],
+                    "content":[{"type":"reasoning_text","text":"private"}]
+                }}),
+            ),
+            event(
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":1,"item":{
+                    "type":"message","id":"msg_1","role":"assistant","content":[]
+                }}),
+            ),
+            event(
+                "response.content_part.added",
+                json!({"type":"response.content_part.added","output_index":1,"content_index":0,"part":{
+                    "type":"output_text","text":""
+                }}),
+            ),
+            event(
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"answer"}),
+            ),
+            event(
+                "response.completed",
+                json!({"type":"response.completed","response":response}),
+            ),
+        ]
+        .join("");
+        let http = FakeHttp {
+            body,
+            request: RefCell::new(None),
+        };
+        let client = OpenAiResponsesClient::with_http(config(), http);
+        let mut events = Vec::new();
+        let reply = client
+            .send_conversation_streaming_with_attempts(&[Message::user("think")], &mut |event| {
+                events.push(event);
+                Ok(())
+            })
+            .result
+            .expect("reasoning response parses");
+
+        assert_eq!(reply.text, "answer");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta { delta, .. }
+                if delta["type"] == "response.reasoning_text.delta"
+                    && delta["delta"] == "private"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta { delta, .. }
+                if delta["type"] == "response.reasoning_summary_text.delta"
+                    && delta["delta"] == "plan"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta { delta, .. }
+                if delta["type"] == "response.output_text.delta"
+                    && delta["delta"] == "answer"
+        )));
     }
 
     #[test]
