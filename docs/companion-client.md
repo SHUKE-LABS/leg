@@ -37,6 +37,29 @@ configuration and `LEG_PRETOOL_HOOK` are inherited by leg. The companion does
 not resolve credentials, retry requests, rehydrate history, run tools, or write
 authoritative trails.
 
+Lifecycle hooks use the same runtime as CLI turns. `LEG_HOOKS_CONFIG`, when
+set, selects the configuration file; otherwise leg checks `.leg/hooks.json` in
+the selected workspace, then the per-user file. For example:
+
+```json
+{
+  "version": 1,
+  "hooks": [
+    { "id": "audit-turn", "event": "TurnStart", "command": "hooks/audit-turn" }
+  ]
+}
+```
+
+Each hook receives a JSON payload on stdin. A turn hook includes
+`hook_event_name`, `cwd`, `prompt`, and, for a session turn, `session_id` and
+`turn_index`; tool hooks also receive their name and input or result. A
+`PreToolUse` denial becomes a model-visible tool error and denied trail record.
+Failures in other hooks are reported to stderr and do not change the turn
+result. Hooks have a fixed 30-second timeout. Project hooks are trusted
+executables and run with the operating-system permissions of the user running
+leg; the companion does not sandbox them. See [Hooks v1](hooks-v1.md) for the
+event payloads, ordering, configuration precedence, and failure details.
+
 ## Shared session catalog
 
 TUI and Web use `SessionCatalog` from the same companion package. The catalog
