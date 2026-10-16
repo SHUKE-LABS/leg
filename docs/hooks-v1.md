@@ -1,8 +1,9 @@
-# Hooks v1 configuration contract
+# Hooks v1 configuration and runtime
 
-This document defines the v1 configuration and selection contract for leg
-hooks. It covers configuration loading and selection; lifecycle dispatch for
-declarative hooks is a separate slice.
+Leg loads one hooks v1 file and runs its selected commands at tool, turn, and
+interactive-session boundaries. Hook commands are executable paths; leg does
+not invoke a shell or parse command arguments. Relative paths resolve from the
+selected configuration file's directory.
 
 ## Configuration format
 
@@ -25,26 +26,8 @@ array whose order is significant:
 ```
 
 Each entry requires `id`, `event`, and `command`. `matcher` is optional;
-`enabled` is optional and defaults to `true`. `command` names one executable
-path, with no shell or argument parsing. Relative command paths are resolved
-from the selected configuration file's directory. The path is not executed or
+`enabled` is optional and defaults to `true`. The path is not executed or
 checked for existence while configuration is loaded.
-
-`PreToolUse`, `PostToolUse`, `SessionStart`, and `SessionEnd` use Claude Code
-command-hook event names; `TurnStart` and `TurnEnd` are leg-specific. Claude
-Code command hooks use regular-expression matchers in event-keyed groups. Leg
-deliberately uses a flat one-event-per-entry list with stable IDs, explicit
-file order, and a versioned top-level schema, and limits matchers to exact tool
-names or `*`.
-
-OpenCode's plugin documentation shows a different open-source design: named
-tool events such as `tool.execute.before`/`tool.execute.after`, with project
-plugins under `.opencode/plugins/` and global plugins under
-`~/.config/opencode/plugins/`, loaded at startup. Leg adopts neither plugin
-callbacks nor multiple loaded source layers; the comparison supports keeping
-event names and selection rules explicit in the v1 contract. References:
-[Claude Code hooks](https://code.claude.com/docs/en/hooks) and
-[OpenCode plugins](https://opencode.ai/docs/plugins/).
 
 ## Discovery and precedence
 
@@ -71,7 +54,7 @@ an error and does not fall through.
 created. A configuration error fails commands that construct `LegConfig`;
 commands that do not construct it do not read hook configuration.
 
-## Events and matchers
+## Events and selection
 
 `event` must be one of these exact names:
 
@@ -89,6 +72,70 @@ exact case-sensitive tool name containing only ASCII letters, digits, `_`,
 regular expressions; alternation and other pattern syntax are invalid. An
 empty matcher or a matcher on a non-tool event is invalid.
 
+For an event and tool, enabled matching entries run sequentially in JSON array
+order. The legacy `LEG_PRETOOL_HOOK`, when configured, runs before declarative
+`PreToolUse` entries. A veto or fail-closed `PreToolUse` error stops the
+remaining entries. Failures from other events do not stop later hooks.
+
+## Payloads
+
+Each command receives one UTF-8 JSON object on stdin. Every payload includes
+`hook_event_name` and `cwd`. `session_id` and `turn_index` appear when the hook
+runs within a session turn. Tool hooks receive the tool's original input. The
+payload fields are:
+
+| Event | Event-specific fields | Boundary |
+| --- | --- | --- |
+| `PreToolUse` | `tool_name`, `tool_input` | Before dispatching a tool handler. |
+| `PostToolUse` | `tool_name`, `tool_input`, `tool_output`, `tool_status` | After a non-denied tool result, including handler errors and unknown tools. It does not run after a `PreToolUse` veto. |
+| `TurnStart` | `prompt` | Before the provider work for each `ask`, `exchange`, or interactive session turn. `prompt` concatenates the turn's text blocks; image content is omitted. |
+| `TurnEnd` | `prompt`, `turn_status`, and either `reply` or `error` | After the tool loop returns for the turn. `turn_status` is `completed` or `failed`. |
+| `SessionStart` | none | When a fresh interactive `leg session` starts. |
+| `SessionEnd` | `turns` | On a clean exit from interactive `leg session`; `turns` is the session's total turn count. |
+
+Tool status values are `completed` and `failed` for `PostToolUse`; a denied
+call does not produce that event. Interactive session resume keeps the
+existing boundary behavior: it does not run `SessionStart` again, and a clean
+exit still runs `SessionEnd`. Interrupted sessions do not run `SessionEnd`.
+Named `leg exchange` session turns receive `session_id` and `turn_index` on
+their turn and tool events; SessionStart and SessionEnd hooks belong to the
+interactive `leg session` boundaries.
+
+For example, a session-scoped `PostToolUse` payload has this shape:
+
+```json
+{
+  "hook_event_name": "PostToolUse",
+  "cwd": "/workspace/project",
+  "session_id": "sess-123",
+  "turn_index": 2,
+  "tool_name": "bash",
+  "tool_input": { "command": "echo hi" },
+  "tool_output": "hi",
+  "tool_status": "completed"
+}
+```
+
+`PreToolUse` keeps the Claude-compatible decision envelope. Exit 0 with empty
+or whitespace-only stdout, or `{"decision":"allow"}`, allows the tool.
+Exit 0 with `{"decision":"deny","reason":"..."}` denies it and returns
+that reason in the tool result. A nonzero exit, spawn failure, malformed,
+truncated, or invalid UTF-8 output, timeout, or cancellation fails closed with
+the generic `denied by pre-tool hook: hook failed` result. A denial prevents
+the handler and remaining `PreToolUse` hooks from running. The denied result
+is surfaced with `status: "denied"` in the existing tool-result event stream.
+
+All events use the existing fixed 30-second `HOOK_TIMEOUT` from
+`src/tools/pretool.rs`; there is no per-hook timeout setting. The process
+runner in `src/tools/process.rs` checks `interrupt::is_signaled()` to detect
+cancellation, then terminates and reaps the child before returning.
+
+`PostToolUse`, `TurnStart`, `TurnEnd`, `SessionStart`, and `SessionEnd` are
+observational. Their stdout does not alter the operation. A spawn error,
+nonzero exit, timeout, or cancellation produces a structured hook outcome and
+one stderr warning per failure from the shared reporter; subsequent hooks
+still run, and the tool, turn, or session result is unchanged.
+
 ## IDs, validation, and disabled entries
 
 IDs are case-sensitive and must match
@@ -101,20 +148,20 @@ missing or empty. Leg never partially loads a file or silently chooses a
 different hook after an error. A valid `enabled: false` entry is validated,
 then omitted from selection.
 
-For an event and tool, leg returns enabled matching entries in JSON array
-order. There is only one selected file, so entries from different sources are
-never combined.
+## `LEG_PRETOOL_HOOK` compatibility and trust
 
-## `LEG_PRETOOL_HOOK` compatibility
+`LEG_PRETOOL_HOOK` remains an optional executable path. It uses the
+`PreToolUse` payload and decision behavior above. When both forms are
+configured, the legacy command runs first, followed by matching declarative
+entries in file order.
 
-`LEG_PRETOOL_HOOK` remains an optional executable path. With no declarative
-file it keeps its existing `PreToolUse` stdin and decision behavior. When both
-forms are configured, selection treats the legacy hook as additive and places
-it before matching declarative `PreToolUse` entries; declarative entries follow
-file order. The existing legacy execution path is unchanged. This contract
-slice loads and selects declarative entries but does not execute them.
+Hooks named by a project `.leg/hooks.json` are trusted as-is. Commands run with
+the operating-system permissions of the user running leg; a project file can
+therefore name commands that act with those permissions.
 
-Hooks named by a project `.leg/hooks.json` are trusted as-is. When hook
-execution is provided, commands run with the operating-system permissions of
-the user running leg; a project file can therefore name commands that act with
-those permissions.
+The event names are compatible with Claude Code for tool and session hooks;
+`TurnStart` and `TurnEnd` are leg-specific. Leg uses a flat one-event-per-entry
+list with stable IDs, explicit file order, and a versioned schema. Its tool
+matchers are exact names or `*`, not Claude Code regular expressions.
+References: [Claude Code hooks](https://code.claude.com/docs/en/hooks) and
+[OpenCode plugins](https://opencode.ai/docs/plugins/).

@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crate::tools::process;
 
-const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
-const GENERIC_DENIAL: &str = "denied by pre-tool hook: hook failed";
+pub(super) const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const GENERIC_DENIAL: &str = "denied by pre-tool hook: hook failed";
 
 pub(super) struct PreToolHook {
     executable: PathBuf,
@@ -27,6 +27,7 @@ impl PreToolHook {
         self
     }
 
+    #[cfg(all(test, unix))]
     pub(super) fn authorize(
         &self,
         tool_name: &str,
@@ -43,8 +44,7 @@ impl PreToolHook {
             "cwd": cwd,
         }))
         .map_err(|_| generic_denial())?;
-        let output = process::run_executable(self.executable.as_os_str(), payload, self.timeout)
-            .map_err(|_| generic_denial())?;
+        let output = self.run_payload(payload).map_err(|_| generic_denial())?;
         if output.status != "exited"
             || output.exit_code != 0
             || output.stdout.omitted_bytes != 0
@@ -54,29 +54,50 @@ impl PreToolHook {
         }
         parse_decision(&output.stdout.text)
     }
+
+    pub(super) fn run_payload(&self, payload: Vec<u8>) -> std::io::Result<process::ProcessOutput> {
+        process::run_executable(self.executable.as_os_str(), payload, self.timeout)
+    }
 }
 
-fn generic_denial() -> String {
+#[cfg(test)]
+pub(super) fn generic_denial() -> String {
     GENERIC_DENIAL.to_string()
 }
 
-fn parse_decision(stdout: &str) -> std::result::Result<(), String> {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PreToolDecision {
+    Allow,
+    Deny(String),
+    Fail,
+}
+
+pub(super) fn parse_decision_kind(stdout: &str) -> PreToolDecision {
     if stdout.trim().is_empty() {
-        return Ok(());
+        return PreToolDecision::Allow;
     }
 
-    let decision: serde_json::Value = serde_json::from_str(stdout).map_err(|_| generic_denial())?;
+    let Ok(decision) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return PreToolDecision::Fail;
+    };
     match decision.get("decision").and_then(serde_json::Value::as_str) {
-        Some("allow") => Ok(()),
-        Some("deny") => {
-            let reason = decision
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .filter(|reason| !reason.trim().is_empty())
-                .ok_or_else(generic_denial)?;
-            Err(format!("denied by pre-tool hook: {reason}"))
-        }
-        _ => Err(generic_denial()),
+        Some("allow") => PreToolDecision::Allow,
+        Some("deny") => decision
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .map(|reason| PreToolDecision::Deny(reason.to_string()))
+            .unwrap_or(PreToolDecision::Fail),
+        _ => PreToolDecision::Fail,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn parse_decision(stdout: &str) -> std::result::Result<(), String> {
+    match parse_decision_kind(stdout) {
+        PreToolDecision::Allow => Ok(()),
+        PreToolDecision::Deny(reason) => Err(format!("denied by pre-tool hook: {reason}")),
+        PreToolDecision::Fail => Err(generic_denial()),
     }
 }
 
@@ -96,6 +117,10 @@ mod tests {
         assert_eq!(
             parse_decision(r#"{"decision":"deny","reason":"role policy"}"#),
             Err("denied by pre-tool hook: role policy".to_string())
+        );
+        assert_eq!(
+            parse_decision_kind(r#"{"decision":"deny","reason":"hook failed"}"#),
+            PreToolDecision::Deny("hook failed".to_string())
         );
     }
 

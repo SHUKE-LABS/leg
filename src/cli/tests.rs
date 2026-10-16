@@ -2496,6 +2496,133 @@ fn preallocated_session_trail_refuses_an_existing_file_without_overwriting_it() 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn resumed_session_skips_session_start_hook_but_runs_session_end_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "leg-session-hook-boundary-{}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).expect("create temporary directory");
+    let _cleanup = Cleanup(directory.clone());
+    let trace = directory.join("events.jsonl");
+    let quote = |path: &std::path::Path| format!("'{}'", path.display());
+    let hook_path = directory.join("record-event");
+    std::fs::write(
+        &hook_path,
+        format!(
+            "#!/bin/sh\npayload=\"$(cat)\"\nprintf '%s\\n' \"$payload\" >> {}\n",
+            quote(&trace)
+        ),
+    )
+    .expect("write lifecycle hook");
+    let mut permissions = std::fs::metadata(&hook_path)
+        .expect("hook metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&hook_path, permissions).expect("make hook executable");
+
+    let config_path = directory.join("hooks.json");
+    let contents = serde_json::json!({
+        "version": 1,
+        "hooks": [
+            { "id": "session-start", "event": "SessionStart", "command": hook_path },
+            { "id": "turn-start", "event": "TurnStart", "command": hook_path },
+            { "id": "turn-end", "event": "TurnEnd", "command": hook_path },
+            { "id": "session-end", "event": "SessionEnd", "command": hook_path },
+        ]
+    })
+    .to_string();
+    let hooks = crate::hooks::load_hook_set(
+        &crate::hooks::HookConfigPaths {
+            explicit: Some(config_path.clone()),
+            ..Default::default()
+        },
+        |path| {
+            if path == config_path {
+                Ok(contents.clone())
+            } else {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+        },
+    )
+    .expect("load lifecycle hook config");
+
+    let make_loop = |reply: &str| {
+        ToolLoop::new(
+            FakeTransport(Ok(AssistantReply::new(reply))),
+            ToolRegistry::new().with_hook_config(hooks.clone(), None),
+            None,
+        )
+    };
+    let mut sink = NoopSink;
+    let mut output = Vec::new();
+    execute_session(
+        &make_loop("fresh reply"),
+        &mut sink,
+        &meta(),
+        std::io::Cursor::new(b"fresh turn\n".to_vec()),
+        &mut output,
+        "sess-hooks".to_string(),
+    )
+    .expect("fresh session completes");
+
+    let mut resumed_output = Vec::new();
+    execute_session_resumed(
+        &make_loop("resumed reply"),
+        &mut sink,
+        &meta(),
+        std::io::Cursor::new(b"resumed turn\n".to_vec()),
+        &mut resumed_output,
+        ResumedSession {
+            session_id: "sess-hooks".to_string(),
+            conversation: Conversation::new(),
+            prior_turns: 1,
+            next_turn_index: 1,
+            summary: None,
+            history_turn_indices: Vec::new(),
+        },
+    )
+    .expect("resumed session completes");
+
+    let payloads: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        payloads
+            .iter()
+            .map(|payload| payload["hook_event_name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "SessionStart",
+            "TurnStart",
+            "TurnEnd",
+            "SessionEnd",
+            "TurnStart",
+            "TurnEnd",
+            "SessionEnd",
+        ]
+    );
+    assert_eq!(payloads[0]["session_id"], "sess-hooks");
+    assert_eq!(payloads[1]["turn_index"], 0);
+    assert_eq!(payloads[4]["turn_index"], 1);
+    assert_eq!(payloads[6]["turns"], 2);
+}
+
 #[test]
 fn parse_args_exchange_unexpected_argument_is_usage_error() {
     assert!(parse_args(&argv(&["exchange", "--who"])).is_err());
