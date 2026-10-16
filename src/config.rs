@@ -472,7 +472,7 @@ fn compose_system_prompt(
 /// Returns the directories whose `AGENTS.md` files apply to `cwd`, ordered
 /// from the repository root to the nearest directory. A non-repository
 /// working directory contributes only itself.
-fn instruction_directories(cwd: &Path) -> Vec<PathBuf> {
+pub(crate) fn instruction_directories(cwd: &Path) -> Vec<PathBuf> {
     // Git for Windows may print a root with different separators, casing, or
     // a path-prefix form than `current_dir`. Canonicalizing both sides makes
     // the ancestor comparison semantic instead of dependent on that spelling.

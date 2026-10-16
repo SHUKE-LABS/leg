@@ -31,5 +31,6 @@ pub mod log;
 pub mod message;
 pub mod model;
 pub mod participant;
+pub mod skills;
 pub mod tools;
 pub mod transport;
