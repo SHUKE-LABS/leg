@@ -1232,6 +1232,7 @@ fn leg(cwd: &Path, base_url: &str) -> Command {
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("LEG_MODEL", "claude-test-model")
+        .env("LEG_THINKING", "off")
         .env("LEG_CONTEXT_WINDOW_TOKENS", "200000")
         .env("LEG_TIMEOUT_SECS", "5")
         .env_remove("LEG_EVENT_LOG")
@@ -1708,6 +1709,29 @@ fn ask_drives_read_edit_bash_and_records_the_tool_trail() {
     assert_eq!(shown.matches("→ completed: ").count(), 3, "{shown}");
     assert!(shown.contains("reply:  all done"), "{shown}");
 
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn unknown_thinking_model_warns_once_and_omits_provider_parameter() {
+    let (base_url, requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
+    let cwd = fixture_dir("unknown-thinking-model");
+    let mut cmd = leg(&cwd, &base_url);
+    cmd.env("LEG_MODEL", "vendor-unknown-model")
+        .env_remove("LEG_THINKING")
+        .args(["ask", "hello"]);
+    let output = run(cmd, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "leg ask failed; stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi there");
+    assert_eq!(stderr.matches("warning: model").count(), 1, "{stderr}");
+    assert!(stderr.contains("vendor-unknown-model"), "{stderr}");
+    assert!(stderr.contains("LEG_THINKING_MAP"), "{stderr}");
+
+    let requests = requests.lock().unwrap();
+    let request: Value = serde_json::from_str(&requests[0]).expect("request body is JSON");
+    assert!(request.get("thinking").is_none(), "{request}");
+    assert!(request.get("output_config").is_none(), "{request}");
     std::fs::remove_dir_all(&cwd).ok();
 }
 

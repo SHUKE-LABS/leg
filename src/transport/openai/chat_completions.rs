@@ -9,6 +9,7 @@ use crate::error::{LegError, Result};
 use crate::model::{
     AssistantReply, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, ToolSpec,
 };
+use crate::thinking::ThinkingRequest;
 use crate::transport::http::{HttpClient, UreqHttpClient};
 use crate::transport::sse::{SseDecoder, SseEvent};
 use crate::transport::{RetryingHttpClient, StreamEvent, Transport, TransportCall};
@@ -229,6 +230,9 @@ fn build_request_body_with_max_tokens(
         "stream": true,
         "stream_options": {"include_usage": true}
     });
+    if let Some(ThinkingRequest::Effort(effort)) = config.thinking.request(max_tokens) {
+        request["reasoning_effort"] = Value::String(effort);
+    }
     if !tools.is_empty() {
         request["tools"] = Value::Array(
             tools
@@ -747,6 +751,7 @@ mod tests {
             stream_idle_timeout: Duration::from_secs(120),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            thinking: crate::thinking::ThinkingConfig::disabled(),
             context_budget: None,
             max_retries: 0,
             retry_base_delay: Duration::ZERO,
@@ -881,6 +886,64 @@ mod tests {
         let body: Value = serde_json::from_str(body).expect("request JSON");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "caller\n\nroot\n\nnested");
+    }
+
+    #[test]
+    fn thinking_effort_is_sent_on_chat_completions_requests() {
+        let http = FakeHttp {
+            body: stream(&[
+                json!({"choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]),
+            request: RefCell::new(None),
+        };
+        let mut config = config();
+        config.model = "o3-mini".to_string();
+        config.thinking = crate::thinking::ThinkingConfig::resolve(
+            Provider::OpenAiChatCompletions,
+            &config.model,
+            None,
+            None,
+        )
+        .expect("thinking config");
+        let client = OpenAiChatCompletionsClient::with_http(config, http);
+        client
+            .send_conversation(&[Message::user("hi")])
+            .expect("response parses");
+
+        let request = client.http.request.borrow();
+        let (_, _, body) = request.as_ref().expect("request captured");
+        let body: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn off_omits_chat_completions_reasoning_field() {
+        let http = FakeHttp {
+            body: stream(&[
+                json!({"choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]),
+            request: RefCell::new(None),
+        };
+        let mut config = config();
+        config.model = "o3-mini".to_string();
+        config.thinking = crate::thinking::ThinkingConfig::resolve(
+            Provider::OpenAiChatCompletions,
+            &config.model,
+            Some("off".to_string()),
+            None,
+        )
+        .expect("thinking config");
+        let client = OpenAiChatCompletionsClient::with_http(config, http);
+        client
+            .send_conversation(&[Message::user("hi")])
+            .expect("response parses");
+
+        let request = client.http.request.borrow();
+        let (_, _, body) = request.as_ref().expect("request captured");
+        let body: Value = serde_json::from_str(body).expect("request JSON");
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

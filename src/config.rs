@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::error::{LegError, Result};
 use crate::hooks::{HookEvent, HookSet, SelectedHook, discover_hook_config_paths, load_hook_set};
+use crate::thinking::ThinkingConfig;
 
 /// Default base URL for the Claude-compatible Messages API.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -123,6 +124,9 @@ pub struct LegConfig {
     /// defaulting to [`DEFAULT_MAX_TOKENS`]. Must be a positive integer; zero is
     /// rejected because the API rejects it.
     pub max_tokens: u32,
+    /// Provider-neutral thinking configuration resolved from `LEG_THINKING`,
+    /// `LEG_THINKING_MAP`, and the selected model's capability table.
+    pub(crate) thinking: ThinkingConfig,
     /// Explicit context-window policy. `None` leaves stateless calls without
     /// budgeting; session entry points require this to be configured.
     pub context_budget: Option<ContextBudget>,
@@ -195,6 +199,13 @@ impl LegConfig {
             ),
         };
         let model = non_empty(lookup("LEG_MODEL")).unwrap_or_else(|| default_model.to_string());
+
+        let thinking = ThinkingConfig::resolve(
+            provider,
+            &model,
+            non_empty(lookup("LEG_THINKING")),
+            non_empty(lookup("LEG_THINKING_MAP")),
+        )?;
 
         let timeout_secs = match non_empty(lookup("LEG_TIMEOUT_SECS")) {
             Some(raw) => {
@@ -353,6 +364,7 @@ impl LegConfig {
             stream_idle_timeout: Duration::from_secs(stream_idle_timeout_secs),
             bash_timeout_secs,
             max_tokens,
+            thinking,
             context_budget,
             max_retries,
             retry_base_delay: Duration::from_millis(retry_base_delay_ms),
@@ -734,6 +746,10 @@ mod tests {
         );
         assert_eq!(cfg.bash_timeout_secs, DEFAULT_BASH_TIMEOUT_SECS);
         assert_eq!(cfg.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            cfg.thinking.request(DEFAULT_MAX_TOKENS),
+            Some(crate::thinking::ThinkingRequest::Effort("high".to_string()))
+        );
         assert_eq!(cfg.max_retries, DEFAULT_MAX_RETRIES);
         assert_eq!(
             cfg.retry_base_delay,
@@ -1015,6 +1031,31 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, LegError::Config(_)));
+    }
+
+    #[test]
+    fn thinking_level_is_validated_and_map_overrides_provider_value() {
+        let invalid = LegConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("LEG_THINKING", "deep"),
+        ]))
+        .unwrap_err();
+        assert!(invalid.to_string().contains("LEG_THINKING"));
+        assert!(invalid.to_string().contains("minimal"));
+
+        let cfg = LegConfig::from_lookup(lookup_from(&[
+            ("LEG_PROVIDER", "openai-responses"),
+            ("OPENAI_API_KEY", "secret"),
+            ("LEG_MODEL", "vendor-reasoning-model"),
+            ("LEG_THINKING_MAP", r#"{"high":"medium"}"#),
+        ]))
+        .expect("thinking override should load");
+        assert_eq!(
+            cfg.thinking.request(DEFAULT_MAX_TOKENS),
+            Some(crate::thinking::ThinkingRequest::Effort(
+                "medium".to_string()
+            ))
+        );
     }
 
     #[test]

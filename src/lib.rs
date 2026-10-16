@@ -32,5 +32,6 @@ pub mod message;
 pub mod model;
 pub mod participant;
 pub mod skills;
+mod thinking;
 pub mod tools;
 pub mod transport;

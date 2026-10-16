@@ -9,6 +9,7 @@ use crate::error::{LegError, Result};
 use crate::model::{
     AssistantReply, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, ToolSpec,
 };
+use crate::thinking::ThinkingRequest;
 use crate::transport::http::{HttpClient, UreqHttpClient};
 use crate::transport::sse::{SseDecoder, SseEvent};
 use crate::transport::{RetryingHttpClient, StreamEvent, Transport, TransportCall};
@@ -222,6 +223,9 @@ fn build_request_body_with_max_tokens(
         "max_output_tokens": max_output_tokens,
         "stream": true
     });
+    if let Some(ThinkingRequest::Effort(effort)) = config.thinking.request(max_output_tokens) {
+        request["reasoning"] = json!({"effort": effort});
+    }
     if let Some(instructions) = system_prompt {
         request["instructions"] = Value::String(instructions.to_string());
     }
@@ -910,6 +914,7 @@ mod tests {
             stream_idle_timeout: Duration::from_secs(120),
             bash_timeout_secs: crate::config::DEFAULT_BASH_TIMEOUT_SECS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            thinking: crate::thinking::ThinkingConfig::disabled(),
             context_budget: None,
             max_retries: 0,
             retry_base_delay: Duration::ZERO,
@@ -1063,6 +1068,111 @@ mod tests {
         let (_, _, body) = request.as_ref().expect("request captured");
         let body: Value = serde_json::from_str(body).expect("request JSON");
         assert_eq!(body["instructions"], "caller\n\nroot\n\nnested");
+    }
+
+    #[test]
+    fn thinking_effort_is_sent_on_responses_requests() {
+        let response = json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+            "usage":{"input_tokens":1,"output_tokens":1}
+        });
+        let event_body = [
+            event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_thinking"}}),
+            ),
+            event(
+                "response.completed",
+                json!({"type":"response.completed","response":response}),
+            ),
+        ]
+        .join("");
+        let mut config = config();
+        config.model = "o3-mini".to_string();
+        config.thinking = crate::thinking::ThinkingConfig::resolve(
+            Provider::OpenAiResponses,
+            &config.model,
+            None,
+            None,
+        )
+        .expect("thinking config");
+        let http = FakeHttp {
+            body: event_body.clone(),
+            request: RefCell::new(None),
+        };
+        let client = OpenAiResponsesClient::with_http(config, http);
+        client
+            .send_conversation(&[Message::user("hi")])
+            .expect("response parses");
+
+        let request = client.http.request.borrow();
+        let (_, _, body) = request.as_ref().expect("request captured");
+        let body: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn thinking_override_and_off_are_reflected_in_responses_body() {
+        let response = json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+            "usage":{"input_tokens":1,"output_tokens":1}
+        });
+        let event_body = [
+            event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_override"}}),
+            ),
+            event(
+                "response.completed",
+                json!({"type":"response.completed","response":response}),
+            ),
+        ]
+        .join("");
+        let mut override_config = config();
+        override_config.model = "vendor-reasoning-model".to_string();
+        override_config.thinking = crate::thinking::ThinkingConfig::resolve(
+            Provider::OpenAiResponses,
+            &override_config.model,
+            Some("high".to_string()),
+            Some(r#"{"high":"medium"}"#.to_string()),
+        )
+        .expect("thinking config");
+        let http = FakeHttp {
+            body: event_body.clone(),
+            request: RefCell::new(None),
+        };
+        let client = OpenAiResponsesClient::with_http(override_config, http);
+        client
+            .send_conversation(&[Message::user("hi")])
+            .expect("response parses");
+        let request = client.http.request.borrow();
+        let (_, _, request_body) = request.as_ref().expect("request captured");
+        let request_body: Value = serde_json::from_str(request_body).expect("request JSON");
+        assert_eq!(request_body["reasoning"]["effort"], "medium");
+
+        let mut off_config = config();
+        off_config.model = "o3-mini".to_string();
+        off_config.thinking = crate::thinking::ThinkingConfig::resolve(
+            Provider::OpenAiResponses,
+            &off_config.model,
+            Some("off".to_string()),
+            None,
+        )
+        .expect("thinking config");
+        let http = FakeHttp {
+            body: event_body,
+            request: RefCell::new(None),
+        };
+        let client = OpenAiResponsesClient::with_http(off_config, http);
+        client
+            .send_conversation(&[Message::user("hi")])
+            .expect("response parses");
+        let request = client.http.request.borrow();
+        let (_, _, request_body) = request.as_ref().expect("request captured");
+        let request_body: Value = serde_json::from_str(request_body).expect("request JSON");
+        assert!(request_body.get("reasoning").is_none());
     }
 
     #[test]
