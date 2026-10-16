@@ -9,7 +9,8 @@
 //! [`Transport`], so every driver (`ask`, `session`, `exchange`) shares it.
 //!
 //! Registered tools are [`ReadTool`] (`read`), [`WriteTool`] (`write`),
-//! [`EditTool`] (`edit`), and [`BashTool`] (`bash`).
+//! [`EditTool`] (`edit`), [`BashTool`] (`bash`), [`ActivateSkillTool`]
+//! (`activate_skill`), and [`ReadSkillResourceTool`] (`read_skill_resource`).
 
 use std::cell::RefCell;
 

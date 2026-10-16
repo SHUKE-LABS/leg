@@ -186,6 +186,9 @@ fn run_leg_exchange_in_dir(
     stdin_body: &str,
 ) -> (bool, String, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_leg"));
+    // Keep user Skill discovery hermetic so prompt assertions do not depend on
+    // the developer's home directory.
+    let isolated_home = session_dir.join("test-home");
     command
         .args(args)
         .env("LEG_HOOKS_CONFIG", empty_hooks_config_path())
@@ -195,6 +198,9 @@ fn run_leg_exchange_in_dir(
         .env("LEG_TIMEOUT_SECS", "5")
         .env("LEG_CONTEXT_WINDOW_TOKENS", "200000")
         .env("LEG_SESSION_DIR", session_dir)
+        .env("HOME", &isolated_home)
+        .env("USERPROFILE", &isolated_home)
+        .env_remove("CODEX_HOME")
         .env_remove("LEG_EVENT_LOG")
         .current_dir(cwd)
         .stdin(Stdio::piped())

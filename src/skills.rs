@@ -160,7 +160,11 @@ impl SkillTurnState {
         if let Some(base) = base.filter(|base| !base.is_empty()) {
             parts.push(base.to_string());
         }
-        if let Some(catalog) = &turn.catalog {
+        if let Some(catalog) = turn
+            .catalog
+            .as_ref()
+            .filter(|catalog| !catalog.skills.is_empty())
+        {
             parts.push(format!(
                 "Available Skills catalog (metadata only). Select by exact name and current snapshot_id with activate_skill(snapshot_id, name); activate again each turn.\n{}",
                 catalog.to_json()
@@ -318,12 +322,12 @@ fn render_active_skills(active: &BTreeMap<String, ActiveSkill>) -> String {
     for (name, skill) in active {
         output.push_str("\n## Skill: ");
         output.push_str(name);
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(&skill.body);
         for (path, content) in &skill.resources {
             output.push_str("\n\n### Resource: ");
             output.push_str(path);
-            output.push_str("\n");
+            output.push('\n');
             output.push_str(content);
         }
         output.push('\n');
@@ -429,12 +433,20 @@ fn load_skill_resource(entry: &SkillEntry, relative_path: &str) -> Result<String
     if !is_within_root(&package_path, &canonical) {
         return Err("Skill resource rejected: path leaves the selected package.".to_string());
     }
+    let path_metadata = fs::metadata(&canonical)
+        .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
+    if !path_metadata.is_file() {
+        return Err("Skill resource rejected: path is not a regular file.".to_string());
+    }
     let mut file = File::open(&canonical)
         .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
     let before = file
         .metadata()
         .map_err(|_| "Skill resource unavailable: file is missing or unreadable.".to_string())?;
-    if !before.is_file() || before.len() > MAX_SKILL_RESOURCE_BYTES as u64 {
+    if !before.is_file() {
+        return Err("Skill resource rejected: path is not a regular file.".to_string());
+    }
+    if before.len() > MAX_SKILL_RESOURCE_BYTES as u64 {
         return Err("Skill resource rejected: file exceeds the 64 KiB resource limit.".to_string());
     }
     let mut content = Vec::new();
@@ -2009,6 +2021,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_skill_catalog_preserves_the_base_prompt_exactly() {
+        let tree = TempTree::new("empty-catalog-prompt");
+        let cwd = tree.path().join("workspace");
+        let catalog = discover(&cwd, None, None);
+        assert!(catalog.skills.is_empty());
+
+        let state = SkillTurnState::new(None);
+        state.begin_turn_with_catalog(catalog);
+
+        assert_eq!(
+            state.compose_prompt(Some("PROJECT_POLICY")),
+            Some("PROJECT_POLICY".to_string())
+        );
+        assert_eq!(state.compose_prompt(None), None);
+    }
+
+    #[test]
     fn activation_and_resource_content_only_enter_the_composed_prompt() {
         let tree = TempTree::new("activation");
         let cwd = tree.path().join("workspace");
@@ -2135,6 +2164,7 @@ mod tests {
             "x".repeat(MAX_SKILL_RESOURCE_BYTES + 1),
         )
         .unwrap();
+        fs::create_dir_all(package.join("references/directory")).unwrap();
         let outside = tree.path().join("outside.md");
         fs::write(&outside, "PRIVATE_OUTSIDE_MARKER").unwrap();
         symlink_file(&outside, &package.join("references/escape.md"));
@@ -2162,6 +2192,12 @@ mod tests {
                 .read_resource(&snapshot_id, "reader", "references/large.md")
                 .unwrap_err()
                 .contains("64 KiB")
+        );
+        assert!(
+            state
+                .read_resource(&snapshot_id, "reader", "references/directory")
+                .unwrap_err()
+                .contains("not a regular file")
         );
         assert!(
             state

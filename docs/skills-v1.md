@@ -239,8 +239,9 @@ The contract-level expected outcomes are:
 | `duplicate/project/.../fixture-duplicate` plus `duplicate/user/.../fixture-duplicate` | One `fixture-duplicate` entry; the project package wins and the user package is named in a duplicate warning. | Activation returns the project marker; the user body is never loaded. |
 
 The fixture self-check remains deliberately weaker than the runtime tests.
-Rust tests exercise discovery, activation, resource confinement, refresh, and
-budget behavior against these fixtures and temporary package trees.
+Rust tests exercise discovery against copied fixtures and exercise activation,
+resource confinement, refresh, and budget behavior against temporary package
+trees.
 
 ## Non-goals
 
