@@ -105,9 +105,11 @@ include `ANTHROPIC_BASE_URL`, `LEG_MODEL`, `LEG_TIMEOUT_SECS`,
 
 `LEG_TIMEOUT_SECS` defaults to 60 and bounds DNS lookup, connection setup,
 request sending, response headers, and the total body read for non-streaming
-responses. Successful streamed responses may run longer while data keeps
-arriving; `LEG_STREAM_IDLE_TIMEOUT_SECS` defaults to 120 and limits how long a
-stream may remain silent between received chunks.
+responses. Response-header timeouts are retried on both streaming and
+non-streaming request paths up to `LEG_MAX_RETRIES`. Successful streamed
+responses may run longer while data keeps arriving;
+`LEG_STREAM_IDLE_TIMEOUT_SECS` defaults to 120 and limits how long a stream may
+remain silent between received chunks.
 
 `LEG_MAX_TOKENS` sets the output-token limit requested for each provider reply
 (default `32000`).

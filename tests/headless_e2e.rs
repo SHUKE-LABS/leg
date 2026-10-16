@@ -336,6 +336,79 @@ fn spawn_held_response_server(send_headers: bool) -> (String, HeldResponseServer
     )
 }
 
+struct HeaderRetryServer {
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for HeaderRetryServer {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Serves a sequence of stalled headers and optional streaming responses. It
+/// stays open until dropped so unexpected retries are also counted.
+fn spawn_header_retry_server(
+    responses: Vec<Option<String>>,
+) -> (String, Arc<Mutex<Vec<String>>>, HeaderRetryServer) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind header retry server");
+    listener
+        .set_nonblocking(true)
+        .expect("set header retry server nonblocking");
+    let addr = listener.local_addr().expect("header retry server address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let (stop, stopped) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut responses = responses.into_iter();
+        let mut stalled_connections = Vec::new();
+        loop {
+            if stopped.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("set accepted header retry stream blocking");
+                    let Some(request) = read_request_body(&mut stream) else {
+                        continue;
+                    };
+                    captured.lock().unwrap().push(request);
+                    if let Some(body) = responses.next().flatten() {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    } else {
+                        stalled_connections.push(stream);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(stalled_connections);
+    });
+
+    (
+        format!("http://{addr}"),
+        requests,
+        HeaderRetryServer {
+            stop,
+            worker: Some(worker),
+        },
+    )
+}
+
 fn spawn_counting_sse_server() -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting SSE server");
     listener
@@ -4509,6 +4582,8 @@ fn stalled_stream_fails_with_idle_timeout_in_response_error_trail() {
     let mut command = leg(&cwd, &base_url);
     command
         .env("LEG_STREAM_IDLE_TIMEOUT_SECS", "1")
+        .env("LEG_MAX_RETRIES", "2")
+        .env("LEG_RETRY_BASE_DELAY_MS", "5")
         .env("LEG_EVENT_LOG", &trail)
         .args(["exchange", "--stream-json"]);
 
@@ -4531,6 +4606,7 @@ fn stalled_stream_fails_with_idle_timeout_in_response_error_trail() {
         .find(|event| event["event"] == "response_error")
         .expect("response error event");
     assert_eq!(outcome["event"], "response_error");
+    assert_eq!(outcome["attempts"], 1);
     assert!(
         outcome["message"]
             .as_str()
@@ -4572,15 +4648,15 @@ fn stalled_buffered_response_keeps_the_request_body_timeout() {
 }
 
 #[test]
-fn response_header_timeout_stops_a_server_that_never_sends_headers() {
-    let (base_url, server) = spawn_held_response_server(false);
+fn response_header_timeout_does_not_retry_when_retries_are_disabled() {
+    let (base_url, requests, server) = spawn_header_retry_server(vec![None]);
     let cwd = fixture_dir("stream-timeout-headers");
     let trail = cwd.join("trail.jsonl");
     let mut command = leg(&cwd, &base_url);
     command
         .env("LEG_TIMEOUT_SECS", "1")
-        .env_remove("LEG_MAX_RETRIES")
-        .env_remove("LEG_RETRY_BASE_DELAY_MS")
+        .env("LEG_MAX_RETRIES", "0")
+        .env("LEG_RETRY_BASE_DELAY_MS", "5")
         .env("LEG_EVENT_LOG", &trail)
         .args(["exchange", "--stream-json"]);
 
@@ -4593,7 +4669,8 @@ fn response_header_timeout_stops_a_server_that_never_sends_headers() {
     );
     assert!(
         elapsed >= Duration::from_millis(800),
-        "failed too early: {elapsed:?}"
+        "failed too early: {elapsed:?}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         elapsed < Duration::from_secs(5),
@@ -4606,7 +4683,72 @@ fn response_header_timeout_stops_a_server_that_never_sends_headers() {
         .expect("response error event");
     assert_eq!(outcome["event"], "response_error");
     assert_eq!(outcome["attempts"], 1);
+    assert_eq!(requests.lock().unwrap().len(), 1);
     assert!(String::from_utf8_lossy(&output.stderr).contains("LEG_TIMEOUT_SECS"));
+    drop(server);
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn response_header_timeout_retries_up_to_the_configured_limit() {
+    let (base_url, requests, server) = spawn_header_retry_server(vec![None, None, None]);
+    let cwd = fixture_dir("stream-timeout-headers-retries");
+    let trail = cwd.join("trail.jsonl");
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_TIMEOUT_SECS", "1")
+        .env("LEG_MAX_RETRIES", "2")
+        .env("LEG_RETRY_BASE_DELAY_MS", "5")
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["exchange", "--stream-json"]);
+
+    let output = run(command, Some("hello\n"));
+
+    assert!(!output.status.success(), "stalled headers must fail");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("LEG_TIMEOUT_SECS"));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    let events = read_events(&trail);
+    let outcome = events
+        .iter()
+        .find(|event| event["event"] == "response_error")
+        .expect("response error event");
+    assert_eq!(outcome["attempts"], 3);
+    drop(server);
+    std::fs::remove_dir_all(&cwd).ok();
+}
+
+#[test]
+fn response_header_timeout_retry_can_complete_the_streaming_turn() {
+    let (base_url, requests, server) =
+        spawn_header_retry_server(vec![None, Some(sse_text_reply("recovered"))]);
+    let cwd = fixture_dir("stream-timeout-headers-recovers");
+    let trail = cwd.join("trail.jsonl");
+    let mut command = leg(&cwd, &base_url);
+    command
+        .env("LEG_TIMEOUT_SECS", "1")
+        .env("LEG_MAX_RETRIES", "2")
+        .env("LEG_RETRY_BASE_DELAY_MS", "5")
+        .env("LEG_EVENT_LOG", &trail)
+        .args(["exchange", "--stream-json"]);
+
+    let output = run(command, Some("hello\n"));
+
+    assert!(
+        output.status.success(),
+        "retry should complete the streaming turn; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let events = read_events(&trail);
+    let outcome = events
+        .iter()
+        .find(|event| event["event"] == "response_ok")
+        .expect("response success event");
+    assert_eq!(
+        outcome["attempts"], 2,
+        "unexpected response outcome: {outcome}"
+    );
+    assert_eq!(outcome["reply"], "recovered");
     drop(server);
     std::fs::remove_dir_all(&cwd).ok();
 }
