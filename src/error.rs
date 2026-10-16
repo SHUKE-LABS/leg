@@ -100,6 +100,9 @@ pub enum LegError {
         /// The provider's raw terminal reason.
         stop_reason: String,
     },
+    /// The active conversation cannot fit in the configured provider context
+    /// window without dropping an in-flight turn or tool result.
+    ContextWindow(String),
     /// A local I/O operation failed.
     Io(String),
     /// The active turn was interrupted by a Unix signal.
@@ -148,6 +151,7 @@ impl LegError {
             LegError::Server { .. } => "server",
             LegError::Api { .. } => "api",
             LegError::Decode(_) | LegError::TokenLimit { .. } => "decode",
+            LegError::ContextWindow(_) => "context_window",
             LegError::Io(_) => "io",
             LegError::Interrupted { .. } => "interrupted",
             LegError::Log(_) => "log",
@@ -163,6 +167,37 @@ impl LegError {
             LegError::TokenLimit { stop_reason, .. } => Some(stop_reason),
             _ => None,
         }
+    }
+
+    /// Whether this provider rejection identifies an input context overflow.
+    pub(crate) fn is_context_window_rejection(&self) -> bool {
+        let message = match self {
+            LegError::Api {
+                error_type,
+                message,
+                ..
+            }
+            | LegError::Server {
+                error_type,
+                message,
+                ..
+            } => format!("{} {message}", error_type.as_deref().unwrap_or_default()),
+            LegError::ProviderStream {
+                error_type,
+                message,
+            } => {
+                format!("{} {message}", error_type.as_deref().unwrap_or_default())
+            }
+            _ => return false,
+        };
+        let message = message.to_ascii_lowercase();
+        message.contains("context window")
+            || message.contains("context length")
+            || message.contains("prompt is too long")
+            || message.contains("input is too long")
+            || message.contains("maximum context")
+            || message.contains("context_length_exceeded")
+            || message.contains("reduce the length of the input")
     }
 }
 
@@ -214,6 +249,7 @@ impl fmt::Display for LegError {
                 f,
                 "response decode error: reply hit max_tokens ({max_tokens}) before producing text or a tool call; raise LEG_MAX_TOKENS"
             ),
+            LegError::ContextWindow(msg) => write!(f, "context window error: {msg}"),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
             LegError::Interrupted { signal } => {
                 write!(f, "interrupted by {}", signal.name())

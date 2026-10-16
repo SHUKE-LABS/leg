@@ -40,6 +40,27 @@ pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 /// Default `max_tokens` requested per reply when `LEG_MAX_TOKENS` is unset.
 pub const DEFAULT_MAX_TOKENS: u32 = 32000;
 
+/// Maximum provider context window when explicitly configured.
+pub const DEFAULT_CONTEXT_KEEP_RECENT_TOKENS_CAP: u64 = 8192;
+
+/// Input and output allowances used by context-window management.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    /// Explicit model context window.
+    pub window_tokens: u64,
+    /// Tokens reserved for the next provider reply and internal summary.
+    pub reserve_tokens: u64,
+    /// Recent historical context to retain during compaction.
+    pub keep_recent_tokens: u64,
+}
+
+impl ContextBudget {
+    /// Usable input allowance after reserving reply capacity.
+    pub const fn input_tokens(self) -> u64 {
+        self.window_tokens.saturating_sub(self.reserve_tokens)
+    }
+}
+
 /// Default number of retries for transient provider failures.
 pub const DEFAULT_MAX_RETRIES: usize = 2;
 
@@ -101,6 +122,9 @@ pub struct LegConfig {
     /// defaulting to [`DEFAULT_MAX_TOKENS`]. Must be a positive integer; zero is
     /// rejected because the API rejects it.
     pub max_tokens: u32,
+    /// Explicit context-window policy. `None` leaves stateless calls without
+    /// budgeting; session entry points require this to be configured.
+    pub context_budget: Option<ContextBudget>,
     /// Maximum retries per provider request. From `LEG_MAX_RETRIES`,
     /// defaulting to [`DEFAULT_MAX_RETRIES`]; zero disables retries.
     pub max_retries: usize,
@@ -123,6 +147,15 @@ pub struct LegConfig {
 }
 
 impl LegConfig {
+    /// Requires an explicit model context window for a long-lived session.
+    pub fn require_context_budget(&self) -> Result<ContextBudget> {
+        self.context_budget.ok_or_else(|| {
+            LegError::Config(
+                "LEG_CONTEXT_WINDOW_TOKENS is required for session and session-backed exchange; set the model's context window explicitly".to_string(),
+            )
+        })
+    }
+
     /// Loads configuration from the process environment.
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|key| std::env::var(key).ok())
@@ -218,6 +251,48 @@ impl LegConfig {
             None => DEFAULT_MAX_TOKENS,
         };
 
+        let context_window_tokens = parse_optional_positive_u64(
+            "LEG_CONTEXT_WINDOW_TOKENS",
+            non_empty(lookup("LEG_CONTEXT_WINDOW_TOKENS")),
+        )?;
+        let configured_reserve = parse_optional_positive_u64(
+            "LEG_CONTEXT_RESERVE_TOKENS",
+            non_empty(lookup("LEG_CONTEXT_RESERVE_TOKENS")),
+        )?;
+        let configured_keep_recent = parse_optional_positive_u64(
+            "LEG_CONTEXT_KEEP_RECENT_TOKENS",
+            non_empty(lookup("LEG_CONTEXT_KEEP_RECENT_TOKENS")),
+        )?;
+        let context_budget = match context_window_tokens {
+            Some(window_tokens) => {
+                let reserve_tokens = configured_reserve.unwrap_or(max_tokens as u64);
+                if reserve_tokens >= window_tokens {
+                    return Err(LegError::Config(format!(
+                        "LEG_CONTEXT_RESERVE_TOKENS ({reserve_tokens}) must be less than LEG_CONTEXT_WINDOW_TOKENS ({window_tokens})"
+                    )));
+                }
+                let usable = window_tokens - reserve_tokens;
+                let default_keep_recent = (usable / 2).min(DEFAULT_CONTEXT_KEEP_RECENT_TOKENS_CAP);
+                let keep_recent_tokens = configured_keep_recent.unwrap_or(default_keep_recent);
+                if keep_recent_tokens == 0 || keep_recent_tokens >= usable {
+                    return Err(LegError::Config(format!(
+                        "LEG_CONTEXT_KEEP_RECENT_TOKENS ({keep_recent_tokens}) must satisfy 0 < keep_recent < usable context budget ({usable} = window - reserve); increase LEG_CONTEXT_WINDOW_TOKENS or lower LEG_CONTEXT_RESERVE_TOKENS"
+                    )));
+                }
+                Some(ContextBudget {
+                    window_tokens,
+                    reserve_tokens,
+                    keep_recent_tokens,
+                })
+            }
+            None if configured_reserve.is_some() || configured_keep_recent.is_some() => {
+                return Err(LegError::Config(
+                    "LEG_CONTEXT_WINDOW_TOKENS is required when LEG_CONTEXT_RESERVE_TOKENS or LEG_CONTEXT_KEEP_RECENT_TOKENS is set".to_string(),
+                ));
+            }
+            None => None,
+        };
+
         let max_retries = match non_empty(lookup("LEG_MAX_RETRIES")) {
             Some(raw) => raw.parse::<usize>().map_err(|_| {
                 LegError::Config(format!(
@@ -265,6 +340,7 @@ impl LegConfig {
             stream_idle_timeout: Duration::from_secs(stream_idle_timeout_secs),
             bash_timeout_secs,
             max_tokens,
+            context_budget,
             max_retries,
             retry_base_delay: Duration::from_millis(retry_base_delay_ms),
             max_tool_rounds,
@@ -272,6 +348,21 @@ impl LegConfig {
             pre_tool_hook,
         })
     }
+}
+
+fn parse_optional_positive_u64(name: &str, raw: Option<String>) -> Result<Option<u64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| LegError::Config(format!("{name} must be a positive integer, got {raw:?}")))?;
+    if parsed == 0 {
+        return Err(LegError::Config(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(Some(parsed))
 }
 
 /// Resolves the optional system prompt from the `LEG_SYSTEM_PROMPT` path.
@@ -614,6 +705,89 @@ mod tests {
     #[test]
     fn default_max_tokens_is_32000() {
         assert_eq!(DEFAULT_MAX_TOKENS, 32000);
+    }
+
+    #[test]
+    fn context_budget_defaults_from_the_explicit_window_and_max_tokens() {
+        let cfg = LegConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("LEG_CONTEXT_WINDOW_TOKENS", "100000"),
+        ]))
+        .expect("valid context window");
+        assert_eq!(
+            cfg.context_budget,
+            Some(ContextBudget {
+                window_tokens: 100_000,
+                reserve_tokens: DEFAULT_MAX_TOKENS as u64,
+                keep_recent_tokens: 8192,
+            })
+        );
+
+        let cfg = LegConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("LEG_MAX_TOKENS", "200"),
+            ("LEG_CONTEXT_WINDOW_TOKENS", "1000"),
+        ]))
+        .expect("custom max tokens feed the reserve default");
+        assert_eq!(
+            cfg.context_budget,
+            Some(ContextBudget {
+                window_tokens: 1000,
+                reserve_tokens: 200,
+                keep_recent_tokens: 400,
+            })
+        );
+    }
+
+    #[test]
+    fn context_budget_rejects_invalid_values_and_unusable_combinations() {
+        for (name, value) in [
+            ("LEG_CONTEXT_WINDOW_TOKENS", "0"),
+            ("LEG_CONTEXT_WINDOW_TOKENS", "wide"),
+            ("LEG_CONTEXT_RESERVE_TOKENS", "0"),
+            ("LEG_CONTEXT_RESERVE_TOKENS", "many"),
+            ("LEG_CONTEXT_KEEP_RECENT_TOKENS", "0"),
+            ("LEG_CONTEXT_KEEP_RECENT_TOKENS", "many"),
+        ] {
+            let mut pairs = vec![("ANTHROPIC_API_KEY", "secret")];
+            if name != "LEG_CONTEXT_WINDOW_TOKENS" {
+                pairs.push(("LEG_CONTEXT_WINDOW_TOKENS", "100000"));
+            }
+            pairs.push((name, value));
+            let error = LegConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
+            assert!(error.to_string().contains(name), "{name}={value}: {error}");
+        }
+
+        for pairs in [
+            vec![
+                ("ANTHROPIC_API_KEY", "secret"),
+                ("LEG_CONTEXT_WINDOW_TOKENS", "100"),
+                ("LEG_CONTEXT_RESERVE_TOKENS", "100"),
+            ],
+            vec![
+                ("ANTHROPIC_API_KEY", "secret"),
+                ("LEG_CONTEXT_WINDOW_TOKENS", "100"),
+                ("LEG_CONTEXT_RESERVE_TOKENS", "10"),
+                ("LEG_CONTEXT_KEEP_RECENT_TOKENS", "90"),
+            ],
+            vec![
+                ("ANTHROPIC_API_KEY", "secret"),
+                ("LEG_CONTEXT_WINDOW_TOKENS", "32001"),
+            ],
+        ] {
+            assert!(matches!(
+                LegConfig::from_lookup(lookup_from(&pairs)),
+                Err(LegError::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn long_lived_session_requires_an_explicit_context_window() {
+        let cfg = LegConfig::from_lookup(lookup_from(&[("ANTHROPIC_API_KEY", "secret")]))
+            .expect("stateless config may omit a model window");
+        let error = cfg.require_context_budget().unwrap_err();
+        assert!(error.to_string().contains("LEG_CONTEXT_WINDOW_TOKENS"));
     }
 
     #[test]

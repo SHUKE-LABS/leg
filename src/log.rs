@@ -27,7 +27,8 @@ use serde_json::Value;
 
 use crate::error::{LegError, Result};
 use crate::events::{
-    Exchange, Outcome, RequestRecord, ToolCallRecord, ToolResultRecord, ToolRoundRecord, ToolStatus,
+    CompactionRecord, Exchange, Outcome, RequestRecord, ToolCallRecord, ToolResultRecord,
+    ToolRoundRecord, ToolStatus,
 };
 use crate::model::{ContentBlock, ImageSource};
 
@@ -230,6 +231,8 @@ pub struct SessionRecord {
     pub declared_turns: Option<u64>,
     /// The session's turns, in file (== `turn_index`) order.
     pub turns: Vec<SessionTurn>,
+    /// Compaction events in append order; the latest summary governs resume.
+    pub compactions: Vec<CompactionRecord>,
 }
 
 /// The outcome of partitioning a trail into sessions: the [`SessionRecord`]s
@@ -324,6 +327,11 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                 }
                 // A sessionless `ask`/`exchange` request carries no session_id
                 // and is skipped — it belongs to no session.
+            }
+            Some("compaction") => {
+                let compaction: CompactionRecord = from_value(value, line_no, "compaction")?;
+                let idx = session_index(&mut report.sessions, &mut index, &compaction.session_id);
+                report.sessions[idx].compactions.push(compaction);
             }
             Some("tool_round") => {
                 let turn = session_turn(&report.sessions, &index, &value);
@@ -449,6 +457,7 @@ fn session_index(
         ended: false,
         declared_turns: None,
         turns: Vec::new(),
+        compactions: Vec::new(),
     });
     index.insert(session_id.to_string(), idx);
     idx
@@ -1141,6 +1150,39 @@ mod tests {
         assert!(!report.sessions[0].ended);
         assert_eq!(report.sessions[0].turns.len(), 1);
         assert_eq!(report.sessions[0].turns[0].outcome, None);
+    }
+
+    #[test]
+    fn parse_sessions_keeps_mid_turn_compaction_and_tool_pairs_before_a_torn_tail() {
+        let trail = concat!(
+            "{\"event\":\"session_start\",\"ts_ms\":1,\"session_id\":\"sess-c\"}\n",
+            "{\"event\":\"request\",\"ts_ms\":2,\"model\":\"m\",\"base_url\":\"u\",\"prompt\":\"old\",\"session_id\":\"sess-c\",\"turn_index\":0}\n",
+            "{\"event\":\"response_ok\",\"ts_ms\":3,\"duration_ms\":1,\"reply\":\"old done\",\"session_id\":\"sess-c\",\"turn_index\":0}\n",
+            "{\"event\":\"request\",\"ts_ms\":4,\"model\":\"m\",\"base_url\":\"u\",\"prompt\":\"active\",\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"event\":\"tool_round\",\"ts_ms\":5,\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read\",\"input\":{}}],\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"event\":\"tool_call\",\"ts_ms\":6,\"tool_use_id\":\"t1\",\"tool_name\":\"read\",\"input\":{},\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"event\":\"tool_result\",\"ts_ms\":7,\"tool_use_id\":\"t1\",\"tool_name\":\"read\",\"status\":\"completed\",\"result\":\"one\",\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"schema\":\"baton.exchange/v1\",\"event\":\"compaction\",\"ts_ms\":8,\"session_id\":\"sess-c\",\"turn_index\":1,\"retained_from_turn_index\":1,\"summary\":\"earlier context\"}\n",
+            "{\"event\":\"tool_round\",\"ts_ms\":9,\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"read\",\"input\":{}}],\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"event\":\"tool_call\",\"ts_ms\":10,\"tool_use_id\":\"t2\",\"tool_name\":\"read\",\"input\":{},\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"event\":\"tool_result\",\"ts_ms\":11,\"tool_use_id\":\"t2\",\"tool_name\":\"read\",\"status\":\"completed\",\"result\":\"two\",\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"event\":\"response_ok\",\"ts_ms\":12,\"duration_ms\":2,\"reply\":\"done\",\"session_id\":\"sess-c\",\"turn_index\":1}\n",
+            "{\"event\":\"response_"
+        );
+        let report = parse_sessions(Cursor::new(trail)).expect("tolerates torn final line");
+        let session = &report.sessions[0];
+        assert_eq!(session.compactions.len(), 1);
+        assert_eq!(session.compactions[0].retained_from_turn_index, 1);
+        assert_eq!(session.compactions[0].summary, "earlier context");
+        assert_eq!(session.turns[1].rounds.len(), 2);
+        assert_eq!(session.turns[1].tools.len(), 2);
+        assert!(
+            session.turns[1]
+                .tools
+                .iter()
+                .all(|pair| pair.result.is_some())
+        );
+        assert_eq!(report.warnings.len(), 1);
     }
 
     #[test]

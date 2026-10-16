@@ -108,6 +108,11 @@ impl<T> TransportCall<T> {
 /// same final reply. Every call maps the full message history onto a provider
 /// request, so a multi-turn session resends its accumulated turns.
 pub trait Transport {
+    /// System prompt selected by this transport's configuration, when any.
+    fn configured_system_prompt(&self) -> Option<&str> {
+        None
+    }
+
     /// Sends `messages` (the full conversation history, oldest first) and
     /// returns the assistant's reply to the latest turn.
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply>;
@@ -133,6 +138,62 @@ pub trait Transport {
         _system_prompt: Option<&str>,
     ) -> TransportCall<AssistantReply> {
         self.send_conversation_with_attempts(messages)
+    }
+
+    /// Serializes the complete provider request used for a normal call and
+    /// returns its UTF-8 byte length. Production transports override this with
+    /// their exact wire body; the default is a conservative transport-neutral
+    /// representation for test and downstream transports.
+    fn estimate_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        streaming: bool,
+    ) -> Result<usize> {
+        let wire_messages = messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role.as_str(),
+                    "content": message.content,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&serde_json::json!({
+            "system": system_prompt,
+            "messages": wire_messages,
+            "stream": streaming,
+        }))
+        .map(|bytes| bytes.len())
+        .map_err(|error| {
+            crate::error::LegError::Transport(format!(
+                "failed to estimate provider request: {error}"
+            ))
+        })
+    }
+
+    /// Estimates a tool-free internal summary request with the requested
+    /// output limit. Production transports serialize their own exact body.
+    fn estimate_summary_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> Result<usize> {
+        let bytes = self.estimate_input_bytes(messages, system_prompt, false)?;
+        Ok(bytes.saturating_add(max_output_tokens.to_string().len()))
+    }
+
+    /// Sends a bounded, tool-free internal context-summary request. Concrete
+    /// provider clients override this to disable advertised tools and apply
+    /// `max_output_tokens` to the wire request.
+    fn send_context_summary(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        _max_output_tokens: u32,
+    ) -> TransportCall<AssistantReply> {
+        self.send_conversation_with_system_prompt(messages, system_prompt)
     }
 
     /// Streams provider events while assembling the assistant reply.
@@ -190,6 +251,10 @@ pub trait Transport {
 /// A shared reference to a transport is itself a transport, so a wrapper such
 /// as [`crate::tools::ToolLoop`] can borrow one.
 impl<T: Transport + ?Sized> Transport for &T {
+    fn configured_system_prompt(&self) -> Option<&str> {
+        (**self).configured_system_prompt()
+    }
+
     fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
         (**self).send_conversation(messages)
     }
@@ -207,6 +272,33 @@ impl<T: Transport + ?Sized> Transport for &T {
         system_prompt: Option<&str>,
     ) -> TransportCall<AssistantReply> {
         (**self).send_conversation_with_system_prompt(messages, system_prompt)
+    }
+
+    fn estimate_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        streaming: bool,
+    ) -> Result<usize> {
+        (**self).estimate_input_bytes(messages, system_prompt, streaming)
+    }
+
+    fn estimate_summary_input_bytes(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> Result<usize> {
+        (**self).estimate_summary_input_bytes(messages, system_prompt, max_output_tokens)
+    }
+
+    fn send_context_summary(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+        max_output_tokens: u32,
+    ) -> TransportCall<AssistantReply> {
+        (**self).send_context_summary(messages, system_prompt, max_output_tokens)
     }
 
     fn send_conversation_streaming_with_attempts(

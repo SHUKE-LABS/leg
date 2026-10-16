@@ -18,8 +18,8 @@ use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
 use crate::participant::{LocalParticipant, Participant, build_response_envelope};
 use crate::tools::{
-    BashTool, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver, ToolRegistry, TurnOutcome,
-    WriteTool, tool_round_limit_warning,
+    BashTool, ContextCompaction, EditTool, ReadSet, ReadTool, ToolLoop, ToolObserver, ToolRegistry,
+    TurnOutcome, WriteTool, tool_round_limit_warning,
 };
 use crate::transport::provider::ProviderTransport;
 use crate::transport::{StreamEvent, Transport, TransportCall};
@@ -146,6 +146,7 @@ pub fn run() -> Result<()> {
             match resume {
                 None => {
                     let config = LegConfig::from_env()?;
+                    config.require_context_budget()?;
                     let base_system_prompt = config.system_prompt.clone();
                     let meta = exchange_meta(&config);
                     let client = build_transport(config);
@@ -163,6 +164,7 @@ pub fn run() -> Result<()> {
                 }
                 Some(args) => {
                     let config = LegConfig::from_env()?;
+                    config.require_context_budget()?;
                     let base_system_prompt = config.system_prompt.clone();
                     let meta = exchange_meta(&config);
                     let client = build_transport(config);
@@ -661,6 +663,8 @@ fn execute_exchange_session(
                     conversation: Conversation::new(),
                     prior_turns: 0,
                     next_turn_index: 0,
+                    summary: None,
+                    history_turn_indices: Vec::new(),
                 },
                 path,
                 true,
@@ -675,6 +679,8 @@ fn execute_exchange_session(
                     conversation: Conversation::new(),
                     prior_turns: 0,
                     next_turn_index: 0,
+                    summary: None,
+                    history_turn_indices: Vec::new(),
                 },
                 path,
                 true,
@@ -683,6 +689,7 @@ fn execute_exchange_session(
     };
 
     let config = LegConfig::from_env()?;
+    config.require_context_budget()?;
     let base_system_prompt = config.system_prompt.clone();
     let meta = exchange_meta(&config);
     let raw = read_exchange_input(in_path)?;
@@ -703,6 +710,8 @@ fn execute_exchange_session(
     } = open_session_event_sink(&session_path, create_new)?;
     let mut sink = Rc::new(RefCell::new(event_sink));
     let transport = build_transport(config);
+    transport.set_context_summary(resumed.summary.clone());
+    transport.set_context_history_turn_indices(resumed.history_turn_indices.clone());
     let mut response_output = Vec::new();
     let result = execute_exchange_session_core(
         &transport,
@@ -788,13 +797,33 @@ fn execute_exchange_session_core(
         },
         &mut warning,
         |sink| {
-            transport.run_observed_with_system_prompt_with_attempts(
+            let sink = RefCell::new(sink);
+            let mut observe_tool = |event: crate::tools::ToolEvent<'_>| {
+                let turn = Some((session_id.as_str(), turn_index));
+                emit(
+                    &mut **sink.borrow_mut(),
+                    &ExchangeEvent::from_tool_event(now_ms(), event, turn),
+                );
+            };
+            let mut observe_compaction = |compaction: ContextCompaction| {
+                emit(
+                    &mut **sink.borrow_mut(),
+                    &ExchangeEvent::compaction(
+                        now_ms(),
+                        &session_id,
+                        turn_index,
+                        compaction.retained_from_turn_index,
+                        &compaction.summary,
+                    ),
+                );
+            };
+            transport.run_observed_with_system_prompt_and_context_with_attempts(
                 resumed.conversation.messages(),
                 system_prompt.as_deref(),
-                &mut |event| {
-                    let turn = Some((session_id.as_str(), turn_index));
-                    emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
-                },
+                &session_id,
+                turn_index,
+                &mut observe_tool,
+                &mut observe_compaction,
             )
         },
     );
@@ -1186,6 +1215,8 @@ fn execute_session_resumed_with_system_prompt(
     resumed: ResumedSession,
     base_system_prompt: Option<&str>,
 ) -> Result<()> {
+    transport.set_context_summary(resumed.summary.clone());
+    transport.set_context_history_turn_indices(resumed.history_turn_indices.clone());
     eprintln!(
         "leg session — resumed {} ({} prior turn(s)); type a message and press enter, Ctrl-D or {SESSION_EXIT_COMMAND} to quit",
         resumed.session_id, resumed.prior_turns,
@@ -1320,13 +1351,33 @@ fn run_session_repl_with_warning_and_system_prompt(
             },
             warning,
             |sink| {
-                transport.run_streaming_observed_with_system_prompt_with_attempts(
+                let sink = RefCell::new(sink);
+                let mut observe_tool = |event: crate::tools::ToolEvent<'_>| {
+                    let turn = Some((session_id.as_str(), turn_index));
+                    emit(
+                        &mut **sink.borrow_mut(),
+                        &ExchangeEvent::from_tool_event(now_ms(), event, turn),
+                    );
+                };
+                let mut observe_compaction = |compaction: ContextCompaction| {
+                    emit(
+                        &mut **sink.borrow_mut(),
+                        &ExchangeEvent::compaction(
+                            now_ms(),
+                            &session_id,
+                            turn_index,
+                            compaction.retained_from_turn_index,
+                            &compaction.summary,
+                        ),
+                    );
+                };
+                transport.run_streaming_observed_with_system_prompt_and_context_with_attempts(
                     conversation.messages(),
                     system_prompt.as_deref(),
-                    &mut |event| {
-                        let turn = Some((session_id.as_str(), turn_index));
-                        emit(sink, &ExchangeEvent::from_tool_event(now_ms(), event, turn));
-                    },
+                    &session_id,
+                    turn_index,
+                    &mut observe_tool,
+                    &mut observe_compaction,
                     &mut |event| {
                         if let Some(text) = stream_event_text(&event)
                             && !text.is_empty()
@@ -1345,6 +1396,7 @@ fn run_session_repl_with_warning_and_system_prompt(
 
         match call.result {
             Ok(outcome) => {
+                transport.record_context_turn(turn_index.saturating_sub(1));
                 interrupt::check()?;
                 if streamed_text {
                     writeln!(output).map_err(io_err)?;
@@ -1544,9 +1596,10 @@ const TOOL_ROUND_LIMIT_PLACEHOLDER: &str = "[stopped: tool-round limit reached]"
 /// shared tool loop.
 fn build_transport(config: LegConfig) -> ToolLoop<ProviderTransport> {
     let max_tool_rounds = config.max_tool_rounds;
+    let context_budget = config.context_budget;
     let registry = build_tool_registry(&config);
     let client = ProviderTransport::from_config(config, registry.specs());
-    ToolLoop::new(client, registry, max_tool_rounds)
+    ToolLoop::new(client, registry, max_tool_rounds).with_context_budget(context_budget)
 }
 
 /// Registers the synchronous tools. `read` and `write` share one read-set
@@ -1601,6 +1654,10 @@ struct ResumedSession {
     prior_turns: usize,
     /// The `turn_index` the first resumed turn will carry.
     next_turn_index: u64,
+    /// Latest summary replacing the prefix before the retained history suffix.
+    summary: Option<String>,
+    /// Turn indices corresponding to the retained successful history turns.
+    history_turn_indices: Vec<u64>,
 }
 
 /// Reads a session trail and rehydrates the target session for `--resume`.
@@ -1664,14 +1721,25 @@ fn select_and_rehydrate(
         }
     };
 
+    let latest_compaction = record.compactions.last();
+    let retained_from = latest_compaction.map(|event| event.retained_from_turn_index);
     let mut conversation = Conversation::new();
     let mut prior_turns = 0;
+    let mut history_turn_indices = Vec::new();
     for turn in &record.turns {
+        if retained_from
+            .is_some_and(|start| turn.request.turn_index.is_some_and(|index| index < start))
+        {
+            continue;
+        }
         if let Some(messages) = rehydrate_turn(turn) {
             for message in messages {
                 conversation.push(message);
             }
             prior_turns += 1;
+            if let Some(index) = turn.request.turn_index {
+                history_turn_indices.push(index);
+            }
         }
     }
 
@@ -1686,6 +1754,8 @@ fn select_and_rehydrate(
         conversation,
         prior_turns,
         next_turn_index,
+        summary: latest_compaction.map(|event| event.summary.clone()),
+        history_turn_indices,
     })
 }
 

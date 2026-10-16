@@ -304,6 +304,21 @@ pub enum ExchangeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_index: Option<u64>,
     },
+    /// Emitted before a provider request that uses a compacted history.
+    Compaction {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// Session that owns the compacted history.
+        session_id: String,
+        /// Turn whose provider request consumes this summary.
+        turn_index: u64,
+        /// First turn retained after the summarized prefix.
+        retained_from_turn_index: u64,
+        /// Plain-text summary of the dropped history.
+        summary: String,
+    },
     /// Emitted once by `leg session` at the start of a run, before any turn.
     SessionStart {
         /// Schema discriminator ([`SCHEMA`]).
@@ -380,7 +395,40 @@ pub struct ToolResultRecord {
     pub error: Option<String>,
 }
 
+/// Read-side record for a persisted context compaction event.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CompactionRecord {
+    /// Wall-clock emission time, Unix epoch milliseconds.
+    pub ts_ms: u64,
+    /// Session that owns the compacted history.
+    pub session_id: String,
+    /// Turn whose provider request consumes this summary.
+    pub turn_index: u64,
+    /// First turn retained after the summarized prefix.
+    pub retained_from_turn_index: u64,
+    /// Plain-text summary of the dropped history.
+    pub summary: String,
+}
+
 impl ExchangeEvent {
+    /// Builds the append-only session compaction event.
+    pub fn compaction(
+        ts_ms: u64,
+        session_id: &str,
+        turn_index: u64,
+        retained_from_turn_index: u64,
+        summary: &str,
+    ) -> Self {
+        ExchangeEvent::Compaction {
+            schema: SCHEMA,
+            ts_ms,
+            session_id: session_id.to_string(),
+            turn_index,
+            retained_from_turn_index,
+            summary: summary.to_string(),
+        }
+    }
+
     /// Builds the persisted form of a tool-loop [`ToolEvent`], stamped with
     /// the session turn's `(session_id, turn_index)` when there is one.
     pub fn from_tool_event(ts_ms: u64, event: ToolEvent<'_>, turn: Option<(&str, u64)>) -> Self {
@@ -886,6 +934,19 @@ mod tests {
         let value: Value = serde_json::to_value(&end).expect("serializes");
         assert_eq!(value["event"], "session_end");
         assert_eq!(value["turns"], 3);
+    }
+
+    #[test]
+    fn compaction_event_serializes_the_resume_boundary() {
+        let event = ExchangeEvent::compaction(11, "sess-1", 5, 3, "keep the user's constraints");
+        let value = serde_json::to_value(event).expect("serializes");
+        assert_eq!(value["schema"], SCHEMA);
+        assert_eq!(value["event"], "compaction");
+        assert_eq!(value["ts_ms"], 11);
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["turn_index"], 5);
+        assert_eq!(value["retained_from_turn_index"], 3);
+        assert_eq!(value["summary"], "keep the user's constraints");
     }
 
     #[test]
