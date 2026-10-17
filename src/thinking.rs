@@ -364,6 +364,18 @@ const MODEL_CAPABILITIES: &[ModelCapability] = &[
 ];
 
 fn capability_for(provider: Provider, model: &str) -> Option<&'static ModelCapability> {
+    let model = if provider == Provider::Anthropic {
+        let model = model.strip_suffix("[1m]").unwrap_or(model);
+        match model {
+            "opus" => "claude-opus-5",
+            "sonnet" => "claude-sonnet-5",
+            "haiku" => "claude-haiku-5",
+            model => model,
+        }
+    } else {
+        model
+    };
+
     MODEL_CAPABILITIES
         .iter()
         .find(|capability| capability.provider == provider && model.starts_with(capability.prefix))
@@ -449,6 +461,30 @@ mod tests {
             config.request(32_000),
             Some(ThinkingRequest::Effort("high".to_string()))
         );
+    }
+
+    #[test]
+    fn resolves_claude_code_aliases_and_one_million_suffix() {
+        for (model, expected_prefix) in [
+            ("opus", "claude-opus-5"),
+            ("opus[1m]", "claude-opus-5"),
+            ("sonnet", "claude-sonnet-5"),
+            ("sonnet[1m]", "claude-sonnet-5"),
+            ("haiku", "claude-haiku-5"),
+            ("haiku[1m]", "claude-haiku-5"),
+            // Keep coverage for full ids, which already prefix-match before
+            // the suffix is stripped.
+            ("claude-opus-5-5[1m]", "claude-opus-5"),
+        ] {
+            assert_eq!(
+                capability_for(Provider::Anthropic, model).map(|capability| capability.prefix),
+                Some(expected_prefix),
+                "model: {model}"
+            );
+        }
+
+        assert!(capability_for(Provider::Anthropic, "opus-foo").is_none());
+        assert!(capability_for(Provider::OpenAiResponses, "opus").is_none());
     }
 
     #[test]
