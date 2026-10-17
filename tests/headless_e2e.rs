@@ -1787,25 +1787,51 @@ fn ask_drives_read_edit_bash_and_records_the_tool_trail() {
 
 #[test]
 fn unknown_thinking_model_warns_once_and_omits_provider_parameter() {
-    let (base_url, requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
-    let cwd = fixture_dir("unknown-thinking-model");
-    let mut cmd = leg(&cwd, &base_url);
-    cmd.env("LEG_MODEL", "vendor-unknown-model")
-        .env_remove("LEG_THINKING")
-        .args(["ask", "hello"]);
-    let output = run(cmd, None);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "leg ask failed; stderr: {stderr}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi there");
-    assert_eq!(stderr.matches("warning: model").count(), 1, "{stderr}");
-    assert!(stderr.contains("vendor-unknown-model"), "{stderr}");
-    assert!(stderr.contains("LEG_THINKING_MAP"), "{stderr}");
+    for model in ["vendor-unknown-model", "opus-foo"] {
+        let (base_url, requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
+        let cwd = fixture_dir("unknown-thinking-model");
+        let mut cmd = leg(&cwd, &base_url);
+        cmd.env("LEG_MODEL", model)
+            .env_remove("LEG_THINKING")
+            .args(["ask", "hello"]);
+        let output = run(cmd, None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "leg ask failed; stderr: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi there");
+        assert_eq!(stderr.matches("warning: model").count(), 1, "{stderr}");
+        assert!(stderr.contains(model), "{stderr}");
+        assert!(stderr.contains("LEG_THINKING_MAP"), "{stderr}");
 
-    let requests = requests.lock().unwrap();
-    let request: Value = serde_json::from_str(&requests[0]).expect("request body is JSON");
-    assert!(request.get("thinking").is_none(), "{request}");
-    assert!(request.get("output_config").is_none(), "{request}");
-    std::fs::remove_dir_all(&cwd).ok();
+        let requests = requests.lock().unwrap();
+        let request: Value = serde_json::from_str(&requests[0]).expect("request body is JSON");
+        assert!(request.get("thinking").is_none(), "{request}");
+        assert!(request.get("output_config").is_none(), "{request}");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+}
+
+#[test]
+fn claude_code_aliases_enable_effort_and_preserve_model_id() {
+    for model in ["opus", "opus[1m]", "sonnet", "sonnet[1m]"] {
+        let (base_url, requests) = spawn_sequence_server(&ONE_TEXT_REPLY);
+        let cwd = fixture_dir("claude-code-model-alias");
+        let mut cmd = leg(&cwd, &base_url);
+        cmd.env("LEG_MODEL", model)
+            .env_remove("LEG_THINKING")
+            .args(["ask", "hello"]);
+        let output = run(cmd, None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "leg ask failed; stderr: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi there");
+        assert!(!stderr.contains("warning: model"), "{stderr}");
+
+        let requests = requests.lock().unwrap();
+        let request: Value = serde_json::from_str(&requests[0]).expect("request body is JSON");
+        assert_eq!(request["model"], model, "{request}");
+        assert_eq!(request["thinking"]["type"], "adaptive", "{request}");
+        assert_eq!(request["output_config"]["effort"], "high", "{request}");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
 }
 
 #[cfg(unix)]

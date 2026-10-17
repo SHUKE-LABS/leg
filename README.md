@@ -120,6 +120,9 @@ remain silent between received chunks.
 clamps unsupported levels down to the nearest supported level; it never raises
 the requested level. `off` omits thinking/reasoning fields. For budget-style
 models, at least 1,024 output tokens remain available for the visible answer.
+For Anthropic's current Claude family, `opus`, `sonnet`, and `haiku` are
+recognized aliases; a trailing `[1m]` is ignored for capability lookup. The
+configured model id is still sent to the provider unchanged.
 
 `LEG_THINKING_MAP` optionally supplies a JSON object mapping levels to provider
 values, for example `{"high":"medium"}`; `null` marks a level unsupported.
