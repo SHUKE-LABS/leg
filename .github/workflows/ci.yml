@@ -294,6 +294,11 @@ jobs:
         shell: bash
         run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-web -p crossterm
 
+      - name: Test the companion resolver on Windows (locked)
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: cargo test --locked --manifest-path companions/Cargo.toml -p leg-ui-client --lib
+
       - name: Build Web host on Windows (locked)
         if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
         shell: bash
@@ -600,6 +605,57 @@ jobs:
           path: ${{ runner.temp }}/leg-tui-windows-behavior.json
           if-no-files-found: warn
           retention-days: 14
+
+  windows-install-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Windows smoke requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_temp="$(cygpath -u "${RUNNER_TEMP}")"
+          venv="${runner_temp}/leg-install-smoke-venv"
+          python -m venv "${venv}"
+          "${venv}/Scripts/python.exe" -m pip install \
+            --requirement companions/leg-tui/tests/requirements.txt
+          echo "INSTALL_SMOKE_PYTHON=${venv}/Scripts/python.exe" >> "${GITHUB_ENV}"
+
+      - name: Build the native binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin leg
+          cargo build --locked --release --manifest-path companions/Cargo.toml \
+            -p leg-ui-client --bin leg-ui-supervisor
+          cargo build --locked --release --manifest-path companions/Cargo.toml -p leg-tui
+          cargo build --locked --release --manifest-path companions/Cargo.toml -p leg-web
+
+      - name: Run the native Windows install and resolution smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${INSTALL_SMOKE_PYTHON}" companions/leg-tui/tests/install_resolution_smoke.py \
+            --leg-bin target/release/leg.exe \
+            --tui-bin companions/target/release/leg-tui.exe \
+            --web-bin companions/target/release/leg-web.exe \
+            --supervisor-bin companions/target/release/leg-ui-supervisor.exe
 
   lint:
     runs-on: ubuntu-latest

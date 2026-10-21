@@ -1,7 +1,14 @@
 fn main() {
     let mut args = std::env::args_os();
     let _ = args.next();
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--internal-supervisor"))
+    let first = args.next();
+    if first.as_deref() == Some(std::ffi::OsStr::new("--version"))
+        || first.as_deref() == Some(std::ffi::OsStr::new("-V"))
+    {
+        println!("leg-ui-supervisor {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if first.as_deref() != Some(std::ffi::OsStr::new("--internal-supervisor"))
         || args.next().is_some()
     {
         eprintln!("leg-ui-supervisor: internal helper; launch it through leg-ui-client");

@@ -148,8 +148,20 @@ The default resolver finds `leg` on `PATH`. A host UI may set
 installations are used as-is. The published `@shukelabs/leg` npm launcher is
 recognized by its exported platform resolver and is resolved through Node to
 the installed platform package's native `leg` executable. Symlinked global
-PATH entries are canonicalized before recognition. A different script wrapper
-is rejected with instructions to select a native binary.
+PATH entries are canonicalized before recognition.
+
+On Windows the lookup enumerates the executable extensions from `PATHEXT`, so
+`leg.exe` and `node.exe` are found, and it tells a native binary, the
+published npm launcher, and a script wrapper apart. A package-manager shim
+that comes first on `PATH` is stepped over: the search continues until it
+reaches a native binary or the launcher. An explicit `--leg-bin` path keeps its
+fail-fast check, and a script wrapper is rejected with instructions to select
+a native binary. A generated npm or pnpm shim is never a valid `--leg-bin`
+value, because the companion has to start the native binary itself.
+
+`leg install` puts the four native binaries in a per-user directory that this
+resolution finds: `%LOCALAPPDATA%\leg\bin` on Windows, and `$XDG_BIN_HOME` or
+`$HOME/.local/bin` on Unix. See the [README](../README.md#install-the-native-binaries).
 
 Before a turn, the client runs the resolved executable's `--version` and
 `--help`, with credentials removed, and requires the `--stream-json` capability.
