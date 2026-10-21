@@ -44,6 +44,31 @@ Unix, `.zip` on Windows) are attached to each
 Each archive contains `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`
 (`.exe` on Windows); keep these binaries together when installing them.
 
+### Install the native binaries
+
+npm and pnpm expose `leg` through a generated script shim, and the TUI and Web
+companions cannot start a turn from one. `leg install` copies the native
+binaries into a per-user directory that they can use:
+
+```
+leg install
+```
+
+- Windows: `%LOCALAPPDATA%\leg\bin`, added to the current user's PATH. The
+  change applies to newly started shells only, so open a new shell afterwards.
+- Unix: `$XDG_BIN_HOME`, or `$HOME/.local/bin` when it is unset. `leg install`
+  never edits shell startup files; add the directory to your PATH yourself.
+
+`leg install --dest <dir>` picks another directory, and `leg install
+--no-path` leaves the Windows PATH alone. `leg install --help` lists every
+option.
+
+Run the command from the native `leg` binary of a release archive or of the
+npm platform package: it installs `leg`, `leg-tui`, `leg-web`, and
+`leg-ui-supervisor` from the directory that holds the running executable, and
+it never copies a package-manager shim. A `cargo install` build has no
+companions beside it, so it has nothing to install.
+
 Releases are created automatically when changes land on `main`. A
 Conventional Commit subject of type `feat` bumps the minor version; every
 other subject bumps patch. The first release uses the current Cargo version
