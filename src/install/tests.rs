@@ -61,6 +61,19 @@ fn destination_entries(destination: &Path) -> Vec<String> {
     names
 }
 
+/// The file names the destination holds after an install, in the same order.
+///
+/// The suffix decides the order, so the list is built from the companions
+/// instead of being written out by hand.
+fn expected_entries() -> Vec<String> {
+    let mut names: Vec<String> = COMPANION_BINARIES
+        .iter()
+        .map(|name| format!("{name}{}", executable_suffix()))
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn install_sources_copies_every_companion_into_the_destination() {
     let scratch = scratch("copies");
@@ -131,15 +144,7 @@ fn repeated_installs_update_in_place_without_duplicate_files() {
         install_sources(&sources, &options, FaultPoint::None).expect("second install succeeds");
 
     assert_eq!(report.installed.len(), COMPANION_BINARIES.len());
-    assert_eq!(
-        destination_entries(&destination),
-        vec![
-            format!("leg-tui{}", executable_suffix()),
-            format!("leg-ui-supervisor{}", executable_suffix()),
-            format!("leg-web{}", executable_suffix()),
-            format!("leg{}", executable_suffix()),
-        ]
-    );
+    assert_eq!(destination_entries(&destination), expected_entries());
     let second = fs::read(destination.join(&sources[0].file_name)).expect("read installed file");
     assert_ne!(first, second, "the reinstall did not update the file");
     assert_eq!(second, b"updated");
@@ -202,12 +207,7 @@ fn a_commit_failure_restores_the_previous_files() {
     );
     assert_eq!(
         destination_entries(&destination),
-        vec![
-            format!("leg-tui{}", executable_suffix()),
-            format!("leg-ui-supervisor{}", executable_suffix()),
-            format!("leg-web{}", executable_suffix()),
-            format!("leg{}", executable_suffix()),
-        ],
+        expected_entries(),
         "the failed commit left files or staging directories behind"
     );
 }

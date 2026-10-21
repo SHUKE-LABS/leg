@@ -11,6 +11,7 @@ const MAX_CHECK_OUTPUT: usize = 1024 * 1024;
 const MAX_NPM_LAUNCHER_BYTES: u64 = 256 * 1024;
 
 /// The executable extensions Windows searches when `PATHEXT` is unset.
+#[cfg(any(windows, test))]
 const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
 
 /// The file extensions that mark a wrapper script rather than a native binary.
