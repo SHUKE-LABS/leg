@@ -14,6 +14,7 @@ use crate::events::{
     now_ms, trail_content,
 };
 use crate::hooks::HookEvent;
+use crate::install::{self, InstallOptions};
 use crate::interrupt;
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
@@ -29,7 +30,7 @@ use crate::transport::{StreamEvent, Transport, TransportCall};
 mod stream;
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
-const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session|--new-session-id <id>] [--session-id-out <path>] [--stream-json]";
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session|--new-session-id <id>] [--session-id-out <path>] [--stream-json] | leg install [--dest <dir>] [--no-path]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
 /// to. An unset or blank value disables recording for `ask`, cold `exchange`,
@@ -87,6 +88,13 @@ enum Command {
         /// Writes a `leg.exchange.stream/v1` NDJSON event stream to stdout.
         stream_json: bool,
     },
+    /// Installs the native leg binaries into a per-user directory.
+    Install {
+        /// The destination override and the Windows PATH opt-out.
+        options: InstallOptions,
+    },
+    /// Prints the `leg install` help body.
+    InstallHelp,
 }
 
 /// The session mode selected for one headless exchange.
@@ -215,6 +223,49 @@ pub fn run() -> Result<()> {
                 stream_json,
             )
         }
+        Some(Command::Install { options }) => {
+            let report = install::install(&options)?;
+            print_install_report(&report);
+            Ok(())
+        }
+        Some(Command::InstallHelp) => {
+            println!("{}", install::help_text());
+            Ok(())
+        }
+    }
+}
+
+/// Prints the summary of a completed `leg install` run.
+fn print_install_report(report: &install::InstallReport) {
+    println!(
+        "Installed the native leg binaries into {}:",
+        report.destination.display()
+    );
+    for file_name in &report.installed {
+        println!("  {file_name}");
+    }
+    if cfg!(windows) {
+        if report.path_updated {
+            println!(
+                "Added {} to the current user's PATH. Open a new shell to use it.",
+                report.destination.display()
+            );
+        } else if report.path_already_present {
+            println!(
+                "{} is already in the current user's PATH. Open a new shell to use it.",
+                report.destination.display()
+            );
+        } else {
+            println!(
+                "The current user's PATH was not changed; add {} to it yourself.",
+                report.destination.display()
+            );
+        }
+    } else {
+        println!(
+            "Add {} to your PATH to use them; leg install does not edit shell startup files.",
+            report.destination.display()
+        );
     }
 }
 
@@ -271,7 +322,14 @@ fn help_text() -> String {
          Each record has a\n\
          zero-based increasing `seq`; text deltas are provisional, and EOF\n\
          without `turn_end` means incomplete. Example NDJSON:\n\
-         {stream_examples}"
+         {stream_examples}\n\n\
+         `leg install` copies the native leg, leg-tui, leg-web, and\n\
+         leg-ui-supervisor binaries that sit beside the running leg executable\n\
+         into a per-user bin directory: %LOCALAPPDATA%\\leg\\bin on Windows, and\n\
+         $XDG_BIN_HOME (else $HOME/.local/bin) on Unix. On Windows the\n\
+         destination joins the current user's PATH, which needs a new shell to\n\
+         take effect; Unix installations never edit shell startup files. Run\n\
+         `leg install --help` for the options."
     )
 }
 
@@ -290,6 +348,7 @@ fn parse_args(args: &[String]) -> Result<Option<Command>> {
         "session" => parse_session(iter).map(Some),
         "log" => parse_log(iter).map(Some),
         "exchange" => parse_exchange(iter).map(Some),
+        "install" => parse_install(iter).map(Some),
         other => Err(LegError::Usage(format!(
             "unrecognised argument {other:?}; {USAGE}"
         ))),
@@ -560,6 +619,41 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
         session,
         session_id_out,
         stream_json,
+    })
+}
+
+/// Parses the arguments following `install`: an optional `--dest <dir>`
+/// destination override and the `--no-path` Windows PATH opt-out.
+fn parse_install<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut destination = None;
+    let mut no_path = false;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(Command::InstallHelp),
+            "--dest" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| LegError::Usage("--dest requires a directory".to_string()))?;
+                if value.trim().is_empty() {
+                    return Err(LegError::Usage("--dest must not be empty".to_string()));
+                }
+                destination = Some(PathBuf::from(value));
+            }
+            "--no-path" => no_path = true,
+            other => {
+                return Err(LegError::Usage(format!(
+                    "unexpected argument {other:?}; usage: leg install [--dest <dir>] [--no-path]"
+                )));
+            }
+        }
+    }
+
+    Ok(Command::Install {
+        options: InstallOptions {
+            destination,
+            no_path,
+        },
     })
 }
 

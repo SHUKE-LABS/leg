@@ -2838,3 +2838,79 @@ fn execute_exchange_core_plain_text_failure_writes_nothing_and_returns_error() {
     assert_eq!(err.kind(), "turn_failure");
     assert!(buf.is_empty(), "plain-text failure must leave stdout empty");
 }
+
+#[test]
+fn install_parses_without_options() {
+    assert_eq!(
+        parse_args(&argv(&["install"])).unwrap(),
+        Some(Command::Install {
+            options: InstallOptions {
+                destination: None,
+                no_path: false,
+            },
+        })
+    );
+}
+
+#[test]
+fn install_parses_the_destination_override_and_path_opt_out() {
+    assert_eq!(
+        parse_args(&argv(&["install", "--dest", "/tmp/leg-bin", "--no-path"])).unwrap(),
+        Some(Command::Install {
+            options: InstallOptions {
+                destination: Some(PathBuf::from("/tmp/leg-bin")),
+                no_path: true,
+            },
+        })
+    );
+}
+
+#[test]
+fn install_help_is_its_own_command() {
+    assert_eq!(
+        parse_args(&argv(&["install", "--help"])).unwrap(),
+        Some(Command::InstallHelp)
+    );
+    assert_eq!(
+        parse_args(&argv(&["install", "-h"])).unwrap(),
+        Some(Command::InstallHelp)
+    );
+}
+
+#[test]
+fn install_rejects_a_destination_without_a_value() {
+    let error = parse_args(&argv(&["install", "--dest"])).expect_err("a value is required");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn install_rejects_a_blank_destination() {
+    let error =
+        parse_args(&argv(&["install", "--dest", "  "])).expect_err("a blank path is refused");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn install_rejects_unknown_arguments() {
+    let error = parse_args(&argv(&["install", "--force"])).expect_err("unknown flags are refused");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn install_help_documents_the_destinations_and_the_windows_path_rules() {
+    let text = install::help_text();
+    assert!(text.contains("leg install"));
+    assert!(text.contains("--dest <dir>"));
+    assert!(text.contains("--no-path"));
+    assert!(text.contains(r"%LOCALAPPDATA%\leg\bin"));
+    assert!(text.contains("$XDG_BIN_HOME"));
+    assert!(text.contains("$HOME/.local/bin"));
+    assert!(text.contains("newly started shells"));
+    assert!(text.contains("never edit shell startup files"));
+}
+
+#[test]
+fn the_usage_summary_lists_the_install_command() {
+    assert!(USAGE.contains("leg install [--dest <dir>] [--no-path]"));
+    assert!(help_text().contains("`leg install`"));
+}

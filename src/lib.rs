@@ -17,6 +17,7 @@
 //! - [`log`] — the JSONL exchange-trail read path (`leg log show`/`replay`,
 //!   `leg session --resume`).
 //! - [`error`] — shared error and result types.
+//! - [`install`] — the `leg install` native-binary installer.
 //! - [`cli`] — the command-line entry surface.
 
 pub mod cli;
@@ -26,6 +27,7 @@ pub mod error;
 pub mod events;
 pub mod hooks;
 mod image_input;
+pub mod install;
 mod interrupt;
 pub mod log;
 pub mod message;

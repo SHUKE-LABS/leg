@@ -105,6 +105,8 @@ pub enum LegError {
     ContextWindow(String),
     /// A local I/O operation failed.
     Io(String),
+    /// The `leg install` command could not materialize the native binaries.
+    Install(String),
     /// The active turn was interrupted by a Unix signal.
     Interrupted {
         /// The signal that requested the interruption.
@@ -153,6 +155,7 @@ impl LegError {
             LegError::Decode(_) | LegError::TokenLimit { .. } => "decode",
             LegError::ContextWindow(_) => "context_window",
             LegError::Io(_) => "io",
+            LegError::Install(_) => "install",
             LegError::Interrupted { .. } => "interrupted",
             LegError::Log(_) => "log",
             LegError::SessionNotFound(_) => "session_not_found",
@@ -251,6 +254,7 @@ impl fmt::Display for LegError {
             ),
             LegError::ContextWindow(msg) => write!(f, "context window error: {msg}"),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
+            LegError::Install(msg) => write!(f, "install error: {msg}"),
             LegError::Interrupted { signal } => {
                 write!(f, "interrupted by {}", signal.name())
             }
