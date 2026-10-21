@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,15 @@ use std::time::{Duration, Instant};
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CHECK_OUTPUT: usize = 1024 * 1024;
 const MAX_NPM_LAUNCHER_BYTES: u64 = 256 * 1024;
+
+/// The executable extensions Windows searches when `PATHEXT` is unset.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
+/// The file extensions that mark a wrapper script rather than a native binary.
+const SCRIPT_EXTENSIONS: [&str; 15] = [
+    "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "mjs", "cjs", "sh", "bash", "zsh", "fish",
+    "py", "rb",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedLeg {
@@ -39,26 +48,145 @@ pub enum ResolveError {
     Run { path: PathBuf, message: String },
 }
 
-pub(crate) fn resolve_leg(override_path: Option<&Path>) -> Result<ResolvedLeg, ResolveError> {
-    let candidate = match override_path {
-        Some(path) => path.to_path_buf(),
-        None => find_on_path(OsStr::new("leg"))?,
-    };
-    let canonical = fs::canonicalize(&candidate).map_err(|source| ResolveError::Inspect {
-        path: candidate.clone(),
-        source,
-    })?;
+/// What a candidate file on PATH turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateKind {
+    /// A native executable.
+    Native,
+    /// The published `@shukelabs/leg` npm launcher.
+    PublishedLauncher,
+    /// A package-manager or shell script wrapper.
+    ScriptWrapper,
+}
 
-    let path = if is_published_npm_launcher(&canonical)? {
-        resolve_npm_binary(&canonical)?
-    } else {
-        if is_script_wrapper(&canonical)? {
-            return Err(ResolveError::UnsupportedWrapper(format!(
-                "{} is a script wrapper. Select a native leg binary, or use the published @shukelabs/leg launcher",
-                canonical.display()
-            )));
+/// The candidate the default PATH search selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selected {
+    /// A native executable.
+    Native(PathBuf),
+    /// The published npm launcher.
+    Launcher(PathBuf),
+}
+
+/// The PATH lookup inputs. The tests inject their own PATH value and
+/// extension list instead of reading the process environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchPath {
+    /// The PATH value, split into directories when the lookup runs.
+    value: Option<OsString>,
+    /// The executable extensions to try after the bare file name.
+    extensions: Vec<String>,
+}
+
+impl SearchPath {
+    /// The PATH lookup of the running process.
+    fn from_environment() -> Self {
+        Self {
+            value: std::env::var_os("PATH"),
+            extensions: executable_extensions(),
         }
-        canonical
+    }
+
+    /// The candidate files for `name`, in search order.
+    fn candidates(&self, name: &str) -> Vec<PathBuf> {
+        let Some(value) = &self.value else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
+        for directory in std::env::split_paths(value) {
+            for file_name in self.file_names(name) {
+                let candidate = directory.join(&file_name);
+                if candidate.is_file() {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        candidates
+    }
+
+    /// The file names a lookup of `name` tries, in order.
+    fn file_names(&self, name: &str) -> Vec<String> {
+        let mut names = vec![name.to_string()];
+        for extension in &self.extensions {
+            names.push(format!("{name}{extension}"));
+        }
+        names
+    }
+}
+
+/// The executable extensions to try, taken from `PATHEXT` on Windows.
+fn executable_extensions() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let mut extensions = parse_extensions(std::env::var_os("PATHEXT").as_deref());
+        // A native binary stays reachable even when `PATHEXT` was edited.
+        if !extensions.iter().any(|extension| extension == ".exe") {
+            extensions.push(".exe".to_string());
+        }
+        extensions
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Parses a `PATHEXT` value into lowercase extensions.
+#[cfg(any(windows, test))]
+fn parse_extensions(pathext: Option<&OsStr>) -> Vec<String> {
+    let raw = match pathext {
+        Some(value) => value.to_string_lossy().into_owned(),
+        None => DEFAULT_PATHEXT.to_string(),
+    };
+    let mut extensions = Vec::new();
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = if trimmed.starts_with('.') {
+            trimmed.to_ascii_lowercase()
+        } else {
+            format!(".{}", trimmed.to_ascii_lowercase())
+        };
+        if !extensions.contains(&normalized) {
+            extensions.push(normalized);
+        }
+    }
+    extensions
+}
+
+pub(crate) fn resolve_leg(override_path: Option<&Path>) -> Result<ResolvedLeg, ResolveError> {
+    resolve_leg_in(override_path, &SearchPath::from_environment())
+}
+
+/// Resolves the leg binary, either the explicit override or the first usable
+/// candidate on PATH.
+fn resolve_leg_in(
+    override_path: Option<&Path>,
+    search: &SearchPath,
+) -> Result<ResolvedLeg, ResolveError> {
+    let path = match override_path {
+        Some(path) => {
+            let canonical = fs::canonicalize(path).map_err(|source| ResolveError::Inspect {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            match classify(&canonical)? {
+                CandidateKind::PublishedLauncher => resolve_npm_binary(&canonical, search)?,
+                CandidateKind::ScriptWrapper => {
+                    return Err(ResolveError::UnsupportedWrapper(format!(
+                        "{} is a script wrapper. Select a native leg binary, or use the published @shukelabs/leg launcher",
+                        canonical.display()
+                    )));
+                }
+                CandidateKind::Native => canonical,
+            }
+        }
+        None => match select_candidate(search)? {
+            Selected::Native(path) => path,
+            Selected::Launcher(path) => resolve_npm_binary(&path, search)?,
+        },
     };
 
     check_executable(&path)?;
@@ -90,17 +218,96 @@ pub(crate) fn resolve_leg(override_path: Option<&Path>) -> Result<ResolvedLeg, R
     Ok(ResolvedLeg { path })
 }
 
-fn find_on_path(name: &OsStr) -> Result<PathBuf, ResolveError> {
-    let Some(path) = std::env::var_os("PATH") else {
-        return Err(ResolveError::NotFound);
-    };
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
+/// Finds the first usable `leg` on PATH, skipping script wrappers.
+///
+/// A package-manager shim that comes first on PATH is not an error: the
+/// search continues until it reaches a native binary or the published npm
+/// launcher.
+fn select_candidate(search: &SearchPath) -> Result<Selected, ResolveError> {
+    for candidate in search.candidates("leg") {
+        let kind = classify(&candidate)?;
+        if kind == CandidateKind::ScriptWrapper {
+            continue;
         }
+        let canonical = fs::canonicalize(&candidate).map_err(|source| ResolveError::Inspect {
+            path: candidate.clone(),
+            source,
+        })?;
+        return Ok(match kind {
+            CandidateKind::PublishedLauncher => Selected::Launcher(canonical),
+            _ => Selected::Native(canonical),
+        });
     }
     Err(ResolveError::NotFound)
+}
+
+/// Classifies a candidate file as a native binary, the published npm
+/// launcher, or a script wrapper.
+fn classify(path: &Path) -> Result<CandidateKind, ResolveError> {
+    let mut file = fs::File::open(path).map_err(|source| ResolveError::Inspect {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut prefix = [0_u8; 2];
+    let count = file
+        .read(&mut prefix)
+        .map_err(|source| ResolveError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if count == prefix.len() && &prefix == b"#!" {
+        return Ok(if is_published_launcher(path)? {
+            CandidateKind::PublishedLauncher
+        } else {
+            CandidateKind::ScriptWrapper
+        });
+    }
+    Ok(if is_script_extension(path) {
+        CandidateKind::ScriptWrapper
+    } else {
+        CandidateKind::Native
+    })
+}
+
+/// Whether the file is the published `@shukelabs/leg` npm launcher.
+fn is_published_launcher(path: &Path) -> Result<bool, ResolveError> {
+    let file = fs::File::open(path).map_err(|source| ResolveError::Inspect {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let length = file
+        .metadata()
+        .map_err(|source| ResolveError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if length > MAX_NPM_LAUNCHER_BYTES {
+        return Ok(false);
+    }
+    let mut content = Vec::new();
+    file.take(MAX_NPM_LAUNCHER_BYTES)
+        .read_to_end(&mut content)
+        .map_err(|source| ResolveError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let content = String::from_utf8_lossy(&content);
+    Ok(content.contains("const platformPackages = {")
+        && content.contains("function resolvePlatformBinary(")
+        && content.contains("module.exports = { platformPackages, resolvePlatformBinary }")
+        && content.contains("require.resolve(`${packageName}/bin/${binaryName}`)"))
+}
+
+/// Whether the file name carries a script extension.
+fn is_script_extension(path: &Path) -> bool {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => {
+            let extension = extension.to_ascii_lowercase();
+            SCRIPT_EXTENSIONS.contains(&extension.as_str())
+        }
+        None => false,
+    }
 }
 
 fn check_executable(path: &Path) -> Result<(), ResolveError> {
@@ -127,67 +334,21 @@ fn check_executable(path: &Path) -> Result<(), ResolveError> {
     Ok(())
 }
 
-fn is_published_npm_launcher(path: &Path) -> Result<bool, ResolveError> {
-    let mut file = fs::File::open(path).map_err(|source| ResolveError::Inspect {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut prefix = [0_u8; 2];
-    let count = file
-        .read(&mut prefix)
-        .map_err(|source| ResolveError::Inspect {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if count != prefix.len() || &prefix != b"#!" {
-        return Ok(false);
+/// Finds the Node.js executable on PATH.
+///
+/// The lookup honours the executable extensions, so a Windows installation
+/// that only exposes `node.exe` is found.
+fn find_node(search: &SearchPath) -> Result<PathBuf, ResolveError> {
+    for candidate in search.candidates("node") {
+        if classify(&candidate)? == CandidateKind::Native {
+            return Ok(candidate);
+        }
     }
-
-    let length = file
-        .metadata()
-        .map_err(|source| ResolveError::Inspect {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .len();
-    if length > MAX_NPM_LAUNCHER_BYTES {
-        return Ok(false);
-    }
-
-    let mut content = prefix.to_vec();
-    file.take(MAX_NPM_LAUNCHER_BYTES - count as u64 + 1)
-        .read_to_end(&mut content)
-        .map_err(|source| ResolveError::Inspect {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if content.len() as u64 > MAX_NPM_LAUNCHER_BYTES {
-        return Ok(false);
-    }
-    let content = String::from_utf8_lossy(&content);
-    Ok(content.contains("const platformPackages = {")
-        && content.contains("function resolvePlatformBinary(")
-        && content.contains("module.exports = { platformPackages, resolvePlatformBinary }")
-        && content.contains("require.resolve(`${packageName}/bin/${binaryName}`)"))
+    Err(ResolveError::NotFound)
 }
 
-fn is_script_wrapper(path: &Path) -> Result<bool, ResolveError> {
-    let mut file = fs::File::open(path).map_err(|source| ResolveError::Inspect {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut prefix = [0_u8; 2];
-    let count = file
-        .read(&mut prefix)
-        .map_err(|source| ResolveError::Inspect {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    Ok(count >= 2 && &prefix == b"#!")
-}
-
-fn resolve_npm_binary(launcher: &Path) -> Result<PathBuf, ResolveError> {
-    let node = find_on_path(OsStr::new("node")).map_err(|_| {
+fn resolve_npm_binary(launcher: &Path, search: &SearchPath) -> Result<PathBuf, ResolveError> {
+    let node = find_node(search).map_err(|_| {
         ResolveError::NpmResolution(
             "Node.js is required to resolve the published launcher".to_string(),
         )
@@ -317,5 +478,224 @@ fn bounded_detail(value: &str) -> String {
         "empty output".to_string()
     } else {
         detail
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+
+    /// The published launcher shipped by this repository.
+    fn published_launcher() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("packaging")
+            .join("npm")
+            .join("leg.js")
+    }
+
+    /// A PATH value that lists `directories` in order.
+    fn search(directories: &[PathBuf], extensions: &[&str]) -> SearchPath {
+        let value = std::env::join_paths(directories).expect("join the search path");
+        SearchPath {
+            value: Some(value),
+            extensions: extensions.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn parse_extensions_reads_the_pathext_value() {
+        let extensions = parse_extensions(Some(OsStr::new(".EXE;.CMD;.EXE")));
+        assert_eq!(extensions, vec![".exe", ".cmd"]);
+    }
+
+    #[test]
+    fn parse_extensions_falls_back_to_the_windows_default() {
+        let extensions = parse_extensions(None);
+        assert!(extensions.contains(&".exe".to_string()));
+        assert!(extensions.contains(&".cmd".to_string()));
+    }
+
+    #[test]
+    fn parse_extensions_skips_blank_entries() {
+        let extensions = parse_extensions(Some(OsStr::new(".EXE;;.CMD;")));
+        assert_eq!(extensions, vec![".exe", ".cmd"]);
+    }
+
+    #[test]
+    fn candidates_try_the_bare_name_and_every_extension() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::write(directory.path().join("leg.exe"), b"binary").expect("write the candidate");
+        let search = search(&[directory.path().to_path_buf()], &[".exe"]);
+
+        let candidates = search.candidates("leg");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], directory.path().join("leg.exe"));
+    }
+
+    #[test]
+    fn candidates_skip_names_that_do_not_exist() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::write(directory.path().join("leg.cmd"), b"shim").expect("write the candidate");
+        let search = search(&[directory.path().to_path_buf()], &[".exe", ".cmd"]);
+
+        let candidates = search.candidates("leg");
+        assert_eq!(candidates, vec![directory.path().join("leg.cmd")]);
+    }
+
+    #[test]
+    fn classify_recognises_a_native_binary() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("leg.exe");
+        fs::write(&path, b"MZ binary").expect("write the candidate");
+
+        assert_eq!(classify(&path).expect("classify"), CandidateKind::Native);
+    }
+
+    #[test]
+    fn classify_recognises_a_script_wrapper() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("leg");
+        fs::write(&path, b"#!/bin/sh\nexec leg \"$@\"\n").expect("write the candidate");
+
+        assert_eq!(
+            classify(&path).expect("classify"),
+            CandidateKind::ScriptWrapper
+        );
+    }
+
+    #[test]
+    fn classify_recognises_a_windows_command_wrapper() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("leg.cmd");
+        fs::write(&path, b"@ECHO off\r\n").expect("write the candidate");
+
+        assert_eq!(
+            classify(&path).expect("classify"),
+            CandidateKind::ScriptWrapper
+        );
+    }
+
+    #[test]
+    fn classify_recognises_the_published_npm_launcher() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("leg.js");
+        fs::copy(published_launcher(), &path).expect("copy the published launcher");
+
+        assert_eq!(
+            classify(&path).expect("classify"),
+            CandidateKind::PublishedLauncher
+        );
+    }
+
+    #[test]
+    fn select_candidate_skips_a_shim_and_picks_the_native_binary() {
+        let shim_dir = tempfile::tempdir().expect("shim directory");
+        let native_dir = tempfile::tempdir().expect("native directory");
+        fs::write(shim_dir.path().join("leg"), b"#!/bin/sh\nexec leg \"$@\"\n")
+            .expect("write the shim");
+        fs::write(native_dir.path().join("leg"), b"native").expect("write the native binary");
+        let search = search(
+            &[
+                shim_dir.path().to_path_buf(),
+                native_dir.path().to_path_buf(),
+            ],
+            &[],
+        );
+
+        let selected = select_candidate(&search).expect("a candidate is selected");
+        assert_eq!(
+            selected,
+            Selected::Native(
+                fs::canonicalize(native_dir.path().join("leg")).expect("canonical path")
+            )
+        );
+    }
+
+    #[test]
+    fn select_candidate_skips_a_windows_command_wrapper() {
+        let shim_dir = tempfile::tempdir().expect("shim directory");
+        let native_dir = tempfile::tempdir().expect("native directory");
+        fs::write(shim_dir.path().join("leg.cmd"), b"@ECHO off\r\n").expect("write the shim");
+        fs::write(native_dir.path().join("leg.exe"), b"native").expect("write the native binary");
+        let search = search(
+            &[
+                shim_dir.path().to_path_buf(),
+                native_dir.path().to_path_buf(),
+            ],
+            &[".exe", ".cmd"],
+        );
+
+        let selected = select_candidate(&search).expect("a candidate is selected");
+        assert_eq!(
+            selected,
+            Selected::Native(
+                fs::canonicalize(native_dir.path().join("leg.exe")).expect("canonical path")
+            )
+        );
+    }
+
+    #[test]
+    fn select_candidate_picks_the_published_launcher() {
+        let directory = tempfile::tempdir().expect("launcher directory");
+        let path = directory.path().join("leg.js");
+        fs::copy(published_launcher(), &path).expect("copy the published launcher");
+        let search = search(&[directory.path().to_path_buf()], &[".js"]);
+
+        let selected = select_candidate(&search).expect("a candidate is selected");
+        assert_eq!(
+            selected,
+            Selected::Launcher(fs::canonicalize(&path).expect("canonical path"))
+        );
+    }
+
+    #[test]
+    fn select_candidate_reports_a_missing_binary() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let search = search(&[directory.path().to_path_buf()], &[".exe"]);
+
+        let error = select_candidate(&search).expect_err("no candidate exists");
+        assert!(matches!(error, ResolveError::NotFound));
+    }
+
+    #[test]
+    fn find_node_honours_the_executable_extensions() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("node.exe");
+        fs::write(&path, b"binary").expect("write the candidate");
+        let search = search(&[directory.path().to_path_buf()], &[".exe"]);
+
+        assert_eq!(find_node(&search).expect("node is found"), path);
+    }
+
+    #[test]
+    fn find_node_skips_a_command_wrapper() {
+        let shim_dir = tempfile::tempdir().expect("shim directory");
+        let node_dir = tempfile::tempdir().expect("node directory");
+        fs::write(shim_dir.path().join("node.cmd"), b"@ECHO off\r\n").expect("write the shim");
+        fs::write(node_dir.path().join("node.exe"), b"binary").expect("write the candidate");
+        let search = search(
+            &[shim_dir.path().to_path_buf(), node_dir.path().to_path_buf()],
+            &[".exe", ".cmd"],
+        );
+
+        assert_eq!(
+            find_node(&search).expect("node is found"),
+            node_dir.path().join("node.exe")
+        );
+    }
+
+    #[test]
+    fn an_explicit_wrapper_path_is_rejected() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("leg");
+        fs::write(&path, b"#!/bin/sh\nexec leg \"$@\"\n").expect("write the wrapper");
+        let search = search(&[directory.path().to_path_buf()], &[]);
+
+        let error = resolve_leg_in(Some(&path), &search).expect_err("a wrapper is rejected");
+        assert!(matches!(error, ResolveError::UnsupportedWrapper(_)));
     }
 }

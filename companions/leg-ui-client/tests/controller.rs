@@ -2391,9 +2391,30 @@ fn companion_controller_contract_and_cleanup() {
     // Default PATH resolution follows a global npm symlink to the published
     // launcher, then the native package binary. Explicitly selecting that same
     // symlink exercises --leg-bin launcher resolution as well.
+    //
+    // A package-manager shim comes first on PATH, the way pnpm and npm place
+    // one on Windows. The resolver has to step over it instead of failing on
+    // it, and it must never run it.
+    let shim_dir = scratch.path().join("shim");
+    fs::create_dir_all(&shim_dir).expect("create shim directory");
+    let shim_marker = scratch.path().join("shim-executed");
+    let shim = shim_dir.join("leg");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\n: > {}\necho 'the package-manager shim ran' >&2\nexit 1\n",
+            shell_quote(&shim_marker)
+        ),
+    )
+    .expect("write the shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod the shim");
+
     let old_path = std::env::var_os("PATH").expect("test PATH");
     let path = std::env::join_paths(
-        std::iter::once(global_entry.parent().unwrap().to_path_buf())
+        std::iter::once(shim_dir.clone())
+            .chain(std::iter::once(
+                global_entry.parent().unwrap().to_path_buf(),
+            ))
             .chain(std::env::split_paths(&old_path)),
     )
     .expect("compose fixture PATH");
@@ -2419,6 +2440,10 @@ fn companion_controller_contract_and_cleanup() {
         )));
         assert_eq!(provider.finish().len(), 1);
     }
+    assert!(
+        !shim_marker.exists(),
+        "the package-manager shim was executed instead of being skipped"
+    );
 
     let missing_platform_root = scratch.path().join("missing-platform");
     let missing_platform_launcher =
