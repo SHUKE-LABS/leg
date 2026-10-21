@@ -363,6 +363,24 @@ fn the_registry_backend_round_trips_a_scratch_key() {
     super::windows_path::write_path_at(&key, "C:\\one;C:\\two").expect("write the scratch path");
     let value = super::windows_path::read_path_at(&key).expect("read the scratch path");
     assert_eq!(value, "C:\\one;C:\\two");
+    super::windows_path::delete_key(&key);
+}
+
+#[cfg(windows)]
+#[test]
+fn the_registry_backend_creates_a_fresh_key_and_value() {
+    let key = format!("Software\\leg-install-tests\\fresh-{}", std::process::id());
+    super::windows_path::delete_key(&key);
+
+    // A user without a current-user PATH reads as an empty PATH.
+    let value = super::windows_path::read_path_at(&key).expect("read a missing path");
+    assert_eq!(value, "");
+
+    // Writing creates the key and the value.
+    super::windows_path::write_path_at(&key, "C:\\only").expect("write a fresh path");
+    let value = super::windows_path::read_path_at(&key).expect("read the fresh path");
+    assert_eq!(value, "C:\\only");
+    super::windows_path::delete_key(&key);
 }
 
 #[cfg(windows)]
@@ -407,5 +425,68 @@ fn a_unix_install_never_updates_the_path() {
     assert!(
         update.is_none(),
         "a Unix installation must not touch the PATH"
+    );
+}
+
+#[test]
+fn a_failed_install_removes_the_destination_it_created() {
+    let scratch = scratch("fresh-destination");
+    let sources = fake_sources(&scratch.path.join("bundle"));
+    let destination = scratch.path.join("bin");
+    assert!(!destination.exists(), "the destination starts out missing");
+
+    let error = install_sources(
+        &sources,
+        &InstallOptions {
+            destination: Some(destination.clone()),
+            no_path: true,
+        },
+        FaultPoint::Stage,
+    )
+    .expect_err("the staging fails");
+
+    assert!(
+        error.to_string().contains("staging"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !destination.exists(),
+        "the failed install left the destination behind"
+    );
+}
+
+#[test]
+fn a_staging_copy_failure_leaves_no_residue() {
+    let scratch = scratch("copy-failure");
+    let bundle = scratch.path.join("bundle");
+    let sources = fake_sources(&bundle);
+    // The source disappears between the discovery and the copy, so the copy
+    // fails with a real I/O error instead of an injected one.
+    fs::remove_file(&sources[0].path).expect("remove the source");
+    let destination = scratch.path.join("bin");
+    fs::create_dir_all(&destination).expect("create the destination");
+
+    let error = install_sources(
+        &sources,
+        &InstallOptions {
+            destination: Some(destination.clone()),
+            no_path: true,
+        },
+        FaultPoint::None,
+    )
+    .expect_err("the copy fails");
+
+    assert!(
+        error.to_string().contains("cannot copy"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        destination.is_dir(),
+        "the failed install removed a directory it did not create"
+    );
+    assert_eq!(
+        destination_entries(&destination),
+        Vec::<String>::new(),
+        "the failed install left a staging directory behind"
     );
 }

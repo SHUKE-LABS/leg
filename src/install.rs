@@ -153,17 +153,21 @@ pub(crate) fn install_sources(
         Some(destination) => destination.clone(),
         None => default_destination()?,
     };
-    prepare_destination(&destination)?;
+
+    // The guard removes everything this run created when the install fails.
+    let mut cleanup = InstallCleanup::default();
+    prepare_destination(&destination, &mut cleanup)?;
 
     // The current user's PATH is read before anything is written, so a
     // registry failure cannot leave a half-finished install behind.
     let path_update = PathUpdate::prepare(&destination, options.no_path)?;
 
-    let commit = commit_files(sources, &destination, fault)?;
+    let commit = commit_files(sources, &destination, fault, &mut cleanup)?;
     let installed = commit.installed.clone();
 
     let Some(update) = path_update else {
         commit.finish();
+        cleanup.finish();
         return Ok(InstallReport {
             destination,
             installed,
@@ -179,6 +183,7 @@ pub(crate) fn install_sources(
         return Err(error);
     }
     commit.finish();
+    cleanup.finish();
     Ok(InstallReport {
         destination,
         installed,
@@ -255,14 +260,10 @@ fn is_script(path: &Path) -> Result<bool> {
 }
 
 /// Creates the destination directory and proves it is writable.
-fn prepare_destination(destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination).map_err(|error| {
-        LegError::Install(format!(
-            "cannot create the install directory {}: {error}",
-            destination.display()
-        ))
-    })?;
+fn prepare_destination(destination: &Path, cleanup: &mut InstallCleanup) -> Result<()> {
+    create_directories(destination, cleanup)?;
     let probe = destination.join(format!(".leg-install-probe-{}", std::process::id()));
+    cleanup.set_probe(probe.clone());
     fs::write(&probe, b"").map_err(|error| {
         LegError::Install(format!(
             "the install directory {} is not writable: {error}",
@@ -271,6 +272,97 @@ fn prepare_destination(destination: &Path) -> Result<()> {
     })?;
     let _ = fs::remove_file(&probe);
     Ok(())
+}
+
+/// Creates the directory and every missing parent, recording the directories
+/// it created so a failed install can remove them again.
+fn create_directories(destination: &Path, cleanup: &mut InstallCleanup) -> Result<()> {
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut current = destination.to_path_buf();
+    loop {
+        if current.as_os_str().is_empty() || current.exists() {
+            break;
+        }
+        missing.push(current.clone());
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    missing.reverse();
+    for directory in missing {
+        match fs::create_dir(&directory) {
+            Ok(()) => cleanup.push_directory(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(LegError::Install(format!(
+                    "cannot create the install directory {}: {error}",
+                    destination.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The state a failed install has to remove.
+///
+/// The guard removes the staging tree, the writability probe, and the
+/// directories the run created, so a failure never leaves a partial install
+/// or an empty destination behind.
+#[derive(Default)]
+struct InstallCleanup {
+    /// The staging tree of the current run.
+    staging: Option<PathBuf>,
+    /// The writability probe file of the current run.
+    probe: Option<PathBuf>,
+    /// The directories the run created, outermost first.
+    directories: Vec<PathBuf>,
+}
+
+impl InstallCleanup {
+    /// Records the staging tree of the current run.
+    fn set_staging(&mut self, staging: PathBuf) {
+        self.staging = Some(staging);
+    }
+
+    /// Records the writability probe file of the current run.
+    fn set_probe(&mut self, probe: PathBuf) {
+        self.probe = Some(probe);
+    }
+
+    /// Records a directory the run created.
+    fn push_directory(&mut self, directory: PathBuf) {
+        self.directories.push(directory);
+    }
+
+    /// Forgets the staged files, so a finished install keeps its result.
+    fn finish(&mut self) {
+        self.staging = None;
+        self.probe = None;
+        self.directories.clear();
+    }
+
+    /// Removes the staging tree, the probe, and the created directories.
+    fn remove(&mut self) {
+        if let Some(probe) = self.probe.take() {
+            let _ = fs::remove_file(&probe);
+        }
+        if let Some(staging) = self.staging.take() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        for directory in self.directories.iter().rev() {
+            // A directory that holds files belongs to the user and stays.
+            let _ = fs::remove_dir(directory);
+        }
+        self.directories.clear();
+    }
+}
+
+impl Drop for InstallCleanup {
+    fn drop(&mut self) {
+        self.remove();
+    }
 }
 
 /// A file that was committed to the destination during this run.
@@ -324,9 +416,12 @@ fn commit_files(
     sources: &[SourceBinary],
     destination: &Path,
     fault: FaultPoint,
+    cleanup: &mut InstallCleanup,
 ) -> Result<FileCommit> {
     let staging = destination.join(format!(".leg-install-staging-{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
+    // The guard removes the staging tree when the install fails.
+    cleanup.set_staging(staging.clone());
     let staged_dir = staging.join("new");
     let backup_dir = staging.join("old");
     fs::create_dir_all(&staged_dir).map_err(|error| {
@@ -344,7 +439,6 @@ fn commit_files(
 
     for source in sources {
         if fault == FaultPoint::Stage {
-            let _ = fs::remove_dir_all(&staging);
             return Err(LegError::Install(
                 "injected failure while staging the installed binaries".to_string(),
             ));
@@ -545,11 +639,11 @@ mod windows_path {
     //! under `HKEY_CURRENT_USER\Environment` and never touches the
     //! machine-wide PATH.
 
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     #[cfg(test)]
-    use windows_sys::Win32::System::Registry::RegCreateKeyW;
+    use windows_sys::Win32::System::Registry::RegDeleteKeyW;
     use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ, RegCloseKey,
+        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegCreateKeyW,
         RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -569,8 +663,8 @@ mod windows_path {
         value.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Opens a key under `HKEY_CURRENT_USER` with the requested access.
-    fn open_key(name: &str, access: u32) -> Result<HKEY> {
+    /// Opens a key under `HKEY_CURRENT_USER` and reports the registry status.
+    fn open_key_status(name: &str, access: u32) -> (HKEY, u32) {
         let wide_name = wide(name);
         let mut key: HKEY = std::ptr::null_mut();
         // SAFETY: the key name is a null-terminated UTF-16 string that outlives
@@ -584,9 +678,20 @@ mod windows_path {
                 &mut key as *mut HKEY,
             )
         };
+        (key, status)
+    }
+
+    /// Opens a key under `HKEY_CURRENT_USER`, creating it when it is missing.
+    fn open_or_create_key(name: &str) -> Result<HKEY> {
+        let wide_name = wide(name);
+        let mut key: HKEY = std::ptr::null_mut();
+        // SAFETY: the key name is a null-terminated UTF-16 string that
+        // outlives the call, and the output handle is written by the call.
+        let status =
+            unsafe { RegCreateKeyW(HKEY_CURRENT_USER, wide_name.as_ptr(), &mut key as *mut HKEY) };
         if status != ERROR_SUCCESS {
             return Err(LegError::Install(format!(
-                "cannot open the current user's environment (registry error {status})"
+                "cannot create the registry key {name} (registry error {status})"
             )));
         }
         Ok(key)
@@ -601,8 +706,19 @@ mod windows_path {
     }
 
     /// Reads the PATH value of the key under `HKEY_CURRENT_USER`.
+    ///
+    /// A key or value that does not exist reads as an empty PATH: a user
+    /// without a current-user PATH still gets the destination registered.
     pub(super) fn read_path_at(key_name: &str) -> Result<String> {
-        let key = open_key(key_name, KEY_READ)?;
+        let (key, status) = open_key_status(key_name, KEY_READ);
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(String::new());
+        }
+        if status != ERROR_SUCCESS {
+            return Err(LegError::Install(format!(
+                "cannot open the current user's environment (registry error {status})"
+            )));
+        }
         let value_name = wide(PATH_VALUE);
         let mut value_type: u32 = 0;
         let mut size: u32 = 0;
@@ -618,6 +734,10 @@ mod windows_path {
                 &mut size as *mut u32,
             )
         };
+        if status == ERROR_FILE_NOT_FOUND {
+            close_key(key);
+            return Ok(String::new());
+        }
         if status != ERROR_SUCCESS {
             close_key(key);
             return Err(LegError::Install(format!(
@@ -667,8 +787,11 @@ mod windows_path {
     }
 
     /// Writes the PATH value of the key under `HKEY_CURRENT_USER`.
+    ///
+    /// The key is created when it does not exist, so a user without a
+    /// current-user environment installs without elevation.
     pub(super) fn write_path_at(key_name: &str, value: &str) -> Result<()> {
-        let key = open_key(key_name, KEY_SET_VALUE)?;
+        let key = open_or_create_key(key_name)?;
         let value_name = wide(PATH_VALUE);
         let data = wide(value);
         let byte_len = (data.len() * std::mem::size_of::<u16>()) as u32;
@@ -707,19 +830,19 @@ mod windows_path {
     /// exercise the backend without touching the real environment.
     #[cfg(test)]
     pub(super) fn create_key(name: &str) -> Result<()> {
-        let wide_name = wide(name);
-        let mut key: HKEY = std::ptr::null_mut();
-        // SAFETY: the key name is a null-terminated UTF-16 string that
-        // outlives the call, and the output handle is written by the call.
-        let status =
-            unsafe { RegCreateKeyW(HKEY_CURRENT_USER, wide_name.as_ptr(), &mut key as *mut HKEY) };
-        if status != ERROR_SUCCESS {
-            return Err(LegError::Install(format!(
-                "cannot create the registry key {name} (registry error {status})"
-            )));
-        }
+        let key = open_or_create_key(name)?;
         close_key(key);
         Ok(())
+    }
+
+    /// Deletes a key under `HKEY_CURRENT_USER`, used by the registry tests to
+    /// leave no scratch key behind.
+    #[cfg(test)]
+    pub(super) fn delete_key(name: &str) {
+        let wide_name = wide(name);
+        // SAFETY: the key name is a null-terminated UTF-16 string that
+        // outlives the call.
+        let _ = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide_name.as_ptr()) };
     }
 
     /// Tells Windows that the user environment changed, so newly started
