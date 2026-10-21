@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """Native Windows smoke for `leg install` and the companion leg resolver.
 
-The smoke installs the native binaries into a temporary directory, puts a
-package-manager shim ahead of that directory on PATH, and runs leg-tui
-without --leg-bin. The turn has to reach the fixture provider, which only
-happens when the resolver stepped over the shim and started the installed
-native leg binary.
+The smoke covers three things on a native Windows host:
 
-The smoke also checks the persistent Windows PATH update: the install
-directory joins the current user's PATH exactly once, the unrelated entries
-survive, and the original value is restored afterwards.
+* `leg install` copies the native binaries into a per-user directory, refuses
+  an incomplete bundle, and updates the current user's PATH exactly once.
+* With a package-manager shim ahead of the installed directory on PATH, a
+  leg-tui turn without `--leg-bin` still reaches the fixture provider, which
+  only happens when the resolver stepped over the shim and started the
+  installed native leg binary.
+* A published npm launcher on PATH resolves through `node.exe` to the
+  platform package's native binary.
+
+The smoke needs Node.js for the launcher check.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -86,6 +90,18 @@ def write_shim(directory: Path) -> None:
     )
 
 
+def build_npm_layout(root: Path, launcher: Path, native_leg: Path) -> Path:
+    """Lays out the published npm package beside its platform package."""
+    package = root / "node_modules" / "@shukelabs" / "leg"
+    package.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(launcher, package / "leg.js")
+    architecture = "x64" if platform.machine().lower() in ("amd64", "x86_64") else "arm64"
+    platform_package = root / "node_modules" / "@shukelabs" / f"leg-win32-{architecture}"
+    (platform_package / "bin").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(native_leg, platform_package / "bin" / "leg.exe")
+    return package
+
+
 def read_user_path() -> tuple[str, int]:
     """Reads the current user's PATH from the registry."""
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as key:
@@ -111,8 +127,9 @@ def check_persistent_path_update(bundle_leg: Path, workspace: Path) -> None:
     original, original_type = read_user_path()
     destination = workspace / "path-install"
     try:
-        result = run_install(bundle_leg, destination, [])
-        assert result.returncode == 0, f"leg install failed: {result.stderr}"
+        for _ in range(2):
+            result = run_install(bundle_leg, destination, [])
+            assert result.returncode == 0, f"leg install failed: {result.stderr}"
         updated, _ = read_user_path()
         entries = path_entries(updated)
         matches = [
@@ -130,8 +147,7 @@ def check_persistent_path_update(bundle_leg: Path, workspace: Path) -> None:
 def run_tui_turn(
     tui_bin: Path,
     supervisor_bin: Path,
-    shim_dir: Path,
-    install_dir: Path,
+    path_prefixes: list[Path],
     workspace: Path,
 ) -> None:
     """Runs a leg-tui turn without --leg-bin and checks the provider request."""
@@ -144,7 +160,7 @@ def run_tui_turn(
             os.environ.copy(), server.environment, state_dir, supervisor_bin
         )
         search_path = os.pathsep.join(
-            [str(shim_dir), str(install_dir), environment.get("PATH", "")]
+            [str(prefix) for prefix in path_prefixes] + [environment.get("PATH", "")]
         )
         environment["PATH"] = search_path
         environment["TERM"] = "xterm-256color"
@@ -199,6 +215,8 @@ def main() -> int:
         "leg-web": web_bin,
         "leg-ui-supervisor": supervisor_bin,
     }
+    node = shutil.which("node.exe") or shutil.which("node")
+    assert node is not None, "the published launcher check needs Node.js on PATH"
 
     with tempfile.TemporaryDirectory(prefix="leg-install-smoke-") as temporary:
         workspace = Path(temporary)
@@ -231,14 +249,35 @@ def main() -> int:
         shutil.copy2(leg_bin, incomplete / "leg.exe")
         result = run_install(incomplete / "leg.exe", workspace / "never", ["--no-path"])
         assert result.returncode != 0, "a missing companion must fail the install"
-        assert "leg-tui" in result.stderr, f"the failure did not name the companion: {result.stderr}"
+        assert "leg-tui" in result.stderr, (
+            f"the failure did not name the companion: {result.stderr}"
+        )
         assert not (workspace / "never").exists(), "a failed install created the destination"
 
         check_persistent_path_update(bundle_leg, workspace)
 
+        # A package-manager shim comes first on PATH: the resolver has to step
+        # over it and start the installed native binary.
         shim_dir = workspace / "shim"
         write_shim(shim_dir)
-        run_tui_turn(tui_bin, supervisor_bin, shim_dir, install_dir, workspace / "workspace")
+        run_tui_turn(
+            tui_bin,
+            supervisor_bin,
+            [shim_dir, install_dir],
+            workspace / "shim-workspace",
+        )
+
+        # The published npm launcher resolves through node.exe to the platform
+        # package's native binary.
+        package_dir = build_npm_layout(
+            workspace / "npm", harness.ROOT / "packaging" / "npm" / "leg.js", leg_bin
+        )
+        run_tui_turn(
+            tui_bin,
+            supervisor_bin,
+            [package_dir],
+            workspace / "launcher-workspace",
+        )
 
     print("install resolution smoke passed")
     return 0
