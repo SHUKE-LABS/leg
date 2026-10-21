@@ -373,3 +373,39 @@ fn the_registry_backend_reads_the_current_user_path() {
     let value = super::windows_path::read_user_path().expect("read the current user's PATH");
     assert!(!value.contains('\0'));
 }
+
+#[test]
+fn an_unavailable_destination_fails_before_writing() {
+    let scratch = scratch("unavailable");
+    let sources = fake_sources(&scratch.path.join("bundle"));
+    let blocker = scratch.path.join("blocker");
+    fs::write(&blocker, b"not a directory").expect("write the blocker");
+    let destination = blocker.join("bin");
+
+    let error = install_sources(
+        &sources,
+        &InstallOptions {
+            destination: Some(destination),
+            no_path: true,
+        },
+        FaultPoint::None,
+    )
+    .expect_err("the destination cannot be created");
+
+    assert!(
+        error.to_string().contains("install directory"),
+        "unexpected error: {error}"
+    );
+    assert!(blocker.is_file(), "the blocker was replaced");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_unix_install_never_updates_the_path() {
+    let destination = PathBuf::from("/tmp/leg-install-unix-boundary");
+    let update = PathUpdate::prepare(&destination, false).expect("prepare the path update");
+    assert!(
+        update.is_none(),
+        "a Unix installation must not touch the PATH"
+    );
+}
