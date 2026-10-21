@@ -119,9 +119,13 @@ fn executable_extensions() -> Vec<String> {
     #[cfg(windows)]
     {
         let mut extensions = parse_extensions(std::env::var_os("PATHEXT").as_deref());
-        // A native binary stays reachable even when `PATHEXT` was edited.
-        if !extensions.iter().any(|extension| extension == ".exe") {
-            extensions.push(".exe".to_string());
+        // A native binary and the published launcher stay reachable even when
+        // `PATHEXT` was edited: the native one is `leg.exe`, and the published
+        // npm launcher is `leg.js`.
+        for required in [".exe", ".js"] {
+            if !extensions.iter().any(|extension| extension == required) {
+                extensions.push(required.to_string());
+            }
         }
         extensions
     }
@@ -168,10 +172,7 @@ fn resolve_leg_in(
 ) -> Result<ResolvedLeg, ResolveError> {
     let path = match override_path {
         Some(path) => {
-            let canonical = fs::canonicalize(path).map_err(|source| ResolveError::Inspect {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            let canonical = canonical_path(path)?;
             match classify(&canonical)? {
                 CandidateKind::PublishedLauncher => resolve_npm_binary(&canonical, search)?,
                 CandidateKind::ScriptWrapper => {
@@ -218,6 +219,36 @@ fn resolve_leg_in(
     Ok(ResolvedLeg { path })
 }
 
+/// Resolves a path to its canonical form.
+///
+/// `fs::canonicalize` returns a verbatim `\\?\` path on Windows. Node.js
+/// cannot `require` such a path, so the prefix is removed and the plain
+/// path is used from then on.
+fn canonical_path(path: &Path) -> Result<PathBuf, ResolveError> {
+    let canonical = fs::canonicalize(path).map_err(|source| ResolveError::Inspect {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(without_verbatim_prefix(canonical))
+}
+
+/// Removes the Windows verbatim path prefix from a canonical path.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let Some(text) = path.to_str() else {
+            return path;
+        };
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 /// Finds the first usable `leg` on PATH, skipping script wrappers.
 ///
 /// A package-manager shim that comes first on PATH is not an error: the
@@ -229,10 +260,7 @@ fn select_candidate(search: &SearchPath) -> Result<Selected, ResolveError> {
         if kind == CandidateKind::ScriptWrapper {
             continue;
         }
-        let canonical = fs::canonicalize(&candidate).map_err(|source| ResolveError::Inspect {
-            path: candidate.clone(),
-            source,
-        })?;
+        let canonical = canonical_path(&candidate)?;
         return Ok(match kind {
             CandidateKind::PublishedLauncher => Selected::Launcher(canonical),
             _ => Selected::Native(canonical),
@@ -370,12 +398,13 @@ fn resolve_npm_binary(launcher: &Path, search: &SearchPath) -> Result<PathBuf, R
         ));
     }
     let path = PathBuf::from(resolved);
-    fs::canonicalize(&path).map_err(|error| {
+    let canonical = fs::canonicalize(&path).map_err(|error| {
         ResolveError::NpmResolution(format!(
             "platform package binary {} cannot be resolved: {error}",
             path.display()
         ))
-    })
+    })?;
+    Ok(without_verbatim_prefix(canonical))
 }
 
 fn run_node(node: &Path, launcher: &Path, script: &str) -> Result<BoundedOutput, String> {
@@ -384,7 +413,47 @@ fn run_node(node: &Path, launcher: &Path, script: &str) -> Result<BoundedOutput,
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
+    add_system_environment(&mut command);
     run_command_bounded(command)
+}
+
+/// Adds the system variables a child process needs to start on this platform.
+///
+/// The children run with a cleared environment so credentials never reach
+/// them, but a Windows process cannot start without `SystemRoot`: Node.js
+/// aborts in its crypto initialisation when the variable is missing.
+fn add_system_environment(command: &mut Command) {
+    #[cfg(windows)]
+    for name in [
+        "ALLUSERSPROFILE",
+        "APPDATA",
+        "COMSPEC",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "NUMBER_OF_PROCESSORS",
+        "OS",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PUBLIC",
+        "SystemDrive",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "USERDOMAIN",
+        "USERNAME",
+        "USERPROFILE",
+        "windir",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn run_bounded(path: &Path, args: &[&OsStr]) -> Result<BoundedOutput, String> {
@@ -497,6 +566,11 @@ mod tests {
             .join("leg.js")
     }
 
+    /// The canonical path of a file, without the Windows verbatim prefix.
+    fn plain(path: &Path) -> PathBuf {
+        without_verbatim_prefix(fs::canonicalize(path).expect("canonical path"))
+    }
+
     /// A PATH value that lists `directories` in order.
     fn search(directories: &[PathBuf], extensions: &[&str]) -> SearchPath {
         let value = std::env::join_paths(directories).expect("join the search path");
@@ -504,6 +578,58 @@ mod tests {
             value: Some(value),
             extensions: extensions.iter().map(|value| value.to_string()).collect(),
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_verbatim_prefix_is_removed_from_a_canonical_path() {
+        assert_eq!(
+            without_verbatim_prefix(PathBuf::from(r"\\?\C:\tools\leg.exe")),
+            PathBuf::from(r"C:\tools\leg.exe")
+        );
+        assert_eq!(
+            without_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\leg.exe")),
+            PathBuf::from(r"\\server\share\leg.exe")
+        );
+        assert_eq!(
+            without_verbatim_prefix(PathBuf::from(r"C:\tools\leg.exe")),
+            PathBuf::from(r"C:\tools\leg.exe")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_published_launcher_resolves_through_node() {
+        let root = tempfile::tempdir().expect("scratch directory");
+        let package = root
+            .path()
+            .join("node_modules")
+            .join("@shukelabs")
+            .join("leg");
+        fs::create_dir_all(&package).expect("create the package directory");
+        fs::copy(published_launcher(), package.join("leg.js")).expect("copy the launcher");
+        let platform_binary = root
+            .path()
+            .join("node_modules")
+            .join("@shukelabs")
+            .join("leg-win32-x64")
+            .join("bin")
+            .join("leg.exe");
+        fs::create_dir_all(platform_binary.parent().expect("the bin directory"))
+            .expect("create the platform package");
+        fs::write(&platform_binary, b"MZ binary").expect("write the platform binary");
+
+        let Some(node_directory) = std::env::var_os("PATH").and_then(|value| {
+            std::env::split_paths(&value).find(|entry| entry.join("node.exe").is_file())
+        }) else {
+            eprintln!("skipping the published launcher check: Node.js is not installed");
+            return;
+        };
+        let search = search(&[package.clone(), node_directory], &[".exe", ".js"]);
+
+        let resolved = resolve_npm_binary(&package.join("leg.js"), &search)
+            .expect("the published launcher resolves");
+        assert_eq!(resolved, plain(&platform_binary));
     }
 
     #[test]
@@ -609,9 +735,7 @@ mod tests {
         let selected = select_candidate(&search).expect("a candidate is selected");
         assert_eq!(
             selected,
-            Selected::Native(
-                fs::canonicalize(native_dir.path().join("leg")).expect("canonical path")
-            )
+            Selected::Native(plain(&native_dir.path().join("leg")))
         );
     }
 
@@ -632,9 +756,7 @@ mod tests {
         let selected = select_candidate(&search).expect("a candidate is selected");
         assert_eq!(
             selected,
-            Selected::Native(
-                fs::canonicalize(native_dir.path().join("leg.exe")).expect("canonical path")
-            )
+            Selected::Native(plain(&native_dir.path().join("leg.exe")))
         );
     }
 
@@ -646,10 +768,7 @@ mod tests {
         let search = search(&[directory.path().to_path_buf()], &[".js"]);
 
         let selected = select_candidate(&search).expect("a candidate is selected");
-        assert_eq!(
-            selected,
-            Selected::Launcher(fs::canonicalize(&path).expect("canonical path"))
-        );
+        assert_eq!(selected, Selected::Launcher(plain(&path)));
     }
 
     #[test]
