@@ -847,6 +847,9 @@ fn a_guest_with_a_ledger_it_cannot_read_is_refused() {
 
     assert_eq!(answer["status"], "error");
     assert_eq!(answer["error"]["reason"], "state_unavailable");
+    // The failure happened before the request was dispatched, but the caller
+    // still learns which request failed.
+    assert_eq!(answer["request_id"], "r-1");
 }
 
 #[cfg(unix)]

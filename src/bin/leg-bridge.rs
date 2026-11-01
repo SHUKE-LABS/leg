@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use leg::bridge::adapter::{SocketHostAdapter, UnavailableAdapter};
 use leg::bridge::protocol::{
     BridgeError, BridgeResponse, BridgeStatus, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    peek_request_id,
 };
 use leg::bridge::service::Bridge;
 use leg::bridge::state::{AuditLog, BridgeState};
@@ -88,8 +89,11 @@ fn main() -> ExitCode {
 
     let response = match build_bridge() {
         Ok(mut bridge) => bridge.handle(&request),
+        // A request that fails before the bridge is built still answers with
+        // the request id the caller used, so the caller can correlate the
+        // failure with its request.
         Err(error) => BridgeResponse::failure(
-            "",
+            request_id_of(&request),
             BridgeStatus::Error,
             BridgeError::new(
                 "state_unavailable",
@@ -144,6 +148,17 @@ fn read_request() -> Result<String, BridgeError> {
         ));
     }
     Ok(request)
+}
+
+/// Reads the request id out of a request line, when it carries one.
+///
+/// The request is not validated here: this only answers the question a caller
+/// asks when the bridge failed before it could answer. An id that is missing,
+/// that is not a string, or that is not well formed yields no id at all.
+fn request_id_of(request: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(request)
+        .map(|value| peek_request_id(&value))
+        .unwrap_or_default()
 }
 
 /// Builds the bridge the command runs.
