@@ -60,7 +60,12 @@ on the host's behalf. The flow is approval-gated and pinned.
   install runs `apk` with fixed arguments against the pinned repositories, and
   the installed executable is verified afterwards.
 - Every failure is a structured error with a machine-readable reason and a
-  remediation, and a failed request leaves the guest unchanged.
+  remediation, and a failed request leaves the guest unchanged. The install, the
+  executable verification, and the state write are one transaction: a failure in
+  any of them removes the package again and puts the state record back. A
+  package the guest already holds at another version is refused before anything
+  is touched, because the install would replace that version and a failed
+  install could not put it back.
 
 The provisioned tools are ordinary Alpine packages inside the guest. They
 cannot grant native iOS or Android permissions, and the guest commands do not

@@ -436,6 +436,8 @@ pub fn provision(
         });
     }
 
+    check_installed_version(&installed, package.name, &candidate)?;
+
     let projected = state
         .provisioned_install_bytes
         .saturating_add(candidate.install_bytes);
@@ -501,12 +503,19 @@ pub fn provision(
         ));
     }
 
+    // The guest must not hold another version of the package: the install
+    // would replace it, and a failed install could not put it back.
+    let installed = env.installed_versions(&allowed_names())?;
+    check_installed_version(&installed, package.name, &candidate)?;
+
+    let previous = state.installed.get(package.name).cloned();
     if let Err(error) = install_and_verify(env, state, package, &candidate) {
         return Err(rollback(
             env,
             state,
             package.name,
             &candidate.version,
+            previous,
             error,
         ));
     }
@@ -542,17 +551,18 @@ fn install_and_verify(
 
 /// Rolls a failed install back, so the guest keeps the state it had.
 ///
-/// The package is removed again and the state record is dropped; when the
-/// removal fails the guest may still hold the package, which the failure
-/// says.
+/// The package is removed again and the state record is put back as it was;
+/// when the removal fails the guest may still hold the package, which the
+/// failure says.
 fn rollback(
     env: &mut dyn GuestEnvironment,
     state: &mut state::GuestState,
     package: &str,
     version: &str,
+    previous: Option<state::InstalledPackage>,
     error: LegError,
 ) -> LegError {
-    state.forget(package);
+    state.restore(package, previous.as_ref());
     match env.uninstall(package, version) {
         Ok(()) => error,
         Err(uninstall_error) => failure(
@@ -561,6 +571,32 @@ fn rollback(
             "the guest may still hold the package; remove it by hand",
         ),
     }
+}
+
+/// Refuses a package the guest already holds at another version.
+///
+/// Installing the candidate would replace the installed version, and a failed
+/// install could not put that version back, so the request is refused before
+/// anything in the guest is touched.
+fn check_installed_version(
+    installed: &BTreeMap<String, String>,
+    package: &str,
+    candidate: &Candidate,
+) -> Result<()> {
+    let Some(version) = installed.get(package) else {
+        return Ok(());
+    };
+    if version == &candidate.version {
+        return Ok(());
+    }
+    Err(failure(
+        "version_mismatch",
+        format!(
+            "the guest holds {package} {version}, not the candidate {}",
+            candidate.version
+        ),
+        format!("remove {package} from the guest (apk del {package}) and provision it again"),
+    ))
 }
 
 /// Runs the package's fixed verification command and checks its output.

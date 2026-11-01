@@ -578,6 +578,117 @@ fn a_failed_verification_rolls_the_install_back() {
 }
 
 #[test]
+fn a_guest_holding_another_version_is_refused_before_anything_is_installed() {
+    let scratch = scratch("version-mismatch");
+    let mut guest = FakeGuest::new();
+    guest
+        .installed
+        .insert("bash".to_string(), "5.2.25-r0".to_string());
+    let mut state = state(&scratch);
+    state.record_install("bash", "5.2.25-r0", 1_000_000);
+    state.save().expect("the state is written");
+
+    let error =
+        provision(&mut guest, &request("bash"), &mut state).expect_err("the guest is refused");
+
+    assert_eq!(reason_of(&error), "version_mismatch");
+    assert!(guest.installs.is_empty());
+    assert_eq!(
+        guest.installed.get("bash"),
+        Some(&"5.2.25-r0".to_string()),
+        "the guest lost the version it held"
+    );
+    assert_eq!(
+        persisted(&scratch)
+            .get("bash")
+            .map(|entry| entry.version.clone()),
+        Some("5.2.25-r0".to_string()),
+        "the persisted state lost the version it held"
+    );
+}
+
+#[test]
+fn a_failed_install_keeps_the_previous_state_record() {
+    let scratch = scratch("previous-record");
+    let mut guest = FakeGuest::new();
+    guest.install_failure = Some(failure("apk_failed"));
+    let mut state = state(&scratch);
+    state.record_install("bash", "5.2.25-r0", 1_000_000);
+    state.save().expect("the state is written");
+
+    let preview =
+        provision(&mut guest, &request("bash"), &mut state).expect("the preview succeeds");
+    let token = preview.approval_token.expect("a token");
+    let approved = ProvisionRequest {
+        package: "bash".to_string(),
+        approval_token: Some(token),
+        storage_budget_bytes: None,
+    };
+    let error = provision(&mut guest, &approved, &mut state).expect_err("the install fails");
+
+    assert_eq!(reason_of(&error), "apk_failed");
+    assert_eq!(
+        state
+            .installed
+            .get("bash")
+            .map(|entry| entry.version.clone()),
+        Some("5.2.25-r0".to_string()),
+        "the state lost the record it held"
+    );
+    assert_eq!(state.provisioned_install_bytes, 1_000_000);
+    assert_eq!(
+        persisted(&scratch)
+            .get("bash")
+            .map(|entry| entry.version.clone()),
+        Some("5.2.25-r0".to_string()),
+        "the persisted state lost the record it held"
+    );
+}
+
+#[test]
+fn a_state_that_cannot_be_saved_keeps_the_previous_state_record() {
+    let scratch = scratch("previous-record-save");
+    let mut guest = FakeGuest::new();
+    let mut state = state(&scratch);
+    state.record_install("bash", "5.2.25-r0", 1_000_000);
+    state.save().expect("the state is written");
+
+    let preview =
+        provision(&mut guest, &request("bash"), &mut state).expect("the preview succeeds");
+    let token = preview.approval_token.expect("a token");
+
+    // A directory where the state file belongs makes writing the state fail.
+    let state_file = scratch.path.join("state.json");
+    let _ = fs::remove_file(&state_file);
+    fs::create_dir(&state_file).expect("replace the state file with a directory");
+
+    let approved = ProvisionRequest {
+        package: "bash".to_string(),
+        approval_token: Some(token),
+        storage_budget_bytes: None,
+    };
+    let error = provision(&mut guest, &approved, &mut state).expect_err("the state is not saved");
+
+    assert!(
+        matches!(error, LegError::Io(_)),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        state
+            .installed
+            .get("bash")
+            .map(|entry| entry.version.clone()),
+        Some("5.2.25-r0".to_string()),
+        "the state lost the record it held"
+    );
+    assert_eq!(state.provisioned_install_bytes, 1_000_000);
+    assert!(
+        !guest.installed.contains_key("bash"),
+        "the guest still holds the package"
+    );
+}
+
+#[test]
 fn a_failed_install_leaves_the_guest_unchanged() {
     let scratch = scratch("install-failure");
     let mut guest = FakeGuest::new();

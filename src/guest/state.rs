@@ -193,6 +193,17 @@ impl GuestState {
         }
     }
 
+    /// Puts a package's record back as it was before an install.
+    ///
+    /// A failed install must leave the state it found, so the previous entry
+    /// is restored rather than dropped.
+    pub fn restore(&mut self, package: &str, previous: Option<&InstalledPackage>) {
+        match previous {
+            Some(entry) => self.record_install(package, &entry.version, entry.install_bytes),
+            None => self.forget(package),
+        }
+    }
+
     /// Issues a one-time approval token for `candidate`.
     pub fn issue_approval(&self, package: &str, candidate: &Candidate) -> Result<String> {
         let directory = self.dir.join(APPROVALS_DIR);

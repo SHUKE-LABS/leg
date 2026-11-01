@@ -177,6 +177,10 @@ others). A request for a package the guest already holds at that version is
 answered with `"status": "already_satisfied"`, and nothing is downloaded or
 installed.
 
+A package the guest holds at *another* version is refused before anything is
+installed: the install would replace that version, and a failed install could
+not put it back. Remove it from the guest first, then provision it again.
+
 The approval token is a host-side credential: keep it out of any channel the
 model can read, or the gate means nothing.
 
