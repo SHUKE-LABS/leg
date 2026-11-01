@@ -99,8 +99,120 @@ against (Alpine 3.20.3, image `alpine:3.20.3`, run under `linux/386`), and the
 This is an emulated Linux artifact, not a native iOS binary: it ships no iOS
 SDK or Swift code, and the binaries cannot reach the Photos, Files, Shortcuts,
 or any other iOS host API. They run with the guest's own Alpine userland and
-its permissions. Provisioning guest packages on first run is separate work
-and is not part of this bundle.
+its permissions.
+
+### Guest inspection and provisioning
+
+Inside the guest, `leg guest` inspects the guest and provisions the approved
+Linux tools. Both commands answer with JSON:
+
+```
+leg guest bootstrap --json
+leg guest provision <package> --json [--approval-token <token>] [--storage-budget-bytes <bytes>]
+```
+
+`leg guest bootstrap --json` reports the guest's Alpine release and
+architecture, the pinned repository identity, the versions of the allowlisted
+packages that are installed, and the free storage:
+
+```json
+{
+  "schema": "leg.guest.bootstrap/v1",
+  "guest": { "release": "3.20.3", "architecture": "x86" },
+  "repository": {
+    "release": "v3.20",
+    "urls": [
+      "https://dl-cdn.alpinelinux.org/alpine/v3.20/main",
+      "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
+    ]
+  },
+  "installed": { "bash": "5.2.26-r0" },
+  "storage": { "free_bytes": 2147483648, "budget_bytes": 268435456 }
+}
+```
+
+The guest is pinned to Alpine 3.20.3 on x86. A guest on another release or
+architecture is refused with a structured error, so an incompatible guest never
+reads as a healthy one.
+
+`leg guest provision <package> --json` previews the exact candidate the
+package would install — version, repository, download and install bytes, and
+checksum — and issues a one-time approval token:
+
+```json
+{
+  "schema": "leg.guest.provision/v1",
+  "status": "approval_required",
+  "package": "bash",
+  "approval_required": true,
+  "approval_token": "3f0c…",
+  "candidate": {
+    "version": "5.2.26-r0",
+    "repository": "https://dl-cdn.alpinelinux.org/alpine/v3.20/main",
+    "architecture": "x86",
+    "download_bytes": 459098,
+    "install_bytes": 1417216,
+    "checksum": "sha1:5313307c0b7ae9288682f6402ade02cbf45042b7"
+  },
+  "verified": false,
+  "cache_hit": false,
+  "storage": { "free_bytes": 2147483648, "budget_bytes": 268435456 }
+}
+```
+
+The preview changes nothing in the guest: the candidate is resolved against a
+throwaway cache directory, and the guest's packages stay as they are. Once a
+host approves the preview, repeating the command with the token installs that
+exact snapshot:
+
+```
+leg guest provision bash --json --approval-token <token>
+```
+
+The approval re-resolves the candidate and installs nothing if the repository
+now offers a different snapshot. The install runs `apk` with fixed arguments
+against the pinned repositories, and the installed executable is verified
+afterwards (`bash -lc 'printf ready'` for bash, the reported version for the
+others). A request for a package the guest already holds at that version is
+answered with `"status": "already_satisfied"`, and nothing is downloaded or
+installed.
+
+A package the guest holds at *another* version is refused before anything is
+installed: the install would replace that version, and a failed install could
+not put it back. Remove it from the guest first, then provision it again.
+
+The approval token is a host-side credential: keep it out of any channel the
+model can read, or the gate means nothing.
+
+Only `bash`, `ffmpeg`, `python3`, and `ripgrep` can be provisioned, and only
+from the pinned Alpine 3.20 repositories. Each package is resolved against the
+repository that carries it, so the reported repository, version, and checksum
+are the ones the install would use. The guest's own `apk` verifies the
+repository signature and the package checksum before it installs anything; a
+failure is reported as a structured error with a remediation, and a failed
+request leaves the guest unchanged — a package whose executable fails
+verification, or whose state cannot be written, is removed again:
+
+```json
+{
+  "schema": "leg.guest.error/v1",
+  "error": {
+    "reason": "offline",
+    "message": "apk --cache-dir … update failed: Can't connect to …",
+    "remediation": "the guest could not reach the pinned repository; check the guest's network"
+  }
+}
+```
+
+The default storage budget is 256 MiB of installed packages;
+`--storage-budget-bytes <bytes>` overrides it. The guest state — the
+installed-package record and the pending approval tokens — lives in
+`LEG_GUEST_STATE_DIR`, else `XDG_STATE_HOME/leg/guest`, else
+`~/.local/state/leg/guest`.
+
+The provisioned tools stay inside the guest: they are ordinary Alpine
+packages, they cannot grant native iOS or Android permissions, and they do
+not change how the desktop binaries install packages.
 
 ## Experimental TUI trial
 

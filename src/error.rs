@@ -36,6 +36,20 @@ impl InterruptSignal {
     }
 }
 
+/// A guest inspection or provisioning failure.
+///
+/// The reason is a stable machine-readable string, the message says what
+/// went wrong, and the remediation says what the host can do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestFailure {
+    /// The stable, machine-readable failure reason.
+    pub reason: &'static str,
+    /// The human-readable failure detail.
+    pub message: String,
+    /// The remediation hint for the host.
+    pub remediation: String,
+}
+
 /// Top-level error type for leg.
 #[derive(Debug)]
 pub enum LegError {
@@ -107,6 +121,9 @@ pub enum LegError {
     Io(String),
     /// The `leg install` command could not materialize the native binaries.
     Install(String),
+    /// A guest inspection or provisioning request failed. The failure carries a
+    /// machine-readable reason and the remediation a host can act on.
+    Guest(GuestFailure),
     /// The active turn was interrupted by a Unix signal.
     Interrupted {
         /// The signal that requested the interruption.
@@ -156,6 +173,7 @@ impl LegError {
             LegError::ContextWindow(_) => "context_window",
             LegError::Io(_) => "io",
             LegError::Install(_) => "install",
+            LegError::Guest(_) => "guest",
             LegError::Interrupted { .. } => "interrupted",
             LegError::Log(_) => "log",
             LegError::SessionNotFound(_) => "session_not_found",
@@ -255,6 +273,9 @@ impl fmt::Display for LegError {
             LegError::ContextWindow(msg) => write!(f, "context window error: {msg}"),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
             LegError::Install(msg) => write!(f, "install error: {msg}"),
+            LegError::Guest(failure) => {
+                write!(f, "guest error ({}): {}", failure.reason, failure.message)
+            }
             LegError::Interrupted { signal } => {
                 write!(f, "interrupted by {}", signal.name())
             }

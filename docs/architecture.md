@@ -40,3 +40,33 @@ mailbox, or session-supervision machinery — that is baton's job. For the
 full harness model (participant paths, the `baton.message/v1` envelope, the
 module layout), see baton's
 [`docs/architecture.md`](https://github.com/SHUKE-LABS/baton/blob/main/docs/architecture.md).
+
+## The guest boundary
+
+`leg guest` (`src/guest.rs`) is a separate surface from the tool loop: it
+inspects and provisions the Alpine guest an iSH host runs, and it never runs
+on the host's behalf. The flow is approval-gated and pinned.
+
+- The candidate is read from the repository index that the guest's own `apk`
+  downloaded and signature-verified, so the reported version, byte counts, and
+  checksum are the ones the install would use. A preview resolves it against a
+  throwaway cache directory, so the guest's packages and cache stay untouched.
+- The package name comes from a four-entry allowlist — `bash`, `ffmpeg`,
+  `python3`, `ripgrep` — and the version, repository, and apk arguments come
+  from the index and from fixed templates. No caller-supplied package name,
+  version, or apk argument reaches the package manager.
+- A preview issues a one-time approval token bound to the exact snapshot; the
+  approval re-resolves that snapshot and installs nothing if it changed. The
+  install runs `apk` with fixed arguments against the pinned repositories, and
+  the installed executable is verified afterwards.
+- Every failure is a structured error with a machine-readable reason and a
+  remediation, and a failed request leaves the guest unchanged. The install, the
+  executable verification, and the state write are one transaction: a failure in
+  any of them removes the package again and puts the state record back. A
+  package the guest already holds at another version is refused before anything
+  is touched, because the install would replace that version and a failed
+  install could not put it back.
+
+The provisioned tools are ordinary Alpine packages inside the guest. They
+cannot grant native iOS or Android permissions, and the guest commands do not
+change how the desktop binaries install packages.

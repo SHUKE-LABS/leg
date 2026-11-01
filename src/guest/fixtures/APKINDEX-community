@@ -1,0 +1,31 @@
+C:Q1SX4AgVyyVom8GBtP+VN249QZi14=
+P:ffmpeg
+V:6.1.1-r8
+A:x86
+S:245732
+I:626688
+T:Complete and free Internet live audio and video broadcasting solution for Linux/Unix
+U:https://ffmpeg.org/
+L:GPL-2.0-or-later AND LGPL-2.1-or-later
+o:ffmpeg
+m:Natanael Copa <ncopa@alpinelinux.org>
+t:1717743521
+c:15a0e828c35f1f72a9459c2ca9bb4c18ea8244a4
+D:so:libavcodec.so.60 so:libavdevice.so.60 so:libavfilter.so.9 so:libavformat.so.60 so:libavutil.so.58 so:libc.musl-x86.so.1 so:libpostproc.so.57 so:libswresample.so.4 so:libswscale.so.7
+p:cmd:ffmpeg=6.1.1-r8 cmd:ffprobe=6.1.1-r8
+
+C:Q1AjBHyuZFBkBILkdpPjqYHD77VEo=
+P:ripgrep
+V:14.1.0-r0
+A:x86
+S:1293955
+I:2895872
+T:ripgrep combines the usability of The Silver Searcher with the raw speed of grep
+U:https://github.com/BurntSushi/ripgrep
+L:MIT OR Unlicense
+o:ripgrep
+m:André Klitzing <aklitzing@gmail.com>
+t:1704662169
+c:de33e28e1cfbfd069be83bb5ee3e75391284185d
+D:so:libc.musl-x86.so.1 so:libgcc_s.so.1 so:libpcre2-8.so.0
+p:cmd:rg=14.1.0-r0
