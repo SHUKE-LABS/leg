@@ -45,10 +45,11 @@ From a clean clone:
 ```
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphonesimulator \
-    -configuration Debug -derivedDataPath build/dd build
+    -configuration Release -derivedDataPath build/dd build
 ```
 
-The build product is `build/dd/Build/Products/Debug-iphonesimulator/LegHost.app`.
+The build product is `build/dd/Build/Products/Release-iphonesimulator/LegHost.app`.
+The derived data lands in `build/`, which the repository ignores.
 
 The `Build iSH runtime` script phase (`scripts/build-ish-runtime.sh`) compiles
 the vendored runtime for every architecture in `ARCHS` and archives it into
@@ -57,8 +58,13 @@ the same runtime with meson, which needs meson, ninja and an LLVM toolchain
 that can target i386 Linux; this script drives the stock Xcode clang instead
 and only needs an ELF linker for the vDSO.
 
-The same phase writes a link map next to the app
-(`build/dd/Build/Products/Debug-iphonesimulator/LegHost.linkmap`).
+Xcode links one binary per architecture, so the link map is written per
+architecture next to the app:
+`build/dd/Build/Products/Release-iphonesimulator/LegHost-<arch>.linkmap`,
+for example `LegHost-x86_64.linkmap`.
+
+The commands below use the Release configuration. A Debug build puts its
+products in `build/dd/Build/Products/Debug-iphonesimulator/` instead.
 
 ## Install and launch in the simulator
 
@@ -66,7 +72,7 @@ The same phase writes a link map next to the app
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 xcrun simctl boot "iPhone 17 Pro"
 xcrun simctl install "iPhone 17 Pro" \
-    build/dd/Build/Products/Debug-iphonesimulator/LegHost.app
+    build/dd/Build/Products/Release-iphonesimulator/LegHost.app
 xcrun simctl launch "iPhone 17 Pro" com.shukelabs.leg.ioshost
 ```
 
@@ -91,17 +97,18 @@ on the command line (or set it in Xcode for the local checkout).
 
 ## Checking what is linked
 
-The host must contain the vendored iSH runtime and no proprietary leg code:
+The host must contain the vendored iSH runtime and no proprietary leg code.
+Run these from the repository root after the Release build above:
 
 ```
-nm -a build/dd/Build/Products/Release-iphonesimulator/LegHost.app/LegHost \
-    | grep -E '_fiber_enter|_emu_'
+app=build/dd/Build/Products/Release-iphonesimulator/LegHost.app
+
+nm -a "$app/LegHost" | grep -E '_fiber_enter|_emu_'
 grep -c 'libish_runtime.a(' \
     build/dd/Build/Products/Release-iphonesimulator/LegHost-x86_64.linkmap
-nm -a build/dd/Build/Products/Release-iphonesimulator/LegHost.app/LegHost \
-    | grep -iE 'leg_tui|leg_ui|leg_web|shukelabs'
+nm -a "$app/LegHost" | grep -iE 'leg_tui|leg_ui|leg_web|shukelabs'
 grep -iE 'leg_tui|leg_ui|leg-web|src/main\.rs|companions/' \
-    build/dd/Build/Products/Release-iphonesimulator/LegHost-x86_64.linkmap
+    build/dd/Build/Products/Release-iphonesimulator/LegHost-*.linkmap
 ```
 
 The first two commands show the vendored runtime: its symbols in the host
