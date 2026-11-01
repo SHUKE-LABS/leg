@@ -6,6 +6,8 @@ rust-version = "1.89"
 description = "leg"
 readme = "README.md"
 license-file = "LICENSE"
+# The iOS host lives in its own GPLv3 directory and is not part of this crate.
+exclude = ["ios/**"]
 
 [[bin]]
 name = "leg"
