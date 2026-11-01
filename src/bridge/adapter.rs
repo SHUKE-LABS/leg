@@ -342,6 +342,25 @@ struct UnixHostConnection {
     buffer: Vec<u8>,
 }
 
+/// Writes `bytes` of filler over a real host socket, for the tests.
+///
+/// The helper is test-only: it lets the tests drive the socket write path
+/// over a real connection — including a write that stalls because the host
+/// stopped reading, which no fake connection can reproduce.
+#[cfg(all(test, unix))]
+pub(crate) fn write_over_a_socket(
+    path: &Path,
+    bytes: usize,
+    deadline: Instant,
+) -> Result<(), ConnectionError> {
+    use std::os::unix::net::UnixStream;
+
+    let stream =
+        UnixStream::connect(path).map_err(|error| ConnectionError::Io(error.to_string()))?;
+    let mut connection = UnixHostConnection::new(stream);
+    connection.send(&"x".repeat(bytes), deadline)
+}
+
 #[cfg(unix)]
 impl UnixHostConnection {
     /// Creates a connection over `stream`.

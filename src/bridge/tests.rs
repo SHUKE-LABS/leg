@@ -1369,3 +1369,93 @@ fn a_host_socket_that_cannot_be_reached_in_time_times_out() {
         "the request reached a host it never connected to"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_write_to_a_real_socket_that_stalls_times_out() {
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    let scratch = scratch("write-stall");
+    let path = scratch.path.join("host.sock");
+    let listener = UnixListener::bind(&path).expect("bind the host socket");
+
+    // The host takes the connection and never reads from it, so the socket
+    // buffer fills and the write stalls.
+    let host = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+
+    let error = adapter::write_over_a_socket(
+        &path,
+        4 * 1024 * 1024,
+        Instant::now() + Duration::from_millis(300),
+    )
+    .expect_err("the write went through");
+
+    assert_eq!(error, ConnectionError::Timeout);
+    drop(host);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_to_a_real_socket_whose_host_is_gone_is_a_transport_error() {
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    let scratch = scratch("write-broken");
+    let path = scratch.path.join("host.sock");
+    let listener = UnixListener::bind(&path).expect("bind the host socket");
+
+    // The host takes the connection and closes it again.
+    let host = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            drop(stream);
+        }
+    });
+
+    let error = adapter::write_over_a_socket(
+        &path,
+        4 * 1024 * 1024,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect_err("the write went through");
+
+    assert!(
+        matches!(error, ConnectionError::Io(_)),
+        "the broken write was not a transport failure: {error:?}"
+    );
+    drop(host);
+}
+
+#[test]
+fn a_request_to_a_host_that_never_connected_keeps_its_id() {
+    let scratch = scratch("unreachable-retry");
+    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    let mut first = Bridge::new(
+        Box::new(adapter::SocketHostAdapter::new(
+            scratch.path.join("nothing.sock"),
+        )),
+        state,
+        AuditLog::new(None),
+    );
+
+    let response = first.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Unavailable);
+
+    // The transport never connected, so nothing happened and the caller may
+    // try again with the same request id.
+    let mut second = bridge(
+        FakeHost::always(HostOutcome::Ok(json!({"items": []}))),
+        &scratch,
+    );
+    let response = second.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(
+        response.status,
+        BridgeStatus::Ok,
+        "the request id was not free again: {response:?}"
+    );
+}
