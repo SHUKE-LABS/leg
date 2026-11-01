@@ -41,8 +41,9 @@ companions.
 Per-platform archives for every CI-supported target (`.tar.gz` on
 Unix, `.zip` on Windows) are attached to each
 [GitHub Release](https://github.com/SHUKE-LABS/leg/releases).
-Each archive contains `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`
+Each desktop archive contains `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`
 (`.exe` on Windows); keep these binaries together when installing them.
+The i386 bundle for iSH hosts is described below.
 
 ### Install the native binaries
 
@@ -76,6 +77,30 @@ other subject bumps patch. The first release uses the current Cargo version
 
 Every published npm package includes `THIRD_PARTY_NOTICES.txt` with the
 licenses of the bundled third-party Rust crates and vendored material.
+
+## iSH bundle for iOS
+
+Each release also attaches `leg-<version>-i686-unknown-linux-musl.tar.gz` for
+hosts that run a Linux i386 userland, such as the [iSH](https://ish.app)
+emulator on iOS. Unpack it inside the iSH filesystem and check the inner
+checksums:
+
+```
+sha256sum --check SHA256SUMS
+```
+
+The archive holds `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`, the
+compatibility manifest `ish-compatibility-v1.json`, and the inner
+`SHA256SUMS`. The manifest records the exact target
+(`i686-unknown-linux-musl`), the pinned Alpine release the bundle is tested
+against (Alpine 3.20.3, image `alpine:3.20.3`, run under `linux/386`), and the
+`--version` command for each binary.
+
+This is an emulated Linux artifact, not a native iOS binary: it ships no iOS
+SDK or Swift code, and the binaries cannot reach the Photos, Files, Shortcuts,
+or any other iOS host API. They run with the guest's own Alpine userland and
+its permissions. Provisioning guest packages on first run is separate work
+and is not part of this bundle.
 
 ## Experimental TUI trial
 
@@ -540,5 +565,7 @@ cargo +1.89.0 clippy --locked --all-targets -- -D warnings
 - aarch64-apple-darwin
 - x86_64-pc-windows-msvc
 - armv7-unknown-linux-musleabihf (cross-compiled; build-only, no native runner)
+- i686-unknown-linux-musl (static; cross-compiled; ships only as the iSH/Alpine
+  i386 bundle)
 
 Linux release binaries use musl and do not require a minimum glibc version.

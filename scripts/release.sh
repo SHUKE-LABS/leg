@@ -1299,6 +1299,404 @@ release_sha256_check() {
     fi
 }
 
+# iSH hosts an Alpine Linux userland on iOS, so the bundle below ships ELF32
+# i386 executables built for i686-unknown-linux-musl. This is a Linux artifact
+# for an emulated guest: it is not a native iOS binary, and it has no access
+# to iOS host APIs such as Photos, Files, or Shortcuts.
+release_ish_target() {
+    printf 'i686-unknown-linux-musl\n'
+}
+
+release_ish_alpine_release() {
+    printf '3.20.3\n'
+}
+
+release_ish_alpine_image() {
+    printf 'alpine:%s\n' "$(release_ish_alpine_release)"
+}
+
+release_ish_docker_platform() {
+    printf 'linux/386\n'
+}
+
+release_ish_manifest_name() {
+    printf 'ish-compatibility-v1.json\n'
+}
+
+release_ish_binary_names() {
+    printf '%s\n' leg leg-tui leg-web leg-ui-supervisor
+}
+
+release_ish_bundle_file_names() {
+    release_ish_binary_names
+    printf '%s\n' "$(release_ish_manifest_name)" SHA256SUMS
+}
+
+# Read the ELF header directly so the check does not depend on `file` being
+# installed on the runner: EI_CLASS 1 is ELF32, EI_DATA 1 is little-endian,
+# and e_machine 3 is EM_386.
+release_ish_validate_elf_i386() {
+    local binary_path="${1:-}" magic="" elf_class="" elf_data="" machine=""
+
+    [[ -n "${binary_path}" && -f "${binary_path}" ]] || {
+        printf "release: iSH binary not found '%s'\n" "${binary_path}" >&2
+        return 1
+    }
+    magic="$(od -An -tu1 -N4 -j0 "${binary_path}" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+    elf_class="$(od -An -tu1 -N1 -j4 "${binary_path}" | tr -d '[:space:]')"
+    elf_data="$(od -An -tu1 -N1 -j5 "${binary_path}" | tr -d '[:space:]')"
+    machine="$(od -An -tu1 -N2 -j18 "${binary_path}" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+
+    [[ "${magic}" == '127 69 76 70' ]] || {
+        printf "release: '%s' is not an ELF executable\n" "${binary_path}" >&2
+        return 1
+    }
+    [[ "${elf_class}" == '1' ]] || {
+        printf "release: '%s' is not an ELF32 executable\n" "${binary_path}" >&2
+        return 1
+    }
+    [[ "${elf_data}" == '1' ]] || {
+        printf "release: '%s' is not a little-endian executable\n" "${binary_path}" >&2
+        return 1
+    }
+    [[ "${machine}" == '3 0' ]] || {
+        printf "release: '%s' is not an i386 executable\n" "${binary_path}" >&2
+        return 1
+    }
+}
+
+release_ish_write_manifest() {
+    local version="${1:-}" bundle_dir="${2:-}"
+    local manifest_path="" name="" sha256="" size="" separator=""
+
+    release_validate_version "${version}" || return 1
+    [[ -d "${bundle_dir}" ]] || {
+        printf "release: iSH bundle directory not found '%s'\n" "${bundle_dir}" >&2
+        return 1
+    }
+    manifest_path="${bundle_dir}/$(release_ish_manifest_name)"
+    {
+        printf '{\n'
+        printf '  "schema_version": 1,\n'
+        printf '  "leg_version": "%s",\n' "${version}"
+        printf '  "target": "%s",\n' "$(release_ish_target)"
+        printf '  "architecture": "i386",\n'
+        printf '  "os": "linux",\n'
+        printf '  "libc": "musl",\n'
+        printf '  "host": "ish",\n'
+        printf '  "alpine_release": "%s",\n' "$(release_ish_alpine_release)"
+        printf '  "alpine_image": "%s",\n' "$(release_ish_alpine_image)"
+        printf '  "docker_platform": "%s",\n' "$(release_ish_docker_platform)"
+        printf '  "binaries": [\n'
+        while read -r name; do
+            sha256="$(cd -- "${bundle_dir}" && release_sha256_sum -- "${name}" | cut -d' ' -f1)"
+            size="$(wc -c <"${bundle_dir}/${name}" | tr -d ' ')"
+            printf '%b' "${separator}"
+            printf '    {\n'
+            printf '      "name": "%s",\n' "${name}"
+            printf '      "version_command": "%s --version",\n' "${name}"
+            printf '      "size": %s,\n' "${size}"
+            printf '      "sha256": "%s"\n' "${sha256}"
+            printf '    }'
+            separator=",\n"
+        done < <(release_ish_binary_names)
+        printf '\n  ]\n'
+        printf '}\n'
+    } >"${manifest_path}"
+}
+
+release_ish_validate_manifest() {
+    local bundle_dir="${1:-}" expected_version="${2:-}"
+    local manifest_path=""
+    manifest_path="${bundle_dir}/$(release_ish_manifest_name)"
+
+    [[ -f "${manifest_path}" ]] || {
+        printf "release: iSH manifest not found '%s'\n" "${manifest_path}" >&2
+        return 1
+    }
+    command -v node >/dev/null 2>&1 || {
+        printf 'release: node is required to validate the iSH manifest\n' >&2
+        return 1
+    }
+
+    node - "${manifest_path}" "${bundle_dir}" "${expected_version}" \
+        "$(release_ish_target)" "$(release_ish_alpine_release)" \
+        "$(release_ish_alpine_image)" "$(release_ish_docker_platform)" <<'NODE'
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const [, , manifestPath, bundleDir, expectedVersion, expectedTarget, expectedAlpineRelease,
+    expectedAlpineImage, expectedPlatform] = process.argv;
+
+function fail(message) {
+  console.error(`release: ${manifestPath}: ${message}`);
+  process.exit(1);
+}
+
+let manifest;
+try {
+  manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+} catch (error) {
+  fail(`invalid JSON: ${error.message}`);
+}
+
+if (manifest.schema_version !== 1) fail('schema_version must be 1');
+if (expectedVersion && manifest.leg_version !== expectedVersion) {
+  fail(`leg_version '${manifest.leg_version}' does not match '${expectedVersion}'`);
+}
+if (manifest.target !== expectedTarget) {
+  fail(`target '${manifest.target}' does not match '${expectedTarget}'`);
+}
+if (manifest.architecture !== 'i386') fail('architecture must be i386');
+if (manifest.os !== 'linux') fail('os must be linux');
+if (manifest.libc !== 'musl') fail('libc must be musl');
+if (manifest.host !== 'ish') fail('host must be ish');
+if (manifest.alpine_release !== expectedAlpineRelease) {
+  fail(`alpine_release '${manifest.alpine_release}' does not match '${expectedAlpineRelease}'`);
+}
+if (manifest.alpine_image !== expectedAlpineImage) {
+  fail(`alpine_image '${manifest.alpine_image}' does not match '${expectedAlpineImage}'`);
+}
+if (manifest.docker_platform !== expectedPlatform) {
+  fail(`docker_platform '${manifest.docker_platform}' does not match '${expectedPlatform}'`);
+}
+
+const expectedNames = ['leg', 'leg-tui', 'leg-web', 'leg-ui-supervisor'];
+if (!Array.isArray(manifest.binaries)) fail('binaries must be an array');
+if (manifest.binaries.length !== expectedNames.length) {
+  fail(`binaries must list exactly ${expectedNames.length} entries`);
+}
+for (const [index, name] of expectedNames.entries()) {
+  const entry = manifest.binaries[index];
+  if (!entry || entry.name !== name) fail(`binaries[${index}] must be '${name}'`);
+  if (entry.version_command !== `${name} --version`) {
+    fail(`binaries[${index}] must record '${name} --version'`);
+  }
+  if (!Number.isInteger(entry.size) || entry.size <= 0) {
+    fail(`binaries[${index}] must record a positive size`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(entry.sha256 || '')) {
+    fail(`binaries[${index}] must record a sha256 digest`);
+  }
+  const binaryPath = path.join(bundleDir, name);
+  if (!fs.existsSync(binaryPath)) fail(`binary '${name}' is missing from the bundle`);
+  const bytes = fs.readFileSync(binaryPath);
+  if (bytes.length !== entry.size) fail(`binary '${name}' size does not match the manifest`);
+  const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+  if (digest !== entry.sha256) fail(`binary '${name}' digest does not match the manifest`);
+}
+NODE
+}
+
+release_ish_write_checksums() {
+    local bundle_dir="${1:-}" name=""
+    local -a names=()
+
+    [[ -d "${bundle_dir}" ]] || {
+        printf "release: iSH bundle directory not found '%s'\n" "${bundle_dir}" >&2
+        return 1
+    }
+    while read -r name; do
+        names+=("${name}")
+    done < <(release_ish_binary_names)
+    names+=("$(release_ish_manifest_name)")
+    (
+        cd -- "${bundle_dir}" || exit 1
+        release_sha256_sum -- "${names[@]}"
+    ) >"${bundle_dir}/SHA256SUMS"
+}
+
+release_ish_stage_bundle() {
+    local version="${1:-}" binaries_dir="${2:-}" bundle_dir="${3:-}"
+    local name=""
+
+    release_validate_version "${version}" || return 1
+    [[ -d "${binaries_dir}" ]] || {
+        printf "release: iSH binary directory not found '%s'\n" "${binaries_dir}" >&2
+        return 1
+    }
+    [[ -n "${bundle_dir}" && ! -e "${bundle_dir}" ]] || {
+        printf "release: iSH bundle directory must be a new path '%s'\n" "${bundle_dir}" >&2
+        return 1
+    }
+    mkdir -p -- "${bundle_dir}" || return 1
+    while read -r name; do
+        [[ -f "${binaries_dir}/${name}" ]] || {
+            printf "release: iSH binary '%s' missing from '%s'\n" "${name}" "${binaries_dir}" >&2
+            return 1
+        }
+        cp -- "${binaries_dir}/${name}" "${bundle_dir}/${name}" || return 1
+        chmod 755 "${bundle_dir}/${name}"
+    done < <(release_ish_binary_names)
+    release_ish_write_manifest "${version}" "${bundle_dir}" || return 1
+    release_ish_write_checksums "${bundle_dir}"
+}
+
+release_ish_verify_bundle() {
+    local bundle_dir="${1:-}" expected_version="${2:-}"
+    local name="" actual="" expected="" listed=""
+
+    [[ -d "${bundle_dir}" ]] || {
+        printf "release: iSH bundle directory not found '%s'\n" "${bundle_dir}" >&2
+        return 1
+    }
+    actual="$(cd -- "${bundle_dir}" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)"
+    expected="$(release_ish_bundle_file_names | LC_ALL=C sort)"
+    if [[ "${actual}" != "${expected}" ]]; then
+        printf 'release: the iSH bundle must contain exactly the four binaries, the manifest, and SHA256SUMS\n' >&2
+        printf 'release: expected:\n%s\nrelease: found:\n%s\n' "${expected}" "${actual}" >&2
+        return 1
+    fi
+    while read -r name; do
+        release_ish_validate_elf_i386 "${bundle_dir}/${name}" || return 1
+    done < <(release_ish_binary_names)
+    (
+        cd -- "${bundle_dir}" || exit 1
+        release_sha256_check SHA256SUMS >/dev/null
+    ) || {
+        printf "release: the iSH bundle checksums do not verify\n" >&2
+        return 1
+    }
+    # sha256sum marks binary-mode entries with a leading '*'; the file names
+    # themselves never contain whitespace.
+    listed="$(awk '{print $2}' "${bundle_dir}/SHA256SUMS" | sed 's/^\*//' | LC_ALL=C sort)"
+    expected="$( { release_ish_binary_names; printf '%s\n' "$(release_ish_manifest_name)"; } | LC_ALL=C sort)"
+    [[ "${listed}" == "${expected}" ]] || {
+        printf 'release: the iSH SHA256SUMS must cover every bundle file except itself\n' >&2
+        return 1
+    }
+    release_ish_validate_manifest "${bundle_dir}" "${expected_version}"
+}
+
+# Fixed metadata, sorted entries, and a timestamp-free gzip stream make the
+# archive byte-for-byte reproducible for identical inputs.
+release_ish_write_archive() {
+    local bundle_dir="${1:-}" archive_path="${2:-}"
+    local name=""
+    local -a entries=()
+
+    [[ -d "${bundle_dir}" && -n "${archive_path}" ]] || {
+        printf 'release: the iSH bundle needs a directory and an archive path\n' >&2
+        return 1
+    }
+    while read -r name; do
+        entries+=("${name}")
+    done < <(release_ish_bundle_file_names | LC_ALL=C sort)
+    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' --format=gnu \
+        -C "${bundle_dir}" -cf - -- "${entries[@]}" \
+        | gzip -n -9 >"${archive_path}"
+}
+
+release_ish_bundle() {
+    local version="${1:-}" binaries_dir="${2:-}" archive_path="${3:-}"
+    local staging="" status=0
+
+    release_validate_version "${version}" || return 1
+    [[ -n "${archive_path}" ]] || {
+        printf 'release: the iSH bundle needs an archive path\n' >&2
+        return 1
+    }
+    staging="$(mktemp -d)" || return 1
+    release_ish_stage_bundle "${version}" "${binaries_dir}" "${staging}/bundle" || status="$?"
+    if (( status == 0 )); then
+        release_ish_verify_bundle "${staging}/bundle" "${version}" || status="$?"
+    fi
+    if (( status == 0 )); then
+        release_ish_write_archive "${staging}/bundle" "${archive_path}" || status="$?"
+    fi
+    rm -rf -- "${staging}"
+    return "${status}"
+}
+
+release_ish_verify_archive() {
+    local archive_path="${1:-}" expected_version="${2:-}"
+    local staging="" status=0
+
+    [[ -f "${archive_path}" ]] || {
+        printf "release: iSH archive not found '%s'\n" "${archive_path}" >&2
+        return 1
+    }
+    staging="$(mktemp -d)" || return 1
+    tar -xzf "${archive_path}" -C "${staging}" || status="$?"
+    if (( status == 0 )); then
+        release_ish_verify_bundle "${staging}" "${expected_version}" || status="$?"
+    fi
+    rm -rf -- "${staging}"
+    return "${status}"
+}
+
+release_ish_manifest_version_commands() {
+    local manifest_path="${1:-}"
+
+    [[ -f "${manifest_path}" ]] || {
+        printf "release: iSH manifest not found '%s'\n" "${manifest_path}" >&2
+        return 1
+    }
+    node -e '
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+for (const entry of manifest.binaries) console.log(entry.version_command);
+' "${manifest_path}"
+}
+
+# Run the bundle in the pinned i386 Alpine image. The manifest records the
+# target and the exact command for each binary; the harness runs those
+# commands and checks that each one reports the release version.
+release_ish_smoke() {
+    local archive_path="${1:-}" expected_version="${2:-}"
+    local staging="" status=0 manifest="" volume="" output="" name=""
+    local -a commands=()
+
+    [[ -f "${archive_path}" ]] || {
+        printf "release: iSH archive not found '%s'\n" "${archive_path}" >&2
+        return 1
+    }
+    command -v docker >/dev/null 2>&1 || {
+        printf 'release: docker is required for the iSH smoke test\n' >&2
+        return 1
+    }
+    staging="$(mktemp -d)" || return 1
+    tar -xzf "${archive_path}" -C "${staging}" || status="$?"
+    if (( status == 0 )); then
+        release_ish_verify_bundle "${staging}" "${expected_version}" || status="$?"
+    fi
+    if (( status == 0 )); then
+        manifest="${staging}/$(release_ish_manifest_name)"
+        mapfile -t commands < <(release_ish_manifest_version_commands "${manifest}")
+        if (( ${#commands[@]} == 0 )); then
+            printf 'release: the iSH manifest records no version commands\n' >&2
+            status=1
+        fi
+    fi
+    if (( status == 0 )); then
+        volume="$(cd -- "${staging}" && pwd)"
+        printf 'iSH smoke: target %s\n' "$(release_ish_target)"
+        printf 'iSH smoke: image %s (%s)\n' "$(release_ish_alpine_image)" "$(release_ish_docker_platform)"
+        for name in "${commands[@]}"; do
+            printf 'iSH smoke: command %s\n' "${name}"
+        done
+        output="$(docker run --rm --platform "$(release_ish_docker_platform)" \
+            --volume "${volume}:/bundle:ro" "$(release_ish_alpine_image)" \
+            sh -c 'cd /bundle && PATH=/bundle:$PATH && set -e
+                for command in "$@"; do
+                    echo "+ ${command}"
+                    sh -c "${command}"
+                done' ish-smoke "${commands[@]}")" || status="$?"
+    fi
+    if (( status == 0 )) && [[ -n "${expected_version}" ]]; then
+        while read -r name; do
+            if ! grep -qxF "${name} ${expected_version}" <<<"${output}"; then
+                printf "release: '%s --version' did not report '%s %s'\n" \
+                    "${name}" "${name}" "${expected_version}" >&2
+                status=1
+            fi
+        done < <(release_ish_binary_names)
+    fi
+    rm -rf -- "${staging}"
+    return "${status}"
+}
+
 release_npm_write_checksums() {
     local tarball_dir="${1:-}" checksum_path="${2:-}" checksum_dir="" checksum_name=""
     local tarball=""
@@ -1339,6 +1737,10 @@ usage:
   scripts/release.sh verify-npm-packages <version> <package-dir>
   scripts/release.sh verify-npm-tarballs <tarball-dir>
   scripts/release.sh npm-checksums <tarball-dir> <checksum-path>
+  scripts/release.sh ish-bundle <version> <binaries-dir> <archive-path>
+  scripts/release.sh verify-ish-bundle <bundle-dir> [version]
+  scripts/release.sh verify-ish-archive <archive-path> [version]
+  scripts/release.sh ish-smoke <archive-path> [version]
   scripts/release.sh third-party-notices
   scripts/release.sh verify-third-party-notices
   scripts/release.sh web-trial-notices <target-triple>
@@ -1389,6 +1791,18 @@ release_main() {
             ;;
         npm-checksums)
             release_npm_write_checksums "${1:-}" "${2:-}"
+            ;;
+        ish-bundle)
+            release_ish_bundle "${1:-}" "${2:-}" "${3:-}"
+            ;;
+        verify-ish-bundle)
+            release_ish_verify_bundle "${1:-}" "${2:-}"
+            ;;
+        verify-ish-archive)
+            release_ish_verify_archive "${1:-}" "${2:-}"
+            ;;
+        ish-smoke)
+            release_ish_smoke "${1:-}" "${2:-}"
             ;;
         third-party-notices)
             release_third_party_notices_generate
