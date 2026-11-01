@@ -21,7 +21,7 @@ use super::protocol::{
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_RESULT_BYTES, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS,
     PROTOCOL_VERSION,
 };
-use super::state::{AuditEntry, AuditLog, BridgeState, audit_timestamp};
+use super::state::{AuditEntry, AuditLog, BridgeState, LockError, audit_timestamp};
 
 /// The longest capability name the audit summary records.
 const AUDIT_CAPABILITY_CHARS: usize = 64;
@@ -148,19 +148,45 @@ impl Bridge {
         let digest = request.input_digest();
         let input_fields = bounded_field_names(&request.input);
 
-        // The ledger must be readable, writable, and locked before anything
-        // reaches the host: a bridge that cannot remember which request ids
-        // it dispatched cannot keep them unique, and must not act.
-        let continuation = match self.begin(&request, &digest, started) {
-            Ok(continuation) => continuation,
-            Err(response) => return *response,
-        };
-
         let timeout_ms = request
             .timeout_ms
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        // The state scope is exclusive. The lock is taken before the ledger is
+        // read and held until the request is answered, so two invocations that
+        // share the state directory cannot read the same ledger, cannot both
+        // see a request id as unused, and cannot dispatch it twice.
+        let lock = match self.state.lock_until(deadline) {
+            Ok(lock) => lock,
+            Err(error) => return self.lock_failure(&request, &digest, error, started),
+        };
+
+        // The ledger must be readable, writable, and locked before anything
+        // reaches the host: a bridge that cannot remember which request ids
+        // it dispatched cannot keep them unique, and must not act.
+        if let Err(error) = self.state.reload() {
+            drop(lock);
+            return self.state_failure(&request, &digest, error, started);
+        }
+
+        let continuation = match self.check_approval(&request, &digest, started) {
+            Ok(continuation) => continuation,
+            Err(response) => {
+                drop(lock);
+                return *response;
+            }
+        };
+
+        // The reservation is written before the host is called, so the id is
+        // taken even if the bridge dies in the middle of the exchange.
+        self.state.reserve(&request.request_id, &digest);
+        if let Err(error) = self.state.save() {
+            self.state.release(&request.request_id);
+            drop(lock);
+            return self.state_failure(&request, &digest, error, started);
+        }
 
         let host_request = HostRequest {
             version: PROTOCOL_VERSION,
@@ -174,55 +200,59 @@ impl Bridge {
         };
 
         let outcome = self.adapter.dispatch(&host_request, deadline);
-        self.finish(
+        let response = self.finish(
             request,
             &digest,
             input_fields,
             outcome,
             continuation,
             started,
-        )
+        );
+        drop(lock);
+        response
     }
 
-    /// Reserves the request id and checks the approval, under the lock.
-    ///
-    /// The lock is the state scope: two invocations that share the state
-    /// directory take turns here, so a request id is checked and reserved
-    /// before the host is called. A second invocation that carries the same
-    /// id finds it taken and never dispatches it.
-    fn begin(
+    /// Answers a request the bridge could not start, because the ledger was
+    /// busy or the wait was cancelled.
+    fn lock_failure(
         &mut self,
         request: &BridgeRequest,
         digest: &str,
+        error: LockError,
         started: Instant,
-    ) -> Result<bool, Box<BridgeResponse>> {
-        let _lock = match self.state.lock() {
-            Ok(lock) => lock,
-            Err(error) => {
-                return Err(Box::new(
-                    self.state_failure(request, digest, error, started),
-                ));
+    ) -> BridgeResponse {
+        let (status, failure) = match error {
+            LockError::Timeout => (
+                BridgeStatus::Error,
+                BridgeError::new(
+                    "timeout",
+                    "the bridge state was held by another request until the deadline",
+                    "send the request again, or ask for a longer deadline",
+                ),
+            ),
+            LockError::Cancelled => (
+                BridgeStatus::Cancelled,
+                BridgeError::new(
+                    "cancelled",
+                    "the request was cancelled before it finished",
+                    "send the request again if it is still wanted",
+                ),
+            ),
+            LockError::Io(error) => {
+                return self.state_failure(request, digest, error, started);
             }
         };
-        if let Err(error) = self.state.reload() {
-            return Err(Box::new(
-                self.state_failure(request, digest, error, started),
-            ));
-        }
-
-        let continuation = self.check_approval(request, digest, started)?;
-
-        // The reservation is written before the host is called, so a second
-        // invocation that carries the same id finds it taken.
-        self.state.reserve(&request.request_id, digest);
-        if let Err(error) = self.state.save() {
-            self.state.release(&request.request_id);
-            return Err(Box::new(
-                self.state_failure(request, digest, error, started),
-            ));
-        }
-
-        Ok(continuation)
+        self.answer(
+            request.request_id.clone(),
+            request.capability.clone(),
+            status,
+            None,
+            Some(failure),
+            started,
+            digest.to_string(),
+            bounded_field_names(&request.input),
+            false,
+        )
     }
 
     /// Answers a request the bridge could not record.
@@ -540,7 +570,9 @@ impl Bridge {
         )
     }
 
-    /// Writes the terminal state of a request to the ledger, under the lock.
+    /// Writes the terminal state of a request to the ledger.
+    ///
+    /// The caller holds the state lock, so the ledger is written under it.
     #[allow(clippy::too_many_arguments)]
     fn record_terminal(
         &mut self,
@@ -553,7 +585,6 @@ impl Bridge {
         token: Option<&str>,
         continuation: bool,
     ) -> Result<(), String> {
-        let _lock = self.state.lock()?;
         self.state.reload()?;
         if reached {
             self.state

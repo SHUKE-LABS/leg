@@ -100,6 +100,11 @@ registry are unchanged.
   effect until the Skill replays the matching token with a fresh request id,
   the same capability, and the same input; the host verifies the token before
   it acts.
+- The guest-local ledger keeps the request ids, their digests, and the
+  approval bindings. It is written under an exclusive lock on the state
+  directory, and the lock is held from the moment the ledger is read until
+  the request is answered, so two invocations that share the state directory
+  cannot dispatch the same request id.
 - Every request has a deadline and a cancellation path, and the bridge writes
   an audit summary that carries request metadata and the *shape* of the input
   — never provider credentials, photo contents, file contents, or shortcut

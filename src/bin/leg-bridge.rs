@@ -15,7 +15,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 
 use leg::bridge::adapter::{SocketHostAdapter, UnavailableAdapter};
-use leg::bridge::protocol::{BridgeError, BridgeResponse, BridgeStatus, MAX_REQUEST_BYTES};
+use leg::bridge::protocol::{
+    BridgeError, BridgeResponse, BridgeStatus, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+};
 use leg::bridge::service::Bridge;
 use leg::bridge::state::{AuditLog, BridgeState};
 
@@ -160,6 +162,9 @@ fn build_bridge() -> Result<Bridge, String> {
 }
 
 /// Writes the response to standard output.
+///
+/// The answer is bounded here as well: whatever the bridge answered, the line
+/// the caller reads never grows past the response limit.
 fn write_response(response: &BridgeResponse) {
     let mut text = match serde_json::to_string(response) {
         Ok(text) => text,
@@ -169,6 +174,23 @@ fn write_response(response: &BridgeResponse) {
              serialized: {error}\",\"remediation\":\"report the failure to the host\"}}}}"
         ),
     };
+    if text.len() > MAX_RESPONSE_BYTES {
+        let fallback = BridgeResponse::failure(
+            response.request_id.clone(),
+            BridgeStatus::Error,
+            BridgeError::new(
+                "response_too_large",
+                format!("the answer is larger than the {MAX_RESPONSE_BYTES} byte limit"),
+                "ask the host for a smaller answer",
+            ),
+        );
+        text = serde_json::to_string(&fallback).unwrap_or_else(|_| {
+            "{\"version\":1,\"request_id\":\"\",\"status\":\"error\",\"result\":null,\"error\":\
+             {\"reason\":\"response_too_large\",\"message\":\"the answer is too large\",\
+             \"remediation\":\"ask the host for a smaller answer\"}}"
+                .to_string()
+        });
+    }
     text.push('\n');
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();

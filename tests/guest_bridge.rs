@@ -180,6 +180,8 @@ mod host {
         Crash,
         /// Stay silent until the test ends.
         Silent,
+        /// Write these bytes as the answer.
+        Raw(Vec<u8>),
     }
 
     /// The fixture host.
@@ -315,6 +317,10 @@ mod host {
                 let _ = writer.flush();
             }
             Answer::Crash => {}
+            Answer::Raw(bytes) => {
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+            }
             Answer::Silent => {
                 // The host says nothing until the test ends.
                 let deadline = Instant::now() + Duration::from_secs(60);
@@ -479,10 +485,10 @@ fn a_request_id_is_used_once() {
     let socket = Some(fixture.path.as_path());
 
     let first = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
-    assert_eq!(first["status"], "ok");
+    assert_eq!(first["status"], "ok", "the bridge answered: {first}");
 
     let second = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
-    assert_eq!(second["status"], "error");
+    assert_eq!(second["status"], "error", "the bridge answered: {second}");
     assert_eq!(second["error"]["reason"], "duplicate_request_id");
     assert_eq!(
         fixture.connection_count(),
@@ -720,6 +726,99 @@ fn a_host_that_is_not_listening_is_answered_unavailable() {
 
     assert_eq!(answer["status"], "unavailable");
     assert_eq!(answer["error"]["reason"], "host_unreachable");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_host_that_sends_a_huge_frame_is_refused() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("huge-frame");
+    let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        // A frame that is over the limit, ended in one piece.
+        let mut bytes = vec![b'x'; 70 * 1024];
+        bytes.push(b'\n');
+        host::Answer::Raw(bytes)
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
+
+    assert_eq!(answer["status"], "error");
+    assert_eq!(answer["error"]["reason"], "host_protocol_violation");
+    assert_eq!(
+        fixture.connection_count(),
+        1,
+        "the oversized frame was dispatched again"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_host_that_sends_a_frame_that_is_not_text_is_refused() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("frame-not-text");
+    let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Raw(vec![0xff, 0xfe, b'\n'])
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
+
+    assert_eq!(answer["status"], "error");
+    assert_eq!(answer["error"]["reason"], "host_crashed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_host_that_asks_for_an_approval_without_a_summary_is_refused() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("no-review");
+    let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "approval_required".to_string(),
+            result: json!({"approval_token": "token-0123456789abcdef"}),
+        }
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
+
+    assert_eq!(answer["status"], "error");
+    assert_eq!(answer["error"]["reason"], "host_protocol_violation");
+}
+
+#[test]
+fn a_guest_with_a_ledger_it_cannot_read_is_refused() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("foreign-ledger");
+    let state_dir = scratch.path.join("state");
+    fs::create_dir_all(&state_dir).expect("create the state directory");
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"schema":"somebody.elses.state/v9","requests":{}}"#,
+    )
+    .expect("write the foreign ledger");
+
+    // The ledger is not the file the bridge wrote, so the bridge refuses it
+    // rather than reading it as its own.
+    let answer = ask(None, &state_dir, &request("r-1", "files.list", json!({})));
+
+    assert_eq!(answer["status"], "error");
+    assert_eq!(answer["error"]["reason"], "state_unavailable");
 }
 
 #[cfg(unix)]

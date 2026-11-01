@@ -29,6 +29,13 @@ pub const MAX_INPUT_BYTES: usize = 32 * 1024;
 /// The largest serialized result the bridge relays back, in bytes.
 pub const MAX_RESULT_BYTES: usize = 64 * 1024;
 
+/// The largest review summary the bridge relays back, in bytes.
+///
+/// A host that asks for an approval has to say what it would do, and that
+/// summary is shown to a human: it is bounded, so it cannot become a
+/// channel of its own.
+pub const MAX_REVIEW_BYTES: usize = 8 * 1024;
+
 /// The largest answer the bridge writes.
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -119,15 +126,19 @@ pub struct BridgeError {
 
 impl BridgeError {
     /// Builds a structured failure.
+    ///
+    /// Every field is bounded here, so a failure the bridge writes is bounded
+    /// whatever the caller put into it: a request that names a long unknown
+    /// field cannot make the answer grow.
     pub fn new(
         reason: impl Into<String>,
         message: impl Into<String>,
         remediation: impl Into<String>,
     ) -> Self {
         Self {
-            reason: reason.into(),
-            message: message.into(),
-            remediation: remediation.into(),
+            reason: bounded_reason(&reason.into(), "bridge_error"),
+            message: truncate(&message.into(), MAX_ERROR_MESSAGE_LEN),
+            remediation: truncate(&remediation.into(), MAX_ERROR_MESSAGE_LEN),
         }
     }
 
@@ -138,20 +149,29 @@ impl BridgeError {
     /// — short and made of the characters a reason is made of — and the
     /// message is cut at a fixed length. Neither can grow the answer.
     pub fn from_host(reason: &str, message: &str, remediation: &str) -> Self {
-        let reason = if !reason.is_empty()
-            && reason.len() <= MAX_ERROR_REASON_LEN
-            && reason.chars().all(|character| {
-                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
-            }) {
-            reason.to_string()
-        } else {
-            "host_error".to_string()
-        };
         Self {
-            reason,
+            reason: bounded_reason(reason, "host_error"),
             message: truncate(message, MAX_ERROR_MESSAGE_LEN),
-            remediation: remediation.to_string(),
+            remediation: truncate(remediation, MAX_ERROR_MESSAGE_LEN),
         }
+    }
+}
+
+/// Keeps a failure reason only when it reads like a reason.
+///
+/// A reason names a cause in a fixed vocabulary, so it is short and made of
+/// lowercase letters, digits, and underscores. Anything else is replaced by
+/// the fallback, which keeps the reason table of the contract true.
+fn bounded_reason(reason: &str, fallback: &str) -> String {
+    if !reason.is_empty()
+        && reason.len() <= MAX_ERROR_REASON_LEN
+        && reason.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+    {
+        reason.to_string()
+    } else {
+        fallback.to_string()
     }
 }
 

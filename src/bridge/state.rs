@@ -8,10 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,9 @@ const LOCK_FILE: &str = "state.lock";
 
 /// The state a request holds while it is on its way to the host.
 const STATE_DISPATCHING: &str = "dispatching";
+
+/// How long the bridge waits between tries for the ledger lock.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The name of the audit log inside the state directory.
 const AUDIT_FILE: &str = "audit.log";
@@ -46,6 +49,13 @@ const MAX_REQUESTS: usize = 64;
 
 /// How many approval bindings the ledger keeps.
 const MAX_APPROVALS: usize = 32;
+
+/// The largest ledger file the bridge reads, in bytes.
+///
+/// The ledger is bounded by its contents — a few dozen short records — so a
+/// file that grew past this limit is not one the bridge wrote, and the bridge
+/// refuses it rather than reading it into memory.
+const MAX_STATE_BYTES: u64 = 128 * 1024;
 
 /// How long an approval token stays redeemable, in seconds.
 const APPROVAL_TTL_SECONDS: u64 = 600;
@@ -92,9 +102,9 @@ pub struct ApprovalRecord {
 
 /// The guest-local bridge ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeState {
     /// The state schema.
-    #[serde(default = "state_schema")]
     pub schema: String,
     /// The requests the bridge has dispatched, keyed by request id.
     #[serde(default)]
@@ -141,19 +151,35 @@ pub fn state_dir() -> Result<PathBuf, String> {
 
 impl BridgeState {
     /// Reads the state held in `dir`; a missing file yields an empty state.
+    ///
+    /// The ledger is bounded and it is the bridge's own file: a file that is
+    /// larger than the limit, that speaks another schema, or that carries
+    /// fields the bridge does not know is refused. The bridge never reads a
+    /// foreign ledger as if it were its own, and never resets one it does not
+    /// understand.
     pub fn load(dir: &Path) -> Result<Self, String> {
         let path = dir.join(STATE_FILE);
-        let mut state = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str::<BridgeState>(&text).map_err(|error| {
+        let text = match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > MAX_STATE_BYTES => {
+                return Err(format!(
+                    "the bridge state at {} is larger than the {MAX_STATE_BYTES} byte limit",
+                    path.display()
+                ));
+            }
+            Ok(_) => fs::read_to_string(&path).map_err(|error| {
                 format!(
-                    "the bridge state at {} could not be read: {error}",
+                    "could not read the bridge state at {}: {error}",
                     path.display()
                 )
             })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BridgeState {
-                schema: state_schema(),
-                ..BridgeState::default()
-            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut state = BridgeState {
+                    schema: state_schema(),
+                    ..BridgeState::default()
+                };
+                state.dir = dir.to_path_buf();
+                return Ok(state);
+            }
             Err(error) => {
                 return Err(format!(
                     "could not read the bridge state at {}: {error}",
@@ -161,6 +187,20 @@ impl BridgeState {
                 ));
             }
         };
+        let mut state: BridgeState = serde_json::from_str(&text).map_err(|error| {
+            format!(
+                "the bridge state at {} could not be read: {error}",
+                path.display()
+            )
+        })?;
+        if state.schema != STATE_SCHEMA {
+            return Err(format!(
+                "the bridge state at {} speaks schema `{}`, not `{STATE_SCHEMA}`",
+                path.display(),
+                state.schema
+            ));
+        }
+        state.trim_to_bounds();
         state.dir = dir.to_path_buf();
         Ok(state)
     }
@@ -186,10 +226,11 @@ impl BridgeState {
     ///
     /// The lock is an advisory lock on a file in the state directory: two
     /// invocations that share the state directory take turns, so a request id
-    /// cannot be dispatched twice. The operating system releases the lock
-    /// when the holder ends, so a crash leaves no stale lock behind.
-    pub fn lock(&self) -> Result<StateLock, String> {
-        StateLock::acquire(&self.dir)
+    /// cannot be dispatched twice. The wait is bounded by the request's own
+    /// deadline, and the operating system releases the lock when the holder
+    /// ends, so a crash leaves no stale lock behind.
+    pub fn lock_until(&self, deadline: Instant) -> Result<StateLock, LockError> {
+        StateLock::acquire_until(&self.dir, deadline)
     }
 
     /// Writes the state back to its directory.
@@ -253,13 +294,6 @@ impl BridgeState {
         self.record_dispatched(request_id, input_sha256, STATE_DISPATCHING);
     }
 
-    /// Whether the request is on its way to the host.
-    pub fn is_dispatching(&self, request_id: &str) -> bool {
-        self.requests
-            .get(request_id)
-            .is_some_and(|record| record.terminal_state == STATE_DISPATCHING)
-    }
-
     /// Gives a reserved request id back.
     ///
     /// A request that never reached the host changed nothing, so its id is
@@ -285,17 +319,7 @@ impl BridgeState {
             redeemed: false,
         };
         self.approvals.insert(token_sha256, record);
-        while self.approvals.len() > MAX_APPROVALS {
-            let Some(oldest) = self
-                .approvals
-                .iter()
-                .min_by_key(|(_, record)| record.issued_at)
-                .map(|(token, _)| token.clone())
-            else {
-                break;
-            };
-            self.approvals.remove(&oldest);
-        }
+        self.trim_to_bounds();
     }
 
     /// The approval the token belongs to.
@@ -324,6 +348,16 @@ impl BridgeState {
             return;
         }
         self.requests.insert(request_id.to_string(), record);
+        self.trim_to_bounds();
+    }
+
+    /// Keeps the ledger within its bounds.
+    ///
+    /// The oldest records fall out first, so the ledger always holds the most
+    /// recent requests. A ledger that grew past its bounds — because it was
+    /// written by another program, or by a version that kept more — is cut
+    /// back to them here.
+    fn trim_to_bounds(&mut self) {
         while self.requests.len() > MAX_REQUESTS {
             let Some(oldest) = self
                 .requests
@@ -335,7 +369,29 @@ impl BridgeState {
             };
             self.requests.remove(&oldest);
         }
+        while self.approvals.len() > MAX_APPROVALS {
+            let Some(oldest) = self
+                .approvals
+                .iter()
+                .min_by_key(|(_, record)| record.issued_at)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            self.approvals.remove(&oldest);
+        }
     }
+}
+
+/// Why the lock on the ledger could not be taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// Another invocation holds the lock and the deadline ran out.
+    Timeout,
+    /// The request was cancelled while the bridge waited for the lock.
+    Cancelled,
+    /// The lock file could not be opened or locked.
+    Io(String),
 }
 
 /// The lock that guards the ledger.
@@ -352,9 +408,14 @@ pub struct StateLock {
 
 impl StateLock {
     /// Takes the lock in `dir`, waiting for the holder to finish.
-    pub fn acquire(dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(dir)
-            .map_err(|error| format!("could not create the state directory: {error}"))?;
+    ///
+    /// The wait is bounded by `deadline`: a request that cannot take the lock
+    /// in time answers `timeout` rather than waiting for a host that may
+    /// never come. The wait also stops when the guest interrupts the bridge.
+    pub fn acquire_until(dir: &Path, deadline: Instant) -> Result<Self, LockError> {
+        fs::create_dir_all(dir).map_err(|error| {
+            LockError::Io(format!("could not create the state directory: {error}"))
+        })?;
         let path = dir.join(LOCK_FILE);
         let file = OpenOptions::new()
             .create(true)
@@ -363,11 +424,32 @@ impl StateLock {
             .truncate(false)
             .open(&path)
             .map_err(|error| {
-                format!("could not open the ledger lock {}: {error}", path.display())
+                LockError::Io(format!(
+                    "could not open the ledger lock {}: {error}",
+                    path.display()
+                ))
             })?;
-        file.lock()
-            .map_err(|error| format!("could not lock the ledger {}: {error}", path.display()))?;
-        Ok(Self { file, path })
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file, path }),
+                // Another invocation holds the lock: the bridge waits for it,
+                // within the request's own deadline.
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => {
+                    return Err(LockError::Io(format!(
+                        "could not lock the ledger {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+            if crate::interrupt::is_signaled() {
+                return Err(LockError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(LockError::Timeout);
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL);
+        }
     }
 
     /// The file the lock is held on.

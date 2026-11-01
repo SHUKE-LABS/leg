@@ -72,7 +72,7 @@ impl HostAdapter for FakeHost {
 /// A connection the host answers over, without a socket.
 struct FakeConnection {
     /// The frames the host sends, in order.
-    frames: Vec<String>,
+    frames: Vec<Vec<u8>>,
     /// The frames the bridge sent.
     sent: Vec<String>,
     /// Whether the connection stays silent instead of closing.
@@ -82,6 +82,11 @@ struct FakeConnection {
 impl FakeConnection {
     /// A connection that answers with `frames`.
     fn answering(frames: Vec<String>) -> Self {
+        Self::answering_bytes(frames.into_iter().map(|frame| frame.into_bytes()).collect())
+    }
+
+    /// A connection that answers with raw frames.
+    fn answering_bytes(frames: Vec<Vec<u8>>) -> Self {
         Self {
             frames,
             sent: Vec::new(),
@@ -100,12 +105,12 @@ impl FakeConnection {
 }
 
 impl HostConnection for FakeConnection {
-    fn send(&mut self, frame: &str) -> Result<(), String> {
+    fn send(&mut self, frame: &str, _deadline: Instant) -> Result<(), String> {
         self.sent.push(frame.to_string());
         Ok(())
     }
 
-    fn receive(&mut self, wait: Duration) -> Result<Option<String>, ConnectionError> {
+    fn receive(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, ConnectionError> {
         if self.frames.is_empty() {
             if self.silent {
                 std::thread::sleep(wait.min(Duration::from_millis(5)));
@@ -886,4 +891,256 @@ fn the_exchange_answers_the_hosts_approval_with_a_review_summary() {
         }
         other => panic!("the outcome was {other:?}"),
     }
+}
+
+#[test]
+fn the_exchange_refuses_an_answer_that_is_not_text() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering_bytes(vec![vec![0xff, 0xfe, b'}']]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_crashed"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_refuses_an_answer_that_is_too_large() {
+    let request = host_request();
+    let mut connection =
+        FakeConnection::answering_bytes(vec![vec![b'x'; adapter::MAX_HOST_FRAME_BYTES + 1]]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_protocol_violation"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_refuses_an_approval_without_a_review_summary() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(vec![reply(
+        &request,
+        "approval_required",
+        json!({"approval_token": "token-0123456789abcdef"}),
+    )]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_protocol_violation"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_refuses_an_approval_with_an_unreviewable_summary() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(vec![reply(
+        &request,
+        "approval_required",
+        json!({
+            "approval_token": "token-0123456789abcdef",
+            "review": 42,
+        }),
+    )]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_protocol_violation"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_refuses_an_approval_with_a_huge_summary() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(vec![reply(
+        &request,
+        "approval_required",
+        json!({
+            "approval_token": "token-0123456789abcdef",
+            "review": {"summary": "x".repeat(protocol::MAX_REVIEW_BYTES + 1)},
+        }),
+    )]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_protocol_violation"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn an_answer_that_grew_past_the_limit_is_replaced_by_a_fixed_one() {
+    let scratch = scratch("huge-answer");
+    // The result is under the result limit and over the response limit, so
+    // only the final check can catch it.
+    let mut bridge = bridge(
+        FakeHost::always(HostOutcome::Ok(json!({"items": ["x".repeat(65_500)]}))),
+        &scratch,
+    );
+
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Error);
+    assert_eq!(
+        response.error.as_ref().expect("the request failed").reason,
+        "response_too_large"
+    );
+    assert!(response.serialized_len() <= protocol::MAX_RESPONSE_BYTES);
+}
+
+#[test]
+fn a_ledger_that_speaks_another_schema_is_refused() {
+    let scratch = scratch("foreign-state");
+    let mut bridge = bridge(FakeHost::always(HostOutcome::Ok(json!({}))), &scratch);
+    // The ledger changed under the bridge: it is not the file the bridge
+    // wrote, and the bridge refuses it rather than reading it as its own.
+    fs::write(
+        scratch.path.join("state.json"),
+        r#"{"schema":"somebody.elses.state/v9","requests":{}}"#,
+    )
+    .expect("write the foreign state");
+
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+
+    assert_eq!(response.status, BridgeStatus::Error);
+    assert_eq!(
+        response.error.as_ref().expect("the request failed").reason,
+        "state_unavailable"
+    );
+}
+
+#[test]
+fn a_ledger_that_grew_past_its_limit_is_refused() {
+    let scratch = scratch("huge-state");
+    let mut bridge = bridge(FakeHost::always(HostOutcome::Ok(json!({}))), &scratch);
+    fs::write(
+        scratch.path.join("state.json"),
+        format!(
+            r#"{{"schema":"leg.bridge.state/v1","requests":{{}},"approvals":{{}},"pad":"{}"}}"#,
+            "x".repeat(200 * 1024)
+        ),
+    )
+    .expect("write the oversized state");
+
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+
+    assert_eq!(response.status, BridgeStatus::Error);
+    assert_eq!(
+        response.error.as_ref().expect("the request failed").reason,
+        "state_unavailable"
+    );
+}
+
+#[test]
+fn a_request_that_finds_the_state_busy_times_out() {
+    let scratch = scratch("busy-state");
+    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    let _held = state
+        .lock_until(Instant::now() + Duration::from_secs(10))
+        .expect("take the ledger lock");
+
+    let mut bridge = bridge(FakeHost::always(HostOutcome::Ok(json!({}))), &scratch);
+    let mut line = request("r-1", "files.list", json!({}));
+    line = line.replace(r#""input":{}"#, r#""input":{},"timeout_ms":100"#);
+
+    let response = bridge.handle(&line);
+    assert_eq!(response.status, BridgeStatus::Error);
+    assert_eq!(
+        response.error.as_ref().expect("the request failed").reason,
+        "timeout"
+    );
+}
+
+/// A host that breaks the ledger while the request is in flight.
+struct LedgerBreakingHost {
+    /// The ledger file the host takes away.
+    path: PathBuf,
+}
+
+impl HostAdapter for LedgerBreakingHost {
+    fn dispatch(&mut self, _request: &HostRequest, _deadline: Instant) -> HostOutcome {
+        // The ledger cannot be written any more: a directory stands where the
+        // ledger file belongs.
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::create_dir_all(&self.path);
+        HostOutcome::Ok(json!({"items": []}))
+    }
+}
+
+#[test]
+fn a_ledger_that_cannot_be_written_after_the_host_answered_is_a_recorded_failure() {
+    let scratch = scratch("broken-ledger");
+    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    let mut bridge = Bridge::new(
+        Box::new(LedgerBreakingHost {
+            path: scratch.path.join("state.json"),
+        }),
+        state,
+        AuditLog::new(None),
+    );
+
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+
+    assert_eq!(response.status, BridgeStatus::Error);
+    let error = response.error.expect("the request failed");
+    assert_eq!(error.reason, "state_unavailable");
+    assert!(
+        error.message.contains("reached the host"),
+        "the failure did not say that the request ran: {error:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_host_socket_that_is_not_there_is_unreachable() {
+    let scratch = scratch("no-socket");
+    let mut adapter = adapter::SocketHostAdapter::new(scratch.path.join("nothing.sock"));
+    let request = host_request();
+
+    let outcome = adapter.dispatch(&request, Instant::now() + Duration::from_secs(5));
+
+    match outcome {
+        HostOutcome::Unavailable { reason, .. } => assert_eq!(reason, "host_unreachable"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_host_socket_that_cannot_be_reached_in_time_times_out() {
+    let scratch = scratch("late-socket");
+    let mut adapter = adapter::SocketHostAdapter::new(scratch.path.join("nothing.sock"));
+    let request = host_request();
+
+    let outcome = adapter.dispatch(&request, Instant::now() - Duration::from_secs(1));
+
+    assert_eq!(outcome, HostOutcome::TimedOut);
 }

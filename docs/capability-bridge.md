@@ -129,7 +129,10 @@ A capability that needs consent never runs before the host approved it.
 
 1. The Skill sends the request without a token. The host answers
    `approval_required` with a review summary and a one-time token. Nothing was
-   performed.
+   performed. The summary is not optional: a host that asks for an approval
+   without one, with one that is not reviewable, or with one that is over the
+   limit broke the protocol, and the bridge answers
+   `host_protocol_violation` rather than asking a human to approve nothing.
 2. The bridge records the binding: the capability, the digest of the input,
    the digest of the token, and the expiry.
 3. The Skill sends a **follow-up request**: a **fresh `request_id`**, the same
@@ -186,13 +189,16 @@ One JSON line each way, bounded in size:
 The bridge accepts an answer only when it carries the request's nonce and
 request id, so a stale answer is never mistaken for a fresh one. An answer in
 another version, an answer for another request, an answer that cannot be
-parsed, and a connection the host closed without answering are four distinct
-failures (`host_protocol_violation` and `host_crashed`).
+parsed, an answer that is not valid UTF-8, and a connection the host closed
+without answering are distinct failures (`host_protocol_violation` and
+`host_crashed`).
 
 ### Cancellation and the deadline
 
 Every request has a deadline: the bridge stops waiting at the deadline and
-answers `error` with the reason `timeout`. The bridge also stops when the
+answers `error` with the reason `timeout`. The deadline covers the whole
+exchange — the connect, the write, and the read — so a host that stops
+answering cannot hold the bridge past it. The bridge also stops when the
 guest's process is interrupted, and answers `cancelled`. In both cases it
 closes the connection, so the host sees the end of the exchange and can stop
 the work it started.
@@ -225,11 +231,18 @@ reaches the host.
 - **Scope.** The ledger lives in the state directory, so the ids are refused
   across the invocations that share it — the invocations of one guest.
 - **The ledger is locked.** The bridge takes an exclusive lock on the state
-  directory while it reads and writes it, and it reserves the request id
-  before it calls the host. Two invocations that carry the same id therefore
-  cannot dispatch it twice: one of them finds the id taken and is refused.
+  directory before it reads the ledger and holds it until the request is
+  answered: the request id is checked, reserved, dispatched, and recorded
+  under that one lock. Two invocations that carry the same id therefore
+  cannot dispatch it twice — one of them finds the id taken and is refused.
+  A request that cannot take the lock before its own deadline answers
+  `timeout`, and one that was cancelled while it waited answers `cancelled`.
   The operating system releases the lock when the holder ends, so a crash
   leaves no lock behind.
+- **The ledger is bounded and it is the bridge's own.** A ledger that is
+  larger than the limit, that speaks another schema, or that carries fields
+  the bridge does not know is refused: the bridge never reads a foreign
+  ledger as if it were its own, and never resets one it does not understand.
 - **Retention.** The ledger keeps the last 64 request ids. An id that falls
   out of the ledger may be used again.
 - **A request that never reached the host keeps its id.** A guest whose host
@@ -247,6 +260,7 @@ reaches the host.
 | Request input | 32 KiB |
 | Answer | 64 KiB |
 | Answer result | 64 KiB |
+| Review summary | 8 KiB |
 | Host frame | 64 KiB |
 | Failure reason | 64 characters |
 | Failure message | 1 KiB |
@@ -257,7 +271,7 @@ reaches the host.
 | Request id | 128 characters |
 | Deadline | 100 ms … 30 s, 5 s by default |
 | Approval lifetime | 10 minutes |
-| Ledger | 64 request ids, 32 approval bindings |
+| Ledger | 64 request ids, 32 approval bindings, 128 KiB on disk |
 
 ## The audit summary and the ledger
 

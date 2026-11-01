@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::protocol::{BridgeError, BridgeStatus, PROTOCOL_VERSION};
+use super::protocol::{BridgeError, BridgeStatus, MAX_REVIEW_BYTES, PROTOCOL_VERSION};
 
 /// The largest frame the bridge reads from the host.
 pub const MAX_HOST_FRAME_BYTES: usize = 64 * 1024;
@@ -135,14 +135,16 @@ pub enum ConnectionError {
 /// one frame. A platform that cannot use a Unix socket supplies its own
 /// implementation of this trait, and the protocol around it stays the same.
 pub trait HostConnection {
-    /// Writes one frame to the host.
-    fn send(&mut self, frame: &str) -> Result<(), String>;
+    /// Writes one frame to the host, before `deadline`.
+    fn send(&mut self, frame: &str, deadline: Instant) -> Result<(), String>;
 
     /// Reads one frame from the host, waiting at most `wait` for it.
     ///
     /// The call returns `Ok(None)` when the host sent nothing within `wait`;
     /// a frame that arrives in pieces stays in the connection's own buffer.
-    fn receive(&mut self, wait: Duration) -> Result<Option<String>, ConnectionError>;
+    /// The frame comes back as bytes: the bridge decodes it strictly, so a
+    /// frame that is not text never reaches the parser.
+    fn receive(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, ConnectionError>;
 }
 
 /// The answer the host writes back over the transport.
@@ -190,27 +192,18 @@ impl HostAdapter for SocketHostAdapter {
     fn dispatch(&mut self, request: &HostRequest, deadline: Instant) -> HostOutcome {
         #[cfg(unix)]
         {
-            use std::os::unix::net::UnixStream;
-
-            let stream = match UnixStream::connect(&self.path) {
+            let stream = match connect_within(&self.path, deadline) {
                 Ok(stream) => stream,
-                Err(error) => {
+                Err(ConnectFailure::TimedOut) => return HostOutcome::TimedOut,
+                Err(ConnectFailure::Cancelled) => return HostOutcome::Cancelled,
+                Err(ConnectFailure::Unreachable(message)) => {
                     return HostOutcome::Unavailable {
                         reason: "host_unreachable".to_string(),
-                        message: format!(
-                            "the host socket {} could not be reached: {error}",
-                            self.path.display()
-                        ),
+                        message,
                     };
                 }
             };
             let mut connection = UnixHostConnection::new(stream);
-            // The connect itself is to a local endpoint and does not wait for
-            // the host, but the deadline still rules: a connection that took
-            // longer than the request may take is no answer at all.
-            if Instant::now() >= deadline {
-                return HostOutcome::TimedOut;
-            }
             exchange(&mut connection, request, deadline)
         }
         #[cfg(not(unix))]
@@ -221,6 +214,71 @@ impl HostAdapter for SocketHostAdapter {
                 message:
                     "this platform has no Unix socket transport; the guest runs on a Unix host"
                         .to_string(),
+            }
+        }
+    }
+}
+
+/// Why the transport could not reach the host.
+#[cfg(unix)]
+enum ConnectFailure {
+    /// The endpoint could not be reached.
+    Unreachable(String),
+    /// The deadline ran out before the endpoint answered.
+    TimedOut,
+    /// The request was cancelled while the bridge was connecting.
+    Cancelled,
+}
+
+/// Connects to the host socket within the deadline.
+///
+/// The connect is a call into the operating system that may block, so it
+/// runs beside the bridge rather than in it: the bridge waits for it within
+/// the request's deadline, and gives the connection up when the deadline is
+/// reached. A connect that finishes later closes its socket and is dropped.
+#[cfg(unix)]
+fn connect_within(
+    path: &Path,
+    deadline: Instant,
+) -> Result<std::os::unix::net::UnixStream, ConnectFailure> {
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    let target = path.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("leg-bridge-connect".to_string())
+        .spawn(move || {
+            let _ = sender.send(UnixStream::connect(&target));
+        });
+    if worker.is_err() {
+        return Err(ConnectFailure::Unreachable(
+            "the bridge could not start a connection to the host socket".to_string(),
+        ));
+    }
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ConnectFailure::TimedOut);
+        }
+        if crate::interrupt::is_signaled() {
+            return Err(ConnectFailure::Cancelled);
+        }
+        match receiver.recv_timeout(remaining.min(POLL_INTERVAL)) {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => {
+                return Err(ConnectFailure::Unreachable(format!(
+                    "the host socket {} could not be reached: {error}",
+                    path.display()
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ConnectFailure::Unreachable(format!(
+                    "the host socket {} could not be reached",
+                    path.display()
+                )));
             }
         }
     }
@@ -248,17 +306,46 @@ impl UnixHostConnection {
 
 #[cfg(unix)]
 impl HostConnection for UnixHostConnection {
-    fn send(&mut self, frame: &str) -> Result<(), String> {
+    fn send(&mut self, frame: &str, deadline: Instant) -> Result<(), String> {
         use std::io::Write as _;
 
-        self.stream
-            .write_all(frame.as_bytes())
-            .and_then(|()| self.stream.write_all(b"\n"))
-            .and_then(|()| self.stream.flush())
-            .map_err(|error| format!("the host socket could not be written: {error}"))
+        // The write is bounded by the deadline: the socket carries a timeout,
+        // and the bridge gives the write up when the deadline is reached
+        // rather than waiting for a host that stopped reading.
+        let mut bytes = frame.as_bytes().to_vec();
+        bytes.push(b'\n');
+        let mut written = 0;
+        while written < bytes.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("the host socket could not be written before the deadline".to_string());
+            }
+            self.stream
+                .set_write_timeout(Some(remaining.max(Duration::from_millis(1))))
+                .map_err(|error| format!("the host socket could not be written: {error}"))?;
+            match self.stream.write(&bytes[written..]) {
+                Ok(0) => return Err("the host socket accepted no bytes".to_string()),
+                Ok(count) => written += count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(
+                        "the host socket could not be written before the deadline".to_string()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(format!("the host socket could not be written: {error}"));
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn receive(&mut self, wait: Duration) -> Result<Option<String>, ConnectionError> {
+    fn receive(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, ConnectionError> {
         use std::io::Read as _;
 
         // A read timeout that rounds to zero is an error on some systems, so
@@ -273,15 +360,7 @@ impl HostConnection for UnixHostConnection {
             Ok(0) => Err(ConnectionError::Closed),
             Ok(count) => {
                 self.buffer.extend_from_slice(&chunk[..count]);
-                if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                    let frame = self.buffer.drain(..=position).collect::<Vec<u8>>();
-                    let frame = &frame[..frame.len() - 1];
-                    return Ok(Some(String::from_utf8_lossy(frame).to_string()));
-                }
-                if self.buffer.len() > MAX_HOST_FRAME_BYTES {
-                    return Err(ConnectionError::TooLarge);
-                }
-                Ok(None)
+                self.take_frame()
             }
             Err(error)
                 if matches!(
@@ -293,6 +372,28 @@ impl HostConnection for UnixHostConnection {
             }
             Err(error) => Err(ConnectionError::Io(error.to_string())),
         }
+    }
+}
+
+#[cfg(unix)]
+impl UnixHostConnection {
+    /// Takes the frame out of the buffer, when one arrived whole.
+    ///
+    /// The frame is measured before it is taken: a host that sends a frame
+    /// larger than the limit is refused, whether the frame ends in this read
+    /// or in a later one.
+    fn take_frame(&mut self) -> Result<Option<Vec<u8>>, ConnectionError> {
+        if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            if position > MAX_HOST_FRAME_BYTES {
+                return Err(ConnectionError::TooLarge);
+            }
+            let frame = self.buffer.drain(..=position).collect::<Vec<u8>>();
+            return Ok(Some(frame[..frame.len() - 1].to_vec()));
+        }
+        if self.buffer.len() > MAX_HOST_FRAME_BYTES {
+            return Err(ConnectionError::TooLarge);
+        }
+        Ok(None)
     }
 }
 
@@ -319,7 +420,7 @@ pub fn exchange(
             };
         }
     };
-    if let Err(error) = connection.send(&frame) {
+    if let Err(error) = connection.send(&frame, deadline) {
         return HostOutcome::Failed {
             reason: "transport_error".to_string(),
             message: error,
@@ -336,7 +437,7 @@ pub fn exchange(
         }
 
         match connection.receive(remaining.min(POLL_INTERVAL)) {
-            Ok(Some(frame)) => return read_answer(&frame, request),
+            Ok(Some(frame)) => return read_frame(&frame, request),
             Ok(None) => {}
             Err(ConnectionError::Closed) => {
                 return HostOutcome::Failed {
@@ -360,6 +461,32 @@ pub fn exchange(
             }
         }
     }
+}
+
+/// Turns the host's answer into a bridge outcome.
+///
+/// The frame is measured and decoded before it is parsed: a frame that is
+/// larger than the limit is a protocol violation, and a frame that is not
+/// valid UTF-8 is a frame the host cannot answer with.
+fn read_frame(frame: &[u8], request: &HostRequest) -> HostOutcome {
+    if frame.len() > MAX_HOST_FRAME_BYTES {
+        return HostOutcome::Failed {
+            reason: "host_protocol_violation".to_string(),
+            message: format!(
+                "the host's answer is larger than the {MAX_HOST_FRAME_BYTES} byte limit"
+            ),
+        };
+    }
+    let frame = match std::str::from_utf8(frame) {
+        Ok(text) => text,
+        Err(_) => {
+            return HostOutcome::Failed {
+                reason: "host_crashed".to_string(),
+                message: "the host's answer is not valid UTF-8".to_string(),
+            };
+        }
+    };
+    read_answer(frame, request)
 }
 
 /// Turns the host's answer into a bridge outcome.
@@ -409,10 +536,35 @@ fn outcome_from_reply(reply: HostReply) -> HostOutcome {
                     message: "the host asked for an approval without a token".to_string(),
                 };
             };
-            let review = fields.get("review").cloned().unwrap_or(Value::Null);
+            // An approval a human has to answer is worth nothing without a
+            // summary of what the host would do, so a host that asks for an
+            // approval without one broke the protocol.
+            let Some(review) = fields.get("review").filter(|review| !review.is_null()) else {
+                return HostOutcome::Failed {
+                    reason: "host_protocol_violation".to_string(),
+                    message: "the host asked for an approval without a review summary".to_string(),
+                };
+            };
+            if !(review.is_object() || review.is_string()) {
+                return HostOutcome::Failed {
+                    reason: "host_protocol_violation".to_string(),
+                    message: "the host asked for an approval with a review summary that is not \
+                               reviewable"
+                        .to_string(),
+                };
+            }
+            if review.to_string().len() > MAX_REVIEW_BYTES {
+                return HostOutcome::Failed {
+                    reason: "host_protocol_violation".to_string(),
+                    message: format!(
+                        "the host asked for an approval with a review summary that is larger than \
+                         the {MAX_REVIEW_BYTES} byte limit"
+                    ),
+                };
+            }
             HostOutcome::ApprovalRequired {
                 approval_token: approval_token.to_string(),
-                review,
+                review: review.clone(),
             }
         }
         BridgeStatus::Denied => {

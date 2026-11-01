@@ -236,7 +236,9 @@ The answer always has the same shape and exactly one of six statuses — `ok`,
 The bridge validates the request before the host sees it: an unknown version,
 an unknown capability, an unknown field, a malformed document, an oversized
 request, a reused request id, and a path that is not relative and normalized
-are all refused without a dispatch. A capability that needs consent answers
+are all refused without a dispatch. The request ids are kept unique by a
+locked ledger in the bridge state directory, so two invocations that share it
+cannot dispatch the same id. A capability that needs consent answers
 `approval_required` with a review summary and a one-time token, and runs
 nothing until the Skill replays that token with a fresh request id, the same
 capability, and the same input.
