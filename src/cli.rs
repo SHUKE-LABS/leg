@@ -13,6 +13,7 @@ use crate::events::{
     EventSink, Exchange, ExchangeEvent, ExchangeMeta, NoopSink, Outcome, ToolStatus, WriterSink,
     now_ms, trail_content,
 };
+use crate::guest;
 use crate::hooks::HookEvent;
 use crate::install::{self, InstallOptions};
 use crate::interrupt;
@@ -30,7 +31,10 @@ use crate::transport::{StreamEvent, Transport, TransportCall};
 mod stream;
 
 /// The one-line usage summary, shared by `--help` output and usage errors.
-const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session|--new-session-id <id>] [--session-id-out <path>] [--stream-json] | leg install [--dest <dir>] [--no-path]";
+const USAGE: &str = "usage: leg [--version|-V] [--help|-h] | leg ask [--model <model>] [--image <path> ...] <prompt> | leg session [--resume <file> [--session <id>]] | leg log show [--file <path>] | leg log replay [--file <path>] [--index <N>] | leg exchange [--in <path>] [--out <path>] [--session <id>|--new-session|--new-session-id <id>] [--session-id-out <path>] [--stream-json] | leg install [--dest <dir>] [--no-path] | leg guest bootstrap --json | leg guest provision <package> --json [--approval-token <token>] [--storage-budget-bytes <bytes>]";
+
+/// The usage of the guest commands.
+const GUEST_USAGE: &str = "usage: leg guest bootstrap --json | leg guest provision <package> --json [--approval-token <token>] [--storage-budget-bytes <bytes>]";
 
 /// Name of the environment variable naming the JSONL exchange trail to append
 /// to. An unset or blank value disables recording for `ask`, cold `exchange`,
@@ -95,6 +99,18 @@ enum Command {
     },
     /// Prints the `leg install` help body.
     InstallHelp,
+    /// Reports the pinned guest's release, architecture, repository, packages,
+    /// and free storage.
+    GuestBootstrap,
+    /// Previews or applies one guest provisioning request.
+    GuestProvision {
+        /// The package to provision.
+        package: String,
+        /// The approval token a previous preview issued.
+        approval_token: Option<String>,
+        /// The storage budget override, in bytes.
+        storage_budget_bytes: Option<u64>,
+    },
 }
 
 /// The session mode selected for one headless exchange.
@@ -232,7 +248,88 @@ pub fn run() -> Result<()> {
             println!("{}", install::help_text());
             Ok(())
         }
+        Some(Command::GuestBootstrap) => execute_guest_bootstrap(),
+        Some(Command::GuestProvision {
+            package,
+            approval_token,
+            storage_budget_bytes,
+        }) => execute_guest_provision(package, approval_token, storage_budget_bytes),
     }
+}
+
+/// The structured error object the guest contract defines.
+#[derive(serde::Serialize)]
+struct GuestErrorReport<'a> {
+    /// The report schema.
+    schema: &'static str,
+    /// The failure itself.
+    error: GuestErrorDetail<'a>,
+}
+
+/// The failure detail inside a guest error report.
+#[derive(serde::Serialize)]
+struct GuestErrorDetail<'a> {
+    /// The machine-readable failure reason.
+    reason: &'a str,
+    /// The human-readable failure detail.
+    message: &'a str,
+    /// The remediation hint for the host.
+    remediation: &'a str,
+}
+
+/// Renders an error for the terminal.
+///
+/// A guest failure is rendered as the structured JSON error object the guest
+/// contract defines; every other failure keeps the plain `error: ...` line.
+pub fn format_error(err: &LegError) -> String {
+    match err {
+        LegError::Guest(failure) => {
+            let payload = GuestErrorReport {
+                schema: "leg.guest.error/v1",
+                error: GuestErrorDetail {
+                    reason: failure.reason,
+                    message: &failure.message,
+                    remediation: &failure.remediation,
+                },
+            };
+            let text = serde_json::to_string(&payload)
+                .unwrap_or_else(|_| format!("error: {} ({})\n", failure.message, failure.reason));
+            format!("{text}\n")
+        }
+        other => format!("error: {other}\n"),
+    }
+}
+
+/// Runs `leg guest bootstrap`.
+fn execute_guest_bootstrap() -> Result<()> {
+    let mut guest = guest::system::SystemGuest::new()?;
+    let report = guest::bootstrap(&mut guest)?;
+    println!("{}", render_json(&report)?);
+    Ok(())
+}
+
+/// Runs `leg guest provision`.
+fn execute_guest_provision(
+    package: String,
+    approval_token: Option<String>,
+    storage_budget_bytes: Option<u64>,
+) -> Result<()> {
+    let mut guest = guest::system::SystemGuest::new()?;
+    let request = guest::ProvisionRequest {
+        package,
+        approval_token,
+        storage_budget_bytes,
+    };
+    let mut state = guest::state::GuestState::load(&guest::state::state_dir()?)?;
+    let report = guest::provision(&mut guest, &request, &mut state)?;
+    println!("{}", render_json(&report)?);
+    Ok(())
+}
+
+/// Renders a report as pretty JSON.
+fn render_json<T: serde::Serialize>(report: &T) -> Result<String> {
+    serde_json::to_string_pretty(report)
+        .map_err(|error| LegError::Io(format!("could not serialize the report: {error}")))
 }
 
 /// Prints the summary of a completed `leg install` run.
@@ -329,7 +426,22 @@ fn help_text() -> String {
          $XDG_BIN_HOME (else $HOME/.local/bin) on Unix. On Windows the\n\
          destination joins the current user's PATH, which needs a new shell to\n\
          take effect; Unix installations never edit shell startup files. Run\n\
-         `leg install --help` for the options."
+         `leg install --help` for the options.\n\n\
+         `leg guest bootstrap --json` reports the pinned Alpine guest's\n\
+         release, architecture, pinned repository, installed allowlisted\n\
+         packages, and free storage. `leg guest provision <package> --json`\n\
+         previews the exact candidate the package would install -- version,\n\
+         repository, download and install bytes, and checksum -- and issues a\n\
+         one-time approval token; repeating the command with\n\
+         `--approval-token <token>` installs that exact snapshot through fixed\n\
+         apk arguments and verifies the installed executable. Only bash,\n\
+         ffmpeg, python3, and ripgrep can be provisioned, and only from the\n\
+         pinned Alpine 3.20 repositories. The default storage budget is\n\
+         256 MiB of installed packages; `--storage-budget-bytes <bytes>`\n\
+         overrides it. The provisioned tools stay inside the guest: they\n\
+         cannot grant native iOS or Android permissions. The guest state\n\
+         lives in LEG_GUEST_STATE_DIR, else XDG_STATE_HOME/leg/guest, else\n\
+         ~/.local/state/leg/guest."
     )
 }
 
@@ -349,6 +461,7 @@ fn parse_args(args: &[String]) -> Result<Option<Command>> {
         "log" => parse_log(iter).map(Some),
         "exchange" => parse_exchange(iter).map(Some),
         "install" => parse_install(iter).map(Some),
+        "guest" => parse_guest(iter).map(Some),
         other => Err(LegError::Usage(format!(
             "unrecognised argument {other:?}; {USAGE}"
         ))),
@@ -654,6 +767,115 @@ fn parse_install<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
             destination,
             no_path,
         },
+    })
+}
+
+/// Parses the arguments following `guest`: one of the `bootstrap` and
+/// `provision` subcommands.
+fn parse_guest<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let Some(subcommand) = iter.next() else {
+        return Err(LegError::Usage(GUEST_USAGE.to_string()));
+    };
+
+    match subcommand.as_str() {
+        "bootstrap" => parse_guest_bootstrap(iter),
+        "provision" => parse_guest_provision(iter),
+        other => Err(LegError::Usage(format!(
+            "unrecognised guest subcommand {other:?}; {GUEST_USAGE}"
+        ))),
+    }
+}
+
+/// Parses the arguments following `guest bootstrap`: the `--json` flag.
+fn parse_guest_bootstrap<'a>(iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut json = false;
+
+    for arg in iter {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => {
+                return Err(LegError::Usage(format!(
+                    "unexpected argument {other:?}; {GUEST_USAGE}"
+                )));
+            }
+        }
+    }
+
+    if !json {
+        return Err(LegError::Usage(format!(
+            "leg guest bootstrap requires --json; {GUEST_USAGE}"
+        )));
+    }
+    Ok(Command::GuestBootstrap)
+}
+
+/// Parses the arguments following `guest provision`: the package name, the
+/// `--json` flag, an optional `--approval-token`, and an optional
+/// `--storage-budget-bytes`.
+fn parse_guest_provision<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut package = None;
+    let mut approval_token = None;
+    let mut storage_budget_bytes = None;
+    let mut json = false;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--approval-token" => {
+                let value = iter.next().ok_or_else(|| {
+                    LegError::Usage("--approval-token requires a token".to_string())
+                })?;
+                if value.trim().is_empty() {
+                    return Err(LegError::Usage(
+                        "--approval-token must not be empty".to_string(),
+                    ));
+                }
+                approval_token = Some(value.clone());
+            }
+            "--storage-budget-bytes" => {
+                let value = iter.next().ok_or_else(|| {
+                    LegError::Usage("--storage-budget-bytes requires a byte count".to_string())
+                })?;
+                storage_budget_bytes = Some(parse_storage_budget(value)?);
+            }
+            other if other.starts_with("--") => {
+                return Err(LegError::Usage(format!(
+                    "unexpected argument {other:?}; {GUEST_USAGE}"
+                )));
+            }
+            other if package.is_none() => package = Some(other.to_string()),
+            other => {
+                return Err(LegError::Usage(format!(
+                    "unexpected argument {other:?}; {GUEST_USAGE}"
+                )));
+            }
+        }
+    }
+
+    if !json {
+        return Err(LegError::Usage(format!(
+            "leg guest provision requires --json; {GUEST_USAGE}"
+        )));
+    }
+    let package = package.ok_or_else(|| {
+        LegError::Usage(format!(
+            "leg guest provision requires a package name; {GUEST_USAGE}"
+        ))
+    })?;
+
+    Ok(Command::GuestProvision {
+        package,
+        approval_token,
+        storage_budget_bytes,
+    })
+}
+
+/// Parses a storage budget, which is a byte count.
+fn parse_storage_budget(raw: &str) -> Result<u64> {
+    raw.trim().parse::<u64>().map_err(|_| {
+        LegError::Usage(format!(
+            "--storage-budget-bytes must be a byte count, not {raw:?}"
+        ))
     })
 }
 

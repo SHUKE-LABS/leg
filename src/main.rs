@@ -12,7 +12,7 @@ fn main() -> ExitCode {
             ExitCode::from(signal.exit_code())
         }
         Err(err) => {
-            eprintln!("error: {err}");
+            eprint!("{}", leg::cli::format_error(&err));
             ExitCode::FAILURE
         }
     }

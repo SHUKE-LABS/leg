@@ -18,6 +18,7 @@
 //!   `leg session --resume`).
 //! - [`error`] — shared error and result types.
 //! - [`install`] — the `leg install` native-binary installer.
+//! - [`guest`] — the `leg guest` inspection and provisioning commands.
 //! - [`cli`] — the command-line entry surface.
 
 pub mod cli;
@@ -25,6 +26,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod events;
+pub mod guest;
 pub mod hooks;
 mod image_input;
 pub mod install;

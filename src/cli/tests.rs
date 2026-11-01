@@ -2914,3 +2914,107 @@ fn the_usage_summary_lists_the_install_command() {
     assert!(USAGE.contains("leg install [--dest <dir>] [--no-path]"));
     assert!(help_text().contains("`leg install`"));
 }
+
+#[test]
+fn guest_bootstrap_parses_the_json_flag() {
+    assert_eq!(
+        parse_args(&argv(&["guest", "bootstrap", "--json"])).unwrap(),
+        Some(Command::GuestBootstrap)
+    );
+}
+
+#[test]
+fn guest_bootstrap_requires_the_json_flag() {
+    let error = parse_args(&argv(&["guest", "bootstrap"])).expect_err("the json flag is required");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn guest_bootstrap_rejects_unknown_arguments() {
+    let error = parse_args(&argv(&["guest", "bootstrap", "--json", "--force"]))
+        .expect_err("unknown flags are refused");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn guest_provision_parses_the_package_and_its_options() {
+    assert_eq!(
+        parse_args(&argv(&[
+            "guest",
+            "provision",
+            "bash",
+            "--json",
+            "--approval-token",
+            "abc123",
+            "--storage-budget-bytes",
+            "1048576"
+        ]))
+        .unwrap(),
+        Some(Command::GuestProvision {
+            package: "bash".to_string(),
+            approval_token: Some("abc123".to_string()),
+            storage_budget_bytes: Some(1_048_576),
+        })
+    );
+}
+
+#[test]
+fn guest_provision_parses_a_package_without_options() {
+    assert_eq!(
+        parse_args(&argv(&["guest", "provision", "ripgrep", "--json"])).unwrap(),
+        Some(Command::GuestProvision {
+            package: "ripgrep".to_string(),
+            approval_token: None,
+            storage_budget_bytes: None,
+        })
+    );
+}
+
+#[test]
+fn guest_provision_requires_a_package_name() {
+    let error = parse_args(&argv(&["guest", "provision", "--json"]))
+        .expect_err("a package name is required");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn guest_provision_requires_the_json_flag() {
+    let error =
+        parse_args(&argv(&["guest", "provision", "bash"])).expect_err("the json flag is required");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn guest_provision_rejects_a_budget_that_is_not_a_byte_count() {
+    let error = parse_args(&argv(&[
+        "guest",
+        "provision",
+        "bash",
+        "--json",
+        "--storage-budget-bytes",
+        "lots",
+    ]))
+    .expect_err("the budget must be a number");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn guest_provision_rejects_an_unknown_flag() {
+    let error = parse_args(&argv(&["guest", "provision", "bash", "--json", "--force"]))
+        .expect_err("unknown flags are refused");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn guest_rejects_an_unknown_subcommand() {
+    let error = parse_args(&argv(&["guest", "uninstall"])).expect_err("the subcommand is refused");
+    assert!(matches!(error, LegError::Usage(_)));
+}
+
+#[test]
+fn the_usage_summary_lists_the_guest_commands() {
+    assert!(USAGE.contains("leg guest bootstrap --json"));
+    assert!(USAGE.contains("leg guest provision <package> --json"));
+    assert!(help_text().contains("`leg guest bootstrap --json`"));
+    assert!(help_text().contains("256 MiB"));
+}
