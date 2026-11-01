@@ -179,6 +179,13 @@ fn state(scratch: &Scratch) -> GuestState {
     GuestState::load(&scratch.path).expect("load the guest state")
 }
 
+/// The packages the persisted guest state records.
+fn persisted(scratch: &Scratch) -> BTreeMap<String, InstalledPackage> {
+    GuestState::load(&scratch.path)
+        .expect("the persisted state is readable")
+        .installed
+}
+
 #[test]
 fn bootstrap_reports_the_guest_the_pinned_repository_and_the_free_storage() {
     let mut guest = FakeGuest::new();
@@ -564,6 +571,10 @@ fn a_failed_verification_rolls_the_install_back() {
     );
     assert!(state.installed.is_empty(), "the state kept the package");
     assert_eq!(state.provisioned_install_bytes, 0);
+    assert!(
+        persisted(&scratch).is_empty(),
+        "the persisted state kept the package"
+    );
 }
 
 #[test]
@@ -591,6 +602,10 @@ fn a_failed_install_leaves_the_guest_unchanged() {
     );
     assert!(state.installed.is_empty());
     assert_eq!(state.provisioned_install_bytes, 0);
+    assert!(
+        persisted(&scratch).is_empty(),
+        "the persisted state kept the package"
+    );
 }
 
 #[test]
@@ -630,6 +645,10 @@ fn a_state_that_cannot_be_saved_rolls_the_install_back() {
     );
     assert!(state.installed.is_empty(), "the state kept the package");
     assert_eq!(state.provisioned_install_bytes, 0);
+    assert!(
+        state_file.is_dir(),
+        "the persisted state was replaced by the rollback"
+    );
 }
 
 #[test]
