@@ -98,10 +98,12 @@ nm -a build/dd/Build/Products/Release-iphonesimulator/LegHost.app/LegHost \
     | grep -E '_vdso_symbol|_fiber_enter'
 nm -a build/dd/Build/Products/Release-iphonesimulator/LegHost.app/LegHost \
     | grep -iE 'leg_tui|leg_ui|leg_web|shukelabs'
+grep -iE 'leg_tui|leg_ui|leg-web|src/main\.rs|companions/' \
+    build/dd/Build/Products/Release-iphonesimulator/LegHost-x86_64.linkmap
 ```
 
-The first command lists the vendored runtime symbols, the second must print
-nothing.
+The first command lists the vendored runtime symbols; the second and the third
+must print nothing.
 
 ## Out of scope
 
