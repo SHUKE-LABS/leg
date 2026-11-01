@@ -36,7 +36,7 @@ as a separate program inside the guest, never linked into the host binary.
 | Device family | iPhone and iPad (`TARGETED_DEVICE_FAMILY = 1,2`) |
 | Bundled identifier | `com.shukelabs.leg.ioshost` |
 | Signing | Automatic development signing (`CODE_SIGN_STYLE = Automatic`) |
-| Architectures | `x86_64` and `arm64` simulator slices, `arm64` device slice |
+| Architectures | `x86_64` and `arm64` simulator slices, `arm64` device slice (no device is attached yet, see `#265`) |
 
 ## Build
 
