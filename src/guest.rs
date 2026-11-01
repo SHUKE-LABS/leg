@@ -138,6 +138,8 @@ pub trait GuestEnvironment {
     fn candidate(&mut self, package: &str) -> Result<Candidate>;
     /// Installs `package` at `version` through the fixed apk transaction.
     fn install(&mut self, package: &str, version: &str) -> Result<()>;
+    /// Removes `package` again, so a failed install leaves no residue.
+    fn uninstall(&mut self, package: &str, version: &str) -> Result<()>;
     /// Runs `program` with `args` and returns its standard output.
     fn run(&mut self, program: &str, args: &[&str]) -> Result<String>;
     /// The bytes still available on the guest's storage.
@@ -193,8 +195,6 @@ pub struct GuestInfo {
     pub release: String,
     /// The guest's apk architecture.
     pub architecture: String,
-    /// Whether the guest matches the pinned release and architecture.
-    pub compatible: bool,
 }
 
 /// The pinned repository identity.
@@ -301,9 +301,9 @@ pub fn architecture_matches(apk_architecture: &str) -> bool {
     apk_architecture == "x86" || apk_architecture == GUEST_ARCHITECTURE
 }
 
-/// Whether a guest release is served by the pinned repositories.
+/// Whether a guest release is the one the pinned bundle is built against.
 pub fn release_matches(release: &str) -> bool {
-    release.starts_with("3.20")
+    release == GUEST_RELEASE
 }
 
 /// The upstream version of an Alpine package version: `6.1.1-r8` is `6.1.1`.
@@ -329,16 +329,20 @@ fn failure(
 
 /// Reports the guest's release, architecture, pinned repository, installed
 /// allowlisted packages, and free storage.
+///
+/// A guest that is not the pinned one is refused with the structured error
+/// instead of a report, so an incompatible guest never reads as a healthy one.
 pub fn bootstrap(env: &mut dyn GuestEnvironment) -> Result<BootstrapReport> {
     let release = env.release()?;
     let architecture = env.architecture()?;
+    ensure_supported_guest(&release, &architecture)?;
+
     let installed = env.installed_versions(&allowed_names())?;
     let free_bytes = env.free_bytes()?;
 
     Ok(BootstrapReport {
         schema: "leg.guest.bootstrap/v1",
         guest: GuestInfo {
-            compatible: release_matches(&release) && architecture_matches(&architecture),
             release,
             architecture,
         },
@@ -352,6 +356,21 @@ pub fn bootstrap(env: &mut dyn GuestEnvironment) -> Result<BootstrapReport> {
             budget_bytes: DEFAULT_STORAGE_BUDGET_BYTES,
         },
     })
+}
+
+/// Refuses a guest that is not the pinned release and architecture.
+fn ensure_supported_guest(release: &str, architecture: &str) -> Result<()> {
+    if release_matches(release) && architecture_matches(architecture) {
+        return Ok(());
+    }
+    Err(failure(
+        "guest_incompatible",
+        format!(
+            "the guest runs Alpine {release} on {architecture}, not the pinned \
+             Alpine {GUEST_RELEASE} on {GUEST_ARCHITECTURE}"
+        ),
+        "run the guest command inside the pinned iSH bundle",
+    ))
 }
 
 /// Previews or applies one provisioning request.
@@ -380,16 +399,7 @@ pub fn provision(
 
     let release = env.release()?;
     let architecture = env.architecture()?;
-    if !release_matches(&release) || !architecture_matches(&architecture) {
-        return Err(failure(
-            "guest_incompatible",
-            format!(
-                "the guest runs Alpine {release} on {architecture}, not the pinned \
-                 Alpine {GUEST_RELEASE} on {GUEST_ARCHITECTURE}"
-            ),
-            "run the guest command inside the pinned iSH bundle",
-        ));
-    }
+    ensure_supported_guest(&release, &architecture)?;
 
     let free_bytes = env.free_bytes()?;
     let candidate = env.candidate(package.name)?;
@@ -491,11 +501,15 @@ pub fn provision(
         ));
     }
 
-    env.install(package.name, &candidate.version)?;
-    let verified = verify_executable(env, package, &candidate.version);
-    state.record_install(package.name, &candidate.version, candidate.install_bytes);
-    state.save()?;
-    verified?;
+    if let Err(error) = install_and_verify(env, state, package, &candidate) {
+        return Err(rollback(
+            env,
+            state,
+            package.name,
+            &candidate.version,
+            error,
+        ));
+    }
 
     Ok(ProvisionReport {
         schema: "leg.guest.provision/v1",
@@ -508,6 +522,45 @@ pub fn provision(
         cache_hit: false,
         storage,
     })
+}
+
+/// Installs the candidate, verifies its executable, and records it.
+///
+/// The three steps are one transaction: when any of them fails, the caller
+/// rolls the install back.
+fn install_and_verify(
+    env: &mut dyn GuestEnvironment,
+    state: &mut state::GuestState,
+    package: &AllowedPackage,
+    candidate: &Candidate,
+) -> Result<()> {
+    env.install(package.name, &candidate.version)?;
+    verify_executable(env, package, &candidate.version)?;
+    state.record_install(package.name, &candidate.version, candidate.install_bytes);
+    state.save()
+}
+
+/// Rolls a failed install back, so the guest keeps the state it had.
+///
+/// The package is removed again and the state record is dropped; when the
+/// removal fails the guest may still hold the package, which the failure
+/// says.
+fn rollback(
+    env: &mut dyn GuestEnvironment,
+    state: &mut state::GuestState,
+    package: &str,
+    version: &str,
+    error: LegError,
+) -> LegError {
+    state.forget(package);
+    match env.uninstall(package, version) {
+        Ok(()) => error,
+        Err(uninstall_error) => failure(
+            "rollback_failed",
+            format!("{error}; the package could not be removed: {uninstall_error}"),
+            "the guest may still hold the package; remove it by hand",
+        ),
+    }
 }
 
 /// Runs the package's fixed verification command and checks its output.

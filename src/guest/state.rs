@@ -184,6 +184,15 @@ impl GuestState {
             .saturating_add(install_bytes);
     }
 
+    /// Drops a recorded package, so a rolled-back install leaves no trace.
+    pub fn forget(&mut self, package: &str) {
+        if let Some(entry) = self.installed.remove(package) {
+            self.provisioned_install_bytes = self
+                .provisioned_install_bytes
+                .saturating_sub(entry.install_bytes);
+        }
+    }
+
     /// Issues a one-time approval token for `candidate`.
     pub fn issue_approval(&self, package: &str, candidate: &Candidate) -> Result<String> {
         let directory = self.dir.join(APPROVALS_DIR);

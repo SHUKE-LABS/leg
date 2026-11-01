@@ -1,0 +1,31 @@
+C:Q1UxMwfAt66SiGgvZAKt4Cy/RQQrc=
+P:bash
+V:5.2.26-r0
+A:x86
+S:459098
+I:1417216
+T:The GNU Bourne Again shell
+U:https://www.gnu.org/software/bash/bash.html
+L:GPL-3.0-or-later
+o:bash
+m:Natanael Copa <ncopa@alpinelinux.org>
+t:1705308069
+c:cafa24fc3e34934ba91ec3a55967c5cc229b0ad8
+D:/bin/sh so:libc.musl-x86.so.1 so:libreadline.so.8
+p:cmd:bash=5.2.26-r0
+
+C:Q1MCNixN2l+9pjPEIQLXuRFamVgLw=
+P:python3
+V:3.12.13-r0
+A:x86
+S:8390746
+I:25006080
+T:High-level scripting language
+U:https://www.python.org/
+L:PSF-2.0
+o:python3
+m:Natanael Copa <ncopa@alpinelinux.org>
+t:1775830591
+c:25e8dd4476efaca8963825717e10dec6c4678b0e
+D:libssl3>=3.3.0 so:libbz2.so.1 so:libc.musl-x86.so.1 so:libcrypto.so.3 so:libexpat.so.1 so:libffi.so.8 so:libgdbm_compat.so.4 so:liblzma.so.5 so:libmpdec.so.4 so:libncursesw.so.6 so:libpanelw.so.6 so:libreadline.so.8 so:libsqlite3.so.0 so:libssl.so.3 so:libz.so.1
+p:cmd:python3=3.12.13-r0 cmd:python=3.12.13-r0

@@ -85,10 +85,14 @@ impl SystemGuest {
         Ok(output)
     }
 
-    /// Writes a repositories file holding exactly the pinned repositories.
-    fn write_repositories(directory: &Path) -> Result<PathBuf> {
+    /// Writes a repositories file holding exactly the given repositories.
+    ///
+    /// A candidate is resolved against one repository at a time, so the file
+    /// it writes holds one URL and the index it caches belongs to that
+    /// repository alone.
+    fn write_repositories(directory: &Path, urls: &[&str]) -> Result<PathBuf> {
         let path = directory.join("repositories");
-        let text = REPOSITORY_URLS
+        let text = urls
             .iter()
             .map(|url| format!("{url}\n"))
             .collect::<String>();
@@ -140,7 +144,7 @@ impl GuestEnvironment for SystemGuest {
                     cache_dir.display()
                 ))
             })?;
-            let repositories = Self::write_repositories(&repository_dir)?;
+            let repositories = Self::write_repositories(&repository_dir, &[url])?;
             let (cache, repositories) = (
                 cache_dir.to_string_lossy().into_owned(),
                 repositories.to_string_lossy().into_owned(),
@@ -175,22 +179,9 @@ impl GuestEnvironment for SystemGuest {
                 })
             })?;
 
-            let entry = entries.iter().find(|entry| {
-                entry.name == package
-                    && (entry.architecture == architecture || entry.architecture == "noarch")
-            });
-            let Some(entry) = entry else {
-                continue;
-            };
-            return Ok(Candidate {
-                package: entry.name.clone(),
-                version: entry.version.clone(),
-                repository: url.to_string(),
-                architecture: entry.architecture.clone(),
-                download_bytes: entry.download_bytes,
-                install_bytes: entry.install_bytes,
-                checksum: entry.checksum.clone(),
-            });
+            if let Some(candidate) = candidate_in(&entries, package, &architecture, url) {
+                return Ok(candidate);
+            }
         }
 
         Err(LegError::Guest(GuestFailure {
@@ -202,7 +193,7 @@ impl GuestEnvironment for SystemGuest {
 
     fn install(&mut self, package: &str, version: &str) -> Result<()> {
         let scratch = Scratch::create("install")?;
-        let repositories = Self::write_repositories(scratch.path())?;
+        let repositories = Self::write_repositories(scratch.path(), &REPOSITORY_URLS)?;
         let repositories = repositories.to_string_lossy().into_owned();
         let spec = format!("{package}={version}");
         self.apk_output(&[
@@ -211,6 +202,25 @@ impl GuestEnvironment for SystemGuest {
             "--no-progress",
             "add",
             &spec,
+        ])?;
+        Ok(())
+    }
+
+    fn uninstall(&mut self, package: &str, _version: &str) -> Result<()> {
+        // Removing a package the guest does not hold is not an error: the
+        // rollback of a failed install must not mask the failure itself.
+        if !self.installed_versions(&[package])?.contains_key(package) {
+            return Ok(());
+        }
+        let scratch = Scratch::create("uninstall")?;
+        let repositories = Self::write_repositories(scratch.path(), &REPOSITORY_URLS)?;
+        let repositories = repositories.to_string_lossy().into_owned();
+        self.apk_output(&[
+            "--repositories-file",
+            &repositories,
+            "--no-progress",
+            "del",
+            package,
         ])?;
         Ok(())
     }
@@ -243,12 +253,7 @@ impl GuestEnvironment for SystemGuest {
 }
 
 /// The bytes still available on the guest's storage.
-///
-/// The `statvfs` field widths follow the target's word size — a 32-bit guest
-/// counts in 32-bit blocks — so the casts are needed on a 32-bit target and
-/// redundant on a 64-bit one.
 #[cfg(unix)]
-#[allow(clippy::unnecessary_cast)]
 fn free_bytes() -> Result<u64> {
     let path = std::ffi::CString::new("/")
         .map_err(|error| LegError::Io(format!("could not build the guest root path: {error}")))?;
@@ -259,7 +264,17 @@ fn free_bytes() -> Result<u64> {
             "could not read the guest's free storage".to_string(),
         ));
     }
-    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    Ok(bytes_of(stats.f_bavail, stats.f_frsize))
+}
+
+/// The bytes a block count and a block size add up to.
+///
+/// The `statvfs` field widths follow the target's word size, so the count and
+/// the block size arrive with different widths on a 32-bit guest; both are
+/// widened here rather than cast at the call site.
+#[cfg(any(unix, test))]
+fn bytes_of(blocks: impl Into<u64>, block_size: impl Into<u64>) -> u64 {
+    blocks.into().saturating_mul(block_size.into())
 }
 
 /// The bytes still available on the guest's storage.
@@ -309,7 +324,35 @@ fn find_index(cache_dir: &Path) -> Option<PathBuf> {
         .filter(|name| name.starts_with(INDEX_PREFIX) && name.ends_with(INDEX_SUFFIX))
         .collect();
     names.sort();
-    names.into_iter().next().map(|name| cache_dir.join(name))
+    match names.len() {
+        1 => Some(cache_dir.join(&names[0])),
+        _ => None,
+    }
+}
+
+/// The candidate one repository's index offers for a package.
+///
+/// The repository is carried into the candidate, so a package resolved from
+/// the community index is reported against the community repository.
+fn candidate_in(
+    entries: &[index::IndexEntry],
+    package: &str,
+    architecture: &str,
+    repository: &str,
+) -> Option<Candidate> {
+    let entry = entries.iter().find(|entry| {
+        entry.name == package
+            && (entry.architecture == architecture || entry.architecture == "noarch")
+    })?;
+    Some(Candidate {
+        package: entry.name.clone(),
+        version: entry.version.clone(),
+        repository: repository.to_string(),
+        architecture: entry.architecture.clone(),
+        download_bytes: entry.download_bytes,
+        install_bytes: entry.install_bytes,
+        checksum: entry.checksum.clone(),
+    })
 }
 
 /// The file name a repository URL is stored under.
@@ -455,3 +498,6 @@ impl Drop for Scratch {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
+
+#[cfg(test)]
+mod tests;

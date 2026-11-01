@@ -9,8 +9,11 @@ use std::path::PathBuf;
 
 use crate::error::{GuestFailure, LegError, Result};
 
-/// The repository index fixture, taken from the pinned Alpine 3.20 indexes.
-const INDEX_FIXTURE: &str = include_str!("fixtures/APKINDEX");
+/// The pinned main repository index fixture.
+const MAIN_INDEX_FIXTURE: &str = include_str!("fixtures/APKINDEX-main");
+
+/// The pinned community repository index fixture.
+const COMMUNITY_INDEX_FIXTURE: &str = include_str!("fixtures/APKINDEX-community");
 
 /// A scratch directory removed when the test ends.
 struct Scratch {
@@ -54,6 +57,8 @@ struct FakeGuest {
     install_failure: Option<GuestFailure>,
     /// The installs the flow performed.
     installs: Vec<(String, String)>,
+    /// The removals the flow performed.
+    uninstalls: Vec<(String, String)>,
     /// The programs the flow ran.
     runs: Vec<String>,
 }
@@ -72,6 +77,7 @@ impl FakeGuest {
             verification_failure: None,
             install_failure: None,
             installs: Vec::new(),
+            uninstalls: Vec::new(),
             runs: Vec::new(),
         }
     }
@@ -105,6 +111,14 @@ impl GuestEnvironment for FakeGuest {
             .push((package.to_string(), version.to_string()));
         self.installed
             .insert(package.to_string(), version.to_string());
+        Ok(())
+    }
+
+    fn uninstall(&mut self, package: &str, version: &str) -> Result<()> {
+        if self.installed.remove(package).is_some() {
+            self.uninstalls
+                .push((package.to_string(), version.to_string()));
+        }
         Ok(())
     }
 
@@ -178,7 +192,6 @@ fn bootstrap_reports_the_guest_the_pinned_repository_and_the_free_storage() {
     assert_eq!(report.schema, "leg.guest.bootstrap/v1");
     assert_eq!(report.guest.release, "3.20.3");
     assert_eq!(report.guest.architecture, "x86");
-    assert!(report.guest.compatible);
     assert_eq!(report.repository.release, "v3.20");
     assert_eq!(
         report.repository.urls,
@@ -190,6 +203,40 @@ fn bootstrap_reports_the_guest_the_pinned_repository_and_the_free_storage() {
     assert_eq!(report.installed.get("bash"), Some(&"5.2.26-r0".to_string()));
     assert_eq!(report.storage.free_bytes, 4096);
     assert_eq!(report.storage.budget_bytes, DEFAULT_STORAGE_BUDGET_BYTES);
+}
+
+#[test]
+fn a_guest_on_another_patch_release_is_refused() {
+    let scratch = scratch("patch-release");
+    let mut guest = FakeGuest::new();
+    guest.release = "3.20.1".to_string();
+    let mut state = state(&scratch);
+
+    let error =
+        provision(&mut guest, &request("bash"), &mut state).expect_err("the guest is refused");
+
+    assert_eq!(reason_of(&error), "guest_incompatible");
+    assert!(guest.installs.is_empty());
+}
+
+#[test]
+fn bootstrap_refuses_a_guest_that_is_not_the_pinned_one() {
+    let mut guest = FakeGuest::new();
+    guest.release = "3.19.1".to_string();
+
+    let error = bootstrap(&mut guest).expect_err("the guest is refused");
+
+    assert_eq!(reason_of(&error), "guest_incompatible");
+}
+
+#[test]
+fn bootstrap_refuses_a_guest_on_another_architecture() {
+    let mut guest = FakeGuest::new();
+    guest.architecture = "x86_64".to_string();
+
+    let error = bootstrap(&mut guest).expect_err("the guest is refused");
+
+    assert_eq!(reason_of(&error), "guest_incompatible");
 }
 
 #[test]
@@ -488,7 +535,7 @@ fn a_candidate_that_changed_after_the_preview_is_refused() {
 }
 
 #[test]
-fn a_failed_verification_is_reported_after_the_install() {
+fn a_failed_verification_rolls_the_install_back() {
     let scratch = scratch("verification");
     let mut guest = FakeGuest::new();
     guest.verification_output = String::new();
@@ -505,15 +552,84 @@ fn a_failed_verification_is_reported_after_the_install() {
     let error = provision(&mut guest, &approved, &mut state).expect_err("the verification fails");
 
     assert_eq!(reason_of(&error), "verification_failed");
-    assert_eq!(guest.installs.len(), 1, "the install was rolled back");
+    assert_eq!(guest.installs.len(), 1, "the package was never installed");
     assert_eq!(
-        state
-            .installed
-            .get("bash")
-            .map(|entry| entry.version.clone()),
-        Some("5.2.26-r0".to_string()),
-        "the installed package was not recorded"
+        guest.uninstalls,
+        vec![("bash".to_string(), "5.2.26-r0".to_string())],
+        "the package was not rolled back"
     );
+    assert!(
+        !guest.installed.contains_key("bash"),
+        "the guest still holds the package"
+    );
+    assert!(state.installed.is_empty(), "the state kept the package");
+    assert_eq!(state.provisioned_install_bytes, 0);
+}
+
+#[test]
+fn a_failed_install_leaves_the_guest_unchanged() {
+    let scratch = scratch("install-failure");
+    let mut guest = FakeGuest::new();
+    guest.install_failure = Some(failure("apk_failed"));
+    let mut state = state(&scratch);
+
+    let preview =
+        provision(&mut guest, &request("bash"), &mut state).expect("the preview succeeds");
+    let token = preview.approval_token.expect("a token");
+    let approved = ProvisionRequest {
+        package: "bash".to_string(),
+        approval_token: Some(token),
+        storage_budget_bytes: None,
+    };
+    let error = provision(&mut guest, &approved, &mut state).expect_err("the install fails");
+
+    assert_eq!(reason_of(&error), "apk_failed");
+    assert!(guest.installs.is_empty());
+    assert!(
+        guest.uninstalls.is_empty(),
+        "a package the guest never held was removed"
+    );
+    assert!(state.installed.is_empty());
+    assert_eq!(state.provisioned_install_bytes, 0);
+}
+
+#[test]
+fn a_state_that_cannot_be_saved_rolls_the_install_back() {
+    let scratch = scratch("state-save");
+    let mut guest = FakeGuest::new();
+    let mut state = state(&scratch);
+
+    let preview =
+        provision(&mut guest, &request("bash"), &mut state).expect("the preview succeeds");
+    let token = preview.approval_token.expect("a token");
+
+    // A directory where the state file belongs makes writing the state fail.
+    let state_file = scratch.path.join("state.json");
+    let _ = fs::remove_file(&state_file);
+    fs::create_dir(&state_file).expect("replace the state file with a directory");
+
+    let approved = ProvisionRequest {
+        package: "bash".to_string(),
+        approval_token: Some(token),
+        storage_budget_bytes: None,
+    };
+    let error = provision(&mut guest, &approved, &mut state).expect_err("the state is not saved");
+
+    assert!(
+        matches!(error, LegError::Io(_)),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        guest.uninstalls,
+        vec![("bash".to_string(), "5.2.26-r0".to_string())],
+        "the package was not rolled back"
+    );
+    assert!(
+        !guest.installed.contains_key("bash"),
+        "the guest still holds the package"
+    );
+    assert!(state.installed.is_empty(), "the state kept the package");
+    assert_eq!(state.provisioned_install_bytes, 0);
 }
 
 #[test]
@@ -611,13 +727,14 @@ fn recording_the_same_package_twice_counts_its_bytes_once() {
 }
 
 #[test]
-fn the_index_fixture_yields_the_pinned_candidate_metadata() {
-    let entries = index::parse_index_text(INDEX_FIXTURE);
+fn the_index_fixtures_yield_the_pinned_candidate_metadata() {
+    let main = index::parse_index_text(MAIN_INDEX_FIXTURE);
+    let community = index::parse_index_text(COMMUNITY_INDEX_FIXTURE);
 
-    let bash = entries
+    let bash = main
         .iter()
         .find(|entry| entry.name == "bash")
-        .expect("bash is in the fixture");
+        .expect("bash is in the main fixture");
     assert_eq!(bash.version, "5.2.26-r0");
     assert_eq!(bash.architecture, "x86");
     assert_eq!(bash.download_bytes, 459_098);
@@ -627,32 +744,37 @@ fn the_index_fixture_yields_the_pinned_candidate_metadata() {
         "sha1:5313307c0b7ae9288682f6402ade02cbf45042b7"
     );
 
-    let ffmpeg = entries
+    let ffmpeg = community
         .iter()
         .find(|entry| entry.name == "ffmpeg")
-        .expect("ffmpeg is in the fixture");
+        .expect("ffmpeg is in the community fixture");
     assert_eq!(ffmpeg.version, "6.1.1-r8");
     assert_eq!(ffmpeg.download_bytes, 245_732);
     assert_eq!(ffmpeg.install_bytes, 626_688);
 }
 
 #[test]
-fn the_index_fixture_holds_every_allowlisted_package() {
-    let entries = index::parse_index_text(INDEX_FIXTURE);
+fn the_index_fixtures_hold_every_allowlisted_package() {
+    let main = index::parse_index_text(MAIN_INDEX_FIXTURE);
+    let community = index::parse_index_text(COMMUNITY_INDEX_FIXTURE);
     for name in allowed_names() {
         assert!(
-            entries.iter().any(|entry| entry.name == name),
-            "{name} is missing from the index fixture"
+            main.iter().any(|entry| entry.name == name)
+                || community.iter().any(|entry| entry.name == name),
+            "{name} is missing from the index fixtures"
         );
     }
 }
 
 #[test]
 fn an_index_archive_yields_its_entries() {
-    let archive = index_archive("APKINDEX", INDEX_FIXTURE.as_bytes());
+    let archive = index_archive("APKINDEX", COMMUNITY_INDEX_FIXTURE.as_bytes());
     let entries = index::parse_index_archive(&archive).expect("the archive is parsed");
 
-    assert_eq!(entries.len(), index::parse_index_text(INDEX_FIXTURE).len());
+    assert_eq!(
+        entries.len(),
+        index::parse_index_text(COMMUNITY_INDEX_FIXTURE).len()
+    );
     assert!(
         entries
             .iter()

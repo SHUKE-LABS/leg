@@ -118,7 +118,7 @@ packages that are installed, and the free storage:
 ```json
 {
   "schema": "leg.guest.bootstrap/v1",
-  "guest": { "release": "3.20.3", "architecture": "x86", "compatible": true },
+  "guest": { "release": "3.20.3", "architecture": "x86" },
   "repository": {
     "release": "v3.20",
     "urls": [
@@ -130,6 +130,10 @@ packages that are installed, and the free storage:
   "storage": { "free_bytes": 2147483648, "budget_bytes": 268435456 }
 }
 ```
+
+The guest is pinned to Alpine 3.20.3 on x86. A guest on another release or
+architecture is refused with a structured error, so an incompatible guest never
+reads as a healthy one.
 
 `leg guest provision <package> --json` previews the exact candidate the
 package would install — version, repository, download and install bytes, and
@@ -177,10 +181,13 @@ The approval token is a host-side credential: keep it out of any channel the
 model can read, or the gate means nothing.
 
 Only `bash`, `ffmpeg`, `python3`, and `ripgrep` can be provisioned, and only
-from the pinned Alpine 3.20 repositories. The guest's own `apk` verifies the
+from the pinned Alpine 3.20 repositories. Each package is resolved against the
+repository that carries it, so the reported repository, version, and checksum
+are the ones the install would use. The guest's own `apk` verifies the
 repository signature and the package checksum before it installs anything; a
 failure is reported as a structured error with a remediation, and a failed
-request leaves the guest unchanged:
+request leaves the guest unchanged — a package whose executable fails
+verification, or whose state cannot be written, is removed again:
 
 ```json
 {
