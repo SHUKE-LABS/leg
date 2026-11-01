@@ -278,7 +278,35 @@ mod host {
         let mut reader = BufReader::new(stream);
 
         let mut line = String::new();
-        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        // The accepted socket may still be in non-blocking mode on some
+        // platforms, so the fixture waits for the request line instead of
+        // giving up on the first refusal.
+        let _ = reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) if line.ends_with('\n') => break,
+                Ok(_) => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return,
+            }
+        }
+        if line.trim().is_empty() {
             return;
         }
         let request: Value = match serde_json::from_str(line.trim()) {
