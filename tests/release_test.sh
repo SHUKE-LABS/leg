@@ -305,6 +305,56 @@ test_ish_elf_validation() (
     assert_rc_nonzero "${status}"
 )
 
+test_ish_version_output_check() (
+    set -euo pipefail
+    local status name
+
+    # `leg` is versioned with the release, so it must report that version.
+    status=0
+    release_ish_verify_version_output leg 0.41.0 "leg 0.41.0" >/dev/null || status="$?"
+    (( status == 0 )) || fail "leg must report the release version"
+
+    status=0
+    release_ish_verify_version_output leg 0.41.0 "leg 0.1.0" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
+    status=0
+    release_ish_verify_version_output leg 0.41.0 "leg 0.41.0 (dirty)" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
+    # The companions keep their own crate versions, so the bundle only requires
+    # a semver from them, the same contract the desktop release rows enforce.
+    for name in leg-tui leg-web leg-ui-supervisor; do
+        status=0
+        release_ish_verify_version_output "${name}" 0.41.0 "${name} 0.1.0" >/dev/null || status="$?"
+        (( status == 0 )) || fail "${name} must report its own crate version"
+
+        status=0
+        release_ish_verify_version_output "${name}" 0.41.0 "${name}" >/dev/null 2>&1 || status="$?"
+        assert_rc_nonzero "${status}"
+
+        status=0
+        release_ish_verify_version_output "${name}" 0.41.0 "${name} 0.1.0 (stale)" >/dev/null 2>&1 || status="$?"
+        assert_rc_nonzero "${status}"
+    done
+
+    # The smoke parses the whole container transcript, so the check has to
+    # survive the echoed command lines around each version.
+    output="+ leg --version
+leg 0.41.0
++ leg-tui --version
+leg-tui 0.1.0
++ leg-web --version
+leg-web 0.1.0
++ leg-ui-supervisor --version
+leg-ui-supervisor 0.1.0"
+    for name in leg leg-tui leg-web leg-ui-supervisor; do
+        status=0
+        release_ish_verify_version_output "${name}" 0.41.0 "${output}" >/dev/null || status="$?"
+        (( status == 0 )) || fail "${name} must be recognised in the smoke transcript"
+    done
+)
+
 test_manifest_and_lockfile_version_reads() (
     set -euo pipefail
     local repo
@@ -986,6 +1036,7 @@ tests=(
     test_ish_bundle_is_reproducible_and_verified
     test_ish_bundle_rejects_wrong_binaries
     test_ish_elf_validation
+    test_ish_version_output_check
     test_manifest_and_lockfile_version_reads
     test_verify_tag_matches_manifest
     test_release_bump_rules
