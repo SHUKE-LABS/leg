@@ -1324,7 +1324,7 @@ release_ish_manifest_name() {
 }
 
 release_ish_binary_names() {
-    printf '%s\n' leg leg-tui leg-web leg-ui-supervisor
+    printf '%s\n' leg leg-bridge leg-tui leg-web leg-ui-supervisor
 }
 
 release_ish_bundle_file_names() {
@@ -1462,7 +1462,7 @@ if (manifest.docker_platform !== expectedPlatform) {
   fail(`docker_platform '${manifest.docker_platform}' does not match '${expectedPlatform}'`);
 }
 
-const expectedNames = ['leg', 'leg-tui', 'leg-web', 'leg-ui-supervisor'];
+const expectedNames = ['leg', 'leg-bridge', 'leg-tui', 'leg-web', 'leg-ui-supervisor'];
 if (!Array.isArray(manifest.binaries)) fail('binaries must be an array');
 if (manifest.binaries.length !== expectedNames.length) {
   fail(`binaries must list exactly ${expectedNames.length} entries`);
@@ -1544,7 +1544,7 @@ release_ish_verify_bundle() {
     actual="$(cd -- "${bundle_dir}" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)"
     expected="$(release_ish_bundle_file_names | LC_ALL=C sort)"
     if [[ "${actual}" != "${expected}" ]]; then
-        printf 'release: the iSH bundle must contain exactly the four binaries, the manifest, and SHA256SUMS\n' >&2
+        printf 'release: the iSH bundle must contain exactly the five binaries, the manifest, and SHA256SUMS\n' >&2
         printf 'release: expected:\n%s\nrelease: found:\n%s\n' "${expected}" "${actual}" >&2
         return 1
     fi
@@ -1640,19 +1640,19 @@ for (const entry of manifest.binaries) console.log(entry.version_command);
 ' "${manifest_path}"
 }
 
-# `leg` is versioned together with the release, so it has to report the
-# release version. The companions keep their own crate versions, so they only
-# have to report a semver, the same contract the desktop release rows enforce
-# for the very same binaries.
+# `leg` and `leg-bridge` are versioned together with the release, so they have
+# to report the release version. The companions keep their own crate versions,
+# so they only have to report a semver, the same contract the desktop release
+# rows enforce for the very same binaries.
 release_ish_verify_version_output() {
     local name="${1:-}" expected_version="${2:-}" output="${3:-}"
 
     [[ -n "${name}" && -n "${expected_version}" ]] || return 1
-    if [[ "${name}" == "leg" ]]; then
-        if grep -qxF "leg ${expected_version}" <<<"${output}"; then
+    if [[ "${name}" == "leg" || "${name}" == "leg-bridge" ]]; then
+        if grep -qxF "${name} ${expected_version}" <<<"${output}"; then
             return 0
         fi
-        printf "release: 'leg --version' did not report 'leg %s'\n" "${expected_version}" >&2
+        printf "release: '%s --version' did not report '%s %s'\n" "${name}" "${name}" "${expected_version}" >&2
         return 1
     fi
     if grep -qxE "${name} [0-9]+\.[0-9]+\.[0-9]+" <<<"${output}"; then

@@ -19,8 +19,10 @@
 //! - [`error`] — shared error and result types.
 //! - [`install`] — the `leg install` native-binary installer.
 //! - [`guest`] — the `leg guest` inspection and provisioning commands.
+//! - [`bridge`] — the versioned, host-mediated capability bridge.
 //! - [`cli`] — the command-line entry surface.
 
+pub mod bridge;
 pub mod cli;
 pub mod config;
 pub mod context;

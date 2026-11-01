@@ -70,3 +70,40 @@ on the host's behalf. The flow is approval-gated and pinned.
 The provisioned tools are ordinary Alpine packages inside the guest. They
 cannot grant native iOS or Android permissions, and the guest commands do not
 change how the desktop binaries install packages.
+
+## The capability bridge
+
+`leg-bridge` (`src/bridge.rs`) is the guest-side endpoint of the mobile
+capability bridge. It is a protocol boundary, not a capability
+implementation: a mobile Skill calls it through the existing `bash` tool, and
+it carries one request to the host that owns the native permission, and one
+answer back. The desktop agent core, the tool registry, and the Skills
+registry are unchanged.
+
+- The request is one line of JSON with a version, a request id, a capability
+  name, a structured input, and — when an approval is redeemed — the token an
+  earlier answer issued. The answer is one line of JSON with exactly one of
+  six statuses: `ok`, `approval_required`, `denied`, `cancelled`,
+  `unavailable`, or `error`.
+- Every request is validated before it reaches the host (`src/bridge/protocol.rs`):
+  an unknown version, an unknown capability, an unknown field, a malformed
+  document, an oversized request, a reused request id, and a path that is not
+  relative and normalized are refused with a bounded structured error, so no
+  dispatch happens.
+- The host owns the transport, the permission prompt, the dispatch, the
+  cancellation, and the user confirmation; the bridge reaches it through the
+  `HostAdapter` seam (`src/bridge/adapter.rs`). This slice ships the
+  file-backed transport and the seam, and no platform adapter.
+- An approval is bound to the request id, the capability, and the digest of
+  the input (`src/bridge/state.rs`). A capability that needs consent is
+  previewed first and performs no side effect until the matching token is
+  replayed with the same request id and the same input.
+- Every request has a deadline and a cancellation path, and the bridge writes
+  an audit summary that carries request metadata and the *shape* of the input
+  — never provider credentials, photo contents, file contents, or shortcut
+  inputs.
+
+The [capability bridge contract](capability-bridge.md) defines the schemas,
+the capability names, the approval semantics, the limits, the audit summary,
+and the rule a platform adapter has to keep: an adapter maps a request onto
+the host API the capability names, and it must not widen the guest's reach.

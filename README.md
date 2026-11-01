@@ -89,9 +89,9 @@ checksums:
 sha256sum --check SHA256SUMS
 ```
 
-The archive holds `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`, the
-compatibility manifest `ish-compatibility-v1.json`, and the inner
-`SHA256SUMS`. The manifest records the exact target
+The archive holds `leg`, `leg-bridge`, `leg-tui`, `leg-web`, and
+`leg-ui-supervisor`, the compatibility manifest `ish-compatibility-v1.json`, and
+the inner `SHA256SUMS`. The manifest records the exact target
 (`i686-unknown-linux-musl`), the pinned Alpine release the bundle is tested
 against (Alpine 3.20.3, image `alpine:3.20.3`, run under `linux/386`), and the
 `--version` command for each binary.
@@ -213,6 +213,40 @@ installed-package record and the pending approval tokens — lives in
 The provisioned tools stay inside the guest: they are ordinary Alpine
 packages, they cannot grant native iOS or Android permissions, and they do
 not change how the desktop binaries install packages.
+
+### The capability bridge
+
+Inside the guest, `leg-bridge` carries a capability request to the host that
+owns the native permission. A mobile Skill calls it through the existing
+`bash` tool, with one request on standard input and one answer on standard
+output:
+
+```
+printf '%s\n' '{"version":1,"request_id":"r-1","capability":"photos.list","input":{"limit":5}}' \
+  | leg-bridge
+```
+
+The answer always has the same shape and exactly one of six statuses — `ok`,
+`approval_required`, `denied`, `cancelled`, `unavailable`, or `error`:
+
+```json
+{"version":1,"request_id":"r-1","status":"ok","result":{},"error":null}
+```
+
+The bridge validates the request before the host sees it: an unknown version,
+an unknown capability, an unknown field, a malformed document, an oversized
+request, a reused request id, and a path that is not relative and normalized
+are all refused without a dispatch. A capability that needs consent answers
+`approval_required` with a review summary and a one-time token, and runs
+nothing until the Skill replays that token with the same request id and the
+same input.
+
+The bridge adds no tool to the desktop registry and changes no Skills
+contract: the host owns the transport, the permission prompt, the dispatch,
+the cancellation, and the user confirmation. The [capability bridge
+contract](docs/capability-bridge.md) defines the schemas, the capability
+names, the approval semantics, the limits, the audit summary, and the rule a
+platform adapter has to keep.
 
 ## Experimental TUI trial
 

@@ -162,6 +162,11 @@ jobs:
             binary="${binary}.exe"
           fi
           test "$("./${binary}" --version)" = "leg ${version}"
+          bridge="target/${TARGET}/release/leg-bridge"
+          if [[ "${TARGET}" == *-windows-* ]]; then
+            bridge="${bridge}.exe"
+          fi
+          test "$("./${bridge}" --version)" = "leg-bridge ${version}"
           suffix=""
           if [[ "${TARGET}" == *-windows-* ]]; then
             suffix=".exe"
@@ -207,6 +212,7 @@ jobs:
           staging="$(mktemp -d)"
           trap 'rm -rf "${staging}"' EXIT
           cp "target/${TARGET}/release/leg" "${staging}/leg"
+          cp "target/${TARGET}/release/leg-bridge" "${staging}/leg-bridge"
           for name in leg-tui leg-web leg-ui-supervisor; do
             cp "companions/target/${TARGET}/release/${name}" "${staging}/${name}"
           done
@@ -341,7 +347,7 @@ jobs:
           for asset in "${assets[@]}"; do
             test -f "dist/${asset}"
             if [[ "${asset}" == "${ish_asset}" ]]; then
-              # The iSH bundle carries the four binaries plus its compatibility
+              # The iSH bundle carries the five binaries plus its compatibility
               # manifest and inner checksums.
               bash scripts/release.sh verify-ish-archive "dist/${asset}" "${version}"
               continue
