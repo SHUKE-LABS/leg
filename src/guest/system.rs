@@ -243,7 +243,12 @@ impl GuestEnvironment for SystemGuest {
 }
 
 /// The bytes still available on the guest's storage.
+///
+/// The `statvfs` field widths follow the target's word size — a 32-bit guest
+/// counts in 32-bit blocks — so the casts are needed on a 32-bit target and
+/// redundant on a 64-bit one.
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 fn free_bytes() -> Result<u64> {
     let path = std::ffi::CString::new("/")
         .map_err(|error| LegError::Io(format!("could not build the guest root path: {error}")))?;
@@ -254,7 +259,7 @@ fn free_bytes() -> Result<u64> {
             "could not read the guest's free storage".to_string(),
         ));
     }
-    Ok(stats.f_bavail as u64 * stats.f_frsize as u64)
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
 /// The bytes still available on the guest's storage.
