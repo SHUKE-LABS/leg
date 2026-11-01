@@ -31,6 +31,11 @@ pub const MAX_HOST_FRAME_BYTES: usize = 64 * 1024;
 /// again.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The longest the bridge waits for one write attempt before it looks at the
+/// clock and at the interrupt flag again.
+#[cfg(unix)]
+const WRITE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// A request the bridge hands to the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostRequest {
@@ -379,9 +384,13 @@ impl HostConnection for UnixHostConnection {
 
         // The write is bounded by the deadline: the socket carries a timeout,
         // and the bridge gives the write up when the deadline is reached
-        // rather than waiting for a host that stopped reading. The wait also
-        // stops when the guest interrupts the request, so a host that stopped
-        // reading cannot hold a cancelled request past the deadline.
+        // rather than waiting for a host that stopped reading.
+        //
+        // The socket gives up on an attempt after a short interval rather
+        // than after the whole of the remaining time, so the loop looks at
+        // the clock and at the interrupt flag every few tens of
+        // milliseconds. A host that stopped reading therefore cannot hold a
+        // cancelled request until the deadline.
         let mut bytes = frame.as_bytes().to_vec();
         bytes.push(b'\n');
         let mut written = 0;
@@ -393,8 +402,11 @@ impl HostConnection for UnixHostConnection {
             if remaining.is_zero() {
                 return Err(ConnectionError::Timeout);
             }
+            let wait = remaining
+                .min(WRITE_POLL_INTERVAL)
+                .max(Duration::from_millis(1));
             self.stream
-                .set_write_timeout(Some(remaining.max(Duration::from_millis(1))))
+                .set_write_timeout(Some(wait))
                 .map_err(|error| ConnectionError::Io(error.to_string()))?;
             match self.stream.write(&bytes[written..]) {
                 Ok(0) => {
@@ -403,14 +415,13 @@ impl HostConnection for UnixHostConnection {
                     ));
                 }
                 Ok(count) => written += count,
+                // The socket buffer is full for now: the loop looks at the
+                // clock and at the interrupt flag again before it writes more.
                 Err(error)
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err(ConnectionError::Timeout);
-                }
+                    ) => {}
                 // The write was interrupted: the loop looks at the clock and
                 // at the interrupt flag again before it writes more.
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}

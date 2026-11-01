@@ -1459,3 +1459,86 @@ fn a_request_to_a_host_that_never_connected_keeps_its_id() {
         "the request id was not free again: {response:?}"
     );
 }
+
+/// The environment variable that turns a test into the child that writes
+/// over a real socket while it is cancelled.
+#[cfg(unix)]
+const INTERRUPT_CHILD_ENV: &str = "LEG_BRIDGE_TEST_INTERRUPT_CHILD";
+
+/// The environment variable that names the socket the child writes to.
+#[cfg(unix)]
+const INTERRUPT_CHILD_SOCKET_ENV: &str = "LEG_BRIDGE_TEST_INTERRUPT_SOCKET";
+
+/// The environment variable that names the file the child writes its result to.
+#[cfg(unix)]
+const INTERRUPT_CHILD_RESULT_ENV: &str = "LEG_BRIDGE_TEST_INTERRUPT_RESULT";
+
+/// The name of the test that runs as the child.
+#[cfg(unix)]
+const INTERRUPT_CHILD_TEST: &str = "bridge::tests::the_write_over_a_real_socket_is_cancelled";
+
+#[cfg(unix)]
+#[test]
+fn a_write_over_a_real_socket_that_is_cancelled_answers_cancelled() {
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    let scratch = scratch("write-cancelled");
+    let path = scratch.path.join("host.sock");
+    // The host takes no connection and reads nothing: the socket buffer
+    // fills and the write stalls.
+    let _listener = UnixListener::bind(&path).expect("bind the host socket");
+    let result = scratch.path.join("result.txt");
+
+    // The interrupt flag is process-global, so the child raises it in a
+    // process of its own; it never reaches the tests beside this one.
+    let status = Command::new(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", INTERRUPT_CHILD_TEST, "--nocapture"])
+        .env(INTERRUPT_CHILD_ENV, "1")
+        .env(INTERRUPT_CHILD_SOCKET_ENV, &path)
+        .env(INTERRUPT_CHILD_RESULT_ENV, &result)
+        .status()
+        .expect("the child ran");
+
+    assert!(status.success(), "the child failed: {status}");
+    let answer = fs::read_to_string(&result).expect("the child wrote its result");
+    assert_eq!(
+        answer.trim(),
+        "cancelled",
+        "the stalled write was not cancelled: {answer}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_write_over_a_real_socket_is_cancelled() {
+    if std::env::var_os(INTERRUPT_CHILD_ENV).is_none() {
+        // The parent runs this test in a child process; in the parent there
+        // is nothing to do.
+        return;
+    }
+    let path = std::env::var_os(INTERRUPT_CHILD_SOCKET_ENV).expect("the socket path");
+    let result = std::env::var_os(INTERRUPT_CHILD_RESULT_ENV).expect("the result path");
+
+    // The interrupt arrives while the write is stalled.
+    let interrupt = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        crate::interrupt::raise_for_tests();
+    });
+
+    let error = adapter::write_over_a_socket(
+        std::path::Path::new(&path),
+        4 * 1024 * 1024,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect_err("the write went through");
+    interrupt.join().expect("the interrupt thread finished");
+
+    let answer = match error {
+        ConnectionError::Cancelled => "cancelled",
+        ConnectionError::Timeout => "timeout",
+        ConnectionError::Io(_) => "transport_error",
+        _ => "other",
+    };
+    fs::write(&result, answer).expect("write the result");
+}

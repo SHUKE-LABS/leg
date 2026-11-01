@@ -204,8 +204,12 @@ exchange — the connect, the write, and the read — so a host that stops
 answering cannot hold the bridge past it. A write that runs past the deadline
 is a `timeout` as well, not a transport failure. The bridge also stops when the
 guest's process is interrupted, and answers `cancelled`; a write that is
-interrupted is a `cancelled` too. In both cases it closes the connection, so
-the host sees the end of the exchange and can stop the work it started.
+interrupted is a `cancelled` too. A write that is stuck does not wait for the
+whole of the remaining time: the bridge gives the socket a short interval,
+looks at the clock and at the interrupt flag, and writes again, so a cancelled
+request ends within that interval rather than at the deadline. In both cases
+it closes the connection, so the host sees the end of the exchange and can stop
+the work it started.
 
 ### What a platform adapter must keep
 
