@@ -1,9 +1,9 @@
 use super::adapter::{
-    self, ConnectionError, HostAdapter, HostConnection, HostOutcome, HostRequest,
+    self, ConnectionError, HostAdapter, HostConnection, HostExchange, HostOutcome, HostRequest,
 };
 use super::protocol::{self, BridgeResponse, BridgeStatus};
 use super::service::Bridge;
-use super::state::{AuditLog, BridgeState};
+use super::state::{AuditLog, BridgeState, RequestRecord};
 
 use std::fs;
 use std::path::PathBuf;
@@ -44,28 +44,49 @@ struct FakeHost {
     answers: Vec<HostOutcome>,
     /// The requests the host received.
     seen: Vec<HostRequest>,
+    /// Whether the request reached the host.
+    reached: bool,
 }
 
 impl FakeHost {
     /// A host that answers every request the same way.
+    ///
+    /// The request reached the host, so its id is used.
     fn always(answer: HostOutcome) -> Self {
         FakeHost {
             answers: vec![answer],
             seen: Vec::new(),
+            reached: true,
+        }
+    }
+
+    /// A host the request never reached.
+    ///
+    /// Nothing was carried to the host, so the request id stays free.
+    fn never_reached(answer: HostOutcome) -> Self {
+        FakeHost {
+            answers: vec![answer],
+            seen: Vec::new(),
+            reached: false,
         }
     }
 }
 
 impl HostAdapter for FakeHost {
-    fn dispatch(&mut self, request: &HostRequest, _deadline: Instant) -> HostOutcome {
+    fn dispatch(&mut self, request: &HostRequest, _deadline: Instant) -> HostExchange {
         self.seen.push(request.clone());
-        if self.answers.len() > 1 {
-            return self.answers.remove(0);
+        let outcome = if self.answers.len() > 1 {
+            self.answers.remove(0)
+        } else {
+            self.answers
+                .first()
+                .cloned()
+                .unwrap_or(HostOutcome::Cancelled)
+        };
+        HostExchange {
+            outcome,
+            reached: self.reached,
         }
-        self.answers
-            .first()
-            .cloned()
-            .unwrap_or(HostOutcome::Cancelled)
     }
 }
 
@@ -77,6 +98,8 @@ struct FakeConnection {
     sent: Vec<String>,
     /// Whether the connection stays silent instead of closing.
     silent: bool,
+    /// The failure the write ends in, when the write fails.
+    send_error: Option<ConnectionError>,
 }
 
 impl FakeConnection {
@@ -91,6 +114,7 @@ impl FakeConnection {
             frames,
             sent: Vec::new(),
             silent: false,
+            send_error: None,
         }
     }
 
@@ -100,14 +124,28 @@ impl FakeConnection {
             frames: Vec::new(),
             sent: Vec::new(),
             silent: true,
+            send_error: None,
+        }
+    }
+
+    /// A connection whose write ends in `error`.
+    fn failing(error: ConnectionError) -> Self {
+        Self {
+            frames: Vec::new(),
+            sent: Vec::new(),
+            silent: false,
+            send_error: Some(error),
         }
     }
 }
 
 impl HostConnection for FakeConnection {
-    fn send(&mut self, frame: &str, _deadline: Instant) -> Result<(), String> {
+    fn send(&mut self, frame: &str, _deadline: Instant) -> Result<(), ConnectionError> {
         self.sent.push(frame.to_string());
-        Ok(())
+        match &self.send_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     fn receive(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, ConnectionError> {
@@ -179,12 +217,15 @@ struct SharedHost {
 }
 
 impl HostAdapter for SharedHost {
-    fn dispatch(&mut self, request: &HostRequest, _deadline: Instant) -> HostOutcome {
+    fn dispatch(&mut self, request: &HostRequest, _deadline: Instant) -> HostExchange {
         self.seen
             .lock()
             .expect("the host lock")
             .push(request.clone());
-        HostOutcome::Ok(json!({"items": []}))
+        HostExchange {
+            outcome: HostOutcome::Ok(json!({"items": []})),
+            reached: true,
+        }
     }
 }
 
@@ -421,6 +462,7 @@ fn an_approval_is_required_before_the_capability_runs() {
                 HostOutcome::Ok(json!({"items": []})),
             ],
             seen: Vec::new(),
+            reached: true,
         },
         &scratch,
     );
@@ -463,6 +505,7 @@ fn an_approval_is_bound_to_the_capability_and_its_input() {
                 HostOutcome::Ok(json!({"items": []})),
             ],
             seen: Vec::new(),
+            reached: true,
         },
         &scratch,
     );
@@ -532,6 +575,7 @@ fn an_approval_is_redeemed_once() {
                 HostOutcome::Ok(json!({"items": []})),
             ],
             seen: Vec::new(),
+            reached: true,
         },
         &scratch,
     );
@@ -998,6 +1042,176 @@ fn the_exchange_refuses_an_approval_with_a_huge_summary() {
 }
 
 #[test]
+fn the_exchange_refuses_an_approval_with_an_empty_review_summary() {
+    for review in [json!(""), json!("   "), json!({}), json!({"summary": ""})] {
+        let request = host_request();
+        let mut connection = FakeConnection::answering(vec![reply(
+            &request,
+            "approval_required",
+            json!({
+                "approval_token": "token-0123456789abcdef",
+                "review": review,
+            }),
+        )]);
+
+        let outcome = adapter::exchange(
+            &mut connection,
+            &request,
+            Instant::now() + Duration::from_secs(5),
+        );
+
+        match outcome {
+            HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_protocol_violation"),
+            other => panic!("the outcome was {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_write_that_runs_past_the_deadline_is_answered_timeout() {
+    let mut connection = FakeConnection::failing(ConnectionError::Timeout);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &host_request(),
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    assert_eq!(outcome, HostOutcome::TimedOut);
+}
+
+#[test]
+fn a_write_that_was_cancelled_is_answered_cancelled() {
+    let mut connection = FakeConnection::failing(ConnectionError::Cancelled);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &host_request(),
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    assert_eq!(outcome, HostOutcome::Cancelled);
+}
+
+#[test]
+fn a_broken_connection_is_answered_transport_error() {
+    let mut connection =
+        FakeConnection::failing(ConnectionError::Io("the socket broke".to_string()));
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &host_request(),
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "transport_error"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn a_request_that_never_connected_keeps_its_id() {
+    for outcome in [HostOutcome::TimedOut, HostOutcome::Cancelled] {
+        let scratch = scratch("never-connected");
+        let mut first = bridge(FakeHost::never_reached(outcome.clone()), &scratch);
+
+        let response = first.handle(&request("r-1", "files.list", json!({})));
+        assert_ne!(response.status, BridgeStatus::Ok);
+
+        // Nothing reached the host, so the caller may try again with the same
+        // request id.
+        let mut second = bridge(
+            FakeHost::always(HostOutcome::Ok(json!({"items": []}))),
+            &scratch,
+        );
+        let response = second.handle(&request("r-1", "files.list", json!({})));
+        assert_eq!(
+            response.status,
+            BridgeStatus::Ok,
+            "the request id was not free again: {response:?}"
+        );
+    }
+}
+
+#[test]
+fn a_ledger_with_an_unknown_nested_field_is_refused() {
+    let scratch = scratch("nested-field");
+    fs::write(
+        scratch.path.join("state.json"),
+        r#"{"schema":"leg.bridge.state/v1","requests":{"r-1":{"input_sha256":"aa",
+           "terminal_state":"ok","issued_at":1,"extra":"surprise"}}}"#,
+    )
+    .expect("write the ledger");
+
+    let error = BridgeState::load(&scratch.path).expect_err("the ledger was read");
+    assert!(
+        error.contains("unknown field"),
+        "the refusal did not name the unknown field: {error}"
+    );
+}
+
+#[test]
+fn a_ledger_with_a_record_that_is_not_the_documented_shape_is_refused() {
+    let scratch = scratch("record-shape");
+    fs::write(
+        scratch.path.join("state.json"),
+        r#"{"schema":"leg.bridge.state/v1","requests":{"r-1":{"input_sha256":"not-a-digest",
+           "terminal_state":"ok","issued_at":1}}}"#,
+    )
+    .expect("write the ledger");
+
+    let error = BridgeState::load(&scratch.path).expect_err("the ledger was read");
+    assert!(
+        error.contains("digest"),
+        "the refusal did not name the record: {error}"
+    );
+}
+
+#[test]
+fn a_ledger_with_an_unknown_request_id_is_refused() {
+    let scratch = scratch("record-id");
+    fs::write(
+        scratch.path.join("state.json"),
+        r#"{"schema":"leg.bridge.state/v1","requests":{"not a request id":
+           {"input_sha256":"aa","terminal_state":"ok","issued_at":1}}}"#,
+    )
+    .expect("write the ledger");
+
+    let error = BridgeState::load(&scratch.path).expect_err("the ledger was read");
+    assert!(
+        error.contains("request id"),
+        "the refusal did not name the record: {error}"
+    );
+}
+
+#[test]
+fn a_ledger_that_would_grow_past_its_limit_is_not_published() {
+    let scratch = scratch("oversized-save");
+    let mut state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    state.requests.insert(
+        "r-1".to_string(),
+        RequestRecord {
+            input_sha256: "x".repeat(200 * 1024),
+            terminal_state: "ok".to_string(),
+            issued_at: 1,
+        },
+    );
+
+    let error = state
+        .save()
+        .expect_err("the oversized ledger was published");
+    assert!(
+        error.contains("limit"),
+        "the refusal did not name the limit: {error}"
+    );
+    assert!(
+        !scratch.path.join("state.json").exists(),
+        "the oversized ledger reached the disk"
+    );
+}
+
+#[test]
 fn an_answer_that_grew_past_the_limit_is_replaced_by_a_fixed_one() {
     let scratch = scratch("huge-answer");
     // The result is under the result limit and over the response limit, so
@@ -1086,12 +1300,15 @@ struct LedgerBreakingHost {
 }
 
 impl HostAdapter for LedgerBreakingHost {
-    fn dispatch(&mut self, _request: &HostRequest, _deadline: Instant) -> HostOutcome {
+    fn dispatch(&mut self, _request: &HostRequest, _deadline: Instant) -> HostExchange {
         // The ledger cannot be written any more: a directory stands where the
         // ledger file belongs.
         let _ = fs::remove_file(&self.path);
         let _ = fs::create_dir_all(&self.path);
-        HostOutcome::Ok(json!({"items": []}))
+        HostExchange {
+            outcome: HostOutcome::Ok(json!({"items": []})),
+            reached: true,
+        }
     }
 }
 
@@ -1125,12 +1342,16 @@ fn a_host_socket_that_is_not_there_is_unreachable() {
     let mut adapter = adapter::SocketHostAdapter::new(scratch.path.join("nothing.sock"));
     let request = host_request();
 
-    let outcome = adapter.dispatch(&request, Instant::now() + Duration::from_secs(5));
+    let exchange = adapter.dispatch(&request, Instant::now() + Duration::from_secs(5));
 
-    match outcome {
+    match exchange.outcome {
         HostOutcome::Unavailable { reason, .. } => assert_eq!(reason, "host_unreachable"),
         other => panic!("the outcome was {other:?}"),
     }
+    assert!(
+        !exchange.reached,
+        "the request reached a host that is not there"
+    );
 }
 
 #[cfg(unix)]
@@ -1140,7 +1361,11 @@ fn a_host_socket_that_cannot_be_reached_in_time_times_out() {
     let mut adapter = adapter::SocketHostAdapter::new(scratch.path.join("nothing.sock"));
     let request = host_request();
 
-    let outcome = adapter.dispatch(&request, Instant::now() - Duration::from_secs(1));
+    let exchange = adapter.dispatch(&request, Instant::now() - Duration::from_secs(1));
 
-    assert_eq!(outcome, HostOutcome::TimedOut);
+    assert_eq!(exchange.outcome, HostOutcome::TimedOut);
+    assert!(
+        !exchange.reached,
+        "the request reached a host it never connected to"
+    );
 }

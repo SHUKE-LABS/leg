@@ -199,12 +199,13 @@ impl Bridge {
             timeout_ms,
         };
 
-        let outcome = self.adapter.dispatch(&host_request, deadline);
+        let exchange = self.adapter.dispatch(&host_request, deadline);
         let response = self.finish(
             request,
             &digest,
             input_fields,
-            outcome,
+            exchange.outcome,
+            exchange.reached,
             continuation,
             started,
         );
@@ -413,19 +414,20 @@ impl Bridge {
     }
 
     /// Turns the host's answer into the bridge's answer.
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &mut self,
         request: BridgeRequest,
         digest: &str,
         input_fields: Vec<String>,
         outcome: HostOutcome,
+        reached: bool,
         continuation: bool,
         started: Instant,
     ) -> BridgeResponse {
         let request_id = request.request_id.clone();
         let capability = request.capability.clone();
         let token = request.approval_token.clone();
-        let reached = reached_host(&outcome);
         // The approval the host issued, when it issued one.
         let mut issued: Option<String> = None;
 
@@ -664,19 +666,5 @@ impl Bridge {
         }
 
         response
-    }
-}
-
-/// Whether the request reached the host.
-///
-/// A transport that never connected leaves the request id free: nothing
-/// happened, so the caller may try again with the same id.
-fn reached_host(outcome: &HostOutcome) -> bool {
-    match outcome {
-        HostOutcome::Unavailable { reason, .. } => !matches!(
-            reason.as_str(),
-            "no_host_transport" | "host_unreachable" | "host_transport_unsupported"
-        ),
-        _ => true,
     }
 }

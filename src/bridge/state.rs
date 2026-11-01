@@ -9,13 +9,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::protocol::{MAX_REQUEST_ID_LEN, sha256_hex};
+use super::protocol::{BridgeStatus, MAX_REQUEST_ID_LEN, capability, sha256_hex, valid_request_id};
 
 /// The schema of the bridge state file.
 const STATE_SCHEMA: &str = "leg.bridge.state/v1";
@@ -68,6 +68,7 @@ const MAX_AUDIT_BYTES: u64 = 256 * 1024;
 /// The record holds the request id, the digest of the request input, and the
 /// state the request ended in. It never holds the input itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestRecord {
     /// The digest of the request input.
     pub input_sha256: String,
@@ -84,6 +85,7 @@ pub struct RequestRecord {
 /// holds its digest, so a token that reaches the ledger file cannot be
 /// replayed from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRecord {
     /// The capability the approval was granted for.
     pub capability: String,
@@ -159,32 +161,15 @@ impl BridgeState {
     /// understand.
     pub fn load(dir: &Path) -> Result<Self, String> {
         let path = dir.join(STATE_FILE);
-        let text = match fs::metadata(&path) {
-            Ok(metadata) if metadata.len() > MAX_STATE_BYTES => {
-                return Err(format!(
-                    "the bridge state at {} is larger than the {MAX_STATE_BYTES} byte limit",
-                    path.display()
-                ));
-            }
-            Ok(_) => fs::read_to_string(&path).map_err(|error| {
-                format!(
-                    "could not read the bridge state at {}: {error}",
-                    path.display()
-                )
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let text = match read_bounded(&path)? {
+            Some(text) => text,
+            None => {
                 let mut state = BridgeState {
                     schema: state_schema(),
                     ..BridgeState::default()
                 };
                 state.dir = dir.to_path_buf();
                 return Ok(state);
-            }
-            Err(error) => {
-                return Err(format!(
-                    "could not read the bridge state at {}: {error}",
-                    path.display()
-                ));
             }
         };
         let mut state: BridgeState = serde_json::from_str(&text).map_err(|error| {
@@ -200,6 +185,7 @@ impl BridgeState {
                 state.schema
             ));
         }
+        state.check_records(&path)?;
         state.trim_to_bounds();
         state.dir = dir.to_path_buf();
         Ok(state)
@@ -236,13 +222,21 @@ impl BridgeState {
     /// Writes the state back to its directory.
     ///
     /// The write is atomic: the ledger reaches the disk whole or not at all,
-    /// so a request id is never half remembered.
+    /// so a request id is never half remembered. The ledger is bounded on the
+    /// way out as well as on the way in: a state that would grow past the
+    /// limit is refused, so the bridge never publishes a ledger it would
+    /// refuse to read.
     pub fn save(&self) -> Result<(), String> {
         fs::create_dir_all(&self.dir)
             .map_err(|error| format!("could not create the state directory: {error}"))?;
         let path = self.dir.join(STATE_FILE);
         let text = serde_json::to_string_pretty(self)
             .map_err(|error| format!("could not serialize the bridge state: {error}"))?;
+        if text.len() as u64 > MAX_STATE_BYTES {
+            return Err(format!(
+                "the bridge state would be larger than the {MAX_STATE_BYTES} byte limit"
+            ));
+        }
         let temporary = path.with_extension("tmp");
         {
             let mut file = fs::File::create(&temporary)
@@ -351,6 +345,65 @@ impl BridgeState {
         self.trim_to_bounds();
     }
 
+    /// Checks that every record in the ledger has the documented shape.
+    ///
+    /// The bridge trusts the ledger it reads: it decides which request ids
+    /// are used and which approvals are still redeemable. A record that does
+    /// not have the shape the bridge writes is not one the bridge wrote, so
+    /// the whole ledger is refused instead of being read as if it were its
+    /// own.
+    fn check_records(&self, path: &Path) -> Result<(), String> {
+        for (request_id, record) in &self.requests {
+            if !valid_request_id(request_id) {
+                return Err(format!(
+                    "the bridge state at {} holds the request id `{request_id}`, which is not one",
+                    path.display()
+                ));
+            }
+            if !is_digest(&record.input_sha256) {
+                return Err(format!(
+                    "the bridge state at {} holds a request record whose digest is not a digest",
+                    path.display()
+                ));
+            }
+            if !is_terminal_state(&record.terminal_state) {
+                return Err(format!(
+                    "the bridge state at {} holds a request record that ended in `{}`",
+                    path.display(),
+                    record.terminal_state
+                ));
+            }
+        }
+        for (token_digest, record) in &self.approvals {
+            if !is_digest(token_digest) || token_digest != &record.token_sha256 {
+                return Err(format!(
+                    "the bridge state at {} holds an approval under a key that is not its digest",
+                    path.display()
+                ));
+            }
+            if !is_digest(&record.input_sha256) {
+                return Err(format!(
+                    "the bridge state at {} holds an approval whose digest is not a digest",
+                    path.display()
+                ));
+            }
+            if capability(&record.capability).is_none() {
+                return Err(format!(
+                    "the bridge state at {} holds an approval for the unknown capability `{}`",
+                    path.display(),
+                    record.capability
+                ));
+            }
+            if record.expires_at < record.issued_at {
+                return Err(format!(
+                    "the bridge state at {} holds an approval that expires before it was issued",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Keeps the ledger within its bounds.
     ///
     /// The oldest records fall out first, so the ledger always holds the most
@@ -381,6 +434,65 @@ impl BridgeState {
             self.approvals.remove(&oldest);
         }
     }
+}
+
+/// Reads a ledger file that may not exist, at most `MAX_STATE_BYTES` long.
+///
+/// The file is read through a bounded reader, so a file that grew between a
+/// size check and the read cannot be pulled into memory, and a file that is
+/// over the limit is refused rather than truncated.
+fn read_bounded(path: &Path) -> Result<Option<String>, String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not read the bridge state at {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "could not read the bridge state at {}: {error}",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(format!(
+            "the bridge state at {} is larger than the {MAX_STATE_BYTES} byte limit",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| format!("the bridge state at {} is not valid UTF-8", path.display()))
+}
+
+/// Whether a string is a SHA-256 digest in lowercase hex.
+fn is_digest(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character))
+}
+
+/// Whether a state is one the bridge writes.
+fn is_terminal_state(state: &str) -> bool {
+    state == STATE_DISPATCHING
+        || [
+            BridgeStatus::Ok,
+            BridgeStatus::ApprovalRequired,
+            BridgeStatus::Denied,
+            BridgeStatus::Cancelled,
+            BridgeStatus::Unavailable,
+            BridgeStatus::Error,
+        ]
+        .iter()
+        .any(|status| status.as_str() == state)
 }
 
 /// Why the lock on the ledger could not be taken.

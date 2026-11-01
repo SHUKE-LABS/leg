@@ -130,9 +130,12 @@ A capability that needs consent never runs before the host approved it.
 1. The Skill sends the request without a token. The host answers
    `approval_required` with a review summary and a one-time token. Nothing was
    performed. The summary is not optional: a host that asks for an approval
-   without one, with one that is not reviewable, or with one that is over the
-   limit broke the protocol, and the bridge answers
+   without one, with one that is not reviewable, with one that is empty, or
+   with one that is over the limit broke the protocol, and the bridge answers
    `host_protocol_violation` rather than asking a human to approve nothing.
+   A summary is a string with content in it, or an object with at least one
+   field that carries content; an empty string, an empty object, and an
+   object whose fields are all empty are not summaries.
 2. The bridge records the binding: the capability, the digest of the input,
    the digest of the token, and the expiry.
 3. The Skill sends a **follow-up request**: a **fresh `request_id`**, the same
@@ -198,10 +201,11 @@ without answering are distinct failures (`host_protocol_violation` and
 Every request has a deadline: the bridge stops waiting at the deadline and
 answers `error` with the reason `timeout`. The deadline covers the whole
 exchange — the connect, the write, and the read — so a host that stops
-answering cannot hold the bridge past it. The bridge also stops when the
-guest's process is interrupted, and answers `cancelled`. In both cases it
-closes the connection, so the host sees the end of the exchange and can stop
-the work it started.
+answering cannot hold the bridge past it. A write that runs past the deadline
+is a `timeout` as well, not a transport failure. The bridge also stops when the
+guest's process is interrupted, and answers `cancelled`; a write that is
+interrupted is a `cancelled` too. In both cases it closes the connection, so
+the host sees the end of the exchange and can stop the work it started.
 
 ### What a platform adapter must keep
 
@@ -240,13 +244,20 @@ reaches the host.
   The operating system releases the lock when the holder ends, so a crash
   leaves no lock behind.
 - **The ledger is bounded and it is the bridge's own.** A ledger that is
-  larger than the limit, that speaks another schema, or that carries fields
-  the bridge does not know is refused: the bridge never reads a foreign
-  ledger as if it were its own, and never resets one it does not understand.
+  larger than the limit, that speaks another schema, that carries fields the
+  bridge does not know — in the ledger itself or in the records inside it — or
+  that holds a record that is not the shape the bridge writes is refused: the
+  bridge never reads a foreign ledger as if it were its own, and never resets
+  one it does not understand. The bound holds on the way out as well: a ledger
+  that would grow past the limit is not published.
 - **Retention.** The ledger keeps the last 64 request ids. An id that falls
   out of the ledger may be used again.
 - **A request that never reached the host keeps its id.** A guest whose host
   was not reachable may try again with the same id, because nothing happened.
+  That covers a transport that never connected — a connect that ran past the
+  deadline, or one that was cancelled — and a request that was refused before
+  it was dispatched. A write that failed halfway is not proof that the host
+  never saw the request, so that id is used.
 - **A ledger that cannot be written is a failure of its own.** The bridge
   refuses the request before it calls the host (`state_unavailable`), and it
   answers a recorded failure when the ledger cannot be written after the host

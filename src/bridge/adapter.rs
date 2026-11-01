@@ -93,13 +93,27 @@ pub enum HostOutcome {
     TimedOut,
 }
 
+/// What the host answered, and whether the request reached it.
+///
+/// The two are separate facts. A transport that never connected did not
+/// deliver the request, so nothing happened and the request id stays free; a
+/// transport that carried the request may have started the work, so the id is
+/// used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostExchange {
+    /// The outcome of the exchange.
+    pub outcome: HostOutcome,
+    /// Whether the request reached the host.
+    pub reached: bool,
+}
+
 /// The seam a platform adapter implements.
 ///
 /// The host answers one request at a time; the bridge gives it a deadline and
 /// expects one answer before that deadline.
 pub trait HostAdapter {
     /// Hands one request to the host and waits for its answer.
-    fn dispatch(&mut self, request: &HostRequest, deadline: Instant) -> HostOutcome;
+    fn dispatch(&mut self, request: &HostRequest, deadline: Instant) -> HostExchange;
 }
 
 /// The transport the bridge uses when the host configured none.
@@ -110,10 +124,13 @@ pub trait HostAdapter {
 pub struct UnavailableAdapter;
 
 impl HostAdapter for UnavailableAdapter {
-    fn dispatch(&mut self, _request: &HostRequest, _deadline: Instant) -> HostOutcome {
-        HostOutcome::Unavailable {
-            reason: "no_host_transport".to_string(),
-            message: "the host configured no capability transport for the guest".to_string(),
+    fn dispatch(&mut self, _request: &HostRequest, _deadline: Instant) -> HostExchange {
+        HostExchange {
+            outcome: HostOutcome::Unavailable {
+                reason: "no_host_transport".to_string(),
+                message: "the host configured no capability transport for the guest".to_string(),
+            },
+            reached: false,
         }
     }
 }
@@ -125,6 +142,10 @@ pub enum ConnectionError {
     Closed,
     /// The host's frame was larger than the limit.
     TooLarge,
+    /// The connection ran past the request deadline.
+    Timeout,
+    /// The guest interrupted the request while the connection was busy.
+    Cancelled,
     /// The connection itself failed.
     Io(String),
 }
@@ -136,7 +157,11 @@ pub enum ConnectionError {
 /// implementation of this trait, and the protocol around it stays the same.
 pub trait HostConnection {
     /// Writes one frame to the host, before `deadline`.
-    fn send(&mut self, frame: &str, deadline: Instant) -> Result<(), String>;
+    ///
+    /// The failure is typed: a write that ran past the deadline and a write
+    /// that was cancelled are not the same thing as a broken connection, and
+    /// the bridge answers them differently.
+    fn send(&mut self, frame: &str, deadline: Instant) -> Result<(), ConnectionError>;
 
     /// Reads one frame from the host, waiting at most `wait` for it.
     ///
@@ -189,31 +214,55 @@ impl SocketHostAdapter {
 }
 
 impl HostAdapter for SocketHostAdapter {
-    fn dispatch(&mut self, request: &HostRequest, deadline: Instant) -> HostOutcome {
+    fn dispatch(&mut self, request: &HostRequest, deadline: Instant) -> HostExchange {
         #[cfg(unix)]
         {
             let stream = match connect_within(&self.path, deadline) {
                 Ok(stream) => stream,
-                Err(ConnectFailure::TimedOut) => return HostOutcome::TimedOut,
-                Err(ConnectFailure::Cancelled) => return HostOutcome::Cancelled,
+                // Nothing was carried to the host, so the request id stays
+                // free: the caller may try again with the same id.
+                Err(ConnectFailure::TimedOut) => {
+                    return HostExchange {
+                        outcome: HostOutcome::TimedOut,
+                        reached: false,
+                    };
+                }
+                Err(ConnectFailure::Cancelled) => {
+                    return HostExchange {
+                        outcome: HostOutcome::Cancelled,
+                        reached: false,
+                    };
+                }
                 Err(ConnectFailure::Unreachable(message)) => {
-                    return HostOutcome::Unavailable {
-                        reason: "host_unreachable".to_string(),
-                        message,
+                    return HostExchange {
+                        outcome: HostOutcome::Unavailable {
+                            reason: "host_unreachable".to_string(),
+                            message,
+                        },
+                        reached: false,
                     };
                 }
             };
             let mut connection = UnixHostConnection::new(stream);
-            exchange(&mut connection, request, deadline)
+            // The host is connected, so the request may have reached it. A
+            // write that failed halfway is not proof that it did not, so the
+            // request id is used.
+            HostExchange {
+                outcome: exchange(&mut connection, request, deadline),
+                reached: true,
+            }
         }
         #[cfg(not(unix))]
         {
             let _ = (request, deadline);
-            HostOutcome::Unavailable {
-                reason: "host_transport_unsupported".to_string(),
-                message:
-                    "this platform has no Unix socket transport; the guest runs on a Unix host"
-                        .to_string(),
+            HostExchange {
+                outcome: HostOutcome::Unavailable {
+                    reason: "host_transport_unsupported".to_string(),
+                    message:
+                        "this platform has no Unix socket transport; the guest runs on a Unix host"
+                            .to_string(),
+                },
+                reached: false,
             }
         }
     }
@@ -306,25 +355,34 @@ impl UnixHostConnection {
 
 #[cfg(unix)]
 impl HostConnection for UnixHostConnection {
-    fn send(&mut self, frame: &str, deadline: Instant) -> Result<(), String> {
+    fn send(&mut self, frame: &str, deadline: Instant) -> Result<(), ConnectionError> {
         use std::io::Write as _;
 
         // The write is bounded by the deadline: the socket carries a timeout,
         // and the bridge gives the write up when the deadline is reached
-        // rather than waiting for a host that stopped reading.
+        // rather than waiting for a host that stopped reading. The wait also
+        // stops when the guest interrupts the request, so a host that stopped
+        // reading cannot hold a cancelled request past the deadline.
         let mut bytes = frame.as_bytes().to_vec();
         bytes.push(b'\n');
         let mut written = 0;
         while written < bytes.len() {
+            if crate::interrupt::is_signaled() {
+                return Err(ConnectionError::Cancelled);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err("the host socket could not be written before the deadline".to_string());
+                return Err(ConnectionError::Timeout);
             }
             self.stream
                 .set_write_timeout(Some(remaining.max(Duration::from_millis(1))))
-                .map_err(|error| format!("the host socket could not be written: {error}"))?;
+                .map_err(|error| ConnectionError::Io(error.to_string()))?;
             match self.stream.write(&bytes[written..]) {
-                Ok(0) => return Err("the host socket accepted no bytes".to_string()),
+                Ok(0) => {
+                    return Err(ConnectionError::Io(
+                        "the host socket accepted no bytes".to_string(),
+                    ));
+                }
                 Ok(count) => written += count,
                 Err(error)
                     if matches!(
@@ -332,13 +390,15 @@ impl HostConnection for UnixHostConnection {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Err(
-                        "the host socket could not be written before the deadline".to_string()
-                    );
+                    return Err(ConnectionError::Timeout);
                 }
+                // The write was interrupted: the loop looks at the clock and
+                // at the interrupt flag again before it writes more.
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    return Err(format!("the host socket could not be written: {error}"));
+                    return Err(ConnectionError::Io(format!(
+                        "the host socket could not be written: {error}"
+                    )));
                 }
             }
         }
@@ -421,9 +481,16 @@ pub fn exchange(
         }
     };
     if let Err(error) = connection.send(&frame, deadline) {
-        return HostOutcome::Failed {
-            reason: "transport_error".to_string(),
-            message: error,
+        // A write that ran past the deadline and a write that was cancelled
+        // are the two outcomes the contract names; a broken connection is a
+        // transport failure.
+        return match error {
+            ConnectionError::Timeout => HostOutcome::TimedOut,
+            ConnectionError::Cancelled => HostOutcome::Cancelled,
+            other => HostOutcome::Failed {
+                reason: "transport_error".to_string(),
+                message: transport_message(other),
+            },
         };
     }
 
@@ -459,7 +526,24 @@ pub fn exchange(
                     message: format!("the host's answer could not be read: {error}"),
                 };
             }
+            Err(ConnectionError::Timeout) => return HostOutcome::TimedOut,
+            Err(ConnectionError::Cancelled) => return HostOutcome::Cancelled,
         }
+    }
+}
+
+/// The message a transport failure carries.
+fn transport_message(error: ConnectionError) -> String {
+    match error {
+        ConnectionError::Io(message) => message,
+        ConnectionError::Closed => "the host closed the connection without answering".to_string(),
+        ConnectionError::TooLarge => {
+            format!("the host's answer is larger than the {MAX_HOST_FRAME_BYTES} byte limit")
+        }
+        ConnectionError::Timeout => {
+            "the host socket could not be written before the deadline".to_string()
+        }
+        ConnectionError::Cancelled => "the request was cancelled before it finished".to_string(),
     }
 }
 
@@ -553,6 +637,15 @@ fn outcome_from_reply(reply: HostReply) -> HostOutcome {
                         .to_string(),
                 };
             }
+            // An empty summary is not a summary: a human asked to approve
+            // nothing learns nothing about what would happen.
+            if !review_is_substantive(review) {
+                return HostOutcome::Failed {
+                    reason: "host_protocol_violation".to_string(),
+                    message: "the host asked for an approval with an empty review summary"
+                        .to_string(),
+                };
+            }
             if review.to_string().len() > MAX_REVIEW_BYTES {
                 return HostOutcome::Failed {
                     reason: "host_protocol_violation".to_string(),
@@ -585,6 +678,31 @@ fn outcome_from_reply(reply: HostReply) -> HostOutcome {
             let (reason, message) = split_error(reply.error, "host_error", "the host failed");
             HostOutcome::Failed { reason, message }
         }
+    }
+}
+
+/// Whether a review summary tells a human something.
+///
+/// A summary is substantive when it carries content: a string with more than
+/// whitespace in it, or an object with at least one field that holds
+/// something. An empty string, an empty object, and an object whose fields
+/// are all empty are not summaries.
+fn review_is_substantive(review: &Value) -> bool {
+    match review {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Object(fields) => fields.values().any(value_is_substantive),
+        _ => false,
+    }
+}
+
+/// Whether a value carries content a reader can see.
+fn value_is_substantive(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Object(fields) => fields.values().any(value_is_substantive),
+        Value::Array(items) => items.iter().any(value_is_substantive),
+        Value::Number(_) | Value::Bool(_) => true,
+        Value::Null => false,
     }
 }
 
