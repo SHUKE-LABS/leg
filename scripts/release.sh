@@ -1640,9 +1640,31 @@ for (const entry of manifest.binaries) console.log(entry.version_command);
 ' "${manifest_path}"
 }
 
+# `leg` is versioned together with the release, so it has to report the
+# release version. The companions keep their own crate versions, so they only
+# have to report a semver, the same contract the desktop release rows enforce
+# for the very same binaries.
+release_ish_verify_version_output() {
+    local name="${1:-}" expected_version="${2:-}" output="${3:-}"
+
+    [[ -n "${name}" && -n "${expected_version}" ]] || return 1
+    if [[ "${name}" == "leg" ]]; then
+        if grep -qxF "leg ${expected_version}" <<<"${output}"; then
+            return 0
+        fi
+        printf "release: 'leg --version' did not report 'leg %s'\n" "${expected_version}" >&2
+        return 1
+    fi
+    if grep -qxE "${name} [0-9]+\.[0-9]+\.[0-9]+" <<<"${output}"; then
+        return 0
+    fi
+    printf "release: '%s --version' did not report a semver version\n" "${name}" >&2
+    return 1
+}
+
 # Run the bundle in the pinned i386 Alpine image. The manifest records the
 # target and the exact command for each binary; the harness runs those
-# commands and checks that each one reports the release version.
+# commands and checks that each one reports a version.
 release_ish_smoke() {
     local archive_path="${1:-}" expected_version="${2:-}"
     local staging="" status=0 manifest="" volume="" output="" name=""
@@ -1686,11 +1708,7 @@ release_ish_smoke() {
     fi
     if (( status == 0 )) && [[ -n "${expected_version}" ]]; then
         while read -r name; do
-            if ! grep -qxF "${name} ${expected_version}" <<<"${output}"; then
-                printf "release: '%s --version' did not report '%s %s'\n" \
-                    "${name}" "${name}" "${expected_version}" >&2
-                status=1
-            fi
+            release_ish_verify_version_output "${name}" "${expected_version}" "${output}" || status=1
         done < <(release_ish_binary_names)
     fi
     rm -rf -- "${staging}"
