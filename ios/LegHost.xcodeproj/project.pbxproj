@@ -252,6 +252,8 @@
 				);
 				INFOPLIST_FILE = LegHost/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_GENERATE_MAP_FILE = YES;
+				LD_MAP_FILE_PATH = "$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).linkmap";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -261,7 +263,6 @@
 					"-force_load",
 					"$(BUILT_PRODUCTS_DIR)/libish_runtime.a",
 					"-lsqlite3",
-					"-Wl,-map,$(BUILT_PRODUCTS_DIR)/LegHost.linkmap",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -283,6 +284,8 @@
 				);
 				INFOPLIST_FILE = LegHost/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_GENERATE_MAP_FILE = YES;
+				LD_MAP_FILE_PATH = "$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).linkmap";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -292,7 +295,6 @@
 					"-force_load",
 					"$(BUILT_PRODUCTS_DIR)/libish_runtime.a",
 					"-lsqlite3",
-					"-Wl,-map,$(BUILT_PRODUCTS_DIR)/LegHost.linkmap",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost;
 				PRODUCT_NAME = "$(TARGET_NAME)";
