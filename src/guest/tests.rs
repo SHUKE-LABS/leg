@@ -646,6 +646,48 @@ fn a_failed_install_keeps_the_previous_state_record() {
 }
 
 #[test]
+fn a_failed_verification_keeps_the_previous_state_record() {
+    let scratch = scratch("previous-record-verification");
+    let mut guest = FakeGuest::new();
+    guest.verification_output = String::new();
+    let mut state = state(&scratch);
+    state.record_install("bash", "5.2.25-r0", 1_000_000);
+    state.save().expect("the state is written");
+
+    let preview =
+        provision(&mut guest, &request("bash"), &mut state).expect("the preview succeeds");
+    let token = preview.approval_token.expect("a token");
+    let approved = ProvisionRequest {
+        package: "bash".to_string(),
+        approval_token: Some(token),
+        storage_budget_bytes: None,
+    };
+    let error = provision(&mut guest, &approved, &mut state).expect_err("the verification fails");
+
+    assert_eq!(reason_of(&error), "verification_failed");
+    assert_eq!(
+        state
+            .installed
+            .get("bash")
+            .map(|entry| entry.version.clone()),
+        Some("5.2.25-r0".to_string()),
+        "the state lost the record it held"
+    );
+    assert_eq!(state.provisioned_install_bytes, 1_000_000);
+    assert_eq!(
+        persisted(&scratch)
+            .get("bash")
+            .map(|entry| entry.version.clone()),
+        Some("5.2.25-r0".to_string()),
+        "the persisted state lost the record it held"
+    );
+    assert!(
+        !guest.installed.contains_key("bash"),
+        "the guest still holds the package"
+    );
+}
+
+#[test]
 fn a_state_that_cannot_be_saved_keeps_the_previous_state_record() {
     let scratch = scratch("previous-record-save");
     let mut guest = FakeGuest::new();
