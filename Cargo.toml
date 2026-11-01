@@ -11,6 +11,10 @@ license-file = "LICENSE"
 name = "leg"
 path = "src/main.rs"
 
+[[bin]]
+name = "leg-bridge"
+path = "src/bin/leg-bridge.rs"
+
 [dependencies]
 base64 = "0.23.1"
 flate2 = "1.1"

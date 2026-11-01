@@ -214,6 +214,44 @@ The provisioned tools stay inside the guest: they are ordinary Alpine
 packages, they cannot grant native iOS or Android permissions, and they do
 not change how the desktop binaries install packages.
 
+### The capability bridge
+
+Inside the guest, `leg-bridge` carries a capability request to the host that
+owns the native permission. A mobile Skill calls it through the existing
+`bash` tool, with one request on standard input and one answer on standard
+output:
+
+```
+printf '%s\n' '{"version":1,"request_id":"r-1","capability":"photos.list","input":{"limit":5}}' \
+  | leg-bridge
+```
+
+The answer always has the same shape and exactly one of six statuses — `ok`,
+`approval_required`, `denied`, `cancelled`, `unavailable`, or `error`:
+
+```json
+{"version":1,"request_id":"r-1","status":"ok","result":{},"error":null}
+```
+
+The bridge validates the request before the host sees it: an unknown version,
+an unknown capability, an unknown field, a malformed document, an oversized
+request, a reused request id, and a path that is not relative and normalized
+are all refused without a dispatch. The request ids are kept unique by a
+locked ledger in the bridge state directory, so two invocations that share it
+cannot dispatch the same id. A capability that needs consent answers
+`approval_required` with a review summary and a one-time token, and runs
+nothing until the Skill replays that token with a fresh request id, the same
+capability, and the same input.
+
+The bridge talks to the host over one fixed transport — a Unix socket named
+by `LEG_BRIDGE_HOST_SOCKET` — and answers `unavailable` when the host
+configured none. It adds no tool to the desktop registry and changes no
+Skills contract: the host owns the permission prompt, the dispatch, the
+cancellation, and the user confirmation. The [capability bridge
+contract](docs/capability-bridge.md) defines the schemas, the capability
+names, the approval semantics, the limits, the audit summary, and the rule a
+platform adapter has to keep.
+
 ## Experimental TUI trial
 
 The terminal interface is experimental and ships with the npm package.

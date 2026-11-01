@@ -232,6 +232,16 @@ pub(crate) fn is_signaled() -> bool {
     signal().is_some()
 }
 
+/// Raises the interrupt flag, for the tests.
+///
+/// The flag is process-global, so a test that needs it has to run in a
+/// process of its own: the flag would otherwise reach every test that runs
+/// beside it.
+#[cfg(all(test, unix))]
+pub(crate) fn raise_for_tests() {
+    SIGNAL.store(libc::SIGINT, Ordering::Relaxed);
+}
+
 #[cfg(unix)]
 /// Polls stdin together with the signal pipe, so a signal wakes blocked reads.
 pub(crate) struct SignalAwareStdin {
