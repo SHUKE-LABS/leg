@@ -1,3 +1,5 @@
 /target
 __pycache__/
 companions/leg-tui/tests/reports/
+# Xcode derived data for the iOS host build (see ios/README.md).
+/build/
