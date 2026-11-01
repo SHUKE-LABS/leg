@@ -95,15 +95,18 @@ The host must contain the vendored iSH runtime and no proprietary leg code:
 
 ```
 nm -a build/dd/Build/Products/Release-iphonesimulator/LegHost.app/LegHost \
-    | grep -E '_vdso_symbol|_fiber_enter'
+    | grep -E '_fiber_enter|_emu_'
+grep -c 'libish_runtime.a(' \
+    build/dd/Build/Products/Release-iphonesimulator/LegHost-x86_64.linkmap
 nm -a build/dd/Build/Products/Release-iphonesimulator/LegHost.app/LegHost \
     | grep -iE 'leg_tui|leg_ui|leg_web|shukelabs'
 grep -iE 'leg_tui|leg_ui|leg-web|src/main\.rs|companions/' \
     build/dd/Build/Products/Release-iphonesimulator/LegHost-x86_64.linkmap
 ```
 
-The first command lists the vendored runtime symbols; the second and the third
-must print nothing.
+The first two commands show the vendored runtime: its symbols in the host
+binary and its objects in the link map. The last two must print nothing,
+because no proprietary leg crate or source is linked into the host.
 
 ## Out of scope
 
