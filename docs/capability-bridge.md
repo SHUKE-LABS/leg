@@ -4,19 +4,19 @@
 carries one capability request from a guest Skill to the host that owns the
 native permission, and one answer back. The bridge is a *protocol* boundary,
 not a capability implementation: it validates the request, binds the approval,
-keeps the request unique, bounds the time, and summarizes the exchange. The
+keeps the request id unique, bounds the time, and summarizes the exchange. The
 host owns the transport, the permission prompt, the dispatch, the
 cancellation, and the user confirmation.
 
-This document defines the request and response schemas, the capability names,
+This document defines the request and answer schemas, the capability names,
 the approval semantics, the size and time limits, the audit summary, and the
 rule a platform adapter has to keep.
 
 ## How a Skill calls the bridge
 
-The bridge ships in the iSH bundle next to `leg`. A mobile Skill calls it
-through the existing `bash` tool — the desktop agent core, the tool registry,
-and the Skills registry are unchanged by this contract:
+A mobile Skill calls the bridge through the existing `bash` tool — the
+desktop agent core, the tool registry, and the Skills registry are unchanged
+by this contract:
 
 ```
 printf '%s\n' '{"version":1,"request_id":"r-1","capability":"photos.list","input":{"limit":5}}' \
@@ -59,19 +59,18 @@ a request id, or carries a disallowed path.
 
 ### Capabilities
 
-| Capability | Approval | Input fields |
+| Capability | Consent | Input fields |
 | --- | --- | --- |
-| `photos.list` | required | `limit` (count, optional), `cursor` (text, optional) |
-| `photos.read` | required | `id` (text) |
-| `files.list` | not required | `path` (path, optional), `limit` (count, optional) |
-| `files.read` | required | `path` (path) |
-| `shortcuts.invoke` | required | `name` (text), `input` (object, optional) |
+| `photos.list` | needed | `limit` (count, optional), `cursor` (text, optional) |
+| `photos.read` | needed | `id` (text) |
+| `files.list` | not needed | `path` (path, optional), `limit` (count, optional) |
+| `files.read` | needed | `path` (path) |
+| `shortcuts.invoke` | needed | `name` (text), `input` (object, optional) |
 
 The names are the contract the mobile slices implement; this slice runs none
-of them. The *approval* column is the bridge's own policy: a capability marked
-"required" is previewed first and only runs once the host's approval token
-has been replayed. The host may ask for an approval for any capability, and
-the bridge honours that too.
+of them. The *consent* column names the capabilities the host is expected to
+gate behind a user approval. The host owns the consent decision: it may ask
+for an approval for any capability, and the bridge honours that too.
 
 A **path** is relative and normalized: no leading `/`, no `..` or `.` segment,
 no empty segment, no backslash, no drive letter, no `~`, no URL scheme, no
@@ -107,65 +106,88 @@ A failure carries a stable reason, a message, and a remediation:
 }
 ```
 
-The reasons that distinguish the outcomes a host can produce are
-`user_refused` (denied), `cancelled`, `no_host_transport` and
-`host_unreachable` and `permission_denied` (unavailable), `timeout` (the host
-did not answer in time), and `host_crashed` (the host's answer could not be
-read).
+The reasons are grouped by the status they answer with:
+
+| Status | Reasons |
+| --- | --- |
+| `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used` |
+| `cancelled` | `cancelled` |
+| `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied` |
+| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large` |
 
 ## Approval semantics
 
 A capability that needs consent never runs before the host approved it.
 
-1. The Skill sends the request without a token. The bridge previews it: the
-   host answers `approval_required` with a review summary and a one-time
-   token. The bridge performs **no** side effect.
-2. The bridge records the token against the request id, the capability, and
-   the digest of the input.
-3. The Skill replays the **same** request id with the **same** input and the
-   token. The bridge checks all three, hands the token to the host, and the
-   host performs the action and answers `ok`.
+1. The Skill sends the request without a token. The host answers
+   `approval_required` with a review summary and a one-time token. Nothing was
+   performed.
+2. The bridge records the binding: the capability, the digest of the input,
+   the digest of the token, and the expiry.
+3. The Skill sends a **follow-up request**: a **fresh `request_id`**, the same
+   capability, the same input, and the token in the top-level
+   `approval_token` field. The bridge checks the binding and hands the token
+   to the host, which verifies it before any side effect.
 
 The binding is what makes the approval mean something:
 
 - a token the bridge did not issue is refused (`approval_unknown`);
-- a token that belongs to another request is refused (`approval_invalid`);
 - an approval for another capability or for a different input is refused
   (`approval_mismatch`);
 - an approval older than ten minutes is refused (`approval_expired`);
-- a request id is used once; a second request with the same id and no token
-  is refused (`duplicate_request_id`).
+- a token that was already redeemed is refused (`approval_used`).
 
 The approval token is a host-side credential: keep it out of any channel the
 model can read, or the gate means nothing.
 
-## The host adapter
+## The host transport
 
-The host reaches the bridge through the `HostAdapter` seam
-(`src/bridge/adapter.rs`). This slice ships the file-backed transport and the
-seam; a later mobile slice implements the seam for its platform.
+The bridge talks to the host over **one fixed transport**: a Unix socket.
+The host listens on the socket and the guest connects to it; the socket is
+named by `LEG_BRIDGE_HOST_SOCKET`.
 
-The file-backed transport needs one directory the bridge and the host both
-see — `LEG_BRIDGE_HOST_DIR`. The bridge writes its request to
-`bridge-request-<request id>.json`, the host writes its answer to
-`bridge-response-<request id>.json`, and the bridge reads the answer only when
-it carries the request's nonce, so a stale answer is never mistaken for a
-fresh one. When the bridge stops waiting — a deadline or a signal — it writes
-`bridge-cancel-<request id>.json`, so the host can stop the work it started.
-The file names carry the request id, so two requests never share a file.
+The endpoint comes from the environment, so a request can never choose one.
+The bridge never loads a request-selected command, plugin, native library, or
+endpoint, and it never runs a capability itself.
 
-The host's answer is one JSON object:
+**The default is unavailable.** When the host configured no transport, the
+bridge answers `unavailable` with the reason `no_host_transport` rather than
+pretending the request failed:
+
+| Situation | Status | Reason |
+| --- | --- | --- |
+| No socket configured | `unavailable` | `no_host_transport` |
+| The socket is configured, but nothing listens on it | `unavailable` | `host_unreachable` |
+| The platform has no Unix sockets | `unavailable` | `host_transport_unsupported` |
+
+The guest is a Linux guest, so the Unix socket is the transport that matters;
+the last row only names the platforms this slice cannot serve.
+
+### The envelope
+
+One JSON line each way, bounded in size:
 
 ```json
-{
-  "version": 1,
-  "nonce": "…",
-  "request_id": "r-1",
-  "status": "approval_required",
-  "result": {"approval_token": "…", "review": {"summary": "…"}},
-  "error": null
-}
+{"version":1,"request_id":"r-1","nonce":"…","capability":"photos.list","input":{},"input_sha256":"…","timeout_ms":5000}
 ```
+
+```json
+{"version":1,"nonce":"…","request_id":"r-1","status":"ok","result":{},"error":null}
+```
+
+The bridge accepts an answer only when it carries the request's nonce and
+request id, so a stale answer is never mistaken for a fresh one. An answer in
+another version, an answer for another request, an answer that cannot be
+parsed, and a connection the host closed without answering are four distinct
+failures (`host_protocol_violation` and `host_crashed`).
+
+### Cancellation and the deadline
+
+Every request has a deadline: the bridge stops waiting at the deadline and
+answers `error` with the reason `timeout`. The bridge also stops when the
+guest's process is interrupted, and answers `cancelled`. In both cases it
+closes the connection, so the host sees the end of the exchange and can stop
+the work it started.
 
 ### What a platform adapter must keep
 
@@ -174,14 +196,30 @@ The host's answer is one JSON object:
   guest's reach: no shell, no native code loading, no private API, and no
   path outside the host's own sandbox.
 - **The host decides.** The permission prompt, the user confirmation, the
-  dispatch, and the cancellation belong to the host. A preview must not
-  perform the action; the bridge reports a host that breaks that rule as
-  `host_protocol_violation`.
+  dispatch, the cancellation, and the verification of an approval token
+  belong to the host.
 - **The bridge validates.** Every check in this document happens in the
   bridge, before the host sees the request. An adapter may add checks of its
   own; it may not skip the bridge's.
 - **No second registry.** The bridge is not an agent tool. It adds no tool to
   the desktop registry and changes no Skills contract.
+
+## Duplicate request ids
+
+A request id names one request, and it is used once.
+
+The bridge keeps a bounded ledger in the state directory. Every request that
+reached the host leaves a record of the request id, the digest of the input,
+and the terminal state the request ended in. A request that arrives with an id
+the ledger already holds is refused with `duplicate_request_id`, and it never
+reaches the host.
+
+- **Scope.** The ledger lives in the state directory, so the ids are refused
+  across the invocations that share it — the invocations of one guest.
+- **Retention.** The ledger keeps the last 64 request ids. An id that falls
+  out of the ledger may be used again.
+- **A request that never reached the host keeps its id.** A guest whose host
+  was not reachable may try again with the same id, because nothing happened.
 
 ## Limits
 
@@ -190,18 +228,17 @@ The host's answer is one JSON object:
 | Request line | 64 KiB |
 | Request input | 32 KiB |
 | Answer result | 64 KiB |
+| Host frame | 64 KiB |
 | Text field | 4 KiB |
 | Object field | 4 KiB |
 | Item count | 100 |
 | Path | 256 bytes |
 | Request id | 128 characters |
 | Deadline | 100 ms … 30 s, 5 s by default |
+| Approval lifetime | 10 minutes |
+| Ledger | 64 request ids, 32 approval bindings |
 
-Every request has a deadline and a cancellation path: the bridge stops
-waiting at the deadline, and it stops when the host stops it or when the
-guest's process is interrupted.
-
-## The audit summary
+## The audit summary and the ledger
 
 The bridge appends one JSON line per request to the audit log — `audit.log` in
 the state directory, or `LEG_BRIDGE_AUDIT_FILE`. The summary carries the
@@ -213,16 +250,21 @@ It never carries the *values*: no provider credential, no photo contents, no
 file contents, and no shortcut input. `LEG_BRIDGE_AUDIT=off` turns the log
 off.
 
+The ledger holds no values either: it keeps request ids, digests, terminal
+states, and the approval binding. The approval token itself is not written
+down — the ledger keeps its digest, so a token that reaches the ledger file
+cannot be replayed from it.
+
 ## Environment
 
 | Variable | Meaning |
 | --- | --- |
-| `LEG_BRIDGE_HOST_DIR` | The directory the bridge and the host share. Without it the bridge answers `unavailable`. |
-| `LEG_BRIDGE_STATE_DIR` | The directory the request records and the audit log live in. Else `XDG_STATE_HOME/leg/bridge`, else `~/.local/state/leg/bridge`. |
+| `LEG_BRIDGE_HOST_SOCKET` | The Unix socket the host listens on. Without it the bridge answers `unavailable`. |
+| `LEG_BRIDGE_STATE_DIR` | The directory the ledger and the audit log live in. Else `XDG_STATE_HOME/leg/bridge`, else `~/.local/state/leg/bridge`. |
 | `LEG_BRIDGE_AUDIT_FILE` | The file the audit summary is appended to. |
 | `LEG_BRIDGE_AUDIT` | `off` turns the audit summary off. |
 
-The state directory holds the request records that keep a request id unique
-and the approval tokens that wait to be redeemed. It lives beside the guest,
-not on the host: the approval an answer issues is redeemed by a later request
-in the same guest.
+The state directory holds the ledger that keeps a request id unique and the
+approval bindings that wait to be redeemed. It lives beside the guest, not on
+the host: the approval an answer issues is redeemed by a later request in the
+same guest.

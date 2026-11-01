@@ -188,7 +188,7 @@ test_ish_bundle_is_reproducible_and_verified() (
     version="0.40.0"
 
     mkdir -p "${repo}/binaries"
-    for name in leg leg-bridge leg-tui leg-web leg-ui-supervisor; do
+    for name in leg leg-tui leg-web leg-ui-supervisor; do
         make_ish_binary_fixture "${repo}/binaries" "${name}"
     done
 
@@ -200,11 +200,10 @@ test_ish_bundle_is_reproducible_and_verified() (
     assert_eq "SHA256SUMS
 ish-compatibility-v1.json
 leg
-leg-bridge
 leg-tui
 leg-ui-supervisor
 leg-web" "${entries}" \
-        "the iSH archive carries the five binaries, the manifest, and SHA256SUMS"
+        "the iSH archive carries the four binaries, the manifest, and SHA256SUMS"
 
     second="${repo}/second.tar.gz"
     release_ish_bundle "${version}" "${repo}/binaries" "${second}"
@@ -224,10 +223,10 @@ leg-web" "${entries}" \
     assert_eq "linux/386" \
         "$(node -e 'console.log(require(process.argv[1]).docker_platform)' "${manifest}")" \
         "the manifest records the container platform"
-    assert_eq "leg leg-bridge leg-tui leg-web leg-ui-supervisor" \
+    assert_eq "leg leg-tui leg-web leg-ui-supervisor" \
         "$(node -e 'console.log(require(process.argv[1]).binaries.map((b) => b.name).join(" "))' "${manifest}")" \
-        "the manifest lists the five shipped binaries"
-    assert_eq "leg --version leg-bridge --version leg-tui --version leg-web --version leg-ui-supervisor --version" \
+        "the manifest lists the four shipped binaries"
+    assert_eq "leg --version leg-tui --version leg-web --version leg-ui-supervisor --version" \
         "$(node -e 'console.log(require(process.argv[1]).binaries.map((b) => b.version_command).join(" "))' "${manifest}")" \
         "the manifest records the exact version command for every binary"
 )
@@ -240,7 +239,7 @@ test_ish_bundle_rejects_wrong_binaries() (
     version="0.40.0"
 
     mkdir -p "${repo}/binaries"
-    for name in leg leg-bridge leg-tui leg-web leg-ui-supervisor; do
+    for name in leg leg-tui leg-web leg-ui-supervisor; do
         make_ish_binary_fixture "${repo}/binaries" "${name}"
     done
     archive="${repo}/leg-${version}-i686-unknown-linux-musl.tar.gz"
@@ -323,15 +322,6 @@ test_ish_version_output_check() (
     release_ish_verify_version_output leg 0.41.0 "leg 0.41.0 (dirty)" >/dev/null 2>&1 || status="$?"
     assert_rc_nonzero "${status}"
 
-    # `leg-bridge` ships with `leg`, so it reports the release version too.
-    status=0
-    release_ish_verify_version_output leg-bridge 0.41.0 "leg-bridge 0.41.0" >/dev/null || status="$?"
-    (( status == 0 )) || fail "leg-bridge must report the release version"
-
-    status=0
-    release_ish_verify_version_output leg-bridge 0.41.0 "leg-bridge 0.1.0" >/dev/null 2>&1 || status="$?"
-    assert_rc_nonzero "${status}"
-
     # The companions keep their own crate versions, so the bundle only requires
     # a semver from them, the same contract the desktop release rows enforce.
     for name in leg-tui leg-web leg-ui-supervisor; do
@@ -352,15 +342,13 @@ test_ish_version_output_check() (
     # survive the echoed command lines around each version.
     output="+ leg --version
 leg 0.41.0
-+ leg-bridge --version
-leg-bridge 0.41.0
 + leg-tui --version
 leg-tui 0.1.0
 + leg-web --version
 leg-web 0.1.0
 + leg-ui-supervisor --version
 leg-ui-supervisor 0.1.0"
-    for name in leg leg-bridge leg-tui leg-web leg-ui-supervisor; do
+    for name in leg leg-tui leg-web leg-ui-supervisor; do
         status=0
         release_ish_verify_version_output "${name}" 0.41.0 "${output}" >/dev/null || status="$?"
         (( status == 0 )) || fail "${name} must be recognised in the smoke transcript"

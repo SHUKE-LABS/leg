@@ -89,9 +89,9 @@ checksums:
 sha256sum --check SHA256SUMS
 ```
 
-The archive holds `leg`, `leg-bridge`, `leg-tui`, `leg-web`, and
-`leg-ui-supervisor`, the compatibility manifest `ish-compatibility-v1.json`, and
-the inner `SHA256SUMS`. The manifest records the exact target
+The archive holds `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`, the
+compatibility manifest `ish-compatibility-v1.json`, and the inner
+`SHA256SUMS`. The manifest records the exact target
 (`i686-unknown-linux-musl`), the pinned Alpine release the bundle is tested
 against (Alpine 3.20.3, image `alpine:3.20.3`, run under `linux/386`), and the
 `--version` command for each binary.
@@ -238,12 +238,14 @@ an unknown capability, an unknown field, a malformed document, an oversized
 request, a reused request id, and a path that is not relative and normalized
 are all refused without a dispatch. A capability that needs consent answers
 `approval_required` with a review summary and a one-time token, and runs
-nothing until the Skill replays that token with the same request id and the
-same input.
+nothing until the Skill replays that token with a fresh request id, the same
+capability, and the same input.
 
-The bridge adds no tool to the desktop registry and changes no Skills
-contract: the host owns the transport, the permission prompt, the dispatch,
-the cancellation, and the user confirmation. The [capability bridge
+The bridge talks to the host over one fixed transport — a Unix socket named
+by `LEG_BRIDGE_HOST_SOCKET` — and answers `unavailable` when the host
+configured none. It adds no tool to the desktop registry and changes no
+Skills contract: the host owns the permission prompt, the dispatch, the
+cancellation, and the user confirmation. The [capability bridge
 contract](docs/capability-bridge.md) defines the schemas, the capability
 names, the approval semantics, the limits, the audit summary, and the rule a
 platform adapter has to keep.

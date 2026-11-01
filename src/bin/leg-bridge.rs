@@ -14,14 +14,13 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 
-use leg::bridge::adapter::{FileHostAdapter, UnavailableAdapter};
+use leg::bridge::adapter::{SocketHostAdapter, UnavailableAdapter};
 use leg::bridge::protocol::{BridgeError, BridgeResponse, BridgeStatus, MAX_REQUEST_BYTES};
 use leg::bridge::service::Bridge;
 use leg::bridge::state::{AuditLog, BridgeState};
 
-/// The environment variable that names the directory the bridge and the host
-/// share.
-const HOST_DIR_ENV: &str = "LEG_BRIDGE_HOST_DIR";
+/// The environment variable that names the Unix socket the host listens on.
+const HOST_SOCKET_ENV: &str = "LEG_BRIDGE_HOST_SOCKET";
 
 /// The usage of the bridge command.
 const USAGE: &str = "\
@@ -42,9 +41,9 @@ the cancellation; the bridge owns the protocol, the approval binding, and the
 audit summary.
 
 Environment:
-  LEG_BRIDGE_HOST_DIR   the directory the bridge and the host share. The
-                        bridge writes its request there and reads the host's
-                        answer from it. Without it the bridge answers
+  LEG_BRIDGE_HOST_SOCKET the Unix socket the host listens on. The bridge
+                        connects to it, writes the request, and reads the
+                        host's answer from it. Without it the bridge answers
                         \"unavailable\".
   LEG_BRIDGE_STATE_DIR  the directory the request records and the audit
                         summary live in. Else XDG_STATE_HOME/leg/bridge,
@@ -143,8 +142,8 @@ fn build_bridge() -> Result<Bridge, String> {
     let audit = AuditLog::from_env(&state_dir);
 
     let adapter: Box<dyn leg::bridge::adapter::HostAdapter> =
-        match std::env::var_os(HOST_DIR_ENV).filter(|path| !path.is_empty()) {
-            Some(dir) => Box::new(FileHostAdapter::new(dir)),
+        match std::env::var_os(HOST_SOCKET_ENV).filter(|path| !path.is_empty()) {
+            Some(path) => Box::new(SocketHostAdapter::new(path)),
             None => Box::new(UnavailableAdapter),
         };
 

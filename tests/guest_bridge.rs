@@ -2,17 +2,16 @@
 //!
 //! The bridge is driven the way a mobile Skill drives it: through the
 //! existing `bash` tool, with one request on standard input. The host side of
-//! the transport is played by the test, which answers through the directory
-//! the bridge and the host share.
+//! the transport is played by the test, which listens on the Unix socket the
+//! bridge connects to.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::Instant;
 
-use leg::bridge::adapter::response_file;
 use leg::tools::{BashTool, ToolHandler};
 use serde_json::{Value, json};
 
@@ -86,10 +85,18 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// Builds the command a guest Skill runs to reach the bridge.
-fn bridge_command(host_dir: &Path, state_dir: &Path, request: &str) -> String {
+///
+/// The host socket is named by the environment, never by the request.
+fn bridge_command(socket: Option<&Path>, state_dir: &Path, request: &str) -> String {
+    let transport = match socket {
+        Some(socket) => format!(
+            "LEG_BRIDGE_HOST_SOCKET={} ",
+            shell_quote(&socket.to_string_lossy())
+        ),
+        None => String::new(),
+    };
     format!(
-        "LEG_BRIDGE_HOST_DIR={} LEG_BRIDGE_STATE_DIR={} {} <<'BRIDGE_REQUEST'\n{}\nBRIDGE_REQUEST\n",
-        shell_quote(&host_dir.to_string_lossy()),
+        "{transport}LEG_BRIDGE_STATE_DIR={} {} <<'BRIDGE_REQUEST'\n{}\nBRIDGE_REQUEST\n",
         shell_quote(&state_dir.to_string_lossy()),
         shell_quote(&shell_path(Path::new(BRIDGE))),
         request.trim_end(),
@@ -97,8 +104,8 @@ fn bridge_command(host_dir: &Path, state_dir: &Path, request: &str) -> String {
 }
 
 /// Runs one request through the `bash` tool and returns the bridge's answer.
-fn ask(host_dir: &Path, state_dir: &Path, request: &str) -> Value {
-    run_command(&bridge_command(host_dir, state_dir, request))
+fn ask(socket: Option<&Path>, state_dir: &Path, request: &str) -> Value {
+    run_command(&bridge_command(socket, state_dir, request))
 }
 
 /// Runs one command through the `bash` tool and returns the bridge's answer.
@@ -125,89 +132,6 @@ fn run_command(command: &str) -> Value {
     serde_json::from_str(line).expect("the answer is JSON")
 }
 
-/// Answers the bridge the way a host does.
-///
-/// The host watches the shared directory for the request the bridge writes and
-/// answers it in the file that carries the same request id.
-fn spawn_host(
-    host_dir: PathBuf,
-    answer: impl Fn(&Value) -> Value + Send + 'static,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        // A request left over from an earlier exchange is not this one's.
-        for stale in fs::read_dir(&host_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("bridge-request-"))
-            })
-        {
-            let _ = fs::remove_file(stale);
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut request_path = None;
-        while Instant::now() < deadline && request_path.is_none() {
-            request_path = fs::read_dir(&host_dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| entry.path())
-                .find(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("bridge-request-"))
-                });
-            if request_path.is_none() {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-        let Some(request_path) = request_path else {
-            return;
-        };
-        let request: Value =
-            serde_json::from_str(&fs::read_to_string(&request_path).expect("read the request"))
-                .expect("the request is JSON");
-        let request_id = request["request_id"]
-            .as_str()
-            .expect("the request has an id");
-        let response_path = host_dir.join(response_file(request_id));
-        let reply = answer(&request);
-        fs::write(&response_path, reply.to_string()).expect("write the answer");
-    })
-}
-
-/// The request files the host can see in the shared directory.
-fn host_request_files(host_dir: &Path) -> Vec<PathBuf> {
-    fs::read_dir(host_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("bridge-request-"))
-        })
-        .collect()
-}
-
-/// Builds the host's answer for one request.
-fn reply(request: &Value, status: &str, result: Value) -> Value {
-    json!({
-        "version": 1,
-        "nonce": request["nonce"],
-        "request_id": request["request_id"],
-        "status": status,
-        "result": result,
-        "error": null,
-    })
-}
-
 /// A request the bridge accepts.
 fn request(id: &str, capability: &str, input: Value) -> String {
     json!({
@@ -219,26 +143,211 @@ fn request(id: &str, capability: &str, input: Value) -> String {
     .to_string()
 }
 
+/// The host the fixture plays.
+///
+/// The host listens on a Unix socket, reads the request the bridge writes,
+/// and answers it the way the test asks for.
+#[cfg(unix)]
+mod host {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+
+    /// What the fixture host does with a request.
+    pub enum Answer {
+        /// Answer with this status and result.
+        Reply {
+            /// The status the host answers with.
+            status: String,
+            /// The result the host answers with.
+            result: Value,
+        },
+        /// Answer with this status and failure.
+        Failure {
+            /// The status the host answers with.
+            status: String,
+            /// The failure the host answers with.
+            reason: String,
+            /// The detail the host answers with.
+            message: String,
+        },
+        /// Close the connection without answering.
+        Crash,
+        /// Stay silent until the test ends.
+        Silent,
+    }
+
+    /// The fixture host.
+    pub struct Fixture {
+        /// The socket the bridge connects to.
+        pub path: std::path::PathBuf,
+        /// How many requests the host received.
+        pub connections: Arc<AtomicUsize>,
+        /// The requests the host received.
+        pub seen: Arc<Mutex<Vec<Value>>>,
+        /// The thread the host runs in.
+        handle: Option<JoinHandle<()>>,
+        /// The flag that tells the host to stop.
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Fixture {
+        /// Starts a host that answers every request with `answer`.
+        pub fn start(
+            path: std::path::PathBuf,
+            answer: impl Fn(&Value) -> Answer + Send + 'static,
+        ) -> Self {
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind the host socket");
+            listener
+                .set_nonblocking(true)
+                .expect("the host socket polls for requests");
+
+            let connections = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let handle = {
+                let connections = Arc::clone(&connections);
+                let seen = Arc::clone(&seen);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                connections.fetch_add(1, Ordering::Relaxed);
+                                serve(stream, &answer, &seen, &stop);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+
+            Self {
+                path,
+                connections,
+                seen,
+                handle: Some(handle),
+                stop,
+            }
+        }
+
+        /// How many requests the host received.
+        pub fn connection_count(&self) -> usize {
+            self.connections.load(Ordering::Relaxed)
+        }
+
+        /// The requests the host received.
+        pub fn requests(&self) -> Vec<Value> {
+            self.seen.lock().expect("the host lock").clone()
+        }
+    }
+
+    /// Answers one request the way the fixture says.
+    fn serve(
+        stream: UnixStream,
+        answer: &impl Fn(&Value) -> Answer,
+        seen: &Arc<Mutex<Vec<Value>>>,
+        stop: &Arc<AtomicBool>,
+    ) {
+        let _ = stream.set_nonblocking(false);
+        let mut writer = match stream.try_clone() {
+            Ok(writer) => writer,
+            Err(_) => return,
+        };
+        let mut reader = BufReader::new(stream);
+
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+            return;
+        }
+        let request: Value = match serde_json::from_str(line.trim()) {
+            Ok(request) => request,
+            Err(_) => return,
+        };
+        seen.lock().expect("the host lock").push(request.clone());
+
+        match answer(&request) {
+            Answer::Reply { status, result } => {
+                let reply = json!({
+                    "version": 1,
+                    "nonce": request["nonce"],
+                    "request_id": request["request_id"],
+                    "status": status,
+                    "result": result,
+                    "error": null,
+                });
+                let _ = writeln!(writer, "{reply}");
+                let _ = writer.flush();
+            }
+            Answer::Failure {
+                status,
+                reason,
+                message,
+            } => {
+                let reply = json!({
+                    "version": 1,
+                    "nonce": request["nonce"],
+                    "request_id": request["request_id"],
+                    "status": status,
+                    "result": null,
+                    "error": {"reason": reason, "message": message},
+                });
+                let _ = writeln!(writer, "{reply}");
+                let _ = writer.flush();
+            }
+            Answer::Crash => {}
+            Answer::Silent => {
+                // The host says nothing until the test ends.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn the_guest_reaches_the_capability_through_the_bash_tool() {
     if !bash_available() {
         return;
     }
     let scratch = scratch("success");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
     let state_dir = scratch.path.join("state");
 
-    let host = spawn_host(host_dir.clone(), |request| {
-        reply(request, "ok", json!({"items": ["summer.jpg"]}))
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "ok".to_string(),
+            result: json!({"items": ["summer.jpg"]}),
+        }
     });
+    let socket = Some(fixture.path.as_path());
 
     let answer = ask(
-        &host_dir,
+        socket,
         &state_dir,
         &request("r-1", "files.list", json!({"limit": 5})),
     );
-    host.join().expect("the host thread finished");
 
     assert_eq!(answer["version"], 1);
     assert_eq!(answer["request_id"], "r-1");
@@ -248,34 +357,24 @@ fn the_guest_reaches_the_capability_through_the_bash_tool() {
 }
 
 #[test]
-fn a_malformed_request_never_reaches_the_host() {
+fn a_bad_request_never_reaches_the_host() {
     if !bash_available() {
         return;
     }
-    let scratch = scratch("malformed");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
+    let scratch = scratch("bad-request");
     let state_dir = scratch.path.join("state");
 
-    let answer = ask(&host_dir, &state_dir, "{\"version\":1,");
-
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "malformed_request");
-    assert!(
-        host_request_files(&host_dir).is_empty(),
-        "the malformed request reached the host"
-    );
-}
-
-#[test]
-fn unknown_versions_capabilities_and_paths_never_reach_the_host() {
-    if !bash_available() {
-        return;
-    }
-    let scratch = scratch("unknown");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
-    let state_dir = scratch.path.join("state");
+    #[cfg(unix)]
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "ok".to_string(),
+            result: json!({}),
+        }
+    });
+    #[cfg(unix)]
+    let socket = Some(fixture.path.as_path());
+    #[cfg(not(unix))]
+    let socket: Option<&Path> = None;
 
     let cases = [
         (
@@ -297,13 +396,19 @@ fn unknown_versions_capabilities_and_paths_never_reach_the_host() {
     ];
 
     for (line, reason) in cases {
-        let answer = ask(&host_dir, &state_dir, &line.to_string());
+        let answer = ask(socket, &state_dir, &line.to_string());
         assert_eq!(answer["status"], "error");
         assert_eq!(answer["error"]["reason"], reason);
     }
 
-    assert!(
-        host_request_files(&host_dir).is_empty(),
+    let malformed = ask(socket, &state_dir, "{\"version\":1,");
+    assert_eq!(malformed["status"], "error");
+    assert_eq!(malformed["error"]["reason"], "malformed_request");
+
+    #[cfg(unix)]
+    assert_eq!(
+        fixture.connection_count(),
+        0,
         "a refused request reached the host"
     );
 }
@@ -314,16 +419,32 @@ fn an_oversized_request_never_reaches_the_host() {
         return;
     }
     let scratch = scratch("oversized");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
     let state_dir = scratch.path.join("state");
+
+    #[cfg(unix)]
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "ok".to_string(),
+            result: json!({}),
+        }
+    });
+    #[cfg(unix)]
+    let socket = Some(fixture.path.as_path());
+    #[cfg(not(unix))]
+    let socket: Option<&Path> = None;
 
     // The payload goes through a file: a command line cannot carry it.
     let payload = scratch.path.join("oversized.ndjson");
     fs::write(&payload, "x".repeat(64 * 1024 + 1)).expect("write the oversized request");
+    let transport = match socket {
+        Some(socket) => format!(
+            "export LEG_BRIDGE_HOST_SOCKET={}; ",
+            shell_quote(&socket.to_string_lossy())
+        ),
+        None => String::new(),
+    };
     let command = format!(
-        "export LEG_BRIDGE_HOST_DIR={} LEG_BRIDGE_STATE_DIR={}; cat {} | {}",
-        shell_quote(&host_dir.to_string_lossy()),
+        "{transport}export LEG_BRIDGE_STATE_DIR={}; cat {} | {}",
         shell_quote(&state_dir.to_string_lossy()),
         shell_quote(&shell_path(&payload)),
         shell_quote(&shell_path(Path::new(BRIDGE))),
@@ -332,131 +453,147 @@ fn an_oversized_request_never_reaches_the_host() {
 
     assert_eq!(answer["status"], "error");
     assert_eq!(answer["error"]["reason"], "request_too_large");
-    assert!(
-        host_request_files(&host_dir).is_empty(),
+    #[cfg(unix)]
+    assert_eq!(
+        fixture.connection_count(),
+        0,
         "the oversized request reached the host"
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_request_id_is_used_once() {
     if !bash_available() {
         return;
     }
     let scratch = scratch("duplicate");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
     let state_dir = scratch.path.join("state");
 
-    let host = spawn_host(host_dir.clone(), |request| {
-        reply(request, "ok", json!({"items": []}))
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "ok".to_string(),
+            result: json!({"items": []}),
+        }
     });
-    let first = ask(
-        &host_dir,
-        &state_dir,
-        &request("r-1", "files.list", json!({})),
-    );
-    host.join().expect("the host thread finished");
+    let socket = Some(fixture.path.as_path());
+
+    let first = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
     assert_eq!(first["status"], "ok");
 
-    let second = ask(
-        &host_dir,
-        &state_dir,
-        &request("r-1", "files.list", json!({})),
-    );
+    let second = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
     assert_eq!(second["status"], "error");
     assert_eq!(second["error"]["reason"], "duplicate_request_id");
+    assert_eq!(
+        fixture.connection_count(),
+        1,
+        "the duplicate request reached the host"
+    );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_approval_the_user_refuses_is_answered_denied() {
     if !bash_available() {
         return;
     }
     let scratch = scratch("denied");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
     let state_dir = scratch.path.join("state");
 
-    let host = spawn_host(host_dir.clone(), |request| {
-        if request["preview"] == json!(true) {
-            reply(
-                request,
-                "approval_required",
-                json!({
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |request| {
+        if request["approval_token"].is_string() {
+            host::Answer::Failure {
+                status: "denied".to_string(),
+                reason: "user_refused".to_string(),
+                message: "the user refused the request".to_string(),
+            }
+        } else {
+            host::Answer::Reply {
+                status: "approval_required".to_string(),
+                result: json!({
                     "approval_token": "token-0123456789abcdef",
                     "review": {"summary": "reads the photo library"},
                 }),
-            )
-        } else {
-            reply(request, "denied", json!(null))
+            }
         }
     });
+    let socket = Some(fixture.path.as_path());
 
-    let preview = ask(
-        &host_dir,
+    let pending = ask(
+        socket,
         &state_dir,
         &request("r-1", "photos.list", json!({"limit": 1})),
     );
-    assert_eq!(preview["status"], "approval_required");
-    let token = preview["result"]["approval_token"]
+    assert_eq!(pending["status"], "approval_required");
+    let token = pending["result"]["approval_token"]
         .as_str()
         .expect("the answer carries a token")
         .to_string();
-    host.join().expect("the host thread finished");
 
-    let host = spawn_host(host_dir.clone(), |request| {
-        reply(request, "denied", json!(null))
-    });
-    let replay = json!({
+    // The follow-up request carries a fresh request id, the same capability
+    // and input, and the token.
+    let follow_up = json!({
         "version": 1,
-        "request_id": "r-1",
+        "request_id": "r-2",
         "capability": "photos.list",
         "input": {"limit": 1},
         "approval_token": token,
     })
     .to_string();
-    let answer = ask(&host_dir, &state_dir, &replay);
-    host.join().expect("the host thread finished");
+    let answer = ask(socket, &state_dir, &follow_up);
 
     assert_eq!(answer["status"], "denied");
-    assert_eq!(answer["request_id"], "r-1");
+    assert_eq!(answer["request_id"], "r-2");
+
+    // The host received both requests, and the follow-up carried the token.
+    #[cfg(unix)]
+    {
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["request_id"], "r-1");
+        assert!(requests[0]["approval_token"].is_null());
+        assert_eq!(requests[1]["request_id"], "r-2");
+        assert_eq!(requests[1]["approval_token"], token);
+    }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cancelled_request_is_answered_cancelled() {
     if !bash_available() {
         return;
     }
     let scratch = scratch("cancelled");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
     let state_dir = scratch.path.join("state");
 
-    let host = spawn_host(host_dir.clone(), |request| {
-        reply(request, "cancelled", json!(null))
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Failure {
+            status: "cancelled".to_string(),
+            reason: "cancelled".to_string(),
+            message: "the user cancelled the request".to_string(),
+        }
     });
+    let socket = Some(fixture.path.as_path());
 
-    let answer = ask(
-        &host_dir,
-        &state_dir,
-        &request("r-1", "files.list", json!({})),
-    );
-    host.join().expect("the host thread finished");
+    let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
 
     assert_eq!(answer["status"], "cancelled");
     assert_eq!(answer["error"]["reason"], "cancelled");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_request_the_host_ignores_times_out() {
     if !bash_available() {
         return;
     }
     let scratch = scratch("timeout");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
     let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Silent
+    });
+    let socket = Some(fixture.path.as_path());
 
     let line = json!({
         "version": 1,
@@ -468,15 +605,59 @@ fn a_request_the_host_ignores_times_out() {
     .to_string();
 
     let started = Instant::now();
-    let answer = ask(&host_dir, &state_dir, &line);
+    let answer = ask(socket, &state_dir, &line);
     let elapsed = started.elapsed();
 
     assert_eq!(answer["status"], "error");
     assert_eq!(answer["error"]["reason"], "timeout");
     assert!(
-        elapsed < Duration::from_secs(30),
+        elapsed < std::time::Duration::from_secs(30),
         "the request did not stop at its deadline: {elapsed:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_host_that_crashes_is_answered_error() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("crash");
+    let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Crash
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
+
+    assert_eq!(answer["status"], "error");
+    assert_eq!(answer["error"]["reason"], "host_crashed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_permission_the_host_withholds_is_answered_unavailable() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("permission");
+    let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Failure {
+            status: "unavailable".to_string(),
+            reason: "permission_denied".to_string(),
+            message: "the host does not grant this capability".to_string(),
+        }
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
+
+    assert_eq!(answer["status"], "unavailable");
+    assert_eq!(answer["error"]["reason"], "permission_denied");
 }
 
 #[test]
@@ -487,48 +668,57 @@ fn a_guest_without_a_host_is_answered_unavailable() {
     let scratch = scratch("unavailable");
     let state_dir = scratch.path.join("state");
 
-    // No host directory is configured, so the bridge has no transport.
-    let command = format!(
-        "LEG_BRIDGE_STATE_DIR={} {} <<'BRIDGE_REQUEST'\n{}\nBRIDGE_REQUEST\n",
-        shell_quote(&state_dir.to_string_lossy()),
-        shell_quote(&shell_path(Path::new(BRIDGE))),
-        request("r-1", "files.list", json!({})),
-    );
-    let output = BashTool::new()
-        .call(&json!({"command": command, "timeout": 60}))
-        .expect("the bash tool ran the bridge");
-    let output: Value = serde_json::from_str(&output).expect("the tool result is JSON");
-    let answer: Value = serde_json::from_str(output["stdout"].as_str().expect("stdout"))
-        .expect("the answer is JSON");
+    // No host socket is configured, so the bridge has no transport.
+    let answer = ask(None, &state_dir, &request("r-1", "files.list", json!({})));
 
     assert_eq!(answer["status"], "unavailable");
     assert_eq!(answer["error"]["reason"], "no_host_transport");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_host_that_is_not_listening_is_answered_unavailable() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("absent-host");
+    let state_dir = scratch.path.join("state");
+
+    // The socket is configured, but nothing listens on it.
+    let socket = scratch.path.join("absent.sock");
+    let answer = ask(
+        Some(&socket),
+        &state_dir,
+        &request("r-1", "files.list", json!({})),
+    );
+
+    assert_eq!(answer["status"], "unavailable");
+    assert_eq!(answer["error"]["reason"], "host_unreachable");
+}
+
+#[cfg(unix)]
 #[test]
 fn the_bridge_keeps_the_request_values_out_of_its_diagnostics() {
     if !bash_available() {
         return;
     }
     let scratch = scratch("secrets");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
     let state_dir = scratch.path.join("state");
 
-    let secret = "s3cr3t-photo-contents";
-    let host = spawn_host(host_dir.clone(), move |request| {
-        reply(
-            request,
-            "approval_required",
-            json!({
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "approval_required".to_string(),
+            result: json!({
                 "approval_token": "token-0123456789abcdef",
-                "review": {"summary": format!("reads {secret}")},
+                "review": {"summary": "reads the photo library"},
             }),
-        )
+        }
     });
+    let socket = Some(fixture.path.as_path());
 
+    let secret = "s3cr3t-photo-contents";
     let answer = ask(
-        &host_dir,
+        socket,
         &state_dir,
         &request(
             "r-1",
@@ -536,7 +726,6 @@ fn the_bridge_keeps_the_request_values_out_of_its_diagnostics() {
             json!({"name": "morning", "input": {"photo": secret}}),
         ),
     );
-    host.join().expect("the host thread finished");
     assert_eq!(answer["status"], "approval_required");
 
     let audit = fs::read_to_string(state_dir.join("audit.log")).expect("the audit summary");

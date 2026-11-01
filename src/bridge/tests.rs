@@ -1,4 +1,6 @@
-use super::adapter::{self, HostAdapter, HostOutcome, HostRequest};
+use super::adapter::{
+    self, ConnectionError, HostAdapter, HostConnection, HostOutcome, HostRequest,
+};
 use super::protocol::{self, BridgeStatus};
 use super::service::Bridge;
 use super::state::{AuditLog, BridgeState};
@@ -6,7 +8,7 @@ use super::state::{AuditLog, BridgeState};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -66,6 +68,54 @@ impl HostAdapter for FakeHost {
     }
 }
 
+/// A connection the host answers over, without a socket.
+struct FakeConnection {
+    /// The frames the host sends, in order.
+    frames: Vec<String>,
+    /// The frames the bridge sent.
+    sent: Vec<String>,
+    /// Whether the connection stays silent instead of closing.
+    silent: bool,
+}
+
+impl FakeConnection {
+    /// A connection that answers with `frames`.
+    fn answering(frames: Vec<String>) -> Self {
+        Self {
+            frames,
+            sent: Vec::new(),
+            silent: false,
+        }
+    }
+
+    /// A connection that never answers.
+    fn silent() -> Self {
+        Self {
+            frames: Vec::new(),
+            sent: Vec::new(),
+            silent: true,
+        }
+    }
+}
+
+impl HostConnection for FakeConnection {
+    fn send(&mut self, frame: &str) -> Result<(), String> {
+        self.sent.push(frame.to_string());
+        Ok(())
+    }
+
+    fn receive(&mut self, wait: Duration) -> Result<Option<String>, ConnectionError> {
+        if self.frames.is_empty() {
+            if self.silent {
+                std::thread::sleep(wait.min(Duration::from_millis(5)));
+                return Ok(None);
+            }
+            return Err(ConnectionError::Closed);
+        }
+        Ok(Some(self.frames.remove(0)))
+    }
+}
+
 /// Builds a bridge over a fake host and a scratch state directory.
 fn bridge(host: FakeHost, scratch: &Scratch) -> Bridge {
     let state = BridgeState::load(&scratch.path).expect("load the bridge state");
@@ -87,6 +137,33 @@ fn request(id: &str, capability: &str, input: Value) -> String {
         "input": input,
     })
     .to_string()
+}
+
+/// The frame the host answers with.
+fn reply(request: &HostRequest, status: &str, result: Value) -> String {
+    json!({
+        "version": 1,
+        "nonce": request.nonce,
+        "request_id": request.request_id,
+        "status": status,
+        "result": result,
+        "error": null,
+    })
+    .to_string()
+}
+
+/// A host request the exchange sends.
+fn host_request() -> HostRequest {
+    HostRequest {
+        version: protocol::PROTOCOL_VERSION,
+        request_id: "r-1".to_string(),
+        nonce: "nonce-0123456789abcdef".to_string(),
+        capability: "files.list".to_string(),
+        input: json!({"limit": 1}),
+        input_sha256: protocol::sha256_hex(b"{}"),
+        approval_token: None,
+        timeout_ms: 1000,
+    }
 }
 
 #[test]
@@ -231,30 +308,33 @@ fn an_approval_is_required_before_the_capability_runs() {
         &scratch,
     );
 
-    let preview = bridge.handle(&request("r-1", "photos.list", json!({"limit": 1})));
-    assert_eq!(preview.status, BridgeStatus::ApprovalRequired);
-    let token = preview.result.expect("the answer carries a result")["approval_token"]
+    let pending = bridge.handle(&request("r-1", "photos.list", json!({"limit": 1})));
+    assert_eq!(pending.status, BridgeStatus::ApprovalRequired);
+    let result = pending.result.expect("the answer carries a result");
+    let token = result["approval_token"]
         .as_str()
         .expect("the answer carries a token")
         .to_string();
     assert_eq!(token, "token-0123456789abcdef");
+    assert_eq!(result["review"]["summary"], "reads the photo library");
 
-    // The replay carries the same request id and the same input.
-    let replay = json!({
+    // The follow-up request carries a fresh request id, the same capability
+    // and input, and the token.
+    let follow_up = json!({
         "version": 1,
-        "request_id": "r-1",
+        "request_id": "r-2",
         "capability": "photos.list",
         "input": {"limit": 1},
         "approval_token": token,
     })
     .to_string();
-    let response = bridge.handle(&replay);
+    let response = bridge.handle(&follow_up);
     assert_eq!(response.status, BridgeStatus::Ok);
-    assert_eq!(response.request_id, "r-1");
+    assert_eq!(response.request_id, "r-2");
 }
 
 #[test]
-fn an_approval_is_bound_to_the_request_and_its_input() {
+fn an_approval_is_bound_to_the_capability_and_its_input() {
     let scratch = scratch("approval-binding");
     let mut bridge = bridge(
         FakeHost {
@@ -275,7 +355,7 @@ fn an_approval_is_bound_to_the_request_and_its_input() {
     // A different input may not reuse the approval.
     let changed = json!({
         "version": 1,
-        "request_id": "r-1",
+        "request_id": "r-2",
         "capability": "photos.list",
         "input": {"limit": 2},
         "approval_token": "token-0123456789abcdef",
@@ -288,10 +368,26 @@ fn an_approval_is_bound_to_the_request_and_its_input() {
         "approval_mismatch"
     );
 
+    // Another capability may not reuse it either.
+    let other = json!({
+        "version": 1,
+        "request_id": "r-3",
+        "capability": "shortcuts.invoke",
+        "input": {"name": "morning"},
+        "approval_token": "token-0123456789abcdef",
+    })
+    .to_string();
+    let response = bridge.handle(&other);
+    assert_eq!(response.status, BridgeStatus::Denied);
+    assert_eq!(
+        response.error.expect("the request failed").reason,
+        "approval_mismatch"
+    );
+
     // A token the bridge never issued is refused as well.
     let forged = json!({
         "version": 1,
-        "request_id": "r-2",
+        "request_id": "r-4",
         "capability": "photos.list",
         "input": {"limit": 1},
         "approval_token": "forged-token-0123456789",
@@ -302,6 +398,54 @@ fn an_approval_is_bound_to_the_request_and_its_input() {
     assert_eq!(
         response.error.expect("the request failed").reason,
         "approval_unknown"
+    );
+}
+
+#[test]
+fn an_approval_is_redeemed_once() {
+    let scratch = scratch("approval-redeemed");
+    let mut bridge = bridge(
+        FakeHost {
+            answers: vec![
+                HostOutcome::ApprovalRequired {
+                    approval_token: "token-0123456789abcdef".to_string(),
+                    review: json!({"summary": "reads the photo library"}),
+                },
+                HostOutcome::Ok(json!({"items": []})),
+                HostOutcome::Ok(json!({"items": []})),
+            ],
+            seen: Vec::new(),
+        },
+        &scratch,
+    );
+
+    bridge.handle(&request("r-1", "photos.list", json!({"limit": 1})));
+
+    let follow_up = json!({
+        "version": 1,
+        "request_id": "r-2",
+        "capability": "photos.list",
+        "input": {"limit": 1},
+        "approval_token": "token-0123456789abcdef",
+    })
+    .to_string();
+    let response = bridge.handle(&follow_up);
+    assert_eq!(response.status, BridgeStatus::Ok);
+
+    // The token cannot be redeemed a second time.
+    let replay = json!({
+        "version": 1,
+        "request_id": "r-3",
+        "capability": "photos.list",
+        "input": {"limit": 1},
+        "approval_token": "token-0123456789abcdef",
+    })
+    .to_string();
+    let response = bridge.handle(&replay);
+    assert_eq!(response.status, BridgeStatus::Denied);
+    assert_eq!(
+        response.error.expect("the request failed").reason,
+        "approval_used"
     );
 }
 
@@ -322,6 +466,54 @@ fn a_request_id_is_used_once() {
         second.error.expect("the request failed").reason,
         "duplicate_request_id"
     );
+}
+
+#[test]
+fn a_request_id_is_used_once_across_invocations() {
+    let scratch = scratch("duplicate-invocations");
+
+    let mut first = bridge(
+        FakeHost::always(HostOutcome::Ok(json!({"items": []}))),
+        &scratch,
+    );
+    let response = first.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Ok);
+
+    // A second invocation over the same state remembers the request id.
+    let mut second = bridge(
+        FakeHost::always(HostOutcome::Ok(json!({"items": []}))),
+        &scratch,
+    );
+    let response = second.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Error);
+    assert_eq!(
+        response.error.expect("the request failed").reason,
+        "duplicate_request_id"
+    );
+}
+
+#[test]
+fn a_request_that_never_reached_the_host_keeps_its_id() {
+    let scratch = scratch("unreachable-id");
+    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    let mut bridge = Bridge::new(
+        Box::new(adapter::UnavailableAdapter),
+        state,
+        AuditLog::new(Some(scratch.path.join("audit.log"))),
+    );
+
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Unavailable);
+
+    // Nothing happened, so the caller may try again with the same id.
+    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    let mut bridge = Bridge::new(
+        Box::new(FakeHost::always(HostOutcome::Ok(json!({"items": []})))),
+        state,
+        AuditLog::new(Some(scratch.path.join("audit.log"))),
+    );
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Ok);
 }
 
 #[test]
@@ -405,78 +597,181 @@ fn the_audit_summary_keeps_the_input_shape_and_not_its_values() {
 }
 
 #[test]
-fn the_file_transport_answers_through_the_shared_directory() {
-    let scratch = scratch("transport");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
-
-    let host = std::thread::spawn({
-        let host_dir = host_dir.clone();
-        move || {
-            let request_path = host_dir.join(adapter::request_file("r-1"));
-            let response_path = host_dir.join(adapter::response_file("r-1"));
-            let deadline = Instant::now() + std::time::Duration::from_secs(10);
-            while Instant::now() < deadline && !request_path.exists() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let request: Value =
-                serde_json::from_str(&fs::read_to_string(&request_path).unwrap()).unwrap();
-            let nonce = request["nonce"].as_str().unwrap().to_string();
-            let reply = json!({
-                "version": 1,
-                "nonce": nonce,
-                "request_id": request["request_id"],
-                "status": "ok",
-                "result": {"items": ["a.jpg"]},
-                "error": null,
-            });
-            fs::write(&response_path, reply.to_string()).unwrap();
-        }
-    });
-
-    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
-    let mut bridge = Bridge::new(
-        Box::new(adapter::FileHostAdapter::new(&host_dir)),
-        state,
-        AuditLog::new(Some(scratch.path.join("audit.log"))),
+fn the_ledger_keeps_no_request_value() {
+    let scratch = scratch("ledger");
+    let mut bridge = bridge(
+        FakeHost::always(HostOutcome::Ok(json!({"items": []}))),
+        &scratch,
     );
-    let response = bridge.handle(&request("r-1", "files.list", json!({})));
-    host.join().expect("the host thread finished");
 
-    assert_eq!(response.status, BridgeStatus::Ok);
-    assert_eq!(response.result, Some(json!({"items": ["a.jpg"]})));
+    bridge.handle(&request(
+        "r-1",
+        "shortcuts.invoke",
+        json!({"name": "morning", "input": {"token": "s3cr3t-photo-contents"}}),
+    ));
+
+    let ledger = fs::read_to_string(scratch.path.join("state.json")).expect("read the ledger");
+    assert!(ledger.contains("r-1"));
+    assert!(
+        !ledger.contains("s3cr3t-photo-contents"),
+        "the ledger carried an input value: {ledger}"
+    );
+    assert!(
+        !ledger.contains("morning"),
+        "the ledger carried an input value: {ledger}"
+    );
 }
 
 #[test]
-fn the_file_transport_times_out_when_the_host_stays_silent() {
-    let scratch = scratch("transport-timeout");
-    let host_dir = scratch.path.join("host");
-    fs::create_dir_all(&host_dir).expect("create the host directory");
+fn the_exchange_sends_the_request_and_reads_the_answer() {
+    let request = host_request();
+    let mut connection =
+        FakeConnection::answering(vec![reply(&request, "ok", json!({"items": ["a.jpg"]}))]);
 
-    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
-    let mut bridge = Bridge::new(
-        Box::new(adapter::FileHostAdapter::new(&host_dir)),
-        state,
-        AuditLog::new(Some(scratch.path.join("audit.log"))),
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
     );
+
+    assert_eq!(outcome, HostOutcome::Ok(json!({"items": ["a.jpg"]})));
+    assert_eq!(connection.sent.len(), 1);
+    let sent: Value = serde_json::from_str(&connection.sent[0]).expect("the frame is JSON");
+    assert_eq!(sent["request_id"], "r-1");
+    assert_eq!(sent["nonce"], request.nonce);
+    assert_eq!(sent["capability"], "files.list");
+}
+
+#[test]
+fn the_exchange_reports_a_host_that_closed_the_connection() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(Vec::new());
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_crashed"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_reports_an_answer_that_belongs_to_another_request() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(vec![
+        json!({
+            "version": 1,
+            "nonce": "another-nonce",
+            "request_id": "r-9",
+            "status": "ok",
+            "result": {},
+            "error": null,
+        })
+        .to_string(),
+    ]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_protocol_violation"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_reports_an_answer_in_another_version() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(vec![
+        json!({
+            "version": 2,
+            "nonce": request.nonce,
+            "request_id": request.request_id,
+            "status": "ok",
+            "result": {},
+            "error": null,
+        })
+        .to_string(),
+    ]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_protocol_violation"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_reports_an_answer_it_cannot_read() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(vec!["{not json".to_string()]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    match outcome {
+        HostOutcome::Failed { reason, .. } => assert_eq!(reason, "host_crashed"),
+        other => panic!("the outcome was {other:?}"),
+    }
+}
+
+#[test]
+fn the_exchange_times_out_when_the_host_stays_silent() {
+    let request = host_request();
+    let mut connection = FakeConnection::silent();
+
     let started = Instant::now();
-    let line = json!({
-        "version": 1,
-        "request_id": "r-1",
-        "capability": "files.list",
-        "input": {},
-        "timeout_ms": 300,
-    })
-    .to_string();
-    let response = bridge.handle(&line);
-    assert_eq!(response.status, BridgeStatus::Error);
-    assert_eq!(
-        response.error.expect("the request failed").reason,
-        "timeout"
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_millis(200),
     );
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert!(
-        host_dir.join(adapter::cancel_file("r-1")).exists(),
-        "the bridge did not tell the host that it stopped waiting"
+
+    assert_eq!(outcome, HostOutcome::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn the_exchange_answers_the_hosts_approval_with_a_review_summary() {
+    let request = host_request();
+    let mut connection = FakeConnection::answering(vec![reply(
+        &request,
+        "approval_required",
+        json!({
+            "approval_token": "token-0123456789abcdef",
+            "review": {"summary": "reads the photo library"},
+        }),
+    )]);
+
+    let outcome = adapter::exchange(
+        &mut connection,
+        &request,
+        Instant::now() + Duration::from_secs(5),
     );
+
+    match outcome {
+        HostOutcome::ApprovalRequired {
+            approval_token,
+            review,
+        } => {
+            assert_eq!(approval_token, "token-0123456789abcdef");
+            assert_eq!(review["summary"], "reads the photo library");
+        }
+        other => panic!("the outcome was {other:?}"),
+    }
 }

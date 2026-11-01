@@ -4,9 +4,9 @@
 //!
 //! 1. the request is read and validated — a malformed, oversized, unknown, or
 //!    path-hostile request never reaches the host;
-//! 2. the request id is checked against the state, so a request id is used
-//!    once and an approval token is only accepted for the request it was
-//!    issued for;
+//! 2. the request id is checked against the ledger, so a request id is used
+//!    once and an approval token is only accepted for the capability and the
+//!    input it was issued for;
 //! 3. the request is handed to the host, which owns the permission prompt, the
 //!    dispatch, and the cancellation;
 //! 4. the answer is written back and summarized in the audit trail.
@@ -25,11 +25,11 @@ use super::state::{AuditEntry, AuditLog, BridgeState, audit_timestamp};
 /// The longest capability name the audit summary records.
 const AUDIT_CAPABILITY_CHARS: usize = 64;
 
-/// The bridge: the protocol, the host seam, the state, and the audit trail.
+/// The bridge: the protocol, the host seam, the ledger, and the audit trail.
 pub struct Bridge {
     /// The transport that reaches the host.
     adapter: Box<dyn HostAdapter>,
-    /// The guest-local request records and approval tokens.
+    /// The guest-local request records and approval bindings.
     state: BridgeState,
     /// The audit summary the bridge writes.
     audit: AuditLog,
@@ -45,7 +45,7 @@ impl Bridge {
         }
     }
 
-    /// The guest-local state of the bridge.
+    /// The guest-local ledger of the bridge.
     pub fn state(&self) -> &BridgeState {
         &self.state
     }
@@ -105,7 +105,6 @@ impl Bridge {
         let request = match protocol::validate_request(&value) {
             Ok(request) => request,
             Err(error) => {
-                self.consume_request_id(&request_id, &raw_capability);
                 return self.answer(
                     request_id,
                     raw_capability,
@@ -125,7 +124,6 @@ impl Bridge {
 
     /// Runs the validated request through the host.
     fn dispatch(&mut self, request: BridgeRequest, started: Instant) -> BridgeResponse {
-        let capability = protocol::capability(&request.capability).expect("a validated request");
         let digest = request.input_digest();
         let input_fields = request
             .input
@@ -133,8 +131,8 @@ impl Bridge {
             .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
 
-        // The state must be writable before anything reaches the host: a
-        // bridge that cannot remember which request ids it answered cannot
+        // The ledger must be writable before anything reaches the host: a
+        // bridge that cannot remember which request ids it dispatched cannot
         // keep them unique, and must not act.
         if let Err(error) = self.state.save() {
             return self.answer(
@@ -164,7 +162,6 @@ impl Bridge {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let preview = !continuation && capability.requires_approval;
 
         let host_request = HostRequest {
             version: PROTOCOL_VERSION,
@@ -173,19 +170,28 @@ impl Bridge {
             capability: request.capability.clone(),
             input: request.input.clone(),
             input_sha256: digest.clone(),
-            preview,
             approval_token: request.approval_token.clone(),
             timeout_ms,
         };
 
         let outcome = self.adapter.dispatch(&host_request, deadline);
-        self.finish(request, &digest, input_fields, outcome, preview, started)
+        self.finish(
+            request,
+            &digest,
+            input_fields,
+            outcome,
+            continuation,
+            started,
+        )
     }
 
-    /// Checks the request against the recorded approvals.
+    /// Checks the request against the ledger.
     ///
-    /// A request without a token must not reuse a request id; a request with a
-    /// token must match the approval the bridge recorded for that request.
+    /// A request id is used once: the ledger remembers the requests that
+    /// reached the host, so a repeated id is refused. A request that carries
+    /// an approval token must carry one the bridge issued for the same
+    /// capability and the same input; the host verifies it again before it
+    /// acts.
     fn check_approval(
         &mut self,
         request: &BridgeRequest,
@@ -200,28 +206,29 @@ impl Bridge {
             .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
 
+        if self.state.is_known(&request_id) {
+            return Err(Box::new(self.answer(
+                request_id.clone(),
+                capability.clone(),
+                BridgeStatus::Error,
+                None,
+                Some(BridgeError::new(
+                    "duplicate_request_id",
+                    format!("the request id `{request_id}` was already used"),
+                    "use a fresh request id",
+                )),
+                started,
+                digest.to_string(),
+                input_fields,
+                false,
+            )));
+        }
+
         let Some(token) = request.approval_token.as_deref() else {
-            if self.state.is_known(&request_id) {
-                return Err(Box::new(self.answer(
-                    request_id.clone(),
-                    capability.clone(),
-                    BridgeStatus::Error,
-                    None,
-                    Some(BridgeError::new(
-                        "duplicate_request_id",
-                        format!("the request id `{request_id}` was already used"),
-                        "use a fresh request id",
-                    )),
-                    started,
-                    digest.to_string(),
-                    input_fields,
-                    false,
-                )));
-            }
             return Ok(false);
         };
 
-        let Some(record) = self.state.pending(&request_id).cloned() else {
+        let Some(record) = self.state.approval_for(token).cloned() else {
             return Err(Box::new(self.answer(
                 request_id.clone(),
                 capability.clone(),
@@ -229,8 +236,8 @@ impl Bridge {
                 None,
                 Some(BridgeError::new(
                     "approval_unknown",
-                    format!("the request id `{request_id}` has no approval waiting to be redeemed"),
-                    "ask for the approval again and replay the token it issues",
+                    "the approval token was not issued by the host for this guest",
+                    "ask the host for an approval and replay the token it issues",
                 )),
                 started,
                 digest.to_string(),
@@ -239,16 +246,16 @@ impl Bridge {
             )));
         };
 
-        if record.approval_token.as_deref() != Some(token) {
+        if record.redeemed {
             return Err(Box::new(self.answer(
-                request_id,
-                capability,
+                request_id.clone(),
+                capability.clone(),
                 BridgeStatus::Denied,
                 None,
                 Some(BridgeError::new(
-                    "approval_invalid",
-                    "the approval token is not the token this request was granted",
-                    "ask for the approval again and replay the token it issues",
+                    "approval_used",
+                    "the approval token was already redeemed",
+                    "ask the host for a fresh approval",
                 )),
                 started,
                 digest.to_string(),
@@ -258,7 +265,7 @@ impl Bridge {
         }
         if record.capability != capability {
             return Err(Box::new(self.answer(
-                request_id,
+                request_id.clone(),
                 capability.clone(),
                 BridgeStatus::Denied,
                 None,
@@ -268,7 +275,7 @@ impl Bridge {
                         "the approval was granted for `{}`, not for `{capability}`",
                         record.capability
                     ),
-                    "ask for the approval again and replay the token it issues",
+                    "ask the host for an approval for this capability",
                 )),
                 started,
                 digest.to_string(),
@@ -278,14 +285,14 @@ impl Bridge {
         }
         if record.input_sha256 != digest {
             return Err(Box::new(self.answer(
-                request_id,
-                capability,
+                request_id.clone(),
+                capability.clone(),
                 BridgeStatus::Denied,
                 None,
                 Some(BridgeError::new(
                     "approval_mismatch",
                     "the approval was granted for a different input",
-                    "ask for the approval again and replay the token it issues",
+                    "ask the host for an approval for this input",
                 )),
                 started,
                 digest.to_string(),
@@ -295,14 +302,14 @@ impl Bridge {
         }
         if !BridgeState::approval_is_fresh(&record) {
             return Err(Box::new(self.answer(
-                request_id,
-                capability,
+                request_id.clone(),
+                capability.clone(),
                 BridgeStatus::Denied,
                 None,
                 Some(BridgeError::new(
                     "approval_expired",
                     "the approval token has expired",
-                    "ask for the approval again and replay the token it issues",
+                    "ask the host for a fresh approval",
                 )),
                 started,
                 digest.to_string(),
@@ -321,31 +328,16 @@ impl Bridge {
         digest: &str,
         input_fields: Vec<String>,
         outcome: HostOutcome,
-        preview: bool,
+        continuation: bool,
         started: Instant,
     ) -> BridgeResponse {
         let request_id = request.request_id.clone();
         let capability = request.capability.clone();
+        let token = request.approval_token.clone();
+        let reached = reached_host(&outcome);
 
         let (status, result, error) = match outcome {
-            HostOutcome::Ok(result) => {
-                if preview {
-                    // A preview asks the host what it would do; a host that
-                    // acts on a preview broke the protocol, and the bridge
-                    // reports it instead of trusting the answer.
-                    (
-                        BridgeStatus::Error,
-                        None,
-                        Some(BridgeError::new(
-                            "host_protocol_violation",
-                            "the host answered a preview with a result",
-                            "the host must answer a preview with an approval summary",
-                        )),
-                    )
-                } else {
-                    (BridgeStatus::Ok, Some(result), None)
-                }
-            }
+            HostOutcome::Ok(result) => (BridgeStatus::Ok, Some(result), None),
             HostOutcome::ApprovalRequired {
                 approval_token,
                 review,
@@ -357,12 +349,14 @@ impl Bridge {
                         Some(BridgeError::new(
                             "host_protocol_violation",
                             "the host issued an approval token that is not a token",
-                            "the host must issue a token the bridge can replay",
+                            "the host must issue a token the bridge can relay",
                         )),
                     )
                 } else {
+                    // The binding names the capability and the digest of the
+                    // input, so the token cannot be redeemed for another one.
                     self.state
-                        .record_approval(&request_id, &capability, digest, &approval_token);
+                        .record_approval(&capability, digest, &approval_token);
                     (
                         BridgeStatus::ApprovalRequired,
                         Some(json!({
@@ -420,13 +414,6 @@ impl Bridge {
             ),
         };
 
-        let approved = request.approval_token.is_some();
-        if status != BridgeStatus::ApprovalRequired {
-            self.state
-                .record_completed(&request_id, &capability, digest);
-        }
-        let _ = self.state.save();
-
         let oversized = result
             .as_ref()
             .is_some_and(|result| result.to_string().len() > MAX_RESULT_BYTES);
@@ -444,6 +431,25 @@ impl Bridge {
             (status, result, error)
         };
 
+        // The request reached the host, so its id is used. The ledger keeps
+        // the last few dozen request ids, which is as long as a caller may
+        // reasonably replay one. A transport that never connected leaves the
+        // id free: nothing happened, so the caller may try again.
+        if reached {
+            self.state
+                .record_dispatched(&request_id, digest, status.as_str());
+        }
+        // A redeemed approval cannot be redeemed twice. An answer that never
+        // arrived leaves the approval pending, because the host decides
+        // whether the action happened.
+        if continuation
+            && let Some(token) = token.as_deref()
+            && matches!(status, BridgeStatus::Ok | BridgeStatus::Denied)
+        {
+            self.state.redeem_approval(token);
+        }
+        let _ = self.state.save();
+
         self.answer(
             request_id,
             capability,
@@ -453,17 +459,8 @@ impl Bridge {
             started,
             digest.to_string(),
             input_fields,
-            approved,
+            continuation,
         )
-    }
-
-    /// Records a request id that a rejected request already used.
-    fn consume_request_id(&mut self, request_id: &str, capability: &str) {
-        if request_id.is_empty() {
-            return;
-        }
-        self.state.record_completed(request_id, capability, "");
-        let _ = self.state.save();
     }
 
     /// Writes the answer and the audit summary.
@@ -508,5 +505,19 @@ impl Bridge {
         }
 
         response
+    }
+}
+
+/// Whether the request reached the host.
+///
+/// A transport that never connected leaves the request id free: nothing
+/// happened, so the caller may try again with the same id.
+fn reached_host(outcome: &HostOutcome) -> bool {
+    match outcome {
+        HostOutcome::Unavailable { reason, .. } => !matches!(
+            reason.as_str(),
+            "no_host_transport" | "host_unreachable" | "host_transport_unsupported"
+        ),
+        _ => true,
     }
 }

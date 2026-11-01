@@ -18,8 +18,9 @@
 //!   *shape* — never provider credentials, photo contents, file contents, or
 //!   shortcut inputs ([`state::AuditLog`]).
 //!
-//! The slice ships no platform adapter: [`adapter::FileHostAdapter`] is the
-//! transport seam a host fills in, and the capability table names the
+//! The slice ships no platform adapter: [`adapter::SocketHostAdapter`] is the
+//! one fixed transport the contract names, [`adapter::HostAdapter`] is the
+//! seam a later mobile slice fills in, and the capability table names the
 //! capabilities a later mobile slice implements.
 
 pub mod adapter;

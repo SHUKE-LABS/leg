@@ -92,12 +92,14 @@ registry are unchanged.
   dispatch happens.
 - The host owns the transport, the permission prompt, the dispatch, the
   cancellation, and the user confirmation; the bridge reaches it through the
-  `HostAdapter` seam (`src/bridge/adapter.rs`). This slice ships the
-  file-backed transport and the seam, and no platform adapter.
-- An approval is bound to the request id, the capability, and the digest of
-  the input (`src/bridge/state.rs`). A capability that needs consent is
-  previewed first and performs no side effect until the matching token is
-  replayed with the same request id and the same input.
+  `HostAdapter` seam (`src/bridge/adapter.rs`). This slice ships the seam and
+  the one fixed transport the contract names — a Unix socket — and no platform
+  adapter. Without a host the bridge answers `unavailable`.
+- An approval is bound to the capability and the digest of the input
+  (`src/bridge/state.rs`). A capability that needs consent performs no side
+  effect until the Skill replays the matching token with a fresh request id,
+  the same capability, and the same input; the host verifies the token before
+  it acts.
 - Every request has a deadline and a cancellation path, and the bridge writes
   an audit summary that carries request metadata and the *shape* of the input
   — never provider credentials, photo contents, file contents, or shortcut

@@ -1,20 +1,21 @@
-//! The host-adapter seam.
+//! The host-adapter seam and the fixed host transport.
 //!
 //! The host owns the transport, the permission prompt, the dispatch, the
 //! cancellation, and the user confirmation. The bridge only owns the
 //! protocol, so it reaches the host through the [`HostAdapter`] trait: a
 //! later mobile slice implements that trait for its platform, and this slice
-//! ships the file-backed transport plus the seam itself.
+//! ships the seam plus the one fixed transport the plan names — a Unix
+//! socket endpoint in `LEG_BRIDGE_HOST_SOCKET`.
 //!
-//! The file-backed transport needs no socket and no exec, which matters in
-//! the iSH guest: the host can hand the guest a directory both of them see,
-//! and the guest can hand the host answers back through the same directory.
+//! The transport is a socket and nothing else: it never loads a
+//! request-selected command, plugin, native library, or endpoint. The
+//! endpoint comes from the environment, the request never names one.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as _;
+#[cfg(unix)]
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,38 +24,12 @@ use serde_json::Value;
 
 use super::protocol::{BridgeError, BridgeStatus, PROTOCOL_VERSION};
 
-/// The prefix of the file the bridge writes its request into.
-///
-/// The file carries the request id, so two requests never share a file.
-pub const REQUEST_FILE_PREFIX: &str = "bridge-request-";
+/// The largest frame the bridge reads from the host.
+pub const MAX_HOST_FRAME_BYTES: usize = 64 * 1024;
 
-/// The prefix of the file the host writes its answer into.
-pub const RESPONSE_FILE_PREFIX: &str = "bridge-response-";
-
-/// The prefix of the file the bridge writes a cancellation notice into.
-pub const CANCEL_FILE_PREFIX: &str = "bridge-cancel-";
-
-/// The suffix every file of the file transport carries.
-const FILE_SUFFIX: &str = ".json";
-
-/// The interval the file transport polls the host with.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// The name of the file the bridge writes the request for `request_id` into.
-pub fn request_file(request_id: &str) -> String {
-    format!("{REQUEST_FILE_PREFIX}{request_id}{FILE_SUFFIX}")
-}
-
-/// The name of the file the host writes the answer for `request_id` into.
-pub fn response_file(request_id: &str) -> String {
-    format!("{RESPONSE_FILE_PREFIX}{request_id}{FILE_SUFFIX}")
-}
-
-/// The name of the file the bridge writes the cancellation notice for
-/// `request_id` into.
-pub fn cancel_file(request_id: &str) -> String {
-    format!("{CANCEL_FILE_PREFIX}{request_id}{FILE_SUFFIX}")
-}
+/// The longest the bridge waits for one read before it looks at the clock
+/// again.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A request the bridge hands to the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,11 +46,6 @@ pub struct HostRequest {
     pub input: Value,
     /// The digest of the input, so the host can bind its approval to it.
     pub input_sha256: String,
-    /// Whether the request may only be previewed.
-    ///
-    /// A preview asks the host what it would do and must not perform the
-    /// action; the host answers it with an approval summary and a token.
-    pub preview: bool,
     /// The approval token a previous answer issued, when the caller replays it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_token: Option<String>,
@@ -148,7 +118,34 @@ impl HostAdapter for UnavailableAdapter {
     }
 }
 
-/// The answer the host writes back over the file transport.
+/// What went wrong on the connection to the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionError {
+    /// The host closed the connection before it answered.
+    Closed,
+    /// The host's frame was larger than the limit.
+    TooLarge,
+    /// The connection itself failed.
+    Io(String),
+}
+
+/// The connection the transport talks to the host over.
+///
+/// The seam is small on purpose: the transport writes one frame and reads
+/// one frame. A platform that cannot use a Unix socket supplies its own
+/// implementation of this trait, and the protocol around it stays the same.
+pub trait HostConnection {
+    /// Writes one frame to the host.
+    fn send(&mut self, frame: &str) -> Result<(), String>;
+
+    /// Reads one frame from the host, waiting at most `wait` for it.
+    ///
+    /// The call returns `Ok(None)` when the host sent nothing within `wait`;
+    /// a frame that arrives in pieces stays in the connection's own buffer.
+    fn receive(&mut self, wait: Duration) -> Result<Option<String>, ConnectionError>;
+}
+
+/// The answer the host writes back over the transport.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostReply {
@@ -168,155 +165,230 @@ struct HostReply {
     error: Option<BridgeError>,
 }
 
-/// The file-backed host transport.
+/// The fixed host transport: a Unix socket endpoint.
 ///
-/// The bridge and the host share one directory: the bridge writes the request
-/// into [`request_file`], and the host writes its answer into
-/// [`response_file`]. The bridge reads the answer only when it carries the
-/// request's nonce, so a stale answer is never mistaken for a fresh one.
-pub struct FileHostAdapter {
-    /// The directory the bridge and the host share.
-    dir: PathBuf,
-    /// The interval the transport polls the host with.
-    poll_interval: Duration,
+/// The host listens on the socket and the guest connects to it. The endpoint
+/// comes from the environment, so a request can never choose it.
+pub struct SocketHostAdapter {
+    /// The socket the bridge connects to.
+    path: PathBuf,
 }
 
-impl FileHostAdapter {
-    /// Creates a transport that talks to the host through `dir`.
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            poll_interval: POLL_INTERVAL,
-        }
+impl SocketHostAdapter {
+    /// Creates a transport that talks to the host through `path`.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
     }
 
-    /// Creates a transport that polls the host at `poll_interval`.
-    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
-        self.poll_interval = poll_interval;
-        self
+    /// The socket the bridge connects to.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
+}
 
-    /// The directory the bridge and the host share.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
+impl HostAdapter for SocketHostAdapter {
+    fn dispatch(&mut self, request: &HostRequest, deadline: Instant) -> HostOutcome {
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixStream;
 
-    /// Writes the request into the shared directory.
-    fn write_request(&self, request: &HostRequest) -> Result<(), String> {
-        let text = serde_json::to_string(request)
-            .map_err(|error| format!("the request could not be serialized: {error}"))?;
-        write_atomic(
-            &self.dir.join(request_file(&request.request_id)),
-            text.as_bytes(),
-        )
-    }
-
-    /// Writes the cancellation notice into the shared directory.
-    fn write_cancel(&self, request: &HostRequest) {
-        let notice = serde_json::json!({
-            "version": PROTOCOL_VERSION,
-            "request_id": request.request_id,
-            "nonce": request.nonce,
-            "reason": "the guest stopped waiting for this request",
-        });
-        if let Ok(text) = serde_json::to_string(&notice) {
-            let _ = write_atomic(
-                &self.dir.join(cancel_file(&request.request_id)),
-                text.as_bytes(),
-            );
-        }
-    }
-
-    /// Reads the host's answer, waiting for it until the deadline.
-    fn read_answer(&self, request: &HostRequest, deadline: Instant) -> HostOutcome {
-        let path = self.dir.join(response_file(&request.request_id));
-        loop {
-            if crate::interrupt::is_signaled() {
-                self.write_cancel(request);
-                return HostOutcome::Cancelled;
-            }
-            match fs::read(&path) {
-                Ok(bytes) => {
-                    match serde_json::from_slice::<HostReply>(&bytes) {
-                        Ok(reply) => {
-                            if reply.nonce != request.nonce
-                                || reply.request_id != request.request_id
-                            {
-                                // The answer belongs to another request; keep
-                                // waiting for this one.
-                                std::thread::sleep(self.poll_interval);
-                                continue;
-                            }
-                            if reply.version != PROTOCOL_VERSION {
-                                return HostOutcome::Failed {
-                                    reason: "host_protocol_violation".to_string(),
-                                    message: format!(
-                                        "the host answered with version {}, not version {PROTOCOL_VERSION}",
-                                        reply.version
-                                    ),
-                                };
-                            }
-                            return outcome_from_reply(reply);
-                        }
-                        Err(error) => {
-                            return HostOutcome::Failed {
-                                reason: "host_crashed".to_string(),
-                                message: format!("the host's answer could not be read: {error}"),
-                            };
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            let stream = match UnixStream::connect(&self.path) {
+                Ok(stream) => stream,
                 Err(error) => {
-                    return HostOutcome::Failed {
-                        reason: "host_crashed".to_string(),
-                        message: format!("the host's answer could not be read: {error}"),
+                    return HostOutcome::Unavailable {
+                        reason: "host_unreachable".to_string(),
+                        message: format!(
+                            "the host socket {} could not be reached: {error}",
+                            self.path.display()
+                        ),
                     };
                 }
-            }
-
+            };
+            let mut connection = UnixHostConnection::new(stream);
+            // The connect itself is to a local endpoint and does not wait for
+            // the host, but the deadline still rules: a connection that took
+            // longer than the request may take is no answer at all.
             if Instant::now() >= deadline {
-                self.write_cancel(request);
                 return HostOutcome::TimedOut;
             }
-            std::thread::sleep(self.poll_interval);
+            exchange(&mut connection, request, deadline)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (request, deadline);
+            HostOutcome::Unavailable {
+                reason: "host_transport_unsupported".to_string(),
+                message:
+                    "this platform has no Unix socket transport; the guest runs on a Unix host"
+                        .to_string(),
+            }
         }
     }
 }
 
-impl HostAdapter for FileHostAdapter {
-    fn dispatch(&mut self, request: &HostRequest, deadline: Instant) -> HostOutcome {
-        if !self.dir.is_dir() {
-            return HostOutcome::Unavailable {
-                reason: "host_unreachable".to_string(),
-                message: format!(
-                    "the host transport directory {} does not exist",
-                    self.dir.display()
-                ),
-            };
-        }
+/// The connection to the host over its Unix socket.
+#[cfg(unix)]
+struct UnixHostConnection {
+    /// The socket the bridge talks to the host over.
+    stream: std::os::unix::net::UnixStream,
+    /// The bytes of a frame that arrived in pieces.
+    buffer: Vec<u8>,
+}
 
-        // A stale answer from an earlier request must never be mistaken for
-        // this one's answer.
-        let response_path = self.dir.join(response_file(&request.request_id));
-        if response_path.exists() {
-            let _ = fs::remove_file(&response_path);
+#[cfg(unix)]
+impl UnixHostConnection {
+    /// Creates a connection over `stream`.
+    fn new(stream: std::os::unix::net::UnixStream) -> Self {
+        Self {
+            stream,
+            buffer: Vec::new(),
         }
-        let _ = fs::remove_file(self.dir.join(cancel_file(&request.request_id)));
+    }
+}
 
-        if let Err(error) = self.write_request(request) {
+#[cfg(unix)]
+impl HostConnection for UnixHostConnection {
+    fn send(&mut self, frame: &str) -> Result<(), String> {
+        use std::io::Write as _;
+
+        self.stream
+            .write_all(frame.as_bytes())
+            .and_then(|()| self.stream.write_all(b"\n"))
+            .and_then(|()| self.stream.flush())
+            .map_err(|error| format!("the host socket could not be written: {error}"))
+    }
+
+    fn receive(&mut self, wait: Duration) -> Result<Option<String>, ConnectionError> {
+        use std::io::Read as _;
+
+        // A read timeout that rounds to zero is an error on some systems, so
+        // the wait never drops below a millisecond.
+        let wait = wait.max(Duration::from_millis(1));
+        self.stream
+            .set_read_timeout(Some(wait))
+            .map_err(|error| ConnectionError::Io(error.to_string()))?;
+
+        let mut chunk = [0u8; 4096];
+        match self.stream.read(&mut chunk) {
+            Ok(0) => Err(ConnectionError::Closed),
+            Ok(count) => {
+                self.buffer.extend_from_slice(&chunk[..count]);
+                if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                    let frame = self.buffer.drain(..=position).collect::<Vec<u8>>();
+                    let frame = &frame[..frame.len() - 1];
+                    return Ok(Some(String::from_utf8_lossy(frame).to_string()));
+                }
+                if self.buffer.len() > MAX_HOST_FRAME_BYTES {
+                    return Err(ConnectionError::TooLarge);
+                }
+                Ok(None)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(ConnectionError::Io(error.to_string())),
+        }
+    }
+}
+
+/// Carries one request to the host and reads its answer.
+///
+/// The exchange is the part of the transport every platform shares: it sends
+/// the request, waits for the answer within the deadline, and turns a broken
+/// answer into a distinct outcome.
+pub fn exchange(
+    connection: &mut dyn HostConnection,
+    request: &HostRequest,
+    deadline: Instant,
+) -> HostOutcome {
+    if crate::interrupt::is_signaled() {
+        return HostOutcome::Cancelled;
+    }
+
+    let frame = match serde_json::to_string(request) {
+        Ok(frame) => frame,
+        Err(error) => {
             return HostOutcome::Failed {
                 reason: "transport_error".to_string(),
-                message: error,
+                message: format!("the request could not be serialized: {error}"),
             };
         }
-
-        let outcome = self.read_answer(request, deadline);
-        // The request has been answered; the shared directory must not keep it
-        // around for the next request to pick up.
-        let _ = fs::remove_file(self.dir.join(request_file(&request.request_id)));
-        outcome
+    };
+    if let Err(error) = connection.send(&frame) {
+        return HostOutcome::Failed {
+            reason: "transport_error".to_string(),
+            message: error,
+        };
     }
+
+    loop {
+        if crate::interrupt::is_signaled() {
+            return HostOutcome::Cancelled;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return HostOutcome::TimedOut;
+        }
+
+        match connection.receive(remaining.min(POLL_INTERVAL)) {
+            Ok(Some(frame)) => return read_answer(&frame, request),
+            Ok(None) => {}
+            Err(ConnectionError::Closed) => {
+                return HostOutcome::Failed {
+                    reason: "host_crashed".to_string(),
+                    message: "the host closed the connection without answering".to_string(),
+                };
+            }
+            Err(ConnectionError::TooLarge) => {
+                return HostOutcome::Failed {
+                    reason: "host_protocol_violation".to_string(),
+                    message: format!(
+                        "the host's answer is larger than the {MAX_HOST_FRAME_BYTES} byte limit"
+                    ),
+                };
+            }
+            Err(ConnectionError::Io(error)) => {
+                return HostOutcome::Failed {
+                    reason: "host_crashed".to_string(),
+                    message: format!("the host's answer could not be read: {error}"),
+                };
+            }
+        }
+    }
+}
+
+/// Turns the host's answer into a bridge outcome.
+fn read_answer(frame: &str, request: &HostRequest) -> HostOutcome {
+    let reply: HostReply = match serde_json::from_str(frame) {
+        Ok(reply) => reply,
+        Err(error) => {
+            return HostOutcome::Failed {
+                reason: "host_crashed".to_string(),
+                message: format!("the host's answer could not be read: {error}"),
+            };
+        }
+    };
+    if reply.version != PROTOCOL_VERSION {
+        return HostOutcome::Failed {
+            reason: "host_protocol_violation".to_string(),
+            message: format!(
+                "the host answered with version {}, not version {PROTOCOL_VERSION}",
+                reply.version
+            ),
+        };
+    }
+    if reply.nonce != request.nonce || reply.request_id != request.request_id {
+        return HostOutcome::Failed {
+            reason: "host_protocol_violation".to_string(),
+            message: "the host's answer belongs to another request".to_string(),
+        };
+    }
+    outcome_from_reply(reply)
 }
 
 /// Turns the host's answer into a bridge outcome.
@@ -374,22 +446,6 @@ fn split_error(
         Some(error) => (error.reason, error.message),
         None => (default_reason.to_string(), default_message.to_string()),
     }
-}
-
-/// Writes `bytes` into `path` through a temporary file and one rename, so a
-/// reader never sees a half-written file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temporary = path.with_extension("tmp");
-    {
-        let mut file = fs::File::create(&temporary)
-            .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-        file.write_all(bytes)
-            .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-        file.sync_all()
-            .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-    }
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("could not publish {}: {error}", path.display()))
 }
 
 /// Builds the token that ties one request to its answer.

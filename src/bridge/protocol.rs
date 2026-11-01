@@ -107,8 +107,10 @@ pub struct BridgeError {
     /// The stable, machine-readable failure reason.
     pub reason: String,
     /// The human-readable failure detail.
+    #[serde(default)]
     pub message: String,
     /// The remediation hint for the caller.
+    #[serde(default)]
     pub remediation: String,
 }
 
