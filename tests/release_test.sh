@@ -151,6 +151,160 @@ link_npm_shim_node_modules() {
     done
 }
 
+# A minimal ELF header: magic, EI_CLASS, EI_DATA, EI_VERSION, EI_OSABI, eight
+# padding bytes, e_type, and the little-endian e_machine.
+make_elf_fixture() {
+    local path="${1}" elf_class="${2:-1}" machine="${3:-3}"
+
+    {
+        printf '\177ELF'
+        case "${elf_class}" in
+            2) printf '\002' ;;
+            *) printf '\001' ;;
+        esac
+        printf '\001\001\000'
+        printf '\000\000\000\000\000\000\000\000'
+        printf '\000\000'
+        case "${machine}" in
+            62) printf '\076' ;;
+            *) printf '\003' ;;
+        esac
+        printf '\000'
+    } >"${path}"
+}
+
+make_ish_binary_fixture() {
+    local dir="${1}" name="${2}"
+
+    make_elf_fixture "${dir}/${name}" 1 3
+    printf 'leg %s fixture payload\n' "${name}" >>"${dir}/${name}"
+}
+
+test_ish_bundle_is_reproducible_and_verified() (
+    set -euo pipefail
+    local repo version archive second entries manifest name
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.40.0"
+
+    mkdir -p "${repo}/binaries"
+    for name in leg leg-tui leg-web leg-ui-supervisor; do
+        make_ish_binary_fixture "${repo}/binaries" "${name}"
+    done
+
+    archive="${repo}/leg-${version}-i686-unknown-linux-musl.tar.gz"
+    release_ish_bundle "${version}" "${repo}/binaries" "${archive}"
+    release_ish_verify_archive "${archive}" "${version}"
+
+    entries="$(tar -tzf "${archive}" | LC_ALL=C sort)"
+    assert_eq "SHA256SUMS
+ish-compatibility-v1.json
+leg
+leg-tui
+leg-ui-supervisor
+leg-web" "${entries}" \
+        "the iSH archive carries the four binaries, the manifest, and SHA256SUMS"
+
+    second="${repo}/second.tar.gz"
+    release_ish_bundle "${version}" "${repo}/binaries" "${second}"
+    assert_eq "$(release_sha256_sum -- "${archive}" | cut -d' ' -f1)" \
+        "$(release_sha256_sum -- "${second}" | cut -d' ' -f1)" \
+        "the iSH archive is byte-for-byte reproducible"
+
+    mkdir "${repo}/unpacked"
+    tar -xzf "${archive}" -C "${repo}/unpacked"
+    manifest="${repo}/unpacked/ish-compatibility-v1.json"
+    assert_eq "i686-unknown-linux-musl" \
+        "$(node -e 'console.log(require(process.argv[1]).target)' "${manifest}")" \
+        "the manifest records the iSH target"
+    assert_eq "alpine:3.20.3" \
+        "$(node -e 'console.log(require(process.argv[1]).alpine_image)' "${manifest}")" \
+        "the manifest pins the Alpine image"
+    assert_eq "linux/386" \
+        "$(node -e 'console.log(require(process.argv[1]).docker_platform)' "${manifest}")" \
+        "the manifest records the container platform"
+    assert_eq "leg leg-tui leg-web leg-ui-supervisor" \
+        "$(node -e 'console.log(require(process.argv[1]).binaries.map((b) => b.name).join(" "))' "${manifest}")" \
+        "the manifest lists the four shipped binaries"
+    assert_eq "leg --version leg-tui --version leg-web --version leg-ui-supervisor --version" \
+        "$(node -e 'console.log(require(process.argv[1]).binaries.map((b) => b.version_command).join(" "))' "${manifest}")" \
+        "the manifest records the exact version command for every binary"
+)
+
+test_ish_bundle_rejects_wrong_binaries() (
+    set -euo pipefail
+    local repo version archive status output name
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.40.0"
+
+    mkdir -p "${repo}/binaries"
+    for name in leg leg-tui leg-web leg-ui-supervisor; do
+        make_ish_binary_fixture "${repo}/binaries" "${name}"
+    done
+    archive="${repo}/leg-${version}-i686-unknown-linux-musl.tar.gz"
+
+    rm "${repo}/binaries/leg-web"
+    status=0
+    output="$(release_ish_bundle "${version}" "${repo}/binaries" "${archive}" 2>&1)" || status="$?"
+    assert_rc_nonzero "${status}"
+    [[ "${output}" == *"iSH binary 'leg-web' missing"* ]] || \
+        fail "the bundle must name the missing binary: ${output}"
+    assert_eq "" "$(find "${repo}" -maxdepth 1 -name '*.tar.gz' -print)" \
+        "a rejected bundle leaves no archive behind"
+
+    make_ish_binary_fixture "${repo}/binaries" leg-web
+    make_elf_fixture "${repo}/binaries/leg" 2 62
+    status=0
+    output="$(release_ish_bundle "${version}" "${repo}/binaries" "${archive}" 2>&1)" || status="$?"
+    assert_rc_nonzero "${status}"
+    [[ "${output}" == *"is not an ELF32 executable"* ]] || \
+        fail "the bundle must reject a non-ELF32 binary: ${output}"
+    assert_eq "" "$(find "${repo}" -maxdepth 1 -name '*.tar.gz' -print)" \
+        "a rejected bundle leaves no archive behind"
+
+    make_ish_binary_fixture "${repo}/binaries" leg
+    release_ish_bundle "${version}" "${repo}/binaries" "${archive}"
+    mkdir "${repo}/unpacked"
+    tar -xzf "${archive}" -C "${repo}/unpacked"
+    node - "${repo}/unpacked/ish-compatibility-v1.json" <<'NODE'
+const fs = require('node:fs');
+const path = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
+manifest.target = 'x86_64-unknown-linux-musl';
+fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+    # Keep the inner checksums consistent so only the manifest target is wrong.
+    release_ish_write_checksums "${repo}/unpacked"
+    status=0
+    release_ish_verify_bundle "${repo}/unpacked" "${version}" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+)
+
+test_ish_elf_validation() (
+    set -euo pipefail
+    local repo status
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+
+    make_elf_fixture "${repo}/i386" 1 3
+    release_ish_validate_elf_i386 "${repo}/i386"
+
+    make_elf_fixture "${repo}/x86-64" 2 62
+    status=0
+    release_ish_validate_elf_i386 "${repo}/x86-64" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
+    printf 'not an elf file\n' >"${repo}/text"
+    status=0
+    release_ish_validate_elf_i386 "${repo}/text" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
+    status=0
+    release_ish_validate_elf_i386 "${repo}/missing" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+)
+
 test_manifest_and_lockfile_version_reads() (
     set -euo pipefail
     local repo
@@ -829,6 +983,9 @@ test_web_trial_notices_cover_companion_graph() (
 )
 
 tests=(
+    test_ish_bundle_is_reproducible_and_verified
+    test_ish_bundle_rejects_wrong_binaries
+    test_ish_elf_validation
     test_manifest_and_lockfile_version_reads
     test_verify_tag_matches_manifest
     test_release_bump_rules
