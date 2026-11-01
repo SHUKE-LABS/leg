@@ -33,8 +33,11 @@ impl Drop for Scratch {
 /// Creates a scratch directory named after the test.
 fn scratch(name: &str) -> Scratch {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // The name is cut short: the host socket lives in this directory, and a
+    // Unix socket path is short on some platforms.
+    let short: String = name.chars().take(20).collect();
     let path = std::env::temp_dir().join(format!(
-        "leg-bridge-guest-{name}-{}-{}",
+        "leg-bridge-guest-{short}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
@@ -143,13 +146,29 @@ fn request(id: &str, capability: &str, input: Value) -> String {
     .to_string()
 }
 
+/// Asserts the status the bridge answered with.
+///
+/// The whole answer is in the failure message: the failure reason and its
+/// message are what tell two answers apart.
+fn assert_status(answer: &Value, status: &str) {
+    assert_eq!(answer["status"], status, "the bridge answered: {answer}");
+}
+
+/// Asserts the failure reason the bridge answered with.
+fn assert_reason(answer: &Value, reason: &str) {
+    assert_eq!(
+        answer["error"]["reason"], reason,
+        "the bridge answered: {answer}"
+    );
+}
+
 /// The host the fixture plays.
 ///
 /// The host listens on a Unix socket, reads the request the bridge writes,
 /// and answers it the way the test asks for.
 #[cfg(unix)]
 mod host {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -265,53 +284,45 @@ mod host {
 
     /// Answers one request the way the fixture says.
     fn serve(
-        stream: UnixStream,
+        mut stream: UnixStream,
         answer: &impl Fn(&Value) -> Answer,
         seen: &Arc<Mutex<Vec<Value>>>,
         stop: &Arc<AtomicBool>,
     ) {
-        let _ = stream.set_nonblocking(false);
+        // A socket that a non-blocking listener accepted keeps the
+        // non-blocking flag on some platforms, and the fixture cannot tell
+        // the platforms apart. It therefore reads and writes with the
+        // refusals a non-blocking socket hands out, so the host answers the
+        // same way everywhere.
+        if let Err(error) = stream.set_nonblocking(true) {
+            eprintln!("the fixture could not set the socket to non-blocking: {error}");
+        }
         let mut writer = match stream.try_clone() {
             Ok(writer) => writer,
-            Err(_) => return,
-        };
-        let mut reader = BufReader::new(stream);
-
-        let mut line = String::new();
-        // The accepted socket may still be in non-blocking mode on some
-        // platforms, so the fixture waits for the request line instead of
-        // giving up on the first refusal.
-        let _ = reader
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(5)));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match reader.read_line(&mut line) {
-                Ok(0) => return,
-                Ok(_) if line.ends_with('\n') => break,
-                Ok(_) => continue,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    if Instant::now() >= deadline {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(2));
-                }
-                Err(_) => return,
+            Err(error) => {
+                eprintln!("the fixture could not clone the socket: {error}");
+                return;
             }
-        }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let line = match read_line(&mut stream, deadline) {
+            Some(line) => line,
+            None => {
+                eprintln!("the fixture read no request line");
+                return;
+            }
+        };
         if line.trim().is_empty() {
+            eprintln!("the fixture read an empty request line");
             return;
         }
         let request: Value = match serde_json::from_str(line.trim()) {
             Ok(request) => request,
-            Err(_) => return,
+            Err(error) => {
+                eprintln!("the fixture could not parse the request: {error}: {line}");
+                return;
+            }
         };
         seen.lock().expect("the host lock").push(request.clone());
 
@@ -325,8 +336,7 @@ mod host {
                     "result": result,
                     "error": null,
                 });
-                let _ = writeln!(writer, "{reply}");
-                let _ = writer.flush();
+                write_frame(&mut writer, format!("{reply}\n").as_bytes(), deadline);
             }
             Answer::Failure {
                 status,
@@ -341,13 +351,11 @@ mod host {
                     "result": null,
                     "error": {"reason": reason, "message": message},
                 });
-                let _ = writeln!(writer, "{reply}");
-                let _ = writer.flush();
+                write_frame(&mut writer, format!("{reply}\n").as_bytes(), deadline);
             }
             Answer::Crash => {}
             Answer::Raw(bytes) => {
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
+                write_frame(&mut writer, &bytes, deadline);
             }
             Answer::Silent => {
                 // The host says nothing until the test ends.
@@ -357,6 +365,74 @@ mod host {
                 }
             }
         }
+    }
+
+    /// Reads one line from the socket.
+    ///
+    /// The bytes that arrived stay in the buffer when the socket refuses the
+    /// read: a line that arrives in pieces is still one line.
+    fn read_line(socket: &mut UnixStream, deadline: Instant) -> Option<String> {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                return String::from_utf8(buffer[..position].to_vec()).ok();
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            match socket.read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(count) => buffer.extend_from_slice(&chunk[..count]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => {
+                    eprintln!("the fixture could not read the request: {error}");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Writes the whole frame to the socket.
+    ///
+    /// The write waits for the socket to take the bytes: a frame that is
+    /// larger than the socket buffer is written in pieces.
+    fn write_frame(socket: &mut UnixStream, bytes: &[u8], deadline: Instant) -> bool {
+        let mut written = 0;
+        while written < bytes.len() {
+            if Instant::now() >= deadline {
+                eprintln!("the fixture did not finish the answer in time");
+                return false;
+            }
+            match socket.write(&bytes[written..]) {
+                Ok(0) => return false,
+                Ok(count) => written += count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => {
+                    eprintln!("the fixture could not write the answer: {error}");
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -385,7 +461,7 @@ fn the_guest_reaches_the_capability_through_the_bash_tool() {
 
     assert_eq!(answer["version"], 1);
     assert_eq!(answer["request_id"], "r-1");
-    assert_eq!(answer["status"], "ok");
+    assert_status(&answer, "ok");
     assert_eq!(answer["result"]["items"], json!(["summer.jpg"]));
     assert!(answer["error"].is_null());
 }
@@ -431,13 +507,13 @@ fn a_bad_request_never_reaches_the_host() {
 
     for (line, reason) in cases {
         let answer = ask(socket, &state_dir, &line.to_string());
-        assert_eq!(answer["status"], "error");
-        assert_eq!(answer["error"]["reason"], reason);
+        assert_status(&answer, "error");
+        assert_reason(&answer, reason);
     }
 
     let malformed = ask(socket, &state_dir, "{\"version\":1,");
-    assert_eq!(malformed["status"], "error");
-    assert_eq!(malformed["error"]["reason"], "malformed_request");
+    assert_status(&malformed, "error");
+    assert_reason(&malformed, "malformed_request");
 
     #[cfg(unix)]
     assert_eq!(
@@ -485,8 +561,8 @@ fn an_oversized_request_never_reaches_the_host() {
     );
     let answer = run_command(&command);
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "request_too_large");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "request_too_large");
     #[cfg(unix)]
     assert_eq!(
         fixture.connection_count(),
@@ -513,11 +589,11 @@ fn a_request_id_is_used_once() {
     let socket = Some(fixture.path.as_path());
 
     let first = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
-    assert_eq!(first["status"], "ok", "the bridge answered: {first}");
+    assert_status(&first, "ok");
 
     let second = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
-    assert_eq!(second["status"], "error", "the bridge answered: {second}");
-    assert_eq!(second["error"]["reason"], "duplicate_request_id");
+    assert_status(&second, "error");
+    assert_reason(&second, "duplicate_request_id");
     assert_eq!(
         fixture.connection_count(),
         1,
@@ -558,7 +634,7 @@ fn an_approval_the_user_refuses_is_answered_denied() {
         &state_dir,
         &request("r-1", "photos.list", json!({"limit": 1})),
     );
-    assert_eq!(pending["status"], "approval_required");
+    assert_status(&pending, "approval_required");
     let token = pending["result"]["approval_token"]
         .as_str()
         .expect("the answer carries a token")
@@ -576,7 +652,7 @@ fn an_approval_the_user_refuses_is_answered_denied() {
     .to_string();
     let answer = ask(socket, &state_dir, &follow_up);
 
-    assert_eq!(answer["status"], "denied");
+    assert_status(&answer, "denied");
     assert_eq!(answer["request_id"], "r-2");
 
     // The host received both requests, and the follow-up carried the token.
@@ -611,8 +687,8 @@ fn a_cancelled_request_is_answered_cancelled() {
 
     let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "cancelled");
-    assert_eq!(answer["error"]["reason"], "cancelled");
+    assert_status(&answer, "cancelled");
+    assert_reason(&answer, "cancelled");
 }
 
 #[cfg(unix)]
@@ -642,8 +718,8 @@ fn a_request_the_host_ignores_times_out() {
     let answer = ask(socket, &state_dir, &line);
     let elapsed = started.elapsed();
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "timeout");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "timeout");
     assert!(
         elapsed < std::time::Duration::from_secs(30),
         "the request did not stop at its deadline: {elapsed:?}"
@@ -666,8 +742,8 @@ fn a_host_that_crashes_is_answered_error() {
 
     let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "host_crashed");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "host_crashed");
     assert_eq!(
         fixture.connection_count(),
         1,
@@ -695,8 +771,8 @@ fn a_permission_the_host_withholds_is_answered_unavailable() {
 
     let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "unavailable");
-    assert_eq!(answer["error"]["reason"], "permission_denied");
+    assert_status(&answer, "unavailable");
+    assert_reason(&answer, "permission_denied");
 }
 
 #[test]
@@ -716,8 +792,8 @@ fn a_request_that_is_not_text_is_refused() {
     );
     let answer = run_command(&command);
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "malformed_request");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "malformed_request");
 }
 
 #[test]
@@ -731,8 +807,8 @@ fn a_guest_without_a_host_is_answered_unavailable() {
     // No host socket is configured, so the bridge has no transport.
     let answer = ask(None, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "unavailable");
-    assert_eq!(answer["error"]["reason"], "no_host_transport");
+    assert_status(&answer, "unavailable");
+    assert_reason(&answer, "no_host_transport");
 }
 
 #[cfg(unix)]
@@ -752,8 +828,8 @@ fn a_host_that_is_not_listening_is_answered_unavailable() {
         &request("r-1", "files.list", json!({})),
     );
 
-    assert_eq!(answer["status"], "unavailable");
-    assert_eq!(answer["error"]["reason"], "host_unreachable");
+    assert_status(&answer, "unavailable");
+    assert_reason(&answer, "host_unreachable");
 }
 
 #[cfg(unix)]
@@ -775,8 +851,8 @@ fn a_host_that_sends_a_huge_frame_is_refused() {
 
     let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "host_protocol_violation");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "host_protocol_violation");
     assert_eq!(
         fixture.connection_count(),
         1,
@@ -800,8 +876,8 @@ fn a_host_that_sends_a_frame_that_is_not_text_is_refused() {
 
     let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "host_crashed");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "host_crashed");
 }
 
 #[cfg(unix)]
@@ -823,8 +899,8 @@ fn a_host_that_asks_for_an_approval_without_a_summary_is_refused() {
 
     let answer = ask(socket, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "host_protocol_violation");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "host_protocol_violation");
 }
 
 #[test]
@@ -845,8 +921,8 @@ fn a_guest_with_a_ledger_it_cannot_read_is_refused() {
     // rather than reading it as its own.
     let answer = ask(None, &state_dir, &request("r-1", "files.list", json!({})));
 
-    assert_eq!(answer["status"], "error");
-    assert_eq!(answer["error"]["reason"], "state_unavailable");
+    assert_status(&answer, "error");
+    assert_reason(&answer, "state_unavailable");
     // The failure happened before the request was dispatched, but the caller
     // still learns which request failed.
     assert_eq!(answer["request_id"], "r-1");
@@ -882,7 +958,7 @@ fn the_bridge_keeps_the_request_values_out_of_its_diagnostics() {
             json!({"name": "morning", "input": {"photo": secret}}),
         ),
     );
-    assert_eq!(answer["status"], "approval_required");
+    assert_status(&answer, "approval_required");
 
     let audit = fs::read_to_string(state_dir.join("audit.log")).expect("the audit summary");
     assert!(audit.contains("r-1"));
