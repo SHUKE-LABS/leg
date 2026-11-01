@@ -634,6 +634,11 @@ fn a_host_that_crashes_is_answered_error() {
 
     assert_eq!(answer["status"], "error");
     assert_eq!(answer["error"]["reason"], "host_crashed");
+    assert_eq!(
+        fixture.connection_count(),
+        1,
+        "the crashed request was dispatched again"
+    );
 }
 
 #[cfg(unix)]
@@ -658,6 +663,27 @@ fn a_permission_the_host_withholds_is_answered_unavailable() {
 
     assert_eq!(answer["status"], "unavailable");
     assert_eq!(answer["error"]["reason"], "permission_denied");
+}
+
+#[test]
+fn a_request_that_is_not_text_is_refused() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("not-text");
+    let state_dir = scratch.path.join("state");
+
+    // Bytes that are not UTF-8 are a malformed request, not a request with
+    // replacement characters in it.
+    let command = format!(
+        "export LEG_BRIDGE_STATE_DIR={}; printf '\\xff\\xfe\\n' | {}",
+        shell_quote(&state_dir.to_string_lossy()),
+        shell_quote(&shell_path(Path::new(BRIDGE))),
+    );
+    let answer = run_command(&command);
+
+    assert_eq!(answer["status"], "error");
+    assert_eq!(answer["error"]["reason"], "malformed_request");
 }
 
 #[test]

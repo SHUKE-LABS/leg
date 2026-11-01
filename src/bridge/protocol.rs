@@ -29,6 +29,9 @@ pub const MAX_INPUT_BYTES: usize = 32 * 1024;
 /// The largest serialized result the bridge relays back, in bytes.
 pub const MAX_RESULT_BYTES: usize = 64 * 1024;
 
+/// The largest answer the bridge writes.
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// The request deadline the bridge applies when a request names none.
 pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
@@ -127,6 +130,43 @@ impl BridgeError {
             remediation: remediation.into(),
         }
     }
+
+    /// Builds a bounded failure out of the host's own strings.
+    ///
+    /// The host is a separate program, so its failure detail may be any
+    /// length and any shape. The reason is kept when it reads like a reason
+    /// — short and made of the characters a reason is made of — and the
+    /// message is cut at a fixed length. Neither can grow the answer.
+    pub fn from_host(reason: &str, message: &str, remediation: &str) -> Self {
+        let reason = if !reason.is_empty()
+            && reason.len() <= MAX_ERROR_REASON_LEN
+            && reason.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+            }) {
+            reason.to_string()
+        } else {
+            "host_error".to_string()
+        };
+        Self {
+            reason,
+            message: truncate(message, MAX_ERROR_MESSAGE_LEN),
+            remediation: remediation.to_string(),
+        }
+    }
+}
+
+/// The longest failure reason the bridge copies from the host.
+pub const MAX_ERROR_REASON_LEN: usize = 64;
+
+/// The longest failure message the bridge copies from the host.
+pub const MAX_ERROR_MESSAGE_LEN: usize = 1024;
+
+/// Cuts a string at `limit` characters, on a character boundary.
+pub fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars().take(limit).collect()
 }
 
 /// The answer the bridge writes back to its caller.

@@ -52,6 +52,9 @@ native code, or a host filesystem path: the input is a JSON object whose
 fields the capability table names, and the only path shape the bridge accepts
 is a relative, normalized path.
 
+The request is decoded strictly: bytes that are not UTF-8 are a malformed
+request, not a request with replacement characters in it.
+
 The bridge refuses a request — before it reaches the host — when it speaks an
 unknown version, names an unknown capability, carries an unknown field, is not
 valid JSON, is larger than 64 KiB, carries an input larger than 32 KiB, reuses
@@ -105,6 +108,11 @@ A failure carries a stable reason, a message, and a remediation:
   }
 }
 ```
+
+Every answer is bounded: the result, the failure reason, and the failure
+message each have a fixed limit, and an answer that grew past the response
+limit is replaced by a fixed one that says so (`response_too_large`). A host
+that answers with a huge failure detail cannot make the bridge's answer grow.
 
 The reasons are grouped by the status they answer with:
 
@@ -216,10 +224,20 @@ reaches the host.
 
 - **Scope.** The ledger lives in the state directory, so the ids are refused
   across the invocations that share it — the invocations of one guest.
+- **The ledger is locked.** The bridge takes an exclusive lock on the state
+  directory while it reads and writes it, and it reserves the request id
+  before it calls the host. Two invocations that carry the same id therefore
+  cannot dispatch it twice: one of them finds the id taken and is refused.
+  The operating system releases the lock when the holder ends, so a crash
+  leaves no lock behind.
 - **Retention.** The ledger keeps the last 64 request ids. An id that falls
   out of the ledger may be used again.
 - **A request that never reached the host keeps its id.** A guest whose host
   was not reachable may try again with the same id, because nothing happened.
+- **A ledger that cannot be written is a failure of its own.** The bridge
+  refuses the request before it calls the host (`state_unavailable`), and it
+  answers a recorded failure when the ledger cannot be written after the host
+  answered — it never claims a request id that was not remembered.
 
 ## Limits
 
@@ -227,8 +245,11 @@ reaches the host.
 | --- | --- |
 | Request line | 64 KiB |
 | Request input | 32 KiB |
+| Answer | 64 KiB |
 | Answer result | 64 KiB |
 | Host frame | 64 KiB |
+| Failure reason | 64 characters |
+| Failure message | 1 KiB |
 | Text field | 4 KiB |
 | Object field | 4 KiB |
 | Item count | 100 |
@@ -247,8 +268,9 @@ names of the input fields, the digest of the input, and whether the request
 redeemed an approval.
 
 It never carries the *values*: no provider credential, no photo contents, no
-file contents, and no shortcut input. `LEG_BRIDGE_AUDIT=off` turns the log
-off.
+file contents, and no shortcut input. The capability name and the field names
+it carries are cut to a fixed length, so a caller cannot make the summary
+grow. `LEG_BRIDGE_AUDIT=off` turns the log off.
 
 The ledger holds no values either: it keeps request ids, digests, terminal
 states, and the approval binding. The approval token itself is not written

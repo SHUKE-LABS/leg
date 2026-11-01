@@ -122,9 +122,18 @@ fn read_request() -> Result<String, BridgeError> {
             "send a smaller request",
         ));
     }
-    let request = String::from_utf8_lossy(&line)
-        .trim_end_matches(['\n', '\r'])
-        .to_string();
+    // The request is decoded strictly: bytes that are not UTF-8 are a
+    // malformed request, not a request with replacement characters in it.
+    let request = match String::from_utf8(line) {
+        Ok(text) => text.trim_end_matches(['\n', '\r']).to_string(),
+        Err(_) => {
+            return Err(BridgeError::new(
+                "malformed_request",
+                "the request is not valid UTF-8",
+                "pipe one request of UTF-8 JSON into the bridge",
+            ));
+        }
+    };
     if request.trim().is_empty() {
         return Err(BridgeError::new(
             "empty_request",

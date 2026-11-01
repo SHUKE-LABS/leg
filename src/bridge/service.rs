@@ -18,12 +18,33 @@ use serde_json::{Value, json};
 use super::adapter::{self, HostAdapter, HostOutcome, HostRequest};
 use super::protocol::{
     self, BridgeError, BridgeRequest, BridgeResponse, BridgeStatus, DEFAULT_TIMEOUT_MS,
-    MAX_REQUEST_BYTES, MAX_RESULT_BYTES, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, PROTOCOL_VERSION,
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_RESULT_BYTES, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS,
+    PROTOCOL_VERSION,
 };
 use super::state::{AuditEntry, AuditLog, BridgeState, audit_timestamp};
 
 /// The longest capability name the audit summary records.
 const AUDIT_CAPABILITY_CHARS: usize = 64;
+
+/// The longest input field name the audit summary records.
+const AUDIT_FIELD_CHARS: usize = 64;
+
+/// The names of the input fields, bounded for the audit summary.
+///
+/// The names come from the caller, so they are cut to a fixed length and a
+/// fixed count: the summary stays small whatever the request carried.
+fn bounded_field_names(input: &Value) -> Vec<String> {
+    input
+        .as_object()
+        .map(|fields| {
+            fields
+                .keys()
+                .take(protocol::MAX_FIELD_COUNT as usize)
+                .map(|name| name.chars().take(AUDIT_FIELD_CHARS).collect())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// The bridge: the protocol, the host seam, the ledger, and the audit trail.
 pub struct Bridge {
@@ -125,34 +146,12 @@ impl Bridge {
     /// Runs the validated request through the host.
     fn dispatch(&mut self, request: BridgeRequest, started: Instant) -> BridgeResponse {
         let digest = request.input_digest();
-        let input_fields = request
-            .input
-            .as_object()
-            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let input_fields = bounded_field_names(&request.input);
 
-        // The ledger must be writable before anything reaches the host: a
-        // bridge that cannot remember which request ids it dispatched cannot
-        // keep them unique, and must not act.
-        if let Err(error) = self.state.save() {
-            return self.answer(
-                request.request_id.clone(),
-                request.capability.clone(),
-                BridgeStatus::Error,
-                None,
-                Some(BridgeError::new(
-                    "state_unavailable",
-                    error,
-                    "make the bridge state directory writable",
-                )),
-                started,
-                digest,
-                input_fields,
-                false,
-            );
-        }
-
-        let continuation = match self.check_approval(&request, &digest, started) {
+        // The ledger must be readable, writable, and locked before anything
+        // reaches the host: a bridge that cannot remember which request ids
+        // it dispatched cannot keep them unique, and must not act.
+        let continuation = match self.begin(&request, &digest, started) {
             Ok(continuation) => continuation,
             Err(response) => return *response,
         };
@@ -185,6 +184,72 @@ impl Bridge {
         )
     }
 
+    /// Reserves the request id and checks the approval, under the lock.
+    ///
+    /// The lock is the state scope: two invocations that share the state
+    /// directory take turns here, so a request id is checked and reserved
+    /// before the host is called. A second invocation that carries the same
+    /// id finds it taken and never dispatches it.
+    fn begin(
+        &mut self,
+        request: &BridgeRequest,
+        digest: &str,
+        started: Instant,
+    ) -> Result<bool, Box<BridgeResponse>> {
+        let _lock = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Err(Box::new(
+                    self.state_failure(request, digest, error, started),
+                ));
+            }
+        };
+        if let Err(error) = self.state.reload() {
+            return Err(Box::new(
+                self.state_failure(request, digest, error, started),
+            ));
+        }
+
+        let continuation = self.check_approval(request, digest, started)?;
+
+        // The reservation is written before the host is called, so a second
+        // invocation that carries the same id finds it taken.
+        self.state.reserve(&request.request_id, digest);
+        if let Err(error) = self.state.save() {
+            self.state.release(&request.request_id);
+            return Err(Box::new(
+                self.state_failure(request, digest, error, started),
+            ));
+        }
+
+        Ok(continuation)
+    }
+
+    /// Answers a request the bridge could not record.
+    fn state_failure(
+        &mut self,
+        request: &BridgeRequest,
+        digest: &str,
+        error: String,
+        started: Instant,
+    ) -> BridgeResponse {
+        self.answer(
+            request.request_id.clone(),
+            request.capability.clone(),
+            BridgeStatus::Error,
+            None,
+            Some(BridgeError::new(
+                "state_unavailable",
+                error,
+                "make the bridge state directory writable",
+            )),
+            started,
+            digest.to_string(),
+            bounded_field_names(&request.input),
+            false,
+        )
+    }
+
     /// Checks the request against the ledger.
     ///
     /// A request id is used once: the ledger remembers the requests that
@@ -200,11 +265,7 @@ impl Bridge {
     ) -> Result<bool, Box<BridgeResponse>> {
         let capability = request.capability.clone();
         let request_id = request.request_id.clone();
-        let input_fields = request
-            .input
-            .as_object()
-            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let input_fields = bounded_field_names(&request.input);
 
         if self.state.is_known(&request_id) {
             return Err(Box::new(self.answer(
@@ -335,6 +396,8 @@ impl Bridge {
         let capability = request.capability.clone();
         let token = request.approval_token.clone();
         let reached = reached_host(&outcome);
+        // The approval the host issued, when it issued one.
+        let mut issued: Option<String> = None;
 
         let (status, result, error) = match outcome {
             HostOutcome::Ok(result) => (BridgeStatus::Ok, Some(result), None),
@@ -355,8 +418,8 @@ impl Bridge {
                 } else {
                     // The binding names the capability and the digest of the
                     // input, so the token cannot be redeemed for another one.
-                    self.state
-                        .record_approval(&capability, digest, &approval_token);
+                    // It is written with the terminal state, under the lock.
+                    issued = Some(approval_token.clone());
                     (
                         BridgeStatus::ApprovalRequired,
                         Some(json!({
@@ -370,9 +433,9 @@ impl Bridge {
             HostOutcome::Denied { reason, message } => (
                 BridgeStatus::Denied,
                 None,
-                Some(BridgeError::new(
-                    reason,
-                    message,
+                Some(BridgeError::from_host(
+                    &reason,
+                    &message,
                     "the host refused the request; ask before retrying",
                 )),
             ),
@@ -388,18 +451,18 @@ impl Bridge {
             HostOutcome::Unavailable { reason, message } => (
                 BridgeStatus::Unavailable,
                 None,
-                Some(BridgeError::new(
-                    reason,
-                    message,
+                Some(BridgeError::from_host(
+                    &reason,
+                    &message,
                     "the host cannot serve this capability right now",
                 )),
             ),
             HostOutcome::Failed { reason, message } => (
                 BridgeStatus::Error,
                 None,
-                Some(BridgeError::new(
-                    reason,
-                    message,
+                Some(BridgeError::from_host(
+                    &reason,
+                    &message,
                     "the host could not serve the request; check the host and retry",
                 )),
             ),
@@ -435,20 +498,34 @@ impl Bridge {
         // the last few dozen request ids, which is as long as a caller may
         // reasonably replay one. A transport that never connected leaves the
         // id free: nothing happened, so the caller may try again.
-        if reached {
-            self.state
-                .record_dispatched(&request_id, digest, status.as_str());
-        }
-        // A redeemed approval cannot be redeemed twice. An answer that never
-        // arrived leaves the approval pending, because the host decides
-        // whether the action happened.
-        if continuation
-            && let Some(token) = token.as_deref()
-            && matches!(status, BridgeStatus::Ok | BridgeStatus::Denied)
-        {
-            self.state.redeem_approval(token);
-        }
-        let _ = self.state.save();
+        //
+        // A ledger that cannot be written is a failure of its own: the
+        // answer says so instead of claiming a request id that was never
+        // remembered.
+        let persistence = self.record_terminal(
+            &request_id,
+            &capability,
+            digest,
+            status,
+            reached,
+            issued.as_deref(),
+            token.as_deref(),
+            continuation,
+        );
+        let (status, result, error) = match persistence {
+            Ok(()) => (status, result, error),
+            Err(error) => (
+                BridgeStatus::Error,
+                None,
+                Some(BridgeError::new(
+                    "state_unavailable",
+                    format!(
+                        "the request reached the host, but the ledger could not be written: {error}"
+                    ),
+                    "check the bridge state directory; the request may have run",
+                )),
+            ),
+        };
 
         self.answer(
             request_id,
@@ -461,6 +538,43 @@ impl Bridge {
             input_fields,
             continuation,
         )
+    }
+
+    /// Writes the terminal state of a request to the ledger, under the lock.
+    #[allow(clippy::too_many_arguments)]
+    fn record_terminal(
+        &mut self,
+        request_id: &str,
+        capability: &str,
+        digest: &str,
+        status: BridgeStatus,
+        reached: bool,
+        issued: Option<&str>,
+        token: Option<&str>,
+        continuation: bool,
+    ) -> Result<(), String> {
+        let _lock = self.state.lock()?;
+        self.state.reload()?;
+        if reached {
+            self.state
+                .record_dispatched(request_id, digest, status.as_str());
+            if let Some(issued) = issued {
+                self.state.record_approval(capability, digest, issued);
+            }
+            // A redeemed approval cannot be redeemed twice. An answer that
+            // never arrived leaves the approval pending, because the host
+            // decides whether the action happened.
+            if continuation
+                && let Some(token) = token
+                && matches!(status, BridgeStatus::Ok | BridgeStatus::Denied)
+            {
+                self.state.redeem_approval(token);
+            }
+        } else {
+            // The request never reached the host, so its id is free again.
+            self.state.release(request_id);
+        }
+        self.state.save()
     }
 
     /// Writes the answer and the audit summary.
@@ -479,13 +593,27 @@ impl Bridge {
     ) -> BridgeResponse {
         let request_id = request_id.into();
         let capability = capability.into();
-        let response = BridgeResponse {
+        let mut response = BridgeResponse {
             version: PROTOCOL_VERSION,
             request_id: request_id.clone(),
             status,
             result,
             error: error.clone(),
         };
+
+        // The answer is bounded whatever the host said: an answer that grew
+        // past the limit is replaced by a fixed one that says so.
+        if response.serialized_len() > MAX_RESPONSE_BYTES {
+            response = BridgeResponse::failure(
+                request_id.clone(),
+                BridgeStatus::Error,
+                BridgeError::new(
+                    "response_too_large",
+                    format!("the answer is larger than the {MAX_RESPONSE_BYTES} byte limit"),
+                    "ask the host for a smaller answer",
+                ),
+            );
+        }
 
         let summary = AuditEntry {
             ts: audit_timestamp(),

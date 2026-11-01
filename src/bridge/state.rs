@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +22,12 @@ const STATE_SCHEMA: &str = "leg.bridge.state/v1";
 
 /// The name of the state file inside the state directory.
 const STATE_FILE: &str = "state.json";
+
+/// The name of the lock file that guards the ledger.
+const LOCK_FILE: &str = "state.lock";
+
+/// The state a request holds while it is on its way to the host.
+const STATE_DISPATCHING: &str = "dispatching";
 
 /// The name of the audit log inside the state directory.
 const AUDIT_FILE: &str = "audit.log";
@@ -158,6 +165,33 @@ impl BridgeState {
         Ok(state)
     }
 
+    /// Reads the ledger again from its directory.
+    ///
+    /// Another invocation may have written to it since this one loaded it,
+    /// and the ledger is only true while it is held under the lock.
+    pub fn reload(&mut self) -> Result<(), String> {
+        let fresh = BridgeState::load(&self.dir)?;
+        self.schema = fresh.schema;
+        self.requests = fresh.requests;
+        self.approvals = fresh.approvals;
+        Ok(())
+    }
+
+    /// The directory the ledger lives in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Takes the lock that guards the ledger in this directory.
+    ///
+    /// The lock is an advisory lock on a file in the state directory: two
+    /// invocations that share the state directory take turns, so a request id
+    /// cannot be dispatched twice. The operating system releases the lock
+    /// when the holder ends, so a crash leaves no stale lock behind.
+    pub fn lock(&self) -> Result<StateLock, String> {
+        StateLock::acquire(&self.dir)
+    }
+
     /// Writes the state back to its directory.
     ///
     /// The write is atomic: the ledger reaches the disk whole or not at all,
@@ -209,6 +243,29 @@ impl BridgeState {
                 issued_at: unix_seconds(),
             },
         );
+    }
+
+    /// Reserves a request id for a request that is on its way to the host.
+    ///
+    /// The reservation is taken under the lock, before the host is called, so
+    /// a second invocation that carries the same id finds it taken.
+    pub fn reserve(&mut self, request_id: &str, input_sha256: &str) {
+        self.record_dispatched(request_id, input_sha256, STATE_DISPATCHING);
+    }
+
+    /// Whether the request is on its way to the host.
+    pub fn is_dispatching(&self, request_id: &str) -> bool {
+        self.requests
+            .get(request_id)
+            .is_some_and(|record| record.terminal_state == STATE_DISPATCHING)
+    }
+
+    /// Gives a reserved request id back.
+    ///
+    /// A request that never reached the host changed nothing, so its id is
+    /// free again and the caller may try once more.
+    pub fn release(&mut self, request_id: &str) {
+        self.requests.remove(request_id);
     }
 
     /// Records an approval the host issued.
@@ -278,6 +335,50 @@ impl BridgeState {
             };
             self.requests.remove(&oldest);
         }
+    }
+}
+
+/// The lock that guards the ledger.
+///
+/// The lock is held for as long as the guard lives, and the operating system
+/// releases it when the process ends — a bridge that dies mid-request leaves
+/// no lock behind.
+pub struct StateLock {
+    /// The file the lock is held on.
+    file: File,
+    /// The path of that file.
+    path: PathBuf,
+}
+
+impl StateLock {
+    /// Takes the lock in `dir`, waiting for the holder to finish.
+    pub fn acquire(dir: &Path) -> Result<Self, String> {
+        fs::create_dir_all(dir)
+            .map_err(|error| format!("could not create the state directory: {error}"))?;
+        let path = dir.join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| {
+                format!("could not open the ledger lock {}: {error}", path.display())
+            })?;
+        file.lock()
+            .map_err(|error| format!("could not lock the ledger {}: {error}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// The file the lock is held on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 

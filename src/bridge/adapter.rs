@@ -437,13 +437,19 @@ fn outcome_from_reply(reply: HostReply) -> HostOutcome {
 }
 
 /// Splits a structured failure into a reason and a message.
+///
+/// The host's own strings are bounded on the way in: the answer the bridge
+/// writes stays within its limit whatever the host said.
 fn split_error(
     error: Option<BridgeError>,
     default_reason: &str,
     default_message: &str,
 ) -> (String, String) {
     match error {
-        Some(error) => (error.reason, error.message),
+        Some(error) => {
+            let bounded = BridgeError::from_host(&error.reason, &error.message, "");
+            (bounded.reason, bounded.message)
+        }
         None => (default_reason.to_string(), default_message.to_string()),
     }
 }

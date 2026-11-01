@@ -1,13 +1,14 @@
 use super::adapter::{
     self, ConnectionError, HostAdapter, HostConnection, HostOutcome, HostRequest,
 };
-use super::protocol::{self, BridgeStatus};
+use super::protocol::{self, BridgeResponse, BridgeStatus};
 use super::service::Bridge;
 use super::state::{AuditLog, BridgeState};
 
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -164,6 +165,117 @@ fn host_request() -> HostRequest {
         approval_token: None,
         timeout_ms: 1000,
     }
+}
+
+/// A host every bridge in the test shares.
+struct SharedHost {
+    /// The requests the host received.
+    seen: Arc<Mutex<Vec<HostRequest>>>,
+}
+
+impl HostAdapter for SharedHost {
+    fn dispatch(&mut self, request: &HostRequest, _deadline: Instant) -> HostOutcome {
+        self.seen
+            .lock()
+            .expect("the host lock")
+            .push(request.clone());
+        HostOutcome::Ok(json!({"items": []}))
+    }
+}
+
+#[test]
+fn two_invocations_cannot_dispatch_the_same_request_id() {
+    let scratch = scratch("concurrent");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let start = Arc::new(Barrier::new(2));
+
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let seen = Arc::clone(&seen);
+        let start = Arc::clone(&start);
+        let dir = scratch.path.clone();
+        threads.push(std::thread::spawn(move || {
+            let state = BridgeState::load(&dir).expect("load the bridge state");
+            let mut bridge = Bridge::new(
+                Box::new(SharedHost {
+                    seen: Arc::clone(&seen),
+                }),
+                state,
+                AuditLog::new(None),
+            );
+            start.wait();
+            bridge.handle(&request("r-1", "files.list", json!({})))
+        }));
+    }
+
+    let answers: Vec<BridgeResponse> = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("the thread finished"))
+        .collect();
+
+    assert_eq!(
+        seen.lock().expect("the host lock").len(),
+        1,
+        "the request id reached the host twice"
+    );
+    assert_eq!(
+        answers
+            .iter()
+            .filter(|answer| answer.status == BridgeStatus::Ok)
+            .count(),
+        1,
+        "both invocations dispatched the request"
+    );
+    let reasons: Vec<String> = answers
+        .iter()
+        .filter_map(|answer| answer.error.as_ref().map(|error| error.reason.clone()))
+        .collect();
+    assert!(
+        reasons.contains(&"duplicate_request_id".to_string()),
+        "the second invocation was not refused: {reasons:?}"
+    );
+}
+
+#[test]
+fn a_host_that_sends_a_huge_failure_does_not_grow_the_answer() {
+    let scratch = scratch("huge-error");
+    let mut bridge = bridge(
+        FakeHost::always(HostOutcome::Denied {
+            reason: "r".repeat(10_000),
+            message: "m".repeat(100_000),
+        }),
+        &scratch,
+    );
+
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Denied);
+    let error = response.error.clone().expect("the request failed");
+    assert_eq!(error.reason, "host_error");
+    assert!(
+        error.message.chars().count() <= protocol::MAX_ERROR_MESSAGE_LEN,
+        "the failure message was not bounded"
+    );
+    assert!(
+        response.serialized_len() <= protocol::MAX_RESPONSE_BYTES,
+        "the answer was not bounded"
+    );
+}
+
+#[test]
+fn a_result_the_host_makes_too_large_is_refused() {
+    let scratch = scratch("huge-result");
+    let mut bridge = bridge(
+        FakeHost::always(HostOutcome::Ok(json!({"items": ["x".repeat(70 * 1024)]}))),
+        &scratch,
+    );
+
+    let response = bridge.handle(&request("r-1", "files.list", json!({})));
+    assert_eq!(response.status, BridgeStatus::Error);
+    assert_eq!(
+        response.error.as_ref().expect("the request failed").reason,
+        "result_too_large"
+    );
+    assert!(response.serialized_len() <= protocol::MAX_RESPONSE_BYTES);
 }
 
 #[test]
