@@ -1,0 +1,329 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AA11AA11AA11AA11AA110001 /* LegHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11AA11AA11AA11AA110010 /* LegHostApp.swift */; };
+		AA11AA11AA11AA11AA110002 /* IshPlatformShim.c in Sources */ = {isa = PBXBuildFile; fileRef = AA11AA11AA11AA11AA110011 /* IshPlatformShim.c */; };
+		AA11AA11AA11AA11AA110003 /* LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = AA11AA11AA11AA11AA110014 /* LICENSE */; };
+		AA11AA11AA11AA11AA110004 /* LICENSE.IOS in Resources */ = {isa = PBXBuildFile; fileRef = AA11AA11AA11AA11AA110015 /* LICENSE.IOS */; };
+		AA11AA11AA11AA11AA110005 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = AA11AA11AA11AA11AA110016 /* THIRD_PARTY_NOTICES.md */; };
+		AA11AA11AA11AA11AA110006 /* ISH_REVISION in Resources */ = {isa = PBXBuildFile; fileRef = AA11AA11AA11AA11AA110017 /* ISH_REVISION */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AA11AA11AA11AA11AA110010 /* LegHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegHostApp.swift; sourceTree = "<group>"; };
+		AA11AA11AA11AA11AA110011 /* IshPlatformShim.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = IshPlatformShim.c; sourceTree = "<group>"; };
+		AA11AA11AA11AA11AA110012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		AA11AA11AA11AA11AA110013 /* LegHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LegHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA11AA11AA11AA11AA110014 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
+		AA11AA11AA11AA11AA110015 /* LICENSE.IOS */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE.IOS; sourceTree = "<group>"; };
+		AA11AA11AA11AA11AA110016 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = text; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
+		AA11AA11AA11AA11AA110017 /* ISH_REVISION */ = {isa = PBXFileReference; lastKnownFileType = text; path = ISH_REVISION; sourceTree = "<group>"; };
+		AA11AA11AA11AA11AA110018 /* build-ish-runtime.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "build-ish-runtime.sh"; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AA11AA11AA11AA11AA110033 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		AA11AA11AA11AA11AA110020 = {
+			isa = PBXGroup;
+			children = (
+				AA11AA11AA11AA11AA110021 /* LegHost */,
+				AA11AA11AA11AA11AA110022 /* vendor */,
+				AA11AA11AA11AA11AA110023 /* scripts */,
+				AA11AA11AA11AA11AA110014 /* LICENSE */,
+				AA11AA11AA11AA11AA110015 /* LICENSE.IOS */,
+				AA11AA11AA11AA11AA110016 /* THIRD_PARTY_NOTICES.md */,
+				AA11AA11AA11AA11AA110024 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		AA11AA11AA11AA11AA110021 /* LegHost */ = {
+			isa = PBXGroup;
+			children = (
+				AA11AA11AA11AA11AA110010 /* LegHostApp.swift */,
+				AA11AA11AA11AA11AA110011 /* IshPlatformShim.c */,
+				AA11AA11AA11AA11AA110012 /* Info.plist */,
+			);
+			path = LegHost;
+			sourceTree = "<group>";
+		};
+		AA11AA11AA11AA11AA110022 /* vendor */ = {
+			isa = PBXGroup;
+			children = (
+				AA11AA11AA11AA11AA110017 /* ISH_REVISION */,
+			);
+			path = vendor/ish;
+			sourceTree = "<group>";
+		};
+		AA11AA11AA11AA11AA110023 /* scripts */ = {
+			isa = PBXGroup;
+			children = (
+				AA11AA11AA11AA11AA110018 /* build-ish-runtime.sh */,
+			);
+			path = scripts;
+			sourceTree = "<group>";
+		};
+		AA11AA11AA11AA11AA110024 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AA11AA11AA11AA11AA110013 /* LegHost.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AA11AA11AA11AA11AA110030 /* LegHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA11AA11AA11AA11AA110031 /* Build configuration list for PBXNativeTarget "LegHost" */;
+			buildPhases = (
+				AA11AA11AA11AA11AA110035 /* Build iSH runtime */,
+				AA11AA11AA11AA11AA110032 /* Sources */,
+				AA11AA11AA11AA11AA110033 /* Frameworks */,
+				AA11AA11AA11AA11AA110034 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LegHost;
+			productName = LegHost;
+			productReference = AA11AA11AA11AA11AA110013 /* LegHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AA11AA11AA11AA11AA110040 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2610;
+				LastUpgradeCheck = 2610;
+				TargetAttributes = {
+					AA11AA11AA11AA11AA110030 = {
+						CreatedOnToolsVersion = 26.1;
+					};
+				};
+			};
+			buildConfigurationList = AA11AA11AA11AA11AA110041 /* Build configuration list for PBXProject "LegHost" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = AA11AA11AA11AA11AA110020;
+			productRefGroup = AA11AA11AA11AA11AA110024 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AA11AA11AA11AA11AA110030 /* LegHost */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		AA11AA11AA11AA11AA110034 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA11AA11AA11AA11AA110006 /* ISH_REVISION in Resources */,
+				AA11AA11AA11AA11AA110003 /* LICENSE in Resources */,
+				AA11AA11AA11AA11AA110004 /* LICENSE.IOS in Resources */,
+				AA11AA11AA11AA11AA110005 /* THIRD_PARTY_NOTICES.md in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		AA11AA11AA11AA11AA110035 /* Build iSH runtime */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Build iSH runtime";
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/libish_runtime.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/bash \"$SRCROOT/scripts/build-ish-runtime.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AA11AA11AA11AA11AA110032 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA11AA11AA11AA11AA110001 /* LegHostApp.swift in Sources */,
+				AA11AA11AA11AA11AA110002 /* IshPlatformShim.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AA11AA11AA11AA11AA110042 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		AA11AA11AA11AA11AA110043 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = s;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		AA11AA11AA11AA11AA110044 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/vendor/ish",
+				);
+				INFOPLIST_FILE = LegHost/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-force_load",
+					"$(BUILT_PRODUCTS_DIR)/libish_runtime.a",
+					"-lsqlite3",
+					"-Wl,-map,$(BUILT_PRODUCTS_DIR)/LegHost.linkmap",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		AA11AA11AA11AA11AA110045 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/vendor/ish",
+				);
+				INFOPLIST_FILE = LegHost/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-force_load",
+					"$(BUILT_PRODUCTS_DIR)/libish_runtime.a",
+					"-lsqlite3",
+					"-Wl,-map,$(BUILT_PRODUCTS_DIR)/LegHost.linkmap",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		AA11AA11AA11AA11AA110031 /* Build configuration list for PBXNativeTarget "LegHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA11AA11AA11AA11AA110044 /* Debug */,
+				AA11AA11AA11AA11AA110045 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AA11AA11AA11AA11AA110041 /* Build configuration list for PBXProject "LegHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA11AA11AA11AA11AA110042 /* Debug */,
+				AA11AA11AA11AA11AA110043 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AA11AA11AA11AA11AA110040 /* Project object */;
+}

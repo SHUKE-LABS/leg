@@ -252,6 +252,15 @@ contract](docs/capability-bridge.md) defines the schemas, the capability
 names, the approval semantics, the limits, the audit summary, and the rule a
 platform adapter has to keep.
 
+## Native iOS host
+
+The repository also carries a native iOS host under [`ios/`](ios/README.md):
+a standalone Xcode project (`LegHost`) that embeds one pinned iSH revision and
+launches a placeholder host screen. It is built and installed separately from
+the emulated bundle above, and it links no proprietary `leg` source: `leg`
+runs inside the guest, as a separate program. See
+[ios/README.md](ios/README.md) for the build, install and signing commands.
+
 ## Experimental TUI trial
 
 The terminal interface is experimental and ships with the npm package.
