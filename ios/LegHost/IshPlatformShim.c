@@ -27,6 +27,8 @@ struct cpu_usage get_cpu_usage(void) {
     struct cpu_usage usage = {0};
     struct rusage self;
 
+    /* iOS exposes no system-wide CPU accounting, so the host reports its own
+     * usage; the idle and nice counters stay at zero. */
     if (getrusage(RUSAGE_SELF, &self) != 0) {
         return usage;
     }
