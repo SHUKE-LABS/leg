@@ -280,6 +280,10 @@ jobs:
       RELEASE_TAG: ${{ needs.tag.outputs.tag }}
       TARGET: i686-unknown-linux-musl
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+
       - name: Download the iSH bundle
         uses: actions/download-artifact@v7
         with:
