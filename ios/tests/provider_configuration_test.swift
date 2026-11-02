@@ -1,11 +1,13 @@
 import Foundation
+import Security
 
 /// Host side fixtures for the provider configuration of the LegHost host.
 ///
 /// The fixtures cover the boundary the host reads its provider
-/// configuration at: the read of the item of the Keychain, the JSON of the
-/// item and the two diagnostics the host reports there. The read of the item
-/// is handed in, so the fixtures need neither a Keychain nor a simulator.
+/// configuration at: the call into the Security framework, the query that
+/// call carries, the JSON of the item and the two diagnostics the host
+/// reports there. The call into the Security framework is handed in, so the
+/// fixtures need neither a Keychain nor a simulator.
 @main
 struct ProviderConfigurationFixtures {
     private var failures = 0
@@ -22,7 +24,9 @@ struct ProviderConfigurationFixtures {
 
     private mutating func run() {
         aValidItemIsRead()
+        theQueryFindsTheItemOfTheProvider()
         anItemThatIsNotThereIsMissing()
+        anItemWithoutDataIsMissing()
         anItemWithoutOneOfTheKeysIsMissing()
         anItemWithAnExtraKeyIsMissing()
         anItemWithoutAPositiveContextWindowIsMissing()
@@ -40,7 +44,7 @@ struct ProviderConfigurationFixtures {
         let configuration = try? ProviderConfigurationStore.load(
             providerOverride: nil,
             hasNoProvider: false,
-            reader: { Data(Self.validItem.utf8) })
+            copyMatching: Self.copying(Self.validItem))
         check(configuration != nil, "the valid item was not read")
         guard let configuration else { return }
         check(configuration.provider == .anthropic,
@@ -55,12 +59,50 @@ struct ProviderConfigurationFixtures {
               "the context window of the valid item is \(configuration.contextWindowTokens)")
     }
 
+    /// The query of the read names the item the host owns.
+    ///
+    /// The item is a generic password of the service of the provider, under
+    /// the account of the provider, and the read asks for its data.
+    private mutating func theQueryFindsTheItemOfTheProvider() {
+        var seen: [String: Any]?
+        _ = try? ProviderConfigurationStore.load(
+            providerOverride: nil,
+            hasNoProvider: false,
+            copyMatching: { query, _ in
+                seen = query as? [String: Any]
+                return errSecItemNotFound
+            })
+        guard let query = seen else {
+            check(false, "the read did not ask the Security framework for anything")
+            return
+        }
+        check(query[kSecClass as String] as? String == (kSecClassGenericPassword as String),
+              "the class of the query is \(String(describing: query[kSecClass as String]))")
+        check(query[kSecAttrService as String] as? String == ProviderConfigurationStore.service,
+              "the service of the query is \(String(describing: query[kSecAttrService as String]))")
+        check(query[kSecAttrAccount as String] as? String == ProviderConfigurationStore.account,
+              "the account of the query is \(String(describing: query[kSecAttrAccount as String]))")
+        check(query[kSecReturnData as String] as? Bool == true,
+              "the query does not ask for the data of the item")
+        check(query[kSecMatchLimit as String] as? String == (kSecMatchLimitOne as String),
+              "the match limit of the query is \(String(describing: query[kSecMatchLimit as String]))")
+    }
+
     /// There is no item, so the configuration is missing.
     private mutating func anItemThatIsNotThereIsMissing() {
         expect(.missing, "the item that is not there") {
             try ProviderConfigurationStore.load(providerOverride: nil,
                                                 hasNoProvider: false,
-                                                reader: { throw ProviderConfigurationError.missing })
+                                                copyMatching: { _, _ in errSecItemNotFound })
+        }
+    }
+
+    /// The read found no data, so the configuration is missing.
+    private mutating func anItemWithoutDataIsMissing() {
+        expect(.missing, "the item without data") {
+            try ProviderConfigurationStore.load(providerOverride: nil,
+                                                hasNoProvider: false,
+                                                copyMatching: { _, _ in errSecSuccess })
         }
     }
 
@@ -70,7 +112,7 @@ struct ProviderConfigurationFixtures {
             try ProviderConfigurationStore.load(
                 providerOverride: nil,
                 hasNoProvider: false,
-                reader: { Data(Self.itemWithoutKey.utf8) })
+                copyMatching: Self.copying(Self.itemWithoutKey))
         }
     }
 
@@ -80,7 +122,7 @@ struct ProviderConfigurationFixtures {
             try ProviderConfigurationStore.load(
                 providerOverride: nil,
                 hasNoProvider: false,
-                reader: { Data(Self.itemWithExtraKey.utf8) })
+                copyMatching: Self.copying(Self.itemWithExtraKey))
         }
     }
 
@@ -91,7 +133,7 @@ struct ProviderConfigurationFixtures {
                 try ProviderConfigurationStore.load(
                     providerOverride: nil,
                     hasNoProvider: false,
-                    reader: { Data(Self.item(withContextWindow: window).utf8) })
+                    copyMatching: Self.copying(Self.item(withContextWindow: window)))
             }
         }
     }
@@ -103,7 +145,7 @@ struct ProviderConfigurationFixtures {
                 try ProviderConfigurationStore.load(
                     providerOverride: nil,
                     hasNoProvider: false,
-                    reader: { Data(Self.item(withEmptyValue: key).utf8) })
+                    copyMatching: Self.copying(Self.item(withEmptyValue: key)))
             }
         }
     }
@@ -114,7 +156,7 @@ struct ProviderConfigurationFixtures {
             try ProviderConfigurationStore.load(
                 providerOverride: nil,
                 hasNoProvider: false,
-                reader: { Data(Self.item(withProvider: "some-other-provider").utf8) })
+                copyMatching: Self.copying(Self.item(withProvider: "some-other-provider")))
         }
     }
 
@@ -124,7 +166,7 @@ struct ProviderConfigurationFixtures {
             try ProviderConfigurationStore.load(
                 providerOverride: nil,
                 hasNoProvider: false,
-                reader: { Data("this is not JSON".utf8) })
+                copyMatching: Self.copying("this is not JSON"))
         }
     }
 
@@ -135,7 +177,7 @@ struct ProviderConfigurationFixtures {
                 try ProviderConfigurationStore.load(
                     providerOverride: nil,
                     hasNoProvider: false,
-                    reader: { Data(Self.item(withProvider: provider).utf8) })
+                    copyMatching: Self.copying(Self.item(withProvider: provider)))
             }
         }
     }
@@ -154,8 +196,8 @@ struct ProviderConfigurationFixtures {
 
     /// Checks that the read reports the expected error.
     private mutating func expect(_ expected: ProviderConfigurationError,
-                        _ what: String,
-                        _ body: () throws -> ProviderConfiguration) {
+                                 _ what: String,
+                                 _ body: () throws -> ProviderConfiguration) {
         do {
             let configuration = try body()
             check(false, "\(what) was read as \(configuration)")
@@ -176,6 +218,14 @@ struct ProviderConfigurationFixtures {
     }
 
     // MARK: - The items
+
+    /// A call into the Security framework that answers with the item.
+    private static func copying(_ item: String) -> ProviderConfigurationStore.ItemCopier {
+        { _, result in
+            result.pointee = (item.data(using: .utf8) ?? Data()) as NSData
+            return errSecSuccess
+        }
+    }
 
     /// An item that holds a usable configuration.
     private static let validItem = """

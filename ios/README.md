@@ -438,9 +438,9 @@ ios/tests/run-host-tests.sh
 ```
 
 The provider configuration of the host has its own fixtures. They hand in
-the read of the item of the Keychain, so they need neither a Keychain nor a
-simulator, and they cover the read, the JSON of the item and the two
-diagnostics:
+the call into the Security framework, so they need neither a Keychain nor a
+simulator, and they cover the query of that call, the JSON of the item and
+the two diagnostics:
 
 ```
 ios/tests/run-provider-tests.sh

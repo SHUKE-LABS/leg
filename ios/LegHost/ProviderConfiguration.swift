@@ -99,11 +99,13 @@ enum ProviderConfigurationStore {
     /// process. A build without the DEBUG controls reads the item of the
     /// Keychain, whatever the controls say.
     ///
-    /// The read of the item is a parameter, so the boundary can be exercised
-    /// without an item in the Keychain of the machine that runs the test.
+    /// The call into the Security framework is a parameter, so the boundary
+    /// can be exercised without an item in the Keychain of the machine that
+    /// runs the test: the fixtures hand in a call that answers with an item
+    /// of their own, and they read the query of the production read.
     static func load(providerOverride: HostProvider?,
                      hasNoProvider: Bool,
-                     reader: ItemReader = readKeychainItem) throws -> ProviderConfiguration {
+                     copyMatching: ItemCopier = copyKeychainItem) throws -> ProviderConfiguration {
         #if DEBUG
         if hasNoProvider {
             throw ProviderConfigurationError.missing
@@ -119,14 +121,18 @@ enum ProviderConfigurationStore {
                                          contextWindowTokens: fixtureContextWindowTokens)
         }
         #endif
-        return try decode(try reader())
+        return try decode(try readKeychainItem(copyMatching: copyMatching))
     }
 
-    /// The read of the item of the Keychain.
+    /// The call into the Security framework that looks the item up.
     ///
-    /// The production read asks the Keychain for the item; a test hands in a
-    /// read of its own.
-    typealias ItemReader = () throws -> Data
+    /// The production read asks the Security framework for the item; a test
+    /// hands in a call of its own and reads the query it was given.
+    typealias ItemCopier = (_ query: CFDictionary,
+                            _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus
+
+    /// The call of the Security framework that looks an item up.
+    static let copyKeychainItem: ItemCopier = SecItemCopyMatching
 
     /// Reads the configuration item from the Keychain.
     ///
@@ -134,7 +140,7 @@ enum ProviderConfigurationStore {
     /// accessibility of an item is not a searchable attribute, so it is a
     /// property of the item the writer stores and not of the search that
     /// finds it.
-    static func readKeychainItem() throws -> Data {
+    static func readKeychainItem(copyMatching: ItemCopier = copyKeychainItem) throws -> Data {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -143,7 +149,7 @@ enum ProviderConfigurationStore {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        let status = copyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess, let data = item as? Data else {
             throw ProviderConfigurationError.missing
         }
