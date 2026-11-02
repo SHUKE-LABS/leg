@@ -14,6 +14,11 @@
 # transcript of those runs has to hold the marker of the failure. The four
 # artifacts of those runs are scanned as well.
 #
+# The script runs the relaunch and the background run as well: the relaunch
+# run starts the app twice and checks the durable ledger of the requests
+# across the two processes, and the background run checks the trail the host
+# writes out when it stops the session.
+#
 # With --skip-run the script runs no scenario and scans the artifacts of the
 # run that is already in the simulator.
 #
@@ -28,6 +33,8 @@ SUCCESS_TEST="LegHostUITests/LegHostFixtureUITests/testTheSuccessScenarioComplet
 PROVIDER_ERROR_TEST="LegHostUITests/LegHostFixtureUITests/testTheProviderErrorScenarioReportsAServerError"
 UNREACHABLE_TEST="LegHostUITests/LegHostFixtureUITests/testTheUnreachableScenarioReportsATransportError"
 RUNTIME_FAILURE_TEST="LegHostUITests/LegHostFixtureUITests/testTheRuntimeFailureScenarioReportsTheRuntimeDiagnostic"
+RELAUNCH_TEST="LegHostUITests/LegHostFixtureUITests/testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests"
+BACKGROUND_TEST="LegHostUITests/LegHostFixtureUITests/testTheBackgroundInterruptsTheTurnAndKeepsTheTrail"
 PROVIDER_ERROR_MARKER="provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR"
 UNREACHABLE_MARKER="transport error:"
 RUNTIME_FAILURE_MARKER="IOS_GUEST_RUNTIME_ERROR"
@@ -143,6 +150,8 @@ TRANSCRIPT=""
 GUEST_TREE=""
 TRAIL=""
 APP_LOG=""
+LEDGER=""
+PERSISTED_TRAIL=""
 
 resolve_artifacts() {
     local container="$1"
@@ -150,6 +159,8 @@ resolve_artifacts() {
     TRANSCRIPT="${container}/Library/Application Support/LegHost/test-artifacts/terminal-transcript.log"
     GUEST_TREE="${container}/Library/Application Support/LegHost/roots/root.active/data"
     TRAIL="${GUEST_TREE}/tmp/leg-ios-fixture/exchange.jsonl"
+    LEDGER="${container}/Library/Application Support/LegHost/test-artifacts/request-ledger.jsonl"
+    PERSISTED_TRAIL="${container}/Library/Application Support/LegHost/test-artifacts/exchange-trail.jsonl"
     APP_LOG="${DERIVED_DATA}/fixture-verification-${log_name}.log"
     capture_app_log "${APP_LOG}"
 }
@@ -209,6 +220,75 @@ check_turn_markers() {
         echo "error: the exchange trail of ${label} does not hold the loopback base URL" >&2
         status=1
     fi
+}
+
+# The durable ledger of the requests the fixture accepted.
+#
+# The ledger holds one JSON object per line: the turn of the request, the
+# ordinal of the request in that turn and the status it was answered with.
+# The ledger of a run that was not reset holds the requests of the runs
+# before it, so the number of lines is the number of accepted requests of
+# every run. A repeated request shows up as a second line with the same
+# ordinal of the same turn.
+check_ledger() {
+    local label="$1"
+    local expected="$2"
+    if [[ ! -f "${LEDGER}" ]]; then
+        echo "error: the request ledger of ${label} is missing at ${LEDGER}" >&2
+        status=1
+        return
+    fi
+    if grep -F -q "${SENTINEL}" "${LEDGER}"; then
+        echo "error: the request ledger of ${label} holds the configured credential" >&2
+        status=1
+    fi
+    local lines
+    lines="$(grep -c . "${LEDGER}" || true)"
+    if [[ "${lines}" != "${expected}" ]]; then
+        echo "error: the request ledger of ${label} holds ${lines} requests, expected ${expected}" >&2
+        status=1
+        return
+    fi
+    local turns
+    turns="$(sed -n 's/.*"turn":"\([^"]*\)".*/\1/p' "${LEDGER}" | sort -u | wc -l | tr -d ' ')"
+    if [[ "${turns}" != "1" ]]; then
+        echo "error: the request ledger of ${label} holds ${turns} turns, a request was repeated" >&2
+        status=1
+        return
+    fi
+    local repeated
+    repeated="$(sed -n 's/.*"request":\([0-9]*\).*/\1/p' "${LEDGER}" | sort | uniq -d | wc -l | tr -d ' ')"
+    if [[ "${repeated}" != "0" ]]; then
+        echo "error: the request ledger of ${label} holds a repeated ordinal of a turn" >&2
+        status=1
+        return
+    fi
+    echo "ok: the request ledger of ${label} holds ${lines} requests of one turn"
+}
+
+# The trail of the session that was stopped.
+#
+# The host writes the trail of the guest out when the session is stopped at
+# the boundary of the host, so the trail of a turn that was interrupted is
+# kept outside the guest root as well.
+check_persisted_trail() {
+    local label="$1"
+    if [[ ! -f "${PERSISTED_TRAIL}" ]]; then
+        echo "error: the persisted trail of ${label} is missing at ${PERSISTED_TRAIL}" >&2
+        status=1
+        return
+    fi
+    if grep -F -q "${SENTINEL}" "${PERSISTED_TRAIL}"; then
+        echo "error: the persisted trail of ${label} holds the configured credential" >&2
+        status=1
+        return
+    fi
+    if [[ ! -s "${PERSISTED_TRAIL}" ]]; then
+        echo "error: the persisted trail of ${label} is empty" >&2
+        status=1
+        return
+    fi
+    echo "ok: the persisted trail of ${label} holds no credential"
 }
 
 # Runs one scenario and scans the artifacts of that run.
@@ -277,6 +357,18 @@ else
     # trail behind: the trail of that run is scanned when it is there.
     run_and_scan "${RUNTIME_FAILURE_TEST}" "runtime failure run" "runtime-failure" \
         "${RUNTIME_FAILURE_MARKER}" "${RUNTIME_FAILURE_MARKER}" optional
+
+    # The relaunch run starts the app twice: the second launch keeps the
+    # workspace and the trail of the first one and does not send the turn
+    # again, so the durable ledger holds the two requests of the first turn
+    # and nothing else.
+    run_and_scan "${RELAUNCH_TEST}" "relaunch run" "relaunch" "" ""
+    check_ledger "the relaunch run" 2
+
+    # The background run stops the session in the middle of the turn, so the
+    # host writes the trail of the stopped turn out.
+    run_and_scan "${BACKGROUND_TEST}" "background run" "background" "" ""
+    check_persisted_trail "the background run"
 fi
 
 if [[ "${status}" -ne 0 ]]; then

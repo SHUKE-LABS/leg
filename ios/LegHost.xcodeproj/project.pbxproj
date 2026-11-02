@@ -28,10 +28,23 @@
 		DD11DD11DD11DD11DD110002 /* LoopbackFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */; };
 		CC11CC11CC11CC11CC110001 /* LegHostUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */; };
 		CC11CC11CC11CC11CC110002 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CC11CC11CC11CC11CC110011 /* XCTest.framework */; };
+		EE11EE11EE11EE11EE110011 /* HostPreflight.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110001 /* HostPreflight.swift */; };
+		EE11EE11EE11EE11EE110012 /* GuestHostLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110002 /* GuestHostLifecycle.swift */; };
+		EE11EE11EE11EE11EE110013 /* FixtureRequestLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */; };
+		EE11EE11EE11EE11EE110031 /* GuestHostLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */; };
+		EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */; };
+		EE11EE11EE11EE11EE110033 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE11CC11CC11CC11CC110011 /* XCTest.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
 		CC11CC11CC11CC11CC110020 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AA11AA11AA11AA11AA110040 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AA11AA11AA11AA11AA110030;
+			remoteInfo = LegHost;
+		};
+		EE11EE11EE11EE11EE110044 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = AA11AA11AA11AA11AA110040 /* Project object */;
 			proxyType = 1;
@@ -67,6 +80,12 @@
 		CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegHostUITests.swift; sourceTree = "<group>"; };
 		CC11CC11CC11CC11CC110011 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Developer/Library/Frameworks/XCTest.framework; sourceTree = SDKROOT; };
 		CC11CC11CC11CC11CC110012 /* LegHostUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		EE11EE11EE11EE11EE110001 /* HostPreflight.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostPreflight.swift; sourceTree = "<group>"; };
+		EE11EE11EE11EE11EE110002 /* GuestHostLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestHostLifecycle.swift; sourceTree = "<group>"; };
+		EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureRequestLedger.swift; sourceTree = "<group>"; };
+		EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestHostLifecycleTests.swift; sourceTree = "<group>"; };
+		EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostPreflightTests.swift; sourceTree = "<group>"; };
+		EE11EE11EE11EE11EE110023 /* LegHostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -85,6 +104,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		EE11EE11EE11EE11EE110042 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EE11EE11EE11EE11EE110033 /* XCTest.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -93,6 +120,7 @@
 			children = (
 				AA11AA11AA11AA11AA110021 /* LegHost */,
 				CC11CC11CC11CC11CC110013 /* LegHostUITests */,
+				EE11EE11EE11EE11EE110020 /* LegHostTests */,
 				AA11AA11AA11AA11AA110022 /* vendor */,
 				AA11AA11AA11AA11AA110023 /* scripts */,
 				BB11BB11BB11BB11BB110020 /* resources */,
@@ -111,6 +139,15 @@
 			path = LegHostUITests;
 			sourceTree = "<group>";
 		};
+		EE11EE11EE11EE11EE110020 /* LegHostTests */ = {
+			isa = PBXGroup;
+			children = (
+				EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */,
+				EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */,
+			);
+			path = LegHostTests;
+			sourceTree = "<group>";
+		};
 		AA11AA11AA11AA11AA110021 /* LegHost */ = {
 			isa = PBXGroup;
 			children = (
@@ -118,9 +155,12 @@
 				AA11AA11AA11AA11AA110011 /* IshPlatformShim.c */,
 				AA11AA11AA11AA11AA110012 /* Info.plist */,
 				BB11BB11BB11BB11BB110004 /* GuestHostController.swift */,
+				EE11EE11EE11EE11EE110002 /* GuestHostLifecycle.swift */,
+				EE11EE11EE11EE11EE110001 /* HostPreflight.swift */,
 				BB11BB11BB11BB11BB110005 /* GuestTerminalView.swift */,
 				DD11DD11DD11DD11DD110011 /* ProviderConfiguration.swift */,
 				DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */,
+				EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */,
 				BB11BB11BB11BB11BB110001 /* Sha256.c */,
 				BB11BB11BB11BB11BB110002 /* GuestProvision.c */,
 				BB11BB11BB11BB11BB110003 /* GuestRuntime.c */,
@@ -171,6 +211,7 @@
 			children = (
 				AA11AA11AA11AA11AA110013 /* LegHost.app */,
 				CC11CC11CC11CC11CC110012 /* LegHostUITests.xctest */,
+				EE11EE11EE11EE11EE110023 /* LegHostTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -215,6 +256,24 @@
 			productReference = CC11CC11CC11CC11CC110012 /* LegHostUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		EE11EE11EE11EE11EE110040 /* LegHostTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = EE11EE11EE11EE11EE110046 /* Build configuration list for PBXNativeTarget "LegHostTests" */;
+			buildPhases = (
+				EE11EE11EE11EE11EE110041 /* Sources */,
+				EE11EE11EE11EE11EE110042 /* Frameworks */,
+				EE11EE11EE11EE11EE110043 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				EE11EE11EE11EE11EE110045 /* PBXTargetDependency */,
+			);
+			name = LegHostTests;
+			productName = LegHostTests;
+			productReference = EE11EE11EE11EE11EE110023 /* LegHostTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -229,6 +288,10 @@
 						CreatedOnToolsVersion = 26.1;
 					};
 					CC11CC11CC11CC11CC110040 = {
+						CreatedOnToolsVersion = 26.1;
+						TestTargetID = AA11AA11AA11AA11AA110030;
+					};
+					EE11EE11EE11EE11EE110040 = {
 						CreatedOnToolsVersion = 26.1;
 						TestTargetID = AA11AA11AA11AA11AA110030;
 					};
@@ -249,6 +312,7 @@
 			targets = (
 				AA11AA11AA11AA11AA110030 /* LegHost */,
 				CC11CC11CC11CC11CC110040 /* LegHostUITests */,
+				EE11EE11EE11EE11EE110040 /* LegHostTests */,
 			);
 		};
 /* End PBXProject section */
@@ -272,6 +336,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		CC11CC11CC11CC11CC110043 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		EE11EE11EE11EE11EE110043 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -329,9 +400,12 @@
 				BB11BB11BB11BB11BB110012 /* GuestProvision.c in Sources */,
 				BB11BB11BB11BB11BB110013 /* GuestRuntime.c in Sources */,
 				BB11BB11BB11BB11BB110014 /* GuestHostController.swift in Sources */,
+				EE11EE11EE11EE11EE110012 /* GuestHostLifecycle.swift in Sources */,
+				EE11EE11EE11EE11EE110011 /* HostPreflight.swift in Sources */,
 				BB11BB11BB11BB11BB110015 /* GuestTerminalView.swift in Sources */,
 				DD11DD11DD11DD11DD110001 /* ProviderConfiguration.swift in Sources */,
 				DD11DD11DD11DD11DD110002 /* LoopbackFixture.swift in Sources */,
+				EE11EE11EE11EE11EE110013 /* FixtureRequestLedger.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -340,6 +414,15 @@
 			buildActionMask = 2147483647;
 			files = (
 				CC11CC11CC11CC11CC110001 /* LegHostUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		EE11EE11EE11EE11EE110041 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EE11EE11EE11EE11EE110031 /* GuestHostLifecycleTests.swift in Sources */,
+				EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -531,6 +614,52 @@
 			};
 			name = Release;
 		};
+		EE11EE11EE11EE11EE110047 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_TESTING_SEARCH_PATHS = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PLATFORM_DIR)/Developer/Library/Frameworks",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/LegHost.app/LegHost";
+			};
+			name = Debug;
+		};
+		EE11EE11EE11EE11EE110048 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_TESTING_SEARCH_PATHS = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PLATFORM_DIR)/Developer/Library/Frameworks",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/LegHost.app/LegHost";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -561,6 +690,15 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		EE11EE11EE11EE11EE110046 /* Build configuration list for PBXNativeTarget "LegHostTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EE11EE11EE11EE11EE110047 /* Debug */,
+				EE11EE11EE11EE11EE110048 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin PBXTargetDependency section */
@@ -568,6 +706,11 @@
 			isa = PBXTargetDependency;
 			target = AA11AA11AA11AA11AA110030 /* LegHost */;
 			targetProxy = CC11CC11CC11CC11CC110020 /* PBXContainerItemProxy */;
+		};
+		EE11EE11EE11EE11EE110045 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AA11AA11AA11AA11AA110030 /* LegHost */;
+			targetProxy = EE11EE11EE11EE11EE110044 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 	};

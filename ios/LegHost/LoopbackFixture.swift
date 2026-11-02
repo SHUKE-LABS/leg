@@ -19,6 +19,9 @@ final class LoopbackFixture {
         /// The listener is closed before the turn, so the guest cannot reach
         /// the fixture at all.
         case unreachable
+        /// The fixture holds the answer back, so a turn stays running long
+        /// enough for the host to be interrupted in the middle of it.
+        case delayed
     }
 
     /// The text the fixture streams in the first answer.
@@ -51,6 +54,11 @@ final class LoopbackFixture {
     let scenario: Scenario
     /// The credential the guest has to send.
     private let expectedAPIKey: String
+    /// The durable record of the requests the fixture accepted.
+    ///
+    /// The ledger is optional: a run without one keeps its counts in
+    /// memory only.
+    private let ledger: FixtureRequestLedger?
     /// The port the fixture listens on.
     private(set) var port: UInt16 = 0
     /// Called after the fixture accepted or rejected a request.
@@ -64,10 +72,15 @@ final class LoopbackFixture {
     private var observation = Observation()
     private var rejection: String?
     private var requestNumber = 0
+    /// The turn the requests belong to.
+    private var turnID = UUID().uuidString
+    /// The number of requests the current turn holds.
+    private var turnRequestCount = 0
 
-    init(scenario: Scenario, expectedAPIKey: String) {
+    init(scenario: Scenario, expectedAPIKey: String, ledger: FixtureRequestLedger? = nil) {
         self.scenario = scenario
         self.expectedAPIKey = expectedAPIKey
+        self.ledger = ledger
     }
 
     /// The base URL the guest is pointed at.
@@ -96,8 +109,15 @@ final class LoopbackFixture {
         case .success: return 2
         case .providerError: return 1
         case .unreachable: return 0
+        case .delayed: return 2
         }
     }
+
+    /// The time the delayed scenario holds its answer back.
+    ///
+    /// The delay is longer than the timeout of the guest, so a turn of the
+    /// delayed scenario is still running when the host is interrupted.
+    static let delayedAnswerDelay: TimeInterval = 120
 
     // MARK: - Listener
 
@@ -239,24 +259,59 @@ final class LoopbackFixture {
             reject(problems.joined(separator: ","), on: connection)
             return
         }
+        // The request is accepted before the answer is on its way: a run
+        // that is interrupted while the answer is coming still shows the
+        // request in the ledger.
         switch scenario {
-        case .success:
-            if number == 1 {
-                answer(status: 200, on: connection, body: firstAnswer())
-            } else if number == 2 {
-                answer(status: 200, on: connection, body: finalAnswer())
-            } else {
-                reject("unexpected request \(number)", on: connection)
-            }
         case .providerError:
-            if number == 1 {
-                answer(status: 500, on: connection, body: providerError())
-            } else {
-                reject("unexpected request \(number)", on: connection)
-            }
+            accept(status: 500)
+            answer(status: 500, on: connection, body: providerError())
         case .unreachable:
             reject("unexpected request \(number)", on: connection)
+        case .success:
+            accept(status: 200)
+            answerTurn(number: number, on: connection)
+        case .delayed:
+            accept(status: 200)
+            // The answer is held back, so the turn is running long enough
+            // for the host to be interrupted in the middle of it.
+            queue.asyncAfter(deadline: .now() + Self.delayedAnswerDelay) { [weak self] in
+                self?.answerTurn(number: number, on: connection)
+            }
         }
+    }
+
+    /// Answers the request of a turn: the first one asks for the tool call,
+    /// the second one carries its result and ends the turn.
+    private func answerTurn(number: Int, on connection: NWConnection) {
+        if number == 1 {
+            answer(status: 200, on: connection, body: firstAnswer())
+        } else if number == 2 {
+            answer(status: 200, on: connection, body: finalAnswer())
+        } else {
+            reject("unexpected request \(number)", on: connection)
+        }
+    }
+
+    /// Records an accepted request.
+    ///
+    /// The count of the run and the durable ledger grow here, so the two
+    /// always hold the same number of requests.
+    private func accept(status: Int) {
+        lock.lock()
+        observation.acceptedRequests += 1
+        observation.statuses.append(status)
+        let expected = expectedRequestCount ?? Int.max
+        if turnRequestCount >= expected {
+            // The turn is complete, so the next request starts a new one.
+            turnID = UUID().uuidString
+            turnRequestCount = 0
+        }
+        turnRequestCount += 1
+        let entry = FixtureRequestLedger.Entry(turn: turnID, request: turnRequestCount, status: status)
+        lock.unlock()
+        try? ledger?.append(turn: entry.turn, request: entry.request, status: entry.status)
+        onObservationChanged?()
     }
 
     /// The reasons the request is not the one the fixture expects.
@@ -307,11 +362,6 @@ final class LoopbackFixture {
     // MARK: - Answers
 
     private func answer(status: Int, on connection: NWConnection, body: String) {
-        lock.lock()
-        observation.acceptedRequests += 1
-        observation.statuses.append(status)
-        lock.unlock()
-        onObservationChanged?()
         let contentType = status == 200 ? "text/event-stream; charset=utf-8" : "application/json"
         respond(status: status, contentType: contentType, body: Data(body.utf8), on: connection)
     }

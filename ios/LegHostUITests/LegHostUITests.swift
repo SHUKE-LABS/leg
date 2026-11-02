@@ -336,11 +336,113 @@ final class LegHostFixtureUITests: XCTestCase {
         }
     }
 
+    /// The relaunch keeps the workspace, the trail and the requests.
+    ///
+    /// The first launch starts from a known state and completes one turn.
+    /// The second launch starts without the reset control: it reuses the
+    /// verified root, the guest program finds the workspace it was given and
+    /// does not ask for one again, the trail of the turn is still there, and
+    /// the durable ledger holds the requests of the first launch only, so
+    /// the turn was not sent again.
+    func testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests() {
+        launch(["-leghost-fixture", "success", "-leghost-provider", "anthropic"])
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        driveOneTurn()
+
+        XCTAssertTrue(waitForState("requests=2"), "the fixture did not accept two requests")
+        let firstTrail = trailCount(in: app.staticTexts["guest-fixture-state"].label)
+        XCTAssertNotNil(firstTrail, "the host does not publish the trail of the turn")
+        XCTAssertGreaterThan(firstTrail ?? 0, 0, "the trail of the turn is empty")
+
+        app.terminate()
+        launch(["-leghost-fixture", "success", "-leghost-provider", "anthropic"], reset: false)
+
+        let root = app.staticTexts["guest-root-state"]
+        XCTAssertTrue(root.waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+        XCTAssertEqual(root.label, "reused verified root")
+        XCTAssertTrue(waitForState("requests=2"), "the relaunch changed the number of requests")
+        let secondTrail = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+        XCTAssertGreaterThanOrEqual(secondTrail, firstTrail ?? 0,
+                                    "the relaunch lost the trail of the turn")
+        XCTAssertTrue(waitForTerminalText("catalog: ", timeout: 60),
+                      "the composer did not come back after the relaunch")
+        XCTAssertFalse(terminalShows("Enter a path and press Enter to select it."),
+                       "the relaunch asked for a workspace again")
+    }
+
+    /// The background interrupts the turn and keeps the trail.
+    ///
+    /// The fixture holds its answer back, so the turn is still running when
+    /// the app goes to the background. iOS does not run the guest in the
+    /// background, so the host stops the session at the boundary it
+    /// controls, shows the interruption with the recovery guidance and keeps
+    /// the trail of the turn. The request the fixture accepted is not
+    /// repeated, so the durable ledger does not grow.
+    func testTheBackgroundInterruptsTheTurnAndKeepsTheTrail() {
+        launch(["-leghost-fixture", "delayed", "-leghost-provider", "anthropic"])
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        driveOneTurn()
+
+        XCTAssertTrue(waitForState("requests=1"), "the fixture did not accept the request")
+        XCTAssertTrue(waitForTrail(), "the trail of the turn is empty")
+        let trailBefore = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+
+        // The app goes to the background in the middle of the turn and comes
+        // back to the foreground.
+        XCUIDevice.shared.press(.home)
+        app.activate()
+
+        XCTAssertTrue(waitForStatus("IOS_SESSION_INTERRUPTED", timeout: startTimeout),
+                      "the interruption is not in the status of the host")
+        XCTAssertTrue(app.staticTexts["guest-interrupted"].waitForExistence(timeout: 60),
+                      "the host does not show the interrupted state")
+        XCTAssertTrue(waitForState("requests=1"), "the interrupted turn was sent again")
+        let trailAfter = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+        XCTAssertEqual(trailAfter, trailBefore, "the trail of the interrupted turn changed")
+    }
+
+    /// The faults of the device are reported before the guest is touched.
+    ///
+    /// Every fault has its own identifier and its own remediation, and the
+    /// host stops before it provisions, boots, starts a session or starts
+    /// the fixture.
+    func testTheDeviceFaultsAreReportedBeforeTheGuestIsProvisioned() {
+        let faults: [(control: String, identifier: String)] = [
+            ("-leghost-runtime-missing", "IOS_RUNTIME_FILES_MISSING"),
+            ("-leghost-runtime-corrupt", "IOS_RUNTIME_FILES_CORRUPT"),
+            ("-leghost-unsupported-architecture", "IOS_ARCHITECTURE_UNSUPPORTED"),
+            ("-leghost-low-storage", "IOS_STORAGE_INSUFFICIENT"),
+        ]
+        for fault in faults {
+            app.terminate()
+            launch(["-leghost-fixture", "success", "-leghost-provider", "anthropic",
+                    fault.control])
+
+            XCTAssertTrue(waitForStatus(fault.identifier, timeout: startTimeout),
+                          "the diagnostic of \(fault.control) is not in the status of the host")
+            XCTAssertTrue(waitForState("provision=0,boot=0,session=0"),
+                          "the host touched the guest for \(fault.control)")
+            XCTAssertTrue(waitForState("listener=0"),
+                          "the host started the fixture for \(fault.control)")
+            XCTAssertTrue(waitForState("requests=0"),
+                          "the fixture accepted a request for \(fault.control)")
+        }
+    }
+
     // MARK: - Helpers
 
     /// Starts the app with the given launch arguments.
-    private func launch(_ arguments: [String]) {
-        app.launchArguments = arguments
+    ///
+    /// The reset control makes the run start from a known state: the guest
+    /// catalog, the exchange trail and the durable ledger of the requests
+    /// are cleared. A run without it keeps the state of the run before it.
+    private func launch(_ arguments: [String], reset: Bool = true) {
+        app.launchArguments = (reset ? ["-leghost-fixture-reset"] : []) + arguments
         app.launch()
     }
 
@@ -426,6 +528,27 @@ final class LegHostFixtureUITests: XCTestCase {
             predicate: NSPredicate(format: "label CONTAINS %@", text),
             object: detail)
         return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    /// The number of records the trail of the guest holds, as the host
+    /// publishes it.
+    private func trailCount(in summary: String) -> Int? {
+        guard let range = summary.range(of: "trail=") else { return nil }
+        let digits = summary[range.upperBound...].prefix { $0.isNumber }
+        return Int(digits)
+    }
+
+    /// Waits for the trail of the guest to hold a record.
+    private func waitForTrail(timeout: TimeInterval = 120) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let count = trailCount(in: app.staticTexts["guest-fixture-state"].label),
+               count > 0 {
+                return true
+            }
+            usleep(1_000_000)
+        }
+        return false
     }
 
     /// The text of the guest terminal.

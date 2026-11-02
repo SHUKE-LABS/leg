@@ -9,11 +9,24 @@ import SwiftUI
 @main
 struct LegHostApp: App {
     @StateObject private var controller = GuestHostController()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             GuestHostScreen(controller: controller)
                 .onAppear { controller.start() }
+                .onChange(of: scenePhase) { phase in
+                    switch phase {
+                    case .background:
+                        // iOS does not run the guest in the background, so
+                        // the session stops at the boundary of the host.
+                        controller.handleBackground()
+                    case .active:
+                        controller.handleForeground()
+                    default:
+                        break
+                    }
+                }
         }
     }
 }
@@ -38,6 +51,16 @@ struct GuestHostScreen: View {
                 statusView(title: "The guest program ended",
                           detail: controller.detail,
                           identifier: "guest-exited")
+            case .interrupted:
+                // The terminal stays on the screen when the session was
+                // interrupted: it holds the screen of the guest as it was
+                // when the session stopped.
+                VStack(spacing: 0) {
+                    statusView(title: "The session was interrupted",
+                              detail: controller.detail,
+                              expands: false)
+                    GuestTerminalView(controller: controller)
+                }
             case .failed(let message):
                 // The terminal stays on the screen when the guest could not
                 // start: the host writes what went wrong into it, and the
@@ -174,6 +197,7 @@ struct GuestHostScreen: View {
         case .running: return "Running the guest"
         case .exited: return "The guest program ended"
         case .failed: return "The guest could not start"
+        case .interrupted: return "The session was interrupted"
         }
     }
 
@@ -208,7 +232,10 @@ struct GuestHostScreen: View {
                 LabeledContent("Guest root", value: "reused the verified root")
             }
             if case .failed = controller.phase {
-                Button("Try again") { controller.start() }
+                Button("Try again") { controller.retry() }
+            }
+            if case .interrupted = controller.phase {
+                Button("Try again") { controller.retry() }
             }
             Spacer()
         }
