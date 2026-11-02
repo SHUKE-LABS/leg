@@ -3,3 +3,7 @@ __pycache__/
 companions/leg-tui/tests/reports/
 # Xcode derived data for the iOS host build (see ios/README.md).
 /build/
+# The pinned guest inputs are fetched by the iOS build phase (see ios/README.md).
+/ios/resources/PinnedInputs/*
+!/ios/resources/PinnedInputs/.gitkeep
+/ios/build/

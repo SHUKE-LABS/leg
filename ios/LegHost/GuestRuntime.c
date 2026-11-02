@@ -1,0 +1,317 @@
+/*
+ * The guest runtime for the LegHost iOS host. See GuestRuntime.h.
+ *
+ * The boot sequence follows the one the vendored iSH app uses: mount the
+ * fakefs root, become the first process, create the device nodes, mount
+ * /proc and /dev/pts and attach a console. The session then runs one program
+ * on a pseudo terminal, exactly like iSH does for its shell.
+ */
+
+#include "GuestRuntime.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <os/log.h>
+
+#include "fs/devices.h"
+#include "fs/path.h"
+#include "fs/tty.h"
+#include "kernel/calls.h"
+#include "kernel/fs.h"
+#include "kernel/init.h"
+#include "kernel/task.h"
+#include "util/sync.h"
+
+#define GUEST_OUTPUT_CAPACITY (256 * 1024)
+#define GUEST_CONSOLE_TTYS 64
+
+static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t output_space = PTHREAD_COND_INITIALIZER;
+static uint8_t output_buffer[GUEST_OUTPUT_CAPACITY];
+static size_t output_head = 0;
+static size_t output_length = 0;
+static guest_output_notify_callback output_notify = NULL;
+static void *output_notify_context = NULL;
+static guest_exit_notify_callback exit_notify = NULL;
+static void *exit_notify_context = NULL;
+
+static struct tty *session_tty = NULL;
+
+/* The console driver owns its terminals, the pseudo terminal driver gets the
+ * slave terminals from pty_open_fake. */
+static struct tty *guest_console_ttys[GUEST_CONSOLE_TTYS];
+static struct tty_driver guest_console_driver = {
+    .ops = NULL,
+    .major = TTY_CONSOLE_MAJOR,
+    .ttys = guest_console_ttys,
+    .limit = GUEST_CONSOLE_TTYS,
+};
+static struct tty_driver guest_pty_driver = {
+    .ops = NULL,
+    .major = 0,
+    .ttys = NULL,
+    .limit = 0,
+};
+
+/* ------------------------------------------------------------ output ring */
+
+/*
+ * Hands terminal output to the host. The buffer is a ring so the guest never
+ * has to wait for the app; if the app stops draining, the oldest output is
+ * dropped rather than stalling the guest.
+ */
+static void deliver_output(const void *data, size_t length) {
+    if (length == 0)
+        return;
+
+    pthread_mutex_lock(&output_mutex);
+
+    if (length > GUEST_OUTPUT_CAPACITY)
+        length = GUEST_OUTPUT_CAPACITY;
+
+    if (output_length + length > GUEST_OUTPUT_CAPACITY) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100 * 1000 * 1000;
+        if (deadline.tv_nsec >= 1000000000) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000;
+        }
+        while (output_length + length > GUEST_OUTPUT_CAPACITY) {
+            if (pthread_cond_timedwait(&output_space, &output_mutex, &deadline) != 0)
+                break;
+        }
+        if (output_length + length > GUEST_OUTPUT_CAPACITY) {
+            /* Still full: drop the oldest half so the guest keeps running. */
+            size_t drop = (output_length + length) - GUEST_OUTPUT_CAPACITY;
+            if (drop > output_length / 2)
+                drop = output_length / 2;
+            output_head = (output_head + drop) % GUEST_OUTPUT_CAPACITY;
+            output_length -= drop;
+        }
+    }
+
+    size_t tail = (output_head + output_length) % GUEST_OUTPUT_CAPACITY;
+    size_t first = GUEST_OUTPUT_CAPACITY - tail;
+    if (first > length)
+        first = length;
+    memcpy(output_buffer + tail, data, first);
+    if (length > first)
+        memcpy(output_buffer, (const uint8_t *) data + first, length - first);
+    output_length += length;
+
+    guest_output_notify_callback notify = output_notify;
+    void *notify_context = output_notify_context;
+
+    pthread_mutex_unlock(&output_mutex);
+
+    if (notify != NULL)
+        notify(notify_context);
+}
+
+size_t guest_runtime_read_output(void *buffer, size_t max_length) {
+    pthread_mutex_lock(&output_mutex);
+
+    size_t length = output_length < max_length ? output_length : max_length;
+    if (length > 0) {
+        size_t first = GUEST_OUTPUT_CAPACITY - output_head;
+        if (first > length)
+            first = length;
+        memcpy(buffer, output_buffer + output_head, first);
+        if (length > first)
+            memcpy((uint8_t *) buffer + first, output_buffer, length - first);
+        output_head = (output_head + length) % GUEST_OUTPUT_CAPACITY;
+        output_length -= length;
+        pthread_cond_broadcast(&output_space);
+    }
+
+    pthread_mutex_unlock(&output_mutex);
+    return length;
+}
+
+void guest_runtime_set_output_notify(guest_output_notify_callback callback, void *context) {
+    pthread_mutex_lock(&output_mutex);
+    output_notify = callback;
+    output_notify_context = context;
+    pthread_mutex_unlock(&output_mutex);
+}
+
+void guest_runtime_set_exit_notify(guest_exit_notify_callback callback, void *context) {
+    exit_notify = callback;
+    exit_notify_context = context;
+}
+
+/* ------------------------------------------------------------ tty drivers */
+
+static int guest_tty_init(struct tty *tty) {
+    (void) tty;
+    return 0;
+}
+
+static int guest_tty_write(struct tty *tty, const void *buf, size_t len, bool blocking) {
+    (void) tty;
+    (void) blocking;
+    deliver_output(buf, len);
+    return (int) len;
+}
+
+static void guest_tty_cleanup(struct tty *tty) {
+    (void) tty;
+}
+
+static const struct tty_driver_ops guest_tty_ops = {
+    .init = guest_tty_init,
+    .write = guest_tty_write,
+    .cleanup = guest_tty_cleanup,
+};
+
+/* ------------------------------------------------------------------- boot */
+
+/* Reports how the guest program ended. The kernel calls this when a task
+ * exits; the code is the exit status, or the signal that killed it. */
+static void guest_exit_hook(struct task *task, int code) {
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO,
+                     "[LegHost] the guest task %d (%s) exited with %d", task->pid, task->comm, code);
+    guest_exit_notify_callback notify = exit_notify;
+    if (notify != NULL)
+        notify(code, exit_notify_context);
+}
+
+int guest_runtime_boot(const char *root_data_dir) {
+    exit_hook = guest_exit_hook;
+
+    guest_console_driver.ops = &guest_tty_ops;
+    guest_pty_driver.ops = &guest_tty_ops;
+
+    int err = mount_root(&fakefs, root_data_dir);
+    if (err < 0)
+        return err;
+
+    /* The first process has to exist before the device nodes are created. */
+    err = become_first_process();
+    if (err < 0)
+        return err;
+
+    create_some_device_nodes();
+
+    /* The root of the fakefs comes out of the import with unusable
+     * permissions, so fix them the way iSH does. */
+    generic_setattrat(AT_PWD, "/", (struct attr) {.type = attr_mode, .mode = 0755}, false);
+
+    do_mount(&procfs, "proc", "/proc", "", 0);
+    do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
+
+    tty_drivers[TTY_CONSOLE_MAJOR] = &guest_console_driver;
+    set_console_device(TTY_CONSOLE_MAJOR, 1);
+
+    err = create_stdio("/dev/console", TTY_CONSOLE_MAJOR, 1);
+    if (err < 0)
+        return err;
+
+    return 0;
+}
+
+/* ---------------------------------------------------------------- session */
+
+int guest_runtime_start_session(const char *program, const char *arguments,
+                                size_t argument_count, const char *environment) {
+    if (program == NULL || arguments == NULL || argument_count == 0)
+        return -EINVAL;
+
+    /* The session runs as a child of the init process. The kernel keeps the
+     * current task per thread, so the session needs a task of its own: the
+     * terminal then has a foreground process group and the interrupt signals
+     * reach the guest. */
+    int err = become_new_init_child();
+    if (err < 0)
+        return err;
+
+    struct tty *tty = pty_open_fake(&guest_pty_driver);
+    if (IS_ERR(tty))
+        return PTR_ERR(tty);
+
+    char stdio_file[64];
+    snprintf(stdio_file, sizeof(stdio_file), "/dev/pts/%d", tty->num);
+    err = create_stdio(stdio_file, TTY_PSEUDO_SLAVE_MAJOR, tty->num);
+    if (err < 0) {
+        lock(&ttys_lock);
+        tty_release(tty);
+        unlock(&ttys_lock);
+        return err;
+    }
+
+    /* The runtime keeps a reference of its own: the guest closes its end of
+     * the terminal when it exits, and the terminal may not be freed before
+     * that. */
+    lock(&tty->lock);
+    tty->refcount++;
+    unlock(&tty->lock);
+
+    /* The reference that pty_open_fake took is not needed anymore. */
+    lock(&ttys_lock);
+    tty_release(tty);
+    unlock(&ttys_lock);
+
+    session_tty = tty;
+
+    /* The guest program asks for the terminal size as soon as it starts, so
+     * the terminal gets a usable size before the program runs. */
+    lock(&tty->lock);
+    tty_set_winsize(tty, (struct winsize_) {.col = 80, .row = 24});
+    unlock(&tty->lock);
+
+    /* The kernel copies the argument vector and the environment into the new
+     * process, so both can be released right afterwards. */
+    err = do_execve(program, argument_count, arguments, environment);
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] exec %{public}s returned %d", program, err);
+    if (err < 0)
+        return err;
+
+    task_start(current);
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] guest task %d started", current->pid);
+    return 0;
+}
+
+int guest_runtime_write_input(const void *data, size_t length) {
+    struct tty *tty = session_tty;
+    if (tty == NULL)
+        return -ENOTTY;
+    ssize_t written = tty_input(tty, data, length, false);
+    if (written < 0)
+        return (int) written;
+    return (int) written;
+}
+
+int guest_runtime_resize(int columns, int rows) {
+    struct tty *tty = session_tty;
+    if (tty == NULL)
+        return -ENOTTY;
+    if (columns <= 0 || rows <= 0)
+        return -EINVAL;
+
+    lock(&tty->lock);
+    tty_set_winsize(tty, (struct winsize_) {.col = columns, .row = rows});
+    unlock(&tty->lock);
+    return 0;
+}
+
+void guest_runtime_shutdown(void) {
+    struct tty *tty = session_tty;
+    if (tty == NULL)
+        return;
+    session_tty = NULL;
+
+    lock(&tty->lock);
+    tty_hangup(tty);
+    unlock(&tty->lock);
+
+    lock(&ttys_lock);
+    tty_release(tty);
+    unlock(&ttys_lock);
+}
