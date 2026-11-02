@@ -219,13 +219,16 @@ nm -a "$app/LegHost" | grep -E '_fiber_enter|_emu_'
 grep -c 'libish_runtime.a(' \
     build/dd/Build/Products/Release-iphonesimulator/LegHost-x86_64.linkmap
 nm -a "$app/LegHost" | grep -iE 'leg_tui|leg_ui|leg_web|shukelabs'
-grep -iE 'leg_tui|leg_ui|leg-web|src/main\.rs|companions/' \
+grep -iE 'leg_tui|leg_ui|src/main\.rs|companions/' \
     build/dd/Build/Products/Release-iphonesimulator/LegHost-*.linkmap
 ```
 
 The first two commands show the vendored runtime: its symbols in the host
 binary and its objects in the link map. The last two must print nothing,
-because no proprietary leg crate or source is linked into the host.
+because no proprietary leg crate or source is linked into the host. The host
+names the four guest programs by file name, so the strings `leg-tui` and
+`leg-web` are in the binary; they are the names of the programs the guest
+root must hold, not code of them.
 
 ## Out of scope
 
