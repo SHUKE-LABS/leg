@@ -409,8 +409,16 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             phase = .running
             detail = provisioned.reused ? "Guest running (reused root)" : "Guest running"
         } catch {
-            phase = .failed(error.localizedDescription)
-            detail = error.localizedDescription
+            let message = error.localizedDescription
+            // The diagnostic of the guest runtime belongs in the terminal as
+            // well: the guest program never ran, so the terminal is the only
+            // place where the run can show what went wrong. The transcript
+            // of a fixture run holds it as well.
+            if message.contains(Self.runtimeErrorDiagnostic) {
+                writeToTerminal("\r\n\(message)\r\n")
+            }
+            phase = .failed(message)
+            detail = message
         }
     }
 

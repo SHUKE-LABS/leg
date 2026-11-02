@@ -361,7 +361,16 @@ The diagnostics the host produces itself are in the status of the host, under
 the `guest-status-detail` identifier: `IOS_PROVIDER_CONFIG_MISSING`,
 `IOS_PROVIDER_CONFIG_UNSUPPORTED` and `IOS_GUEST_RUNTIME_ERROR`. The runtime
 diagnostic is the host's own finding: the guest program it was asked to run
-is not there.
+is not there. The guest program never ran in that case, so the host writes
+the diagnostic into the terminal as well, and the terminal stays on the
+screen when the guest could not start, because it is the only place the run
+can show what went wrong:
+
+| Run | What the terminal holds |
+| --- | --- |
+| Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
+| Unreachable | `transport error: ...` |
+| Runtime failure | `IOS_GUEST_RUNTIME_ERROR: the guest program could not be started ...` |
 
 ### What the fixture observes
 

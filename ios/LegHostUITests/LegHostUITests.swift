@@ -287,12 +287,16 @@ final class LegHostFixtureUITests: XCTestCase {
     /// The guest program is not there, so the guest runtime cannot start it.
     ///
     /// The host reports the runtime diagnostic and starts no session, so the
-    /// fixture never saw a request. The diagnostic is the host's own, so it
-    /// is in the status of the host and not in the terminal of the guest.
+    /// fixture never saw a request. The guest program never ran, so the
+    /// terminal is the only place where the run can show what went wrong:
+    /// the diagnostic is written into the terminal, and the transcript of the
+    /// run holds it as well.
     func testTheRuntimeFailureScenarioReportsTheRuntimeDiagnostic() {
         launch(["-leghost-fixture", "success", "-leghost-provider", "anthropic",
                 "-leghost-runtime-failure"])
 
+        XCTAssertTrue(waitForTerminalText("IOS_GUEST_RUNTIME_ERROR", timeout: startTimeout),
+                      "the runtime diagnostic is not in the terminal")
         XCTAssertTrue(waitForStatus("IOS_GUEST_RUNTIME_ERROR", timeout: startTimeout),
                       "the runtime diagnostic is not in the status of the host")
         XCTAssertTrue(waitForState("session=0"), "the host started a session")

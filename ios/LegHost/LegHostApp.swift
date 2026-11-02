@@ -39,7 +39,15 @@ struct GuestHostScreen: View {
                           detail: controller.detail,
                           identifier: "guest-exited")
             case .failed(let message):
-                statusView(title: "The guest could not start", detail: message)
+                // The terminal stays on the screen when the guest could not
+                // start: the host writes what went wrong into it, and the
+                // terminal is where the guest would have spoken.
+                VStack(spacing: 0) {
+                    statusView(title: "The guest could not start",
+                              detail: message,
+                              expands: false)
+                    GuestTerminalView(controller: controller)
+                }
             default:
                 statusView(title: title, detail: controller.detail)
             }
@@ -169,7 +177,14 @@ struct GuestHostScreen: View {
         }
     }
 
-    private func statusView(title: String, detail: String, identifier: String? = nil) -> some View {
+    /// The status of the host.
+    ///
+    /// The view fills the screen unless it sits above the terminal: there the
+    /// terminal takes the room the status does not need.
+    private func statusView(title: String,
+                            detail: String,
+                            identifier: String? = nil,
+                            expands: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("LegHost")
                 .font(.largeTitle.bold())
@@ -198,7 +213,9 @@ struct GuestHostScreen: View {
             Spacer()
         }
         .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity,
+               maxHeight: expands ? .infinity : nil,
+               alignment: .topLeading)
     }
 }
 
