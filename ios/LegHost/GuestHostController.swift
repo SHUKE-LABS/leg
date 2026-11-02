@@ -373,7 +373,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             // guest root: a missing or an unsupported configuration has to be
             // reported before anything is provisioned.
             detail = "Reading the provider configuration"
-            let configuration = try ProviderConfigurationStore.load(options: options)
+            let configuration = try ProviderConfigurationStore.load(
+                providerOverride: options.provider,
+                hasNoProvider: options.hasNoProvider)
             if options.fixtureScenario == nil && configuration.baseURL.isEmpty {
                 throw ProviderConfigurationError.missing
             }

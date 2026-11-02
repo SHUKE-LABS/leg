@@ -425,6 +425,15 @@ root.
 ios/tests/run-host-tests.sh
 ```
 
+The provider configuration of the host has its own fixtures. They hand in
+the read of the item of the Keychain, so they need neither a Keychain nor a
+simulator, and they cover the read, the JSON of the item and the two
+diagnostics:
+
+```
+ios/tests/run-provider-tests.sh
+```
+
 The same provisioner runs against the real pinned archives:
 
 ```

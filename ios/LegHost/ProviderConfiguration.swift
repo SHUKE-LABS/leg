@@ -96,13 +96,19 @@ enum ProviderConfigurationStore {
     ///
     /// The DEBUG launch controls replace the Keychain item for one run. They
     /// never write anything: the override lives in memory and dies with the
-    /// process.
-    static func load(options: HostLaunchOptions) throws -> ProviderConfiguration {
+    /// process. A build without the DEBUG controls reads the item of the
+    /// Keychain, whatever the controls say.
+    ///
+    /// The read of the item is a parameter, so the boundary can be exercised
+    /// without an item in the Keychain of the machine that runs the test.
+    static func load(providerOverride: HostProvider?,
+                     hasNoProvider: Bool,
+                     reader: ItemReader = readKeychainItem) throws -> ProviderConfiguration {
         #if DEBUG
-        if options.hasNoProvider {
+        if hasNoProvider {
             throw ProviderConfigurationError.missing
         }
-        if let provider = options.provider {
+        if let provider = providerOverride {
             guard provider == .anthropic else {
                 throw ProviderConfigurationError.unsupported(provider: provider.rawValue)
             }
@@ -113,8 +119,14 @@ enum ProviderConfigurationStore {
                                          contextWindowTokens: fixtureContextWindowTokens)
         }
         #endif
-        return try decode(try readItem())
+        return try decode(try reader())
     }
+
+    /// The read of the item of the Keychain.
+    ///
+    /// The production read asks the Keychain for the item; a test hands in a
+    /// read of its own.
+    typealias ItemReader = () throws -> Data
 
     /// Reads the configuration item from the Keychain.
     ///
@@ -122,7 +134,7 @@ enum ProviderConfigurationStore {
     /// accessibility of an item is not a searchable attribute, so it is a
     /// property of the item the writer stores and not of the search that
     /// finds it.
-    static func readItem() throws -> Data {
+    static func readKeychainItem() throws -> Data {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
