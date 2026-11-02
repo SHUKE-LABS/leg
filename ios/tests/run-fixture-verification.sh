@@ -58,6 +58,16 @@ echo "simulator: ${udid}"
 
 run_scenario() {
     local test_id="$1"
+    # Every scenario gets a simulator of its own. The accessibility server of
+    # a simulator wedges when a second run drives the app on the simulator of
+    # the first one, and the run that follows the wedge fails with an
+    # accessibility timeout instead of an assertion.
+    xcrun simctl shutdown "${udid}" >/dev/null 2>&1 || true
+    sleep 5
+    xcrun simctl boot "${udid}" >/dev/null 2>&1
+    xcrun simctl bootstatus "${udid}" -b >/dev/null 2>&1
+    xcrun simctl terminate "${udid}" "${BUNDLE_ID}" >/dev/null 2>&1 || true
+    sleep 2
     xcodebuild test \
         -project "${ROOT}/ios/LegHost.xcodeproj" \
         -scheme LegHost \
@@ -68,6 +78,21 @@ run_scenario() {
 }
 
 status=0
+
+# The container of the app in the simulator.
+#
+# Every run installs the app again, and the install gives the app a new
+# container, so the container is asked for after every run.
+app_container() {
+    xcrun simctl get_app_container "${udid}" "${BUNDLE_ID}" data
+}
+
+# The log of the app in the simulator.
+capture_app_log() {
+    local path="$1"
+    xcrun simctl spawn "${udid}" log show --style compact --last 10m \
+        --predicate 'process == "LegHost"' >"${path}" 2>/dev/null || true
+}
 
 scan_file() {
     local label="$1"
@@ -105,7 +130,7 @@ if [[ "${skip_run}" -eq 0 ]]; then
     echo "=== the success scenario"
     run_scenario "${SUCCESS_TEST}"
 
-    container="$(xcrun simctl get_app_container "${udid}" "${BUNDLE_ID}" data)"
+    container="$(app_container)"
     if [[ -z "${container}" ]]; then
         echo "error: the app container of ${BUNDLE_ID} is not there." >&2
         exit 1
@@ -117,8 +142,7 @@ if [[ "${skip_run}" -eq 0 ]]; then
     trail="${guest_tree}/tmp/leg-ios-fixture/exchange.jsonl"
     app_log="${DERIVED_DATA}/fixture-verification-app.log"
 
-    xcrun simctl spawn "${udid}" log show --style compact --last 10m \
-        --predicate 'process == "LegHost"' >"${app_log}" 2>/dev/null || true
+    capture_app_log "${app_log}"
 
     scan_file "terminal transcript" "${transcript}"
     scan_file "application log" "${app_log}"
@@ -146,6 +170,14 @@ if [[ "${skip_run}" -eq 0 ]]; then
     echo "=== the provider error scenario"
     run_scenario "${PROVIDER_ERROR_TEST}"
 
+    # Every run installs the app again, and the install gives the app a new
+    # container, so the container is asked for again after the run.
+    container="$(app_container)"
+    transcript="${container}/Library/Application Support/LegHost/test-artifacts/terminal-transcript.log"
+    app_log="${DERIVED_DATA}/fixture-verification-provider-error-app.log"
+
+    capture_app_log "${app_log}"
+
     if ! grep -F -q "${PROVIDER_ERROR_MARKER}" "${transcript}" 2>/dev/null; then
         echo "error: the terminal transcript does not hold the marker of the provider error" >&2
         status=1
@@ -153,6 +185,7 @@ if [[ "${skip_run}" -eq 0 ]]; then
         echo "ok: the terminal transcript holds the marker of the provider error"
     fi
     scan_file "terminal transcript of the provider error run" "${transcript}"
+    scan_file "application log of the provider error run" "${app_log}"
 fi
 
 if [[ "${status}" -ne 0 ]]; then
