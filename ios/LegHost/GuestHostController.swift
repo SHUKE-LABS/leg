@@ -206,21 +206,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         Task { await prepare() }
     }
 
-    /// Removes the provisioned root and provisions it again.
-    func reset() {
-        Task {
-            do {
-                let roots = try Self.rootsDirectory()
-                try FileManager.default.removeItem(at: roots)
-                phase = .preparing
-                detail = "The guest root was removed."
-                await prepare()
-            } catch {
-                phase = .failed("The guest root could not be removed: \(error.localizedDescription)")
-            }
-        }
-    }
-
     private func prepare() async {
         do {
             phase = .preparing
