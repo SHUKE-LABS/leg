@@ -215,7 +215,10 @@ xcodebuild test -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphonesimula
 
 The tests need a booted simulator. Every test launches the app with the
 `-leghost-reset` argument, so the host imports the guest root again; the
-import takes a moment on a cold container.
+import takes a moment on a cold container. Every test of this class also
+launches the app with `-leghost-provider anthropic`, because the host reads
+its provider configuration before it touches the guest root and stops
+without one.
 
 The `LegHostFixtureUITests` class drives the app against the loopback fixture
 instead. It launches the app with the fixture arguments, so it reuses the
