@@ -3958,8 +3958,9 @@ fn main() {
         unsafe { signal(2, ignore_interrupt); }
     }
     let fixture = env::current_dir().unwrap().join("fixture");
-    let log = OpenOptions::new().create(true).append(true).open(fixture.join("turns.log")).unwrap();
-    writeln!(&log, "{session_id}|{prompt}").unwrap();
+    let mut log = OpenOptions::new().create(true).append(true).open(fixture.join("turns.log")).unwrap();
+    // One write keeps concurrent sessions from interleaving a single log line.
+    log.write_all(format!("{session_id}|{prompt}\n").as_bytes()).unwrap();
     if prompt == "FAIL-BEFORE-TRAIL" {
         std::process::exit(1);
     }
@@ -4487,6 +4488,11 @@ fn main() {
             .unwrap()
             .to_string();
 
+        // The parked stop is dropped: a stop that lands before the exchange
+        // starts cancels the turn instead of stopping a running exchange, and
+        // which of the two happens is a scheduling race. The turn is stopped
+        // below, once the exchange has started.
+        stop.abort();
         pause_release_tx.send(()).unwrap();
         let (status, busy) = second_submit.await.unwrap();
         assert_eq!(status, StatusCode::CONFLICT, "{busy}");
@@ -4494,7 +4500,10 @@ fn main() {
         let (status, workspace_busy) = workspace_change.await.unwrap();
         assert_eq!(status, StatusCode::CONFLICT, "{workspace_busy}");
         assert_eq!(workspace_busy["error"], "session_busy");
-        let (status, stopped) = stop.await.unwrap();
+        let _ = wait_for_fixture_id(&fixture_dir, "HOLD-CANCELLED").await;
+        let mut stop_request = api_request(&host, &format!("/api/sessions/{cancelled_draft}/stop"));
+        *stop_request.method_mut() = Method::POST;
+        let (status, stopped) = round_trip_json(&router, stop_request).await;
         assert_eq!(status, StatusCode::OK, "{stopped}");
         assert_eq!(stopped["status"], "stop_requested");
         assert_eq!(stopped["turn_id"], first_turn_id);
