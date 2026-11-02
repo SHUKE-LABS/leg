@@ -409,15 +409,27 @@ A fixture run writes four artifacts, all inside the app container:
 ios/tests/run-fixture-verification.sh
 ```
 
-The script runs the success scenario in the booted simulator, scans the four
-artifacts for the configured credential and then runs the provider error
-scenario, because the failure of a turn is reported by the guest in its
-exchange trail and the host writes that report into the terminal: the
-transcript of that run has to hold the marker of the failure. The script
-fails when the credential shows up in any of the four artifacts, when the
-turn did not reach the fixture and when the transcript does not hold the
-marker. Pass `--udid <simulator udid>` to pick the simulator, and
-`--skip-run` to scan a run that already happened.
+The script runs four scenarios in the booted simulator: the success
+scenario, the provider error scenario, the unreachable scenario and the
+runtime failure scenario. Every scenario gets a simulator of its own, and
+the four artifacts of every run are scanned for the configured credential.
+The script fails when the credential shows up in any of the artifacts, when
+the turn did not reach the fixture and when the transcript of a run does not
+hold the marker of that run.
+
+| Scenario | The transcript of the run holds |
+| --- | --- |
+| Success | `IOS_FIXTURE_STREAM_TEXT`, `IOS_FIXTURE_TOOL_RESULT`, `IOS_FIXTURE_FINAL_RESPONSE` |
+| Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
+| Unreachable | `transport error:` |
+| Runtime failure | `IOS_GUEST_RUNTIME_ERROR` |
+
+The exchange trail of a run is only there when the guest program ran, so the
+runtime failure run has no trail to scan.
+
+Pass `--udid <simulator udid>` to pick the simulator, and `--skip-run` to
+scan the run that is already in the simulator: the script runs no scenario
+then, and it scans the four artifacts of the last run.
 
 ### The fixture tests
 

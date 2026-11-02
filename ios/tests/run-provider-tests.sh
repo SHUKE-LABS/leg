@@ -4,9 +4,10 @@
 # host.
 #
 # The fixtures compile the configuration source of the host for the build
-# host and exercise it directly: the read of the item of the Keychain, the
-# JSON of the item and the diagnostics. The read of the item is handed in,
-# so the fixtures need neither a Keychain nor a simulator.
+# host and exercise it directly: the query of the read of the item of the
+# Keychain, the JSON of the item and the diagnostics. The call into the
+# Security framework is handed in, so the fixtures need neither a Keychain
+# nor a simulator.
 #
 # Usage: ios/tests/run-provider-tests.sh
 
