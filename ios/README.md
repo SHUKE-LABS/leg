@@ -18,6 +18,13 @@ pinned guest bundle and the pinned Alpine root. On launch it
 5. boots the vendored iSH runtime on that root, opens a pseudo terminal and
    runs `/usr/local/bin/leg-tui` on it.
 
+The pinned Alpine root has no `bash`, and the guest program runs its
+commands with `bash -lc`, so the provisioner stages a shim at
+`/usr/local/bin/bash` in the guest that runs the shell the root does have
+(`/bin/busybox sh`). The shim is part of the staging archive, so it is
+verified with the other staged files, and a root that was imported before
+the shim existed is imported again.
+
 The terminal is [hterm](https://github.com/ish-app/libapps) in a `WKWebView`:
 the guest output is written into it, the keyboard (software or hardware) is
 forwarded to the guest terminal, and the terminal size is reported to the
@@ -40,6 +47,15 @@ implemented in the vendored tree, and the change is listed in
 [`vendor/ish/LOCAL_CHANGES.md`](vendor/ish/LOCAL_CHANGES.md). It is the only
 instruction the pinned guest bundle needs that the vendored emulator was
 missing.
+
+The same file lists the two other changes the vendored tree carries. A
+readlink of `/proc/<pid>/exe` for a task without an address space took the
+emulator down, so the read now fails with `ESRCH` for such a task. A guest
+that bounded its socket reads had its `setsockopt` refused with `EINVAL`,
+because the emulator knew the timeout options by other numbers than a Linux
+guest uses and because the timeout value is wider on the host than in the
+guest; the two options now have the numbers a Linux guest uses and the
+timeout is translated in both directions.
 
 ## Licensing
 
@@ -293,6 +309,41 @@ offers the composer. The simulator test
 
 The send control is on the screen because the software keyboard cannot send
 the key the guest TUI submits the composer with.
+
+The host names the two programs of the pinned bundle to the guest program
+(`--leg-bin` and `--supervisor-bin`). The guest program would otherwise find
+them next to its own executable, which it looks up through `/proc/self/exe`;
+the emulator cannot answer that read for the process it runs, so the host
+spells the paths out instead.
+
+A fixture run starts from the same state every time. The host removes the
+state the guest program keeps between runs: the catalog of the guest program,
+so the run asks for a workspace again and shows the first-run warning again,
+and the exchange trail of the last run, so the trail holds this run only. It
+creates the directory of the trail, because the guest appends to the trail
+file and does not make its directory.
+
+### The failure of a turn
+
+A turn that fails is reported by the guest, and the host shows what the
+guest reported. The guest writes every turn to the exchange trail, and a
+failed turn writes a `response_error` record with the message the guest
+produced. The host reads that record while the run goes on and shows the
+message under the `guest-turn-failure` identifier:
+
+| Run | What the guest reported |
+| --- | --- |
+| Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
+| Unreachable | `transport error: ...` |
+
+The host does not write the message itself: it shows the message the guest
+recorded, so the class of the failure is the one the guest reported. The
+host reads the trail of a fixture run only.
+
+The guest program of the pinned bundle does not render the failure of a turn
+in the iOS host: the turn never ends there, so the guest program keeps
+showing the turn as running. The guest does report the failure, in the
+trail, and the host shows that report.
 
 ### What the fixture observes
 

@@ -60,6 +60,13 @@ extern const char *const guest_program_names[GUEST_PROGRAM_COUNT];
 #define GUEST_PROGRAMS_DIR "/usr/local/bin"
 #define GUEST_MARKER_PATH "/etc/leg/guest-bundle.json"
 
+/*
+ * The shell the guest program runs its commands with. The pinned Alpine root
+ * has no bash, and the guest program asks for one by name, so the provisioner
+ * stages a shim that runs the shell the root does have.
+ */
+#define GUEST_SHELL_SHIM_PATH "/usr/local/bin/bash"
+
 /* The guest bundle archive holds exactly these six files. */
 #define GUEST_BUNDLE_FILE_COUNT 6
 extern const char *const guest_bundle_file_names[GUEST_BUNDLE_FILE_COUNT];

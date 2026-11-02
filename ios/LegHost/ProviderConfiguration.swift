@@ -162,9 +162,17 @@ enum ProviderConfigurationStore {
     /// The stored configuration, as it is written down in the Keychain item.
     private struct StoredConfiguration: Decodable {
         let provider: String
-        let api_key: String
-        let base_url: String
+        let apiKey: String
+        let baseURL: String
         let model: String
-        let context_window_tokens: Int
+        let contextWindowTokens: Int
+
+        enum CodingKeys: String, CodingKey {
+            case provider
+            case apiKey = "api_key"
+            case baseURL = "base_url"
+            case model
+            case contextWindowTokens = "context_window_tokens"
+        }
     }
 }

@@ -302,7 +302,12 @@ static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
     if (task == NULL)
         return _ESRCH;
     lock(&task->general_lock);
-    int err = generic_getpath(task->mm->exefile, buf);
+    // A task without an address space has no executable to point at: its
+    // memory is already gone. The other handlers of this file check for the
+    // same case, and a missing check here takes the whole emulator down.
+    int err = task->mm == NULL || task->mm->exefile == NULL
+        ? _ESRCH
+        : generic_getpath(task->mm->exefile, buf);
     unlock(&task->general_lock);
     proc_put_task(task);
     return err;

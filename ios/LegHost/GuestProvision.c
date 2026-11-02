@@ -44,6 +44,15 @@ const char *const guest_bundle_file_names[GUEST_BUNDLE_FILE_COUNT] = {
     "SHA256SUMS", "ish-compatibility-v1.json", "leg", "leg-tui", "leg-web", "leg-ui-supervisor",
 };
 
+/*
+ * The shell the guest program runs its commands with. The pinned Alpine root
+ * has no bash and the guest program asks for one by name, so the provisioner
+ * stages a shim that runs the shell the root does have.
+ */
+static const char guest_shell_shim[] =
+    "#!/bin/sh\n"
+    "exec /bin/busybox sh \"$@\"\n";
+
 #define GUEST_COMPATIBILITY_MANIFEST "ish-compatibility-v1.json"
 #define GUEST_COMPATIBILITY_SUMS "SHA256SUMS"
 #define GUEST_STAGING_DIR_PREFIX "root.staging."
@@ -1558,6 +1567,30 @@ static bool build_staging_archive(const char *alpine_path, const char *bundle_pa
     archive_read_free(bundle_archive);
     bundle_archive = NULL;
 
+    /*
+     * The shell the guest program runs its commands with. The pinned Alpine
+     * root has no bash and the guest program asks for one by name, so the
+     * provisioner stages a shim that runs the shell the root does have.
+     */
+    if (!write_entry_header(out, GUEST_SHELL_SHIM_PATH, AE_IFREG, 0755,
+                            (uint64_t) (sizeof(guest_shell_shim) - 1), NULL, NULL, 0, error,
+                            error_size))
+        goto done;
+    if (archive_write_data(out, guest_shell_shim, sizeof(guest_shell_shim) - 1) < 0) {
+        set_error(error, error_size, "cannot write the shell shim: %s", archive_error_string(out));
+        goto done;
+    }
+
+    struct staged_file shim;
+    memset(&shim, 0, sizeof(shim));
+    snprintf(shim.path, sizeof(shim.path), "%s", GUEST_SHELL_SHIM_PATH);
+    shim.size = sizeof(guest_shell_shim) - 1;
+    sha256_hex(guest_shell_shim, sizeof(guest_shell_shim) - 1, shim.sha256);
+    if (!staged_list_add(files, &shim)) {
+        set_error(error, error_size, "out of memory recording the staged files");
+        goto done;
+    }
+
     /* The marker goes in last: it describes everything staged before it. */
     char *marker = NULL;
     size_t marker_length = 0;
@@ -1779,6 +1812,14 @@ static enum reuse_state check_active_root(const char *active, const struct guest
         if (!verify_file_digest(guest_path, bundle->entries[index].sha256, error, error_size))
             return REUSE_INVALID;
     }
+
+    /* The shell shim is staged by this build, so its digest is known here. */
+    snprintf(path, sizeof(path), "%s/data%s", active, GUEST_SHELL_SHIM_PATH);
+    char shim_sha[SHA256_HEX_LEN + 1];
+    sha256_hex(guest_shell_shim, sizeof(guest_shell_shim) - 1, shim_sha);
+    if (!verify_file_digest(path, shim_sha, error, error_size))
+        return REUSE_INVALID;
+
     return REUSE_VALID;
 }
 

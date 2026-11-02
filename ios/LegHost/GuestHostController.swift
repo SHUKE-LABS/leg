@@ -74,6 +74,10 @@ struct HostLaunchOptions {
     static let defaultProgram = "/usr/local/bin/leg-tui"
     /// The guest program that is not there, for the runtime failure run.
     static let missingProgram = "/usr/local/bin/leg-missing-fixture-program"
+    /// The provider program of the pinned bundle.
+    static let legProgram = "/usr/local/bin/leg"
+    /// The supervisor program of the pinned bundle.
+    static let supervisorProgram = "/usr/local/bin/leg-ui-supervisor"
 
     /// The options of the current run.
     static func current(arguments: [String] = ProcessInfo.processInfo.arguments) -> HostLaunchOptions {
@@ -289,10 +293,18 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     @Published private(set) var terminalSize = GuestTerminalSize()
     /// What the host did in this run.
     @Published private(set) var state = HostState()
+    /// The failure the guest reported for the turn, in a fixture run.
+    ///
+    /// The guest program records every turn in its exchange trail, and a
+    /// failed turn records the failure the guest reported there. The host
+    /// shows what the guest reported, so a failed turn is visible on the
+    /// screen even when the guest program does not render the failure
+    /// itself.
+    @Published private(set) var guestTurnFailure: String?
 
     /// The stable diagnostic the host shows when the guest runtime cannot run
     /// the guest program.
-    static let runtimeErrorDiagnostic = "IOS_GUEST_RUNTIME_ERROR"
+    nonisolated static let runtimeErrorDiagnostic = "IOS_GUEST_RUNTIME_ERROR"
 
     private weak var sink: GuestTerminalSink?
     private let outputSignal = DispatchSemaphore(value: 0)
@@ -317,6 +329,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private var fixture: LoopbackFixture?
     /// The file the raw terminal output is written to, in a fixture run.
     private var transcriptHandle: FileHandle?
+    /// The watcher of the guest's exchange trail, in a fixture run.
+    private var trailWatcher: DispatchSourceTimer?
 
     /// The environment every guest session gets.
     private static let baseEnvironment = [
@@ -376,6 +390,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
             phase = .booting
             detail = "Booting the guest"
+            if options.fixtureScenario != nil {
+                // The guest appends its exchange trail to a file, so the
+                // directory of the trail has to be there before the session
+                // starts, and the state of the last run has to be gone, so
+                // this run is the same run every time.
+                try prepareFixtureState(root: provisioned.activeRoot)
+                watchExchangeTrail(root: provisioned.activeRoot)
+            }
             try await boot(root: provisioned.activeRoot)
             state.boots += 1
             watchGuestExit()
@@ -469,6 +491,73 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     // MARK: - Runtime
 
+    /// The state a fixture run starts from.
+    ///
+    /// A fixture run has to be the same run every time, so the state the
+    /// guest program keeps between runs is removed: the catalog of the guest
+    /// program, so it asks for a workspace again and shows the first-run
+    /// warning again, and the exchange trail of the last run, so the trail
+    /// holds this run only. The directory of the trail is created, because
+    /// the guest appends to the trail file and does not make its directory.
+    private func prepareFixtureState(root: String) throws {
+        let data = URL(fileURLWithPath: root).appendingPathComponent("data")
+        let guestState = data
+            .appendingPathComponent("root")
+            .appendingPathComponent(".local")
+            .appendingPathComponent("state")
+            .appendingPathComponent("leg-ui")
+        if FileManager.default.fileExists(atPath: guestState.path) {
+            try FileManager.default.removeItem(at: guestState)
+        }
+        let trailDirectory = data
+            .appendingPathComponent("tmp")
+            .appendingPathComponent("leg-ios-fixture")
+        let trail = trailDirectory.appendingPathComponent("exchange.jsonl")
+        if FileManager.default.fileExists(atPath: trail.path) {
+            try FileManager.default.removeItem(at: trail)
+        }
+        try FileManager.default.createDirectory(at: trailDirectory, withIntermediateDirectories: true)
+    }
+
+    /// Watches the exchange trail of the guest for the failure of the turn.
+    ///
+    /// The guest program writes the trail as it goes, so the host sees the
+    /// failure of a turn while the run is still going. The watcher stops
+    /// when it finds the failure, or when the run ends.
+    private func watchExchangeTrail(root: String) {
+        let trail = URL(fileURLWithPath: root)
+            .appendingPathComponent("data")
+            .appendingPathComponent("tmp")
+            .appendingPathComponent("leg-ios-fixture")
+            .appendingPathComponent("exchange.jsonl")
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
+        timer.setEventHandler { [weak self, weak timer] in
+            guard let failure = GuestHostController.turnFailure(in: trail) else { return }
+            timer?.cancel()
+            DispatchQueue.main.async { self?.guestTurnFailure = failure }
+        }
+        trailWatcher = timer
+        timer.resume()
+    }
+
+    /// Reads the failure the guest reported for the turn out of the trail.
+    ///
+    /// The trail holds one JSON object per line. A failed turn records a
+    /// `response_error` line, and that line holds the message the guest
+    /// reported.
+    nonisolated private static func turnFailure(in trail: URL) -> String? {
+        guard let data = try? Data(contentsOf: trail),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n") {
+            guard let record = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  record["event"] as? String == "response_error",
+                  let message = record["message"] as? String, !message.isEmpty else { continue }
+            return message
+        }
+        return nil
+    }
+
     private func boot(root: String) async throws {
         let dataDirectory = root + "/data"
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -499,6 +588,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let exitCode = status >> 8
         let signal = status & 0x7f
         fixture?.stop()
+        trailWatcher?.cancel()
+        trailWatcher = nil
         if exitCode != 0 {
             phase = .exited(status)
             detail = "The guest program exited with code \(exitCode)."
@@ -513,6 +604,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     private func startSession() async throws {
         let program = options.program
+        let guestArguments = self.guestArguments(for: program)
         let guestEnvironment = self.guestEnvironment()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -522,12 +614,13 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 // process, so they are built inside the closure that runs the
                 // session.
                 let storage = CStringStorage()
-                let arguments = storage.cBuffer(program + "\0")
+                let arguments = storage.cBuffer(guestArguments.joined(separator: "\0") + "\0")
                 let environment = storage.cBuffer(guestEnvironment.joined(separator: "\0") + "\0")
 
                 let status = withExtendedLifetime(storage) {
                     program.withCString { programPointer in
-                        guest_runtime_start_session(programPointer, arguments, 1, environment)
+                        guest_runtime_start_session(programPointer, arguments,
+                                                   guestArguments.count, environment)
                     }
                 }
                 if status < 0 {
@@ -542,6 +635,21 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     }
 
     // MARK: - Environment
+
+    /// The arguments the guest program runs with.
+    ///
+    /// The guest program finds its companion programs next to its own
+    /// executable, and it looks for its own executable through
+    /// `/proc/self/exe`. The emulator cannot answer that read for the process
+    /// it runs, and the answer takes the whole host down, so the host names
+    /// the two programs of the pinned bundle instead. A guest program that is
+    /// not the guest TUI takes no arguments.
+    private func guestArguments(for program: String) -> [String] {
+        guard program == HostLaunchOptions.defaultProgram else { return [program] }
+        return [program,
+                "--leg-bin", HostLaunchOptions.legProgram,
+                "--supervisor-bin", HostLaunchOptions.supervisorProgram]
+    }
 
     /// The environment the guest session runs with.
     ///
@@ -662,10 +770,13 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     func sendInput(_ text: String) {
         var normalized = text.replacingOccurrences(of: "\n", with: "\r")
         if normalized.isEmpty { return }
-        NSLog("[LegHost] forwarding %d bytes to the guest", normalized.utf8.count)
-        normalized.withCString { pointer in
+        let bytes = Array(normalized.utf8)
+        let written = normalized.withCString { pointer in
             guest_runtime_write_input(pointer, strlen(pointer))
         }
+        NSLog("[LegHost] forwarded %d of %d bytes to the guest: %@",
+              written, bytes.count,
+              bytes.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "))
     }
 
     /// Reports the terminal size to the guest.

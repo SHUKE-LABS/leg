@@ -183,8 +183,8 @@ static inline int sock_flags_from_real(int real) {
 #define SO_TIMESTAMP_ 29
 #define SO_PROTOCOL_ 38
 #define SO_DOMAIN_ 39
-#define SO_RCVTIMEO_ 66
-#define SO_SNDTIMEO_ 67
+#define SO_RCVTIMEO_ 20
+#define SO_SNDTIMEO_ 21
 #define IP_TOS_ 1
 #define IP_TTL_ 2
 #define IP_HDRINCL_ 3

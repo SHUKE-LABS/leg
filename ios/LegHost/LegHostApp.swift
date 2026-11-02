@@ -31,6 +31,7 @@ struct GuestHostScreen: View {
                 VStack(spacing: 0) {
                     statusBar
                     stateRow
+                    failureRow
                     controlRow
                     GuestTerminalView(controller: controller)
                 }
@@ -84,6 +85,25 @@ struct GuestHostScreen: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 2)
+    }
+
+    /// The failure the guest reported for the turn.
+    ///
+    /// The guest program records the failure of a turn in its exchange
+    /// trail. The host shows what the guest reported there, so a failed
+    /// turn is visible on the screen. The line is empty while the turn
+    /// runs or when the guest reported no failure.
+    @ViewBuilder
+    private var failureRow: some View {
+        if let failure = controller.guestTurnFailure {
+            Text(failure)
+                .font(.caption2.monospaced())
+                .foregroundStyle(Color.red)
+                .lineLimit(2)
+                .accessibilityIdentifier("guest-turn-failure")
+                .padding(.horizontal, 12)
+                .padding(.vertical, 2)
+        }
     }
 
     /// The keys the software keyboard cannot send.
