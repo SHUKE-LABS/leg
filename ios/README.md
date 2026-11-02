@@ -201,6 +201,142 @@ The tests need a booted simulator. Every test launches the app with the
 `-leghost-reset` argument, so the host imports the guest root again; the
 import takes a moment on a cold container.
 
+The `LegHostFixtureUITests` class drives the app against the loopback fixture
+instead. It launches the app with the fixture arguments, so it reuses the
+verified guest root and does not import it again.
+
+## Provider configuration
+
+The host owns the provider configuration and reads it before it touches the
+guest root: a missing or an unsupported configuration is reported before
+anything is provisioned, booted or started.
+
+The configuration is one Keychain generic password:
+
+| Field | Value |
+| --- | --- |
+| Service | `com.shukelabs.leg.ioshost.provider` |
+| Account | `default` |
+| Accessibility | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` |
+
+Its data is UTF-8 JSON with exactly these five keys:
+
+```json
+{"provider":"anthropic","api_key":"sk-ant-...","base_url":"https://api.anthropic.com","model":"claude-sonnet-4-5","context_window_tokens":200000}
+```
+
+`context_window_tokens` has to be a positive number. The host reports two
+stable diagnostics:
+
+| Diagnostic | Meaning |
+| --- | --- |
+| `IOS_PROVIDER_CONFIG_MISSING` | There is no item, or the item does not hold exactly the five keys with usable values. |
+| `IOS_PROVIDER_CONFIG_UNSUPPORTED` | The item names `openai-chat-completions` or `openai-responses`. This host speaks the Anthropic Messages protocol. |
+
+The guest gets the configuration as an allowlist: `TERM`, `HOME`, `PATH`,
+`SHELL`, `LEG_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`,
+`LEG_MODEL` and `LEG_CONTEXT_WINDOW_TOKENS`. Nothing else of the host
+environment reaches the guest, and no `LEGHOST_*` variable is ever passed on.
+
+## The loopback fixture
+
+The fixture serves the Anthropic Messages endpoint on `127.0.0.1`, so one
+guest turn runs without a provider. It is a DEBUG-only fixture: it is
+reachable through the launch arguments below, it keeps its configuration in
+memory and it never becomes a place where a credential is stored.
+
+### Launch arguments
+
+| Argument | Meaning |
+| --- | --- |
+| `-leghost-fixture success` | The fixture answers the first request with a text and a `bash` tool call, and the second one with the final text. |
+| `-leghost-fixture provider-error` | The fixture answers the first request with HTTP 500. |
+| `-leghost-fixture unreachable` | The fixture closes its port before the turn, so the guest cannot reach it. |
+| `-leghost-provider anthropic` | The run is configured for the Anthropic Messages protocol. |
+| `-leghost-provider openai-chat-completions` | The run is configured for a provider this host refuses. |
+| `-leghost-provider openai-responses` | The run is configured for a provider this host refuses. |
+| `-leghost-no-provider` | The run has no provider configuration at all. |
+| `-leghost-runtime-failure` | The guest runtime is asked for a program that is not there. |
+
+The provider arguments configure the run in memory: the credential is
+`IOS_FIXTURE_CREDENTIAL_SENTINEL`, the model is `claude-ios-fixture` and the
+context window is `200000`. Nothing is written to the Keychain, to the user
+defaults or to the file system.
+
+A fixture run pins the turn down with these values, which the guest gets in
+addition to the ones above:
+
+```
+LEG_MAX_TOKENS=256
+LEG_MAX_TOOL_ROUNDS=1
+LEG_MAX_RETRIES=0
+LEG_RETRY_BASE_DELAY_MS=0
+LEG_TIMEOUT_SECS=5
+LEG_STREAM_IDLE_TIMEOUT_SECS=5
+LEG_BASH_TIMEOUT_SECS=5
+LEG_EVENT_LOG=/tmp/leg-ios-fixture/exchange.jsonl
+NO_COLOR=1
+```
+
+The zero retry budget makes the number of provider requests the same on
+every run.
+
+### The turn
+
+The guest program asks for a workspace, shows the first-run warning and then
+offers the composer. The simulator test
+
+1. types `/tmp` and presses Enter to select the workspace,
+2. presses Enter to acknowledge the first-run warning, when it is shown,
+3. types `IOS_FIXTURE_TURN`,
+4. presses the send control (`ctrl-s`) the host offers above the terminal.
+
+The send control is on the screen because the software keyboard cannot send
+the key the guest TUI submits the composer with.
+
+### What the fixture observes
+
+The host shows the counts of the run and the fixture observation under the
+`guest-fixture-state` identifier, and the tests read them from there:
+
+| Run | State |
+| --- | --- |
+| Success | `provision=1,boot=1,session=1,requests=2,statuses=200,200,validation=ok` |
+| Provider error | one request with the status 500 |
+| Unreachable | no accepted request |
+| Missing configuration | no provisioning, no boot, no session, no listener and no request |
+| Unsupported provider | the same as the missing configuration |
+
+The fixture validates every request in memory: the method, the path, the
+`stream` flag, the credential and the order of the requests. The second
+request has to carry the tool result of the `bash` call, and a third request
+is refused. The observation holds counts, statuses and the validation
+result only; a request header, a request body and the credential are never
+written down.
+
+### The artifacts
+
+A fixture run writes four artifacts, all inside the app container:
+
+| Artifact | Path |
+| --- | --- |
+| Terminal transcript | `Library/Application Support/LegHost/test-artifacts/terminal-transcript.log` |
+| Application log | the `LegHost` entries of the system log |
+| Guest file system | `Library/Application Support/LegHost/roots/root.active/data` |
+| Exchange trail | `tmp/leg-ios-fixture/exchange.jsonl` in the guest file system |
+
+### The verification command
+
+```
+ios/tests/run-fixture-verification.sh
+```
+
+The script runs the success scenario in the booted simulator and then scans
+the four artifacts for the configured credential. It fails when the
+credential shows up in any of them, and when the turn did not reach the
+fixture. Pass `--udid <simulator udid>` to pick the simulator, and
+`--skip-run` to scan a run that already happened.
+
 ## Host fixtures
 
 The provisioner is covered by host side fixtures that need neither the
@@ -245,6 +381,8 @@ root must hold, not code of them.
 
 ## Out of scope
 
-Keychain and provider wiring, lifecycle and session persistence, physical
-device runtime testing, the native Photos, Files and Shortcuts adapters, and
-App Store metadata are later slices of `#255`.
+The settings UI, lifecycle and session persistence, physical device runtime
+testing, the native Photos, Files and Shortcuts adapters, and App Store
+metadata are later slices of `#255`. The provider support of this slice is
+the Anthropic Messages protocol; the OpenAI wire variants are covered only
+as the rejection cases of the fixture.

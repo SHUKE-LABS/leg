@@ -30,6 +30,7 @@ struct GuestHostScreen: View {
             case .running:
                 VStack(spacing: 0) {
                     statusBar
+                    stateRow
                     controlRow
                     GuestTerminalView(controller: controller)
                 }
@@ -67,6 +68,24 @@ struct GuestHostScreen: View {
         .padding(.vertical, 4)
     }
 
+    /// What the host did in this run.
+    ///
+    /// The line holds the lifecycle counts and the fixture observation. It
+    /// carries no request data and no credential.
+    private var stateRow: some View {
+        HStack(spacing: 8) {
+            Text(controller.state.summary)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+                .accessibilityIdentifier("guest-fixture-state")
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 2)
+    }
+
     /// The keys the software keyboard cannot send.
     ///
     /// The row sits above the terminal, so it stays reachable while the
@@ -88,6 +107,25 @@ struct GuestHostScreen: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier(key.identifier)
             }
+            #if DEBUG
+            // The guest TUI submits the composer with the send key, which the
+            // software keyboard cannot send. A fixture run offers it on the
+            // screen, so the test can drive one turn reproducibly.
+            if controller.isFixtureRun {
+                Button {
+                    controller.sendInput(GuestTerminalKey.submit)
+                } label: {
+                    Text(Self.submitLabel)
+                        .font(.caption.monospaced())
+                        .frame(minWidth: 26)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.12))
+                        .foregroundStyle(Color.white)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("guest-key-submit")
+            }
+            #endif
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8)
@@ -96,6 +134,8 @@ struct GuestHostScreen: View {
 
     /// The label of the interrupt control.
     private static let interruptLabel = "ctrl-c"
+    /// The label of the send control.
+    private static let submitLabel = "ctrl-s"
 
     /// The keys the host offers, in the order they are shown.
     private static let controlKeys: [ControlKey] = [
@@ -142,6 +182,10 @@ struct GuestHostScreen: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
             }
+            Text(controller.state.summary)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("guest-fixture-state")
             Divider()
             LabeledContent("Vendored iSH revision", value: HostBundle.ishRevision ?? "unknown")
             if controller.reusedVerifiedRoot {
