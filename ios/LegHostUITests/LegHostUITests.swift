@@ -233,19 +233,19 @@ final class LegHostFixtureUITests: XCTestCase {
         XCTAssertTrue(state.label.contains(
             "provision=1,boot=1,session=1,requests=2,statuses=200,200,validation=ok"),
             "the host state is \(state.label)")
-        XCTAssertTrue(waitForText("IOS_FIXTURE_STREAM_TEXT"),
-                      "the streamed text is not on the screen")
-        XCTAssertTrue(waitForText("IOS_FIXTURE_TOOL_RESULT"),
-                      "the tool result is not on the screen")
-        XCTAssertTrue(waitForText("IOS_FIXTURE_FINAL_RESPONSE"),
-                      "the final response is not on the screen")
+        XCTAssertTrue(waitForTerminalText("IOS_FIXTURE_STREAM_TEXT"),
+                      "the streamed text is not in the terminal")
+        XCTAssertTrue(waitForTerminalText("IOS_FIXTURE_TOOL_RESULT"),
+                      "the tool result is not in the terminal")
+        XCTAssertTrue(waitForTerminalText("IOS_FIXTURE_FINAL_RESPONSE"),
+                      "the final response is not in the terminal")
     }
 
     /// The provider answers the first request with a server error.
     ///
     /// The fixture recorded one request with the status 500, and the guest
-    /// reported the provider failure, not a transport failure and not a
-    /// runtime failure.
+    /// reported the provider failure in its terminal, not a transport failure
+    /// and not a runtime failure.
     func testTheProviderErrorScenarioReportsAServerError() {
         launch(["-leghost-fixture", "provider-error", "-leghost-provider", "anthropic"])
         XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
@@ -253,21 +253,21 @@ final class LegHostFixtureUITests: XCTestCase {
 
         driveOneTurn()
 
-        XCTAssertTrue(waitForText(
+        XCTAssertTrue(waitForTerminalText(
             "provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR"),
-            "the provider error is not on the screen")
+            "the provider error is not in the terminal")
         XCTAssertTrue(waitForState("statuses=500"), "the fixture did not record the 500")
         XCTAssertTrue(waitForState("requests=1"), "the fixture did not record one request")
-        XCTAssertFalse(screenContains("transport error:"),
+        XCTAssertFalse(terminalShows("transport error:"),
                        "the provider error was reported as a transport error")
-        XCTAssertFalse(screenContains("IOS_GUEST_RUNTIME_ERROR"),
+        XCTAssertFalse(terminalShows("IOS_GUEST_RUNTIME_ERROR"),
                        "the provider error was reported as a runtime error")
     }
 
     /// The loopback port is closed, so the guest cannot reach the provider.
     ///
     /// The fixture accepted no request at all, and the guest reported a
-    /// transport failure.
+    /// transport failure in its terminal.
     func testTheUnreachableScenarioReportsATransportError() {
         launch(["-leghost-fixture", "unreachable", "-leghost-provider", "anthropic"])
         XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
@@ -275,30 +275,31 @@ final class LegHostFixtureUITests: XCTestCase {
 
         driveOneTurn()
 
-        XCTAssertTrue(waitForText("transport error:"),
-                      "the transport error is not on the screen")
+        XCTAssertTrue(waitForTerminalText("transport error:"),
+                      "the transport error is not in the terminal")
         XCTAssertTrue(waitForState("requests=0"), "the fixture accepted a request")
-        XCTAssertFalse(screenContains("provider server error"),
+        XCTAssertFalse(terminalShows("provider server error"),
                        "the transport failure was reported as a provider error")
-        XCTAssertFalse(screenContains("IOS_GUEST_RUNTIME_ERROR"),
+        XCTAssertFalse(terminalShows("IOS_GUEST_RUNTIME_ERROR"),
                        "the transport failure was reported as a runtime error")
     }
 
     /// The guest program is not there, so the guest runtime cannot start it.
     ///
     /// The host reports the runtime diagnostic and starts no session, so the
-    /// fixture never saw a request.
+    /// fixture never saw a request. The diagnostic is the host's own, so it
+    /// is in the status of the host and not in the terminal of the guest.
     func testTheRuntimeFailureScenarioReportsTheRuntimeDiagnostic() {
         launch(["-leghost-fixture", "success", "-leghost-provider", "anthropic",
                 "-leghost-runtime-failure"])
 
-        XCTAssertTrue(waitForText("IOS_GUEST_RUNTIME_ERROR", timeout: startTimeout),
-                      "the runtime diagnostic is not on the screen")
+        XCTAssertTrue(waitForStatus("IOS_GUEST_RUNTIME_ERROR", timeout: startTimeout),
+                      "the runtime diagnostic is not in the status of the host")
         XCTAssertTrue(waitForState("session=0"), "the host started a session")
         XCTAssertTrue(waitForState("requests=0"), "the fixture accepted a request")
-        XCTAssertFalse(screenContains("provider server error"),
+        XCTAssertFalse(terminalShows("provider server error"),
                        "the runtime failure was reported as a provider error")
-        XCTAssertFalse(screenContains("transport error:"),
+        XCTAssertFalse(terminalShows("transport error:"),
                        "the runtime failure was reported as a transport error")
     }
 
@@ -307,8 +308,8 @@ final class LegHostFixtureUITests: XCTestCase {
     func testAMissingConfigurationIsReportedBeforeTheGuestIsProvisioned() {
         launch(["-leghost-fixture", "success", "-leghost-no-provider"])
 
-        XCTAssertTrue(waitForText("IOS_PROVIDER_CONFIG_MISSING", timeout: startTimeout),
-                      "the missing configuration diagnostic is not on the screen")
+        XCTAssertTrue(waitForStatus("IOS_PROVIDER_CONFIG_MISSING", timeout: startTimeout),
+                      "the missing configuration diagnostic is not in the status of the host")
         XCTAssertTrue(waitForState("provision=0,boot=0,session=0"),
                       "the host provisioned the guest")
         XCTAssertTrue(waitForState("requests=0"), "the fixture accepted a request")
@@ -322,8 +323,8 @@ final class LegHostFixtureUITests: XCTestCase {
             app.terminate()
             launch(["-leghost-fixture", "success", "-leghost-provider", provider])
 
-            XCTAssertTrue(waitForText("IOS_PROVIDER_CONFIG_UNSUPPORTED", timeout: startTimeout),
-                          "the unsupported provider diagnostic is not on the screen for \(provider)")
+            XCTAssertTrue(waitForStatus("IOS_PROVIDER_CONFIG_UNSUPPORTED", timeout: startTimeout),
+                          "the unsupported provider diagnostic is not in the status of the host for \(provider)")
             XCTAssertTrue(waitForState("provision=0,boot=0,session=0"),
                           "the host provisioned the guest for \(provider)")
             XCTAssertTrue(waitForState("requests=0"), "the fixture accepted a request for \(provider)")
@@ -348,7 +349,7 @@ final class LegHostFixtureUITests: XCTestCase {
         let terminal = app.otherElements["guest-terminal"]
         XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
 
-        XCTAssertTrue(waitForText("Enter a path and press Enter to select it."),
+        XCTAssertTrue(waitForTerminalText("Enter a path and press Enter to select it."),
                       "the guest program did not ask for a workspace")
         focusGuest()
         app.typeText("/tmp")
@@ -356,12 +357,12 @@ final class LegHostFixtureUITests: XCTestCase {
 
         // The first-run warning comes next, unless a previous run already
         // acknowledged it.
-        if waitForText("Press Enter to acknowledge and open the composer.", timeout: 30) {
+        if waitForTerminalText("Press Enter to acknowledge and open the composer.", timeout: 30) {
             focusGuest()
             app.typeText("\n")
         }
 
-        XCTAssertTrue(waitForText("catalog: "), "the composer did not appear")
+        XCTAssertTrue(waitForTerminalText("catalog: "), "the composer did not appear")
         focusGuest()
         app.typeText(prompt)
         let submit = app.buttons["guest-key-submit"]
@@ -405,16 +406,18 @@ final class LegHostFixtureUITests: XCTestCase {
         return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 
-    /// Waits for the screen to show `text`.
+    /// Waits for the terminal to show `text`.
     ///
-    /// The terminal draws a line as several elements, so a phrase can be
-    /// split over them and the gap between two words can hold more than one
-    /// space. The screen is read as one string and the words are looked for
-    /// in order, so a phrase does not have to sit in one element.
-    private func waitForText(_ text: String, timeout: TimeInterval = 120) -> Bool {
+    /// The terminal is the screen of the guest program, so the text of a turn
+    /// is read from there and not from the screen of the host. The terminal
+    /// draws a line as several elements, so a phrase can be split over them
+    /// and the gap between two words can hold more than one space. The
+    /// terminal is read as one string and the words are looked for in order,
+    /// so a phrase does not have to sit in one element.
+    private func waitForTerminalText(_ text: String, timeout: TimeInterval = 120) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if Self.shows(text, in: app.debugDescription) { return true }
+            if Self.shows(text, in: terminalText()) { return true }
             // The screen is read through the accessibility tree, and the tree
             // of a simulator is read one snapshot at a time. The wait is
             // polled every other second, so a long wait does not keep the
@@ -424,12 +427,33 @@ final class LegHostFixtureUITests: XCTestCase {
         return false
     }
 
-    /// Whether the screen shows `text` right now.
+    /// Waits for the status of the host to show `text`.
     ///
-    /// The words are looked for in order, in the whole screen: the terminal
-    /// text and the status of the host.
-    private func screenContains(_ text: String) -> Bool {
-        Self.shows(text, in: app.debugDescription)
+    /// The status of the host holds the diagnostics the host produces itself:
+    /// the configuration of the provider and the runtime of the guest.
+    private func waitForStatus(_ text: String, timeout: TimeInterval = 120) -> Bool {
+        let detail = app.staticTexts["guest-status-detail"]
+        guard detail.waitForExistence(timeout: timeout) else { return false }
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", text),
+            object: detail)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    /// The text of the guest terminal.
+    ///
+    /// The terminal is read as one snapshot of its own tree. The guest
+    /// program draws while the terminal is read, so the elements of the tree
+    /// are resolved one by one against a tree that changes under the reader,
+    /// and the read fails on a screen that moves. The snapshot of the
+    /// terminal holds the labels of the terminal as one string.
+    private func terminalText() -> String {
+        app.otherElements["guest-terminal"].debugDescription
+    }
+
+    /// Whether the terminal shows `text` right now.
+    private func terminalShows(_ text: String) -> Bool {
+        Self.shows(text, in: terminalText())
     }
 
     /// Whether `text` shows up in `screen`.

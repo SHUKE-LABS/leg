@@ -335,25 +335,33 @@ file and does not make its directory.
 
 ### The failure of a turn
 
-A turn that fails is reported by the guest, and the host shows what the
-guest reported. The guest writes every turn to the exchange trail, and a
-failed turn writes a `response_error` record with the message the guest
-produced. The host reads that record while the run goes on and shows the
-message under the `guest-turn-failure` identifier:
+A turn that fails is reported by the guest, and the host writes what the
+guest reported into the terminal. The guest writes every turn to the
+exchange trail, and a failed turn writes a `response_error` record with the
+message the guest produced. The host reads that record while the run goes
+on and writes the message into the terminal, where the guest speaks:
 
 | Run | What the guest reported |
 | --- | --- |
 | Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
 | Unreachable | `transport error: ...` |
 
-The host does not write the message itself: it shows the message the guest
+The host does not write the message itself: it writes the message the guest
 recorded, so the class of the failure is the one the guest reported. The
-host reads the trail of a fixture run only.
+terminal transcript of the run holds the message as well, because the
+transcript records what the terminal showed. The host reads the trail of a
+fixture run only.
 
 The guest program of the pinned bundle does not render the failure of a turn
 in the iOS host: the turn never ends there, so the guest program keeps
 showing the turn as running. The guest does report the failure, in the
-trail, and the host shows that report.
+trail, and the host writes that report into the terminal.
+
+The diagnostics the host produces itself are in the status of the host, under
+the `guest-status-detail` identifier: `IOS_PROVIDER_CONFIG_MISSING`,
+`IOS_PROVIDER_CONFIG_UNSUPPORTED` and `IOS_GUEST_RUNTIME_ERROR`. The runtime
+diagnostic is the host's own finding: the guest program it was asked to run
+is not there.
 
 ### What the fixture observes
 
@@ -392,10 +400,14 @@ A fixture run writes four artifacts, all inside the app container:
 ios/tests/run-fixture-verification.sh
 ```
 
-The script runs the success scenario in the booted simulator and then scans
-the four artifacts for the configured credential. It fails when the
-credential shows up in any of them, and when the turn did not reach the
-fixture. Pass `--udid <simulator udid>` to pick the simulator, and
+The script runs the success scenario in the booted simulator, scans the four
+artifacts for the configured credential and then runs the provider error
+scenario, because the failure of a turn is reported by the guest in its
+exchange trail and the host writes that report into the terminal: the
+transcript of that run has to hold the marker of the failure. The script
+fails when the credential shows up in any of the four artifacts, when the
+turn did not reach the fixture and when the transcript does not hold the
+marker. Pass `--udid <simulator udid>` to pick the simulator, and
 `--skip-run` to scan a run that already happened.
 
 ### The fixture tests

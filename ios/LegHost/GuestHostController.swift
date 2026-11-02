@@ -293,14 +293,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     @Published private(set) var terminalSize = GuestTerminalSize()
     /// What the host did in this run.
     @Published private(set) var state = HostState()
-    /// The failure the guest reported for the turn, in a fixture run.
-    ///
-    /// The guest program records every turn in its exchange trail, and a
-    /// failed turn records the failure the guest reported there. The host
-    /// shows what the guest reported, so a failed turn is visible on the
-    /// screen even when the guest program does not render the failure
-    /// itself.
-    @Published private(set) var guestTurnFailure: String?
 
     /// The stable diagnostic the host shows when the guest runtime cannot run
     /// the guest program.
@@ -537,10 +529,22 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         timer.setEventHandler { [weak self, weak timer] in
             guard let failure = GuestHostController.turnFailure(in: trail) else { return }
             timer?.cancel()
-            DispatchQueue.main.async { self?.guestTurnFailure = failure }
+            DispatchQueue.main.async { self?.reportTurnFailure(failure) }
         }
         trailWatcher = timer
         timer.resume()
+    }
+
+    /// Writes the failure the guest reported for the turn into the terminal.
+    ///
+    /// The guest program of the pinned bundle does not render the failure of
+    /// a turn in the iOS host: the turn never ends there. The guest does
+    /// report the failure, in its exchange trail, and the host writes that
+    /// report into the terminal, where the guest speaks. The transcript of
+    /// the run holds it as well, because the transcript records what the
+    /// terminal showed.
+    private func reportTurnFailure(_ failure: String) {
+        writeToTerminal("\r\n\(failure)\r\n")
     }
 
     /// Reads the failure the guest reported for the turn out of the trail.

@@ -8,6 +8,11 @@
 # exchange trail. The run fails when the configured credential shows up in
 # any of them, and when the turn did not reach the fixture.
 #
+# The script runs the provider error scenario as well, because the failure
+# of a turn is reported by the guest in its exchange trail and the host
+# writes that report into the terminal: the transcript of that run has to
+# hold the marker of the failure.
+#
 # Usage: ios/tests/run-fixture-verification.sh [--udid <simulator udid>] [--skip-run]
 
 set -euo pipefail
@@ -15,7 +20,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUNDLE_ID="com.shukelabs.leg.ioshost"
 SENTINEL="IOS_FIXTURE_CREDENTIAL_SENTINEL"
-TEST_ID="LegHostUITests/LegHostFixtureUITests/testTheSuccessScenarioCompletesOneTurn"
+SUCCESS_TEST="LegHostUITests/LegHostFixtureUITests/testTheSuccessScenarioCompletesOneTurn"
+PROVIDER_ERROR_TEST="LegHostUITests/LegHostFixtureUITests/testTheProviderErrorScenarioReportsAServerError"
+PROVIDER_ERROR_MARKER="provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR"
 DERIVED_DATA="${ROOT}/build/dd"
 
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
@@ -49,30 +56,16 @@ if [[ -z "${udid}" ]]; then
 fi
 echo "simulator: ${udid}"
 
-if [[ "${skip_run}" -eq 0 ]]; then
+run_scenario() {
+    local test_id="$1"
     xcodebuild test \
         -project "${ROOT}/ios/LegHost.xcodeproj" \
         -scheme LegHost \
         -sdk iphonesimulator \
         -destination "platform=iOS Simulator,id=${udid}" \
         -derivedDataPath "${DERIVED_DATA}" \
-        -only-testing:"${TEST_ID}"
-fi
-
-container="$(xcrun simctl get_app_container "${udid}" "${BUNDLE_ID}" data)"
-if [[ -z "${container}" ]]; then
-    echo "error: the app container of ${BUNDLE_ID} is not there." >&2
-    exit 1
-fi
-echo "container: ${container}"
-
-transcript="${container}/Library/Application Support/LegHost/test-artifacts/terminal-transcript.log"
-guest_tree="${container}/Library/Application Support/LegHost/roots/root.active/data"
-trail="${guest_tree}/tmp/leg-ios-fixture/exchange.jsonl"
-app_log="${DERIVED_DATA}/fixture-verification-app.log"
-
-xcrun simctl spawn "${udid}" log show --style compact --last 10m \
-    --predicate 'process == "LegHost"' >"${app_log}" 2>/dev/null || true
+        -only-testing:"${test_id}"
+}
 
 status=0
 
@@ -108,24 +101,58 @@ scan_tree() {
     echo "ok: the ${label} holds no credential"
 }
 
-scan_file "terminal transcript" "${transcript}"
-scan_file "application log" "${app_log}"
-scan_tree "guest file system" "${guest_tree}"
-scan_file "exchange trail" "${trail}"
+if [[ "${skip_run}" -eq 0 ]]; then
+    echo "=== the success scenario"
+    run_scenario "${SUCCESS_TEST}"
 
-for marker in IOS_FIXTURE_STREAM_TEXT IOS_FIXTURE_TOOL_RESULT IOS_FIXTURE_FINAL_RESPONSE; do
-    if ! grep -F -q "${marker}" "${transcript}" 2>/dev/null; then
-        echo "error: the terminal transcript does not hold ${marker}" >&2
+    container="$(xcrun simctl get_app_container "${udid}" "${BUNDLE_ID}" data)"
+    if [[ -z "${container}" ]]; then
+        echo "error: the app container of ${BUNDLE_ID} is not there." >&2
+        exit 1
+    fi
+    echo "container: ${container}"
+
+    transcript="${container}/Library/Application Support/LegHost/test-artifacts/terminal-transcript.log"
+    guest_tree="${container}/Library/Application Support/LegHost/roots/root.active/data"
+    trail="${guest_tree}/tmp/leg-ios-fixture/exchange.jsonl"
+    app_log="${DERIVED_DATA}/fixture-verification-app.log"
+
+    xcrun simctl spawn "${udid}" log show --style compact --last 10m \
+        --predicate 'process == "LegHost"' >"${app_log}" 2>/dev/null || true
+
+    scan_file "terminal transcript" "${transcript}"
+    scan_file "application log" "${app_log}"
+    scan_tree "guest file system" "${guest_tree}"
+    scan_file "exchange trail" "${trail}"
+
+    for marker in IOS_FIXTURE_STREAM_TEXT IOS_FIXTURE_TOOL_RESULT IOS_FIXTURE_FINAL_RESPONSE; do
+        if ! grep -F -q "${marker}" "${transcript}" 2>/dev/null; then
+            echo "error: the terminal transcript does not hold ${marker}" >&2
+            status=1
+        fi
+    done
+    if ! grep -F -q "IOS_FIXTURE_TURN" "${trail}" 2>/dev/null; then
+        echo "error: the exchange trail does not hold the prompt of the turn" >&2
         status=1
     fi
-done
-if ! grep -F -q "IOS_FIXTURE_TURN" "${trail}" 2>/dev/null; then
-    echo "error: the exchange trail does not hold the prompt of the turn" >&2
-    status=1
-fi
-if ! grep -F -q "127.0.0.1" "${trail}" 2>/dev/null; then
-    echo "error: the exchange trail does not hold the loopback base URL" >&2
-    status=1
+    if ! grep -F -q "127.0.0.1" "${trail}" 2>/dev/null; then
+        echo "error: the exchange trail does not hold the loopback base URL" >&2
+        status=1
+    fi
+
+    # The failure of a turn is reported by the guest in its exchange trail,
+    # and the host writes that report into the terminal. The transcript of
+    # the run has to hold the marker, so the terminal is the record of it.
+    echo "=== the provider error scenario"
+    run_scenario "${PROVIDER_ERROR_TEST}"
+
+    if ! grep -F -q "${PROVIDER_ERROR_MARKER}" "${transcript}" 2>/dev/null; then
+        echo "error: the terminal transcript does not hold the marker of the provider error" >&2
+        status=1
+    else
+        echo "ok: the terminal transcript holds the marker of the provider error"
+    fi
+    scan_file "terminal transcript of the provider error run" "${transcript}"
 fi
 
 if [[ "${status}" -ne 0 ]]; then
