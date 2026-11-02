@@ -16,6 +16,15 @@ struct GuestTerminalView: UIViewRepresentable {
     func updateUIView(_ uiView: GuestTerminalUIView, context: Context) {}
 }
 
+/// The web view that draws the terminal.
+///
+/// The keyboard belongs to the host, which forwards it to the guest, so the
+/// web view never takes the focus. Without this a tap on the terminal gives
+/// the keyboard to the page, and the input field loses it again.
+final class GuestTerminalWebView: WKWebView {
+    override var canBecomeFirstResponder: Bool { false }
+}
+
 /// The view that hosts hterm and forwards the keyboard to the guest.
 ///
 /// The keyboard goes into a hidden text field under the terminal, so the
@@ -79,7 +88,7 @@ final class GuestTerminalUIView: UIView, GuestTerminalSink, UITextFieldDelegate 
 
     override init(frame: CGRect) {
         let configuration = WKWebViewConfiguration()
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = GuestTerminalWebView(frame: .zero, configuration: configuration)
         super.init(frame: frame)
         setUp()
     }
@@ -157,7 +166,8 @@ final class GuestTerminalUIView: UIView, GuestTerminalSink, UITextFieldDelegate 
     }
 
     @objc private func focusTerminal() {
-        inputField.becomeFirstResponder()
+        let focused = inputField.becomeFirstResponder()
+        NSLog("[LegHost] the terminal took the keyboard focus: %d", focused)
     }
 
     // MARK: - Keyboard
