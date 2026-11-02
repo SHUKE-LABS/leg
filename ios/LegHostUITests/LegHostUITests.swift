@@ -212,6 +212,10 @@ final class LegHostFixtureUITests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        // The app is ended before the next test starts, so the run of one
+        // test does not hold the accessibility connection of the simulator
+        // while the next one drives the app.
+        app.terminate()
         app = nil
     }
 
@@ -415,7 +419,11 @@ final class LegHostFixtureUITests: XCTestCase {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if Self.shows(text, in: app.debugDescription) { return true }
-            usleep(1_000_000)
+            // The screen is read through the accessibility tree, and the tree
+            // of a simulator is read one snapshot at a time. The wait is
+            // polled every other second, so a long wait does not keep the
+            // accessibility server of the simulator busy.
+            usleep(2_000_000)
         }
         return false
     }
