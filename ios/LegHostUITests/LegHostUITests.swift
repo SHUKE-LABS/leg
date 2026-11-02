@@ -212,10 +212,6 @@ final class LegHostFixtureUITests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        // The app is ended before the next test starts, so the run of one
-        // test does not hold the accessibility connection of the simulator
-        // while the next one drives the app.
-        app.terminate()
         app = nil
     }
 

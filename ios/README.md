@@ -398,6 +398,20 @@ credential shows up in any of them, and when the turn did not reach the
 fixture. Pass `--udid <simulator udid>` to pick the simulator, and
 `--skip-run` to scan a run that already happened.
 
+### The fixture tests
+
+```
+ios/tests/run-fixture-tests.sh
+```
+
+The script runs every fixture test with a simulator of its own. The
+accessibility server of a simulator wedges when a long run of the tests
+drives the app again and again, and the test that follows the wedge fails
+with an accessibility timeout instead of an assertion, so every test starts
+from a simulator that was booted for it. Pass the names of the tests to run
+only some of them.
+
+
 ## Host fixtures
 
 The provisioner is covered by host side fixtures that need neither the
