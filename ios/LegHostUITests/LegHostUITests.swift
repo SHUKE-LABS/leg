@@ -66,7 +66,7 @@ final class LegHostUITests: XCTestCase {
 
         // The keyboard reaches the guest program. The tap gives the keyboard
         // to the terminal, then the keys are typed the way a user types them.
-        terminal.tap()
+        GuestKeyboard.focus(app)
         app.typeText("hello")
         let typed = app.staticTexts
             .matching(NSPredicate(format: "label CONTAINS %@", "hello")).firstMatch
@@ -131,7 +131,7 @@ final class LegHostUITests: XCTestCase {
         let terminal = app.otherElements["guest-terminal"]
         XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
 
-        terminal.tap()
+        GuestKeyboard.focus(app)
         // The subshell is a child process: it exits on its own.
         app.typeText("(exit 0)\n")
         // The session is still alive, so the shell still runs commands. The
@@ -377,23 +377,7 @@ final class LegHostFixtureUITests: XCTestCase {
     /// swallowed by the terminal page, so it is repeated until the tree shows
     /// the field holding the focus.
     private func focusGuest() {
-        let terminal = app.otherElements["guest-terminal"]
-        let top = terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.05))
-        for _ in 0..<6 {
-            if inputHasFocus() { return }
-            top.tap()
-            usleep(700_000)
-        }
-    }
-
-    /// Whether the hidden input field holds the keyboard focus.
-    ///
-    /// The accessibility tree marks the element that holds the focus, so the
-    /// field is looked for in it.
-    private func inputHasFocus() -> Bool {
-        app.debugDescription
-            .split(separator: "\n")
-            .contains { $0.contains("guest-input") && $0.contains("Focused") }
+        GuestKeyboard.focus(app)
     }
 
     /// Waits for the host state to hold `text`.
@@ -467,5 +451,35 @@ final class LegHostFixtureUITests: XCTestCase {
             rest = rest[range.upperBound...]
         }
         return true
+    }
+}
+
+/// The keyboard of the host, which forwards it to the guest program.
+///
+/// The keyboard goes into a hidden text field under the terminal, so the
+/// terminal has to be tapped to give the field the focus. The tap can be
+/// swallowed by the terminal page, and a simulator under load swallows it
+/// more often, so the tap is repeated until the tree shows the field holding
+/// the focus.
+enum GuestKeyboard {
+    /// Gives the keyboard to the guest program.
+    static func focus(_ app: XCUIApplication) {
+        let terminal = app.otherElements["guest-terminal"]
+        let top = terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.05))
+        for _ in 0..<6 {
+            if hasFocus(app) { return }
+            top.tap()
+            usleep(700_000)
+        }
+    }
+
+    /// Whether the hidden input field holds the keyboard focus.
+    ///
+    /// The accessibility tree marks the element that holds the focus, so the
+    /// field is looked for in it.
+    private static func hasFocus(_ app: XCUIApplication) -> Bool {
+        app.debugDescription
+            .split(separator: "\n")
+            .contains { $0.contains("guest-input") && $0.contains("Focused") }
     }
 }
