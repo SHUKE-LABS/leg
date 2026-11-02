@@ -280,6 +280,12 @@ The provider arguments configure the run in memory: the credential is
 context window is `200000`. Nothing is written to the Keychain, to the user
 defaults or to the file system.
 
+A run without the fixture talks to a closed port on the loopback interface,
+so it stays on the device: a turn of such a run fails with a transport error
+instead of reaching a provider. A DEBUG run without a Keychain item needs one
+of the provider arguments, or the host stops at the configuration boundary
+with `IOS_PROVIDER_CONFIG_MISSING` before it touches the guest root.
+
 A fixture run pins the turn down with these values, which the guest gets in
 addition to the ones above:
 

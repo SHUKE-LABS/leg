@@ -85,6 +85,12 @@ enum ProviderConfigurationStore {
     static let fixtureModel = "claude-ios-fixture"
     /// The context window a fixture run uses.
     static let fixtureContextWindowTokens = 200_000
+    /// The base URL a run uses when it does not talk to the fixture.
+    ///
+    /// It is a closed port on the loopback interface, so a run without the
+    /// fixture stays on the device: a turn of such a run fails with a
+    /// transport error instead of reaching a provider.
+    static let overrideBaseURL = "http://127.0.0.1:1"
 
     /// Reads the configuration the host owns.
     ///
@@ -102,7 +108,7 @@ enum ProviderConfigurationStore {
             }
             return ProviderConfiguration(provider: provider,
                                          apiKey: fixtureCredential,
-                                         baseURL: "",
+                                         baseURL: overrideBaseURL,
                                          model: fixtureModel,
                                          contextWindowTokens: fixtureContextWindowTokens)
         }

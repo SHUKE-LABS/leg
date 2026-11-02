@@ -13,6 +13,14 @@ final class LegHostUITests: XCTestCase {
     /// container.
     private let startTimeout: TimeInterval = 300
 
+    /// The arguments every run of these tests uses.
+    ///
+    /// The host reads its provider configuration before it touches the guest
+    /// root, so a run without a configuration stops at that boundary. The
+    /// provider control gives the run one in memory, without the Keychain and
+    /// without the fixture.
+    private static let launchArguments = ["-leghost-provider", "anthropic"]
+
     private var app: XCUIApplication!
 
     override func setUpWithError() throws {
@@ -20,7 +28,7 @@ final class LegHostUITests: XCTestCase {
         app = XCUIApplication()
         // The reset makes the test start from a known state: the host removes
         // the provisioned root and imports it again.
-        app.launchArguments = ["-leghost-reset"]
+        app.launchArguments = ["-leghost-reset"] + Self.launchArguments
         app.launch()
         // Every test starts in portrait, so a rotation has a direction to
         // change.
@@ -114,7 +122,7 @@ final class LegHostUITests: XCTestCase {
         // The guest runs a shell, so the test can make it spawn a child that
         // exits while the session itself stays alive.
         app.terminate()
-        app.launchArguments = ["-leghost-reset", "-leghost-program", "/bin/sh"]
+        app.launchArguments = Self.launchArguments + ["-leghost-reset", "-leghost-program", "/bin/sh"]
         app.launch()
 
         XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
@@ -146,7 +154,7 @@ final class LegHostUITests: XCTestCase {
                       "the host did not reach the running state")
 
         app.terminate()
-        app.launchArguments = []
+        app.launchArguments = Self.launchArguments
         app.launch()
 
         let state = app.staticTexts["guest-root-state"]
