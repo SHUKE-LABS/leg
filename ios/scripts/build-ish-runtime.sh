@@ -11,24 +11,29 @@
 #     emit ELF (ld.lld, or the rust-lld shipped with a rustup toolchain);
 #   * cpu-offsets.h is regenerated the same way upstream's
 #     tools/staticdefine.sh does, from the assembled asbestos/offsets.c;
-#   * every runtime source is compiled for the iOS target and archived.
+#   * every runtime source is compiled for the iOS target and archived;
+#   * the vendored libarchive is compiled the same way, because the guest
+#     root importer (tools/fakefs.c) needs it to read the pinned archives.
 #
 # The source list mirrors the `kernel=ish` build in upstream's meson.build.
 
 set -euo pipefail
 
 ISH_SRC="${SRCROOT:?SRCROOT is not set}/vendor/ish"
+LIBARCHIVE_SRC="${ISH_SRC}/deps/libarchive"
 OUT_ROOT="${BUILT_PRODUCTS_DIR:?BUILT_PRODUCTS_DIR is not set}"
 WORK_DIR="${OUT_ROOT}/ish-runtime"
 OBJ_DIR="${WORK_DIR}/obj"
 LIB="${OUT_ROOT}/libish_runtime.a"
+LIBARCHIVE="${OUT_ROOT}/libarchive.a"
 
 if [[ ! -d "${ISH_SRC}" ]]; then
     echo "error: vendored iSH runtime not found at ${ISH_SRC}" >&2
     exit 1
 fi
 
-rm -rf "${WORK_DIR}"
+# The object directory is kept between builds: the vendored runtime is
+# recompiled only when it actually changes.
 mkdir -p "${OBJ_DIR}"
 
 DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
@@ -100,10 +105,18 @@ fs/proc/pid.c fs/dyndev.c fs/adhoc.c fs/sock.c fs/pipe.c fs/sockrestart.c
 fs/lock.c fs/dev.c fs/mem.c fs/tty.c fs/tty-real.c fs/pty.c fs/tmp.c
 fs/poll.c fs/fake-db.c fs/fake-migrate.c fs/fake-rebuild.c
 util/timer.c util/sync.c util/fifo.c util/fchdir.c
+tools/fakefs.c
 EOF
 }
 
+# The vendored libarchive: the guest root importer reads the pinned archives
+# with it, and the iOS SDK has no libarchive of its own.
+libarchive_sources() {
+    find "${LIBARCHIVE_SRC}" -maxdepth 1 -name '*.c' -print | LC_ALL=C sort
+}
+
 archives=()
+libarchive_archives=()
 for arch in ${ARCHS}; do
     arch_dir="${OBJ_DIR}/${arch}"
     gen_dir="${arch_dir}/generated"
@@ -113,33 +126,63 @@ for arch in ${ARCHS}; do
         -target "${arch}-apple-ios${DEPLOYMENT_TARGET}${SDK_SUFFIX}"
         -isysroot "${SDKROOT:?SDKROOT is not set}"
         -std=gnu11
-        -DLOG_HANDLER_DPRINTF=1
+        -DLOG_HANDLER_OS_LOG=1
         -DENGINE_ASBESTOS=1
         -I"${ISH_SRC}"
+        -I"${LIBARCHIVE_SRC}"
         -I"${gen_dir}"
     )
 
+    # The vendored runtime hardly ever changes, and recompiling it for every
+    # change of the app is the slowest part of the build. The objects are kept
+    # between builds and are only rebuilt when the compiler flags change or
+    # when a file of the vendored tree is newer than them.
+    flags_hash="$(printf '%s' "${cflags[*]}" | shasum -a 256 | cut -d' ' -f1)"
+    config_file="${arch_dir}/.config"
+    if [[ ! -f "${config_file}" ]] || [[ "$(cat "${config_file}")" != "${flags_hash}" ]]; then
+        rm -f "${arch_dir}"/*.o
+        rm -rf "${gen_dir}"
+        mkdir -p "${gen_dir}/vdso"
+        printf '%s' "${flags_hash}" >"${config_file}"
+    fi
+
+    newest_vendored="$(find "${ISH_SRC}" "${LIBARCHIVE_SRC}" -type f -exec stat -f '%m' {} + |
+        LC_ALL=C sort -n | tail -1)"
+    if [[ -z "${newest_vendored}" ]]; then
+        newest_vendored=0
+    fi
+
+    up_to_date() {
+        # The file is up to date when it exists and is not older than the
+        # newest file of the vendored tree.
+        [[ -f "$1" ]] && [[ "$(stat -f '%m' "$1")" -ge "${newest_vendored}" ]]
+    }
+
     # vDSO: an i386 ELF shared object embedded into the runtime by kernel/vdso.c
-    PATH="${linker_dir}:${PATH}" "${CLANG}" \
-        -target i386-unknown-linux-gnu \
-        -fuse-ld=lld \
-        -nostdlib \
-        -fno-stack-protector \
-        -Wl,-T,"${ISH_SRC}/vdso/vdso.lds" \
-        -Wl,--hash-style,sysv \
-        -shared \
-        -fPIC \
-        "${ISH_SRC}/vdso/vdso.S" \
-        "${ISH_SRC}/vdso/vdso.c" \
-        -o "${gen_dir}/vdso/libvdso.so.elf"
+    if ! up_to_date "${gen_dir}/vdso/libvdso.so.elf"; then
+        PATH="${linker_dir}:${PATH}" "${CLANG}" \
+            -target i386-unknown-linux-gnu \
+            -fuse-ld=lld \
+            -nostdlib \
+            -fno-stack-protector \
+            -Wl,-T,"${ISH_SRC}/vdso/vdso.lds" \
+            -Wl,--hash-style,sysv \
+            -shared \
+            -fPIC \
+            "${ISH_SRC}/vdso/vdso.S" \
+            "${ISH_SRC}/vdso/vdso.c" \
+            -o "${gen_dir}/vdso/libvdso.so.elf"
+    fi
 
     # cpu-offsets.h: offsets of the emulated CPU state, used by the gadgets
-    "${CLANG}" "${cflags[@]}" -include "${ISH_SRC}/tools/staticdefine.h" -S -o - \
-        "${ISH_SRC}/asbestos/offsets.c" |
-        sed -ne 's:^[[:space:]]*\.ascii[[:space:]]*"\(.*\)".*:\1:;
-                 /^->/{s:->#\(.*\):/* \1 */:;
-                 s:^->\([^ ]*\) [\$$#]*\([^ ]*\) \(.*\):#define \1 \2 /* \3 */:;
-                 s:->::; p;}' >"${gen_dir}/cpu-offsets.h"
+    if ! up_to_date "${gen_dir}/cpu-offsets.h"; then
+        "${CLANG}" "${cflags[@]}" -include "${ISH_SRC}/tools/staticdefine.h" -S -o - \
+            "${ISH_SRC}/asbestos/offsets.c" |
+            sed -ne 's:^[[:space:]]*\.ascii[[:space:]]*"\(.*\)".*:\1:;
+                     /^->/{s:->#\(.*\):/* \1 */:;
+                     s:^->\([^ ]*\) [\$$#]*\([^ ]*\) \(.*\):#define \1 \2 /* \3 */:;
+                     s:->::; p;}' >"${gen_dir}/cpu-offsets.h"
+    fi
 
     if [[ ! -s "${gen_dir}/cpu-offsets.h" ]]; then
         echo "error: cpu-offsets.h generation produced no output" >&2
@@ -149,7 +192,9 @@ for arch in ${ARCHS}; do
     objects=()
     for source in $(sources_for_arch "${arch}"); do
         object="${arch_dir}/${source//\//_}.o"
-        "${CLANG}" "${cflags[@]}" -c "${ISH_SRC}/${source}" -o "${object}"
+        if ! up_to_date "${object}"; then
+            "${CLANG}" "${cflags[@]}" -c "${ISH_SRC}/${source}" -o "${object}"
+        fi
         objects+=("${object}")
     done
 
@@ -158,8 +203,34 @@ for arch in ${ARCHS}; do
     "${AR}" rcs "${archive}" "${objects[@]}"
     archives+=("${archive}")
     echo "built ${archive} from ${#objects[@]} vendored iSH objects"
+
+    libarchive_objects=()
+    for source in $(libarchive_sources); do
+        object="${arch_dir}/libarchive_$(basename "${source}" .c).o"
+        if ! up_to_date "${object}"; then
+            "${CLANG}" \
+                -target "${arch}-apple-ios${DEPLOYMENT_TARGET}${SDK_SUFFIX}" \
+                -isysroot "${SDKROOT}" \
+                -std=gnu11 \
+                -DHAVE_CONFIG_H \
+                -I"${LIBARCHIVE_SRC}" \
+                -I"${ISH_SRC}/deps" \
+                -c "${source}" -o "${object}"
+        fi
+        libarchive_objects+=("${object}")
+    done
+
+    libarchive_archive="${OBJ_DIR}/libarchive-${arch}.a"
+    rm -f "${libarchive_archive}"
+    "${AR}" rcs "${libarchive_archive}" "${libarchive_objects[@]}"
+    libarchive_archives+=("${libarchive_archive}")
+    echo "built ${libarchive_archive} from ${#libarchive_objects[@]} vendored libarchive objects"
 done
 
 rm -f "${LIB}"
 "${LIPO}" -create "${archives[@]}" -output "${LIB}"
 echo "built ${LIB} for: ${ARCHS}"
+
+rm -f "${LIBARCHIVE}"
+"${LIPO}" -create "${libarchive_archives[@]}" -output "${LIBARCHIVE}"
+echo "built ${LIBARCHIVE} for: ${ARCHS}"

@@ -1,39 +1,155 @@
 import SwiftUI
 
-/// Native iOS host scaffold.
+/// The native iOS host for the leg guest.
 ///
-/// The host embeds the pinned iSH revision vendored under `vendor/ish`; the
-/// revision marker travels in the app bundle and is shown here. This slice
-/// does not ingest the guest bundle, so no guest process is started.
+/// The host embeds the pinned iSH revision vendored under `vendor/ish`, the
+/// pinned guest bundle and the pinned Alpine root. On launch it verifies both
+/// pinned inputs, imports them into a fakefs root and runs `leg-tui` on a
+/// pseudo terminal.
 @main
 struct LegHostApp: App {
+    @StateObject private var controller = GuestHostController()
+
     var body: some Scene {
         WindowGroup {
-            HostPlaceholderView()
+            GuestHostScreen(controller: controller)
+                .onAppear { controller.start() }
         }
     }
 }
 
-struct HostPlaceholderView: View {
-    private let revision = HostBundle.ishRevision ?? "unknown"
+/// The screen: the terminal once the guest runs, the progress before that.
+struct GuestHostScreen: View {
+    @ObservedObject var controller: GuestHostController
 
     var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            switch controller.phase {
+            case .running:
+                VStack(spacing: 0) {
+                    statusBar
+                    controlRow
+                    GuestTerminalView(controller: controller)
+                }
+            case .exited:
+                statusView(title: "The guest program ended",
+                          detail: controller.detail,
+                          identifier: "guest-exited")
+            case .failed(let message):
+                statusView(title: "The guest could not start", detail: message)
+            default:
+                statusView(title: title, detail: controller.detail)
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    /// The bar above the terminal. It records whether this launch imported
+    /// the guest root or reused the verified one, and the size the guest
+    /// terminal was told about.
+    private var statusBar: some View {
+        HStack(spacing: 8) {
+            Text(controller.reusedVerifiedRoot ? "reused verified root" : "imported root")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("guest-root-state")
+            Spacer()
+            if !controller.terminalSize.isEmpty {
+                Text("\(controller.terminalSize.columns)x\(controller.terminalSize.rows)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("guest-terminal-size")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+    }
+
+    /// The keys the software keyboard cannot send.
+    ///
+    /// The row sits above the terminal, so it stays reachable while the
+    /// software keyboard covers the lower half of the screen. Without it a
+    /// guest program could not be interrupted without a hardware keyboard.
+    private var controlRow: some View {
+        HStack(spacing: 6) {
+            ForEach(Self.controlKeys) { key in
+                Button {
+                    controller.sendInput(key.sequence)
+                } label: {
+                    Text(key.label)
+                        .font(.caption.monospaced())
+                        .frame(minWidth: 26)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.12))
+                        .foregroundStyle(key.label == Self.interruptLabel ? Color.red : Color.white)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(key.identifier)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+    }
+
+    /// The label of the interrupt control.
+    private static let interruptLabel = "ctrl-c"
+
+    /// The keys the host offers, in the order they are shown.
+    private static let controlKeys: [ControlKey] = [
+        ControlKey(identifier: "guest-key-escape", label: "esc", sequence: GuestTerminalKey.escape),
+        ControlKey(identifier: "guest-key-tab", label: "tab", sequence: GuestTerminalKey.tab),
+        ControlKey(identifier: "guest-key-left", label: "←", sequence: GuestTerminalKey.left),
+        ControlKey(identifier: "guest-key-up", label: "↑", sequence: GuestTerminalKey.up),
+        ControlKey(identifier: "guest-key-down", label: "↓", sequence: GuestTerminalKey.down),
+        ControlKey(identifier: "guest-key-right", label: "→", sequence: GuestTerminalKey.right),
+        ControlKey(identifier: "guest-key-interrupt", label: interruptLabel,
+                   sequence: GuestTerminalKey.interrupt),
+    ]
+
+    /// One of the keys the host offers.
+    private struct ControlKey: Identifiable {
+        let identifier: String
+        let label: String
+        let sequence: String
+
+        var id: String { identifier }
+    }
+
+    private var title: String {
+        switch controller.phase {
+        case .preparing: return "Preparing the guest"
+        case .provisioning: return "Verifying the pinned inputs"
+        case .booting: return "Booting the guest"
+        case .running: return "Running the guest"
+        case .exited: return "The guest program ended"
+        case .failed: return "The guest could not start"
+        }
+    }
+
+    private func statusView(title: String, detail: String, identifier: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("LegHost")
                 .font(.largeTitle.bold())
-            Text("Native iOS host scaffold")
+            Text(title)
                 .font(.headline)
+                .accessibilityIdentifier(identifier ?? "guest-status-title")
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
             Divider()
-            LabeledContent("Vendored iSH revision", value: revision)
-            LabeledContent("Guest runtime", value: "not started")
-            Text("""
-                The pinned iSH runtime is linked into this binary. This slice \
-                does not ingest the #253 guest bundle, does not open a PTY, \
-                and does not expose native Photos, Files or Shortcuts \
-                capabilities.
-                """)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            LabeledContent("Vendored iSH revision", value: HostBundle.ishRevision ?? "unknown")
+            if controller.reusedVerifiedRoot {
+                LabeledContent("Guest root", value: "reused the verified root")
+            }
+            if case .failed = controller.phase {
+                Button("Try again") { controller.start() }
+            }
             Spacer()
         }
         .padding()

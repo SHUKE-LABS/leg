@@ -255,11 +255,40 @@ platform adapter has to keep.
 ## Native iOS host
 
 The repository also carries a native iOS host under [`ios/`](ios/README.md):
-a standalone Xcode project (`LegHost`) that embeds one pinned iSH revision and
-launches a placeholder host screen. It is built and installed separately from
-the emulated bundle above, and it links no proprietary `leg` source: `leg`
-runs inside the guest, as a separate program. See
-[ios/README.md](ios/README.md) for the build, install and signing commands.
+a standalone Xcode project (`LegHost`) that embeds one pinned iSH revision. On
+launch it verifies the pinned guest bundle and the pinned Alpine i386 root
+against their SHA-256 digests, imports them into a guest root with the vendored
+iSH importer, boots the vendored runtime and runs `/usr/local/bin/leg-tui` on a
+pseudo terminal that is drawn with hterm. The terminal accepts the software
+and the hardware keyboard, reports its size to the guest and forwards
+interrupts; the keys the software keyboard cannot send, the interrupt among
+them, are offered on the screen. It is built and installed separately from the
+emulated bundle above, and it links no proprietary `leg` source: `leg` runs
+inside the guest, as a separate program.
+
+The host pins its two inputs by URL and SHA-256:
+
+| Input | URL | SHA-256 |
+| --- | --- | --- |
+| leg guest bundle `v0.43.1` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.43.1/leg-0.43.1-i686-unknown-linux-musl.tar.gz` | `c7ba65aa24e127039d0292ae1db8b8573fbc07565e5ea40805630dd58305277d` |
+| Alpine i386 root `3.20.3` | `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz` | `4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9` |
+
+Build, install, run and reset it with:
+
+```
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphonesimulator \
+    -configuration Release -derivedDataPath build/dd build
+xcrun simctl install "iPhone 17 Pro" \
+    build/dd/Build/Products/Release-iphonesimulator/LegHost.app
+xcrun simctl launch "iPhone 17 Pro" com.shukelabs.leg.ioshost
+xcrun simctl uninstall "iPhone 17 Pro" com.shukelabs.leg.ioshost
+```
+
+The last command resets the host: it removes the provisioned guest root, so
+the next launch imports it again. See [ios/README.md](ios/README.md) for the
+pinned inputs, the build, install and signing commands, the host fixtures and
+the simulator UI tests.
 
 ## Experimental TUI trial
 

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>schema_version</key>
+	<integer>1</integer>
+	<key>inputs</key>
+	<array>
+		<dict>
+			<key>name</key>
+			<string>leg_guest_bundle</string>
+			<key>url</key>
+			<string>https://github.com/SHUKE-LABS/leg/releases/download/v0.43.1/leg-0.43.1-i686-unknown-linux-musl.tar.gz</string>
+			<key>filename</key>
+			<string>leg-0.43.1-i686-unknown-linux-musl.tar.gz</string>
+			<key>sha256</key>
+			<string>c7ba65aa24e127039d0292ae1db8b8573fbc07565e5ea40805630dd58305277d</string>
+		</dict>
+		<dict>
+			<key>name</key>
+			<string>alpine_root</string>
+			<key>url</key>
+			<string>https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz</string>
+			<key>filename</key>
+			<string>alpine-minirootfs-3.20.3-x86.tar.gz</string>
+			<key>sha256</key>
+			<string>4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9</string>
+		</dict>
+	</array>
+	<key>compatibility</key>
+	<dict>
+		<key>target</key>
+		<string>i686-unknown-linux-musl</string>
+		<key>architecture</key>
+		<string>i386</string>
+		<key>os</key>
+		<string>linux</string>
+		<key>libc</key>
+		<string>musl</string>
+		<key>alpine_release</key>
+		<string>3.20.3</string>
+		<key>docker_platform</key>
+		<string>linux/386</string>
+	</dict>
+</dict>
+</plist>
