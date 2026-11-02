@@ -111,12 +111,16 @@ enum ProviderConfigurationStore {
     }
 
     /// Reads the configuration item from the Keychain.
+    ///
+    /// The item is found by its class, its service and its account. The
+    /// accessibility of an item is not a searchable attribute, so it is a
+    /// property of the item the writer stores and not of the search that
+    /// finds it.
     static func readItem() throws -> Data {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]

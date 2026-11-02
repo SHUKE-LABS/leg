@@ -227,7 +227,8 @@ The host owns the provider configuration and reads it before it touches the
 guest root: a missing or an unsupported configuration is reported before
 anything is provisioned, booted or started.
 
-The configuration is one Keychain generic password:
+The configuration is one Keychain generic password. The host reads the item
+and never writes it, so the credential stays where the user put it:
 
 | Field | Value |
 | --- | --- |
