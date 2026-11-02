@@ -36,6 +36,8 @@ enum GuestTerminalKey {
     static let left = "\u{1b}[D"
     /// The interrupt.
     static let interrupt = "\u{3}"
+    /// The send. The guest TUI submits the composer with it.
+    static let submit = "\u{13}"
 }
 
 /// The terminal the guest output is written to.
@@ -50,6 +52,100 @@ struct GuestHostError: LocalizedError {
     let message: String
 
     var errorDescription: String? { message }
+}
+
+/// The launch controls of one run of the host.
+///
+/// The provider, the fixture and the guest program are named on the command
+/// line. The provider and the fixture controls are DEBUG-only: they configure
+/// one run in memory and never write to the Keychain, to the user defaults or
+/// to the file system.
+struct HostLaunchOptions {
+    /// The fixture scenario, when the run is a fixture run.
+    var fixtureScenario: LoopbackFixture.Scenario?
+    /// The provider the run is configured for.
+    var provider: HostProvider?
+    /// Whether the run has no provider configuration at all.
+    var hasNoProvider = false
+    /// The guest program the session runs.
+    var program = HostLaunchOptions.defaultProgram
+
+    /// The guest program the host runs.
+    static let defaultProgram = "/usr/local/bin/leg-tui"
+    /// The guest program that is not there, for the runtime failure run.
+    static let missingProgram = "/usr/local/bin/leg-missing-fixture-program"
+    /// The provider program of the pinned bundle.
+    static let legProgram = "/usr/local/bin/leg"
+    /// The supervisor program of the pinned bundle.
+    static let supervisorProgram = "/usr/local/bin/leg-ui-supervisor"
+
+    /// The options of the current run.
+    static func current(arguments: [String] = ProcessInfo.processInfo.arguments) -> HostLaunchOptions {
+        var options = HostLaunchOptions()
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            var consumed = 1
+            switch argument {
+            case "-leghost-program":
+                if index + 1 < arguments.count {
+                    options.program = arguments[index + 1]
+                    consumed = 2
+                }
+            #if DEBUG
+            case "-leghost-no-provider":
+                options.hasNoProvider = true
+            case "-leghost-provider":
+                if index + 1 < arguments.count {
+                    options.provider = HostProvider(rawValue: arguments[index + 1])
+                    consumed = 2
+                }
+            case "-leghost-fixture":
+                if index + 1 < arguments.count {
+                    options.fixtureScenario = LoopbackFixture.Scenario(rawValue: arguments[index + 1])
+                    consumed = 2
+                }
+            case "-leghost-runtime-failure":
+                options.program = HostLaunchOptions.missingProgram
+            #endif
+            default:
+                break
+            }
+            index += consumed
+        }
+        return options
+    }
+}
+
+/// What the host did in one run.
+///
+/// The state holds counts and the fixture validation result. It carries no
+/// request data and no credential, so it can be shown on the screen and read
+/// by the tests.
+struct HostState: Equatable {
+    /// The number of times the guest root was provisioned.
+    var provisions = 0
+    /// The number of times the guest was booted.
+    var boots = 0
+    /// The number of times a guest session was started.
+    var sessions = 0
+    /// The number of times the loopback fixture was started.
+    var listeners = 0
+    /// The number of requests the fixture accepted.
+    var requests = 0
+    /// The HTTP statuses the fixture answered with, in order.
+    var statuses: [Int] = []
+    /// The fixture validation result.
+    var validation = "none"
+
+    /// The state as the tests read it.
+    var summary: String {
+        let statuses = self.statuses.isEmpty
+            ? ""
+            : self.statuses.map(String.init).joined(separator: ",")
+        return "provision=\(provisions),boot=\(boots),session=\(sessions),requests=\(requests),"
+            + "statuses=\(statuses),validation=\(validation),listener=\(listeners)"
+    }
 }
 
 /// Keeps C strings alive for as long as the C structures that point at them.
@@ -195,6 +291,12 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     @Published private(set) var reusedVerifiedRoot = false
     /// The size the guest terminal was told about, in character cells.
     @Published private(set) var terminalSize = GuestTerminalSize()
+    /// What the host did in this run.
+    @Published private(set) var state = HostState()
+
+    /// The stable diagnostic the host shows when the guest runtime cannot run
+    /// the guest program.
+    nonisolated static let runtimeErrorDiagnostic = "IOS_GUEST_RUNTIME_ERROR"
 
     private weak var sink: GuestTerminalSink?
     private let outputSignal = DispatchSemaphore(value: 0)
@@ -205,28 +307,46 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// the guest program is not lost.
     private var pendingOutput = ""
 
-    /// The guest program the host runs.
-    private static let guestProgram = "/usr/local/bin/leg-tui"
+    /// The launch controls of this run.
+    private var options = HostLaunchOptions.current()
 
-    /// The program the session runs.
+    /// Whether the run is a fixture run.
     ///
-    /// The default is the guest TUI. The simulator tests run a shell instead,
-    /// so they can make the guest spawn a helper process that exits while the
-    /// session keeps running.
-    private static var sessionProgram: String {
-        let arguments = ProcessInfo.processInfo.arguments
-        guard let index = arguments.firstIndex(of: "-leghost-program"),
-              index + 1 < arguments.count else {
-            return guestProgram
-        }
-        return arguments[index + 1]
-    }
+    /// A fixture run offers the send control on the screen: the software
+    /// keyboard cannot send the key the guest TUI submits the composer with.
+    var isFixtureRun: Bool { options.fixtureScenario != nil }
+    /// The provider configuration this run uses.
+    private var configuration: ProviderConfiguration?
+    /// The loopback fixture, in a fixture run.
+    private var fixture: LoopbackFixture?
+    /// The file the raw terminal output is written to, in a fixture run.
+    private var transcriptHandle: FileHandle?
+    /// The watcher of the guest's exchange trail, in a fixture run.
+    private var trailWatcher: DispatchSourceTimer?
 
-    private static let guestEnvironment = [
+    /// The environment every guest session gets.
+    private static let baseEnvironment = [
         "TERM=xterm-256color",
         "HOME=/root",
         "PATH=/usr/local/bin:/usr/bin:/bin",
         "SHELL=/bin/sh",
+    ]
+
+    /// The values a fixture run pins, so the turn is deterministic.
+    ///
+    /// The zero retry budget makes the number of provider requests the same
+    /// on every run, and the short timeouts keep a stuck turn from outliving
+    /// the test.
+    private static let fixtureEnvironment = [
+        "LEG_MAX_TOKENS=256",
+        "LEG_MAX_TOOL_ROUNDS=1",
+        "LEG_MAX_RETRIES=0",
+        "LEG_RETRY_BASE_DELAY_MS=0",
+        "LEG_TIMEOUT_SECS=5",
+        "LEG_STREAM_IDLE_TIMEOUT_SECS=5",
+        "LEG_BASH_TIMEOUT_SECS=5",
+        "LEG_EVENT_LOG=/tmp/leg-ios-fixture/exchange.jsonl",
+        "NO_COLOR=1",
     ]
 
     // MARK: - Lifecycle
@@ -239,25 +359,66 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private func prepare() async {
         do {
             phase = .preparing
+            options = HostLaunchOptions.current()
+
+            // The provider configuration is read before the host touches the
+            // guest root: a missing or an unsupported configuration has to be
+            // reported before anything is provisioned.
+            detail = "Reading the provider configuration"
+            let configuration = try ProviderConfigurationStore.load(
+                providerOverride: options.provider,
+                hasNoProvider: options.hasNoProvider)
+            if options.fixtureScenario == nil && configuration.baseURL.isEmpty {
+                throw ProviderConfigurationError.missing
+            }
+            self.configuration = configuration
+
             try Self.removeProvisionedRootIfRequested()
             phase = .provisioning
             detail = "Verifying the pinned guest inputs"
             let pins = try HostPins.load()
             let provisioned = try await provision(pins)
+            state.provisions += 1
             reusedVerifiedRoot = provisioned.reused
             detail = provisioned.reused ? "Reusing the verified guest root" : "Imported the guest root"
 
             phase = .booting
             detail = "Booting the guest"
+            if options.fixtureScenario != nil {
+                // The guest appends its exchange trail to a file, so the
+                // directory of the trail has to be there before the session
+                // starts, and the state of the last run has to be gone, so
+                // this run is the same run every time.
+                try prepareFixtureState(root: provisioned.activeRoot)
+                watchExchangeTrail(root: provisioned.activeRoot)
+            }
             try await boot(root: provisioned.activeRoot)
+            state.boots += 1
             watchGuestExit()
+
+            // The fixture is the provider the guest talks to. It starts after
+            // the configuration is accepted and before the session, so the
+            // guest reaches it from its first request.
+            if let scenario = options.fixtureScenario {
+                try startFixture(scenario: scenario, configuration: configuration)
+            }
+
             try await startSession()
+            state.sessions += 1
             startOutputPump()
             phase = .running
             detail = provisioned.reused ? "Guest running (reused root)" : "Guest running"
         } catch {
-            phase = .failed(error.localizedDescription)
-            detail = error.localizedDescription
+            let message = error.localizedDescription
+            // The diagnostic of the guest runtime belongs in the terminal as
+            // well: the guest program never ran, so the terminal is the only
+            // place where the run can show what went wrong. The transcript
+            // of a fixture run holds it as well.
+            if message.contains(Self.runtimeErrorDiagnostic) {
+                writeToTerminal("\r\n\(message)\r\n")
+            }
+            phase = .failed(message)
+            detail = message
         }
     }
 
@@ -332,6 +493,85 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     // MARK: - Runtime
 
+    /// The state a fixture run starts from.
+    ///
+    /// A fixture run has to be the same run every time, so the state the
+    /// guest program keeps between runs is removed: the catalog of the guest
+    /// program, so it asks for a workspace again and shows the first-run
+    /// warning again, and the exchange trail of the last run, so the trail
+    /// holds this run only. The directory of the trail is created, because
+    /// the guest appends to the trail file and does not make its directory.
+    private func prepareFixtureState(root: String) throws {
+        let data = URL(fileURLWithPath: root).appendingPathComponent("data")
+        let guestState = data
+            .appendingPathComponent("root")
+            .appendingPathComponent(".local")
+            .appendingPathComponent("state")
+            .appendingPathComponent("leg-ui")
+        if FileManager.default.fileExists(atPath: guestState.path) {
+            try FileManager.default.removeItem(at: guestState)
+        }
+        let trailDirectory = data
+            .appendingPathComponent("tmp")
+            .appendingPathComponent("leg-ios-fixture")
+        let trail = trailDirectory.appendingPathComponent("exchange.jsonl")
+        if FileManager.default.fileExists(atPath: trail.path) {
+            try FileManager.default.removeItem(at: trail)
+        }
+        try FileManager.default.createDirectory(at: trailDirectory, withIntermediateDirectories: true)
+    }
+
+    /// Watches the exchange trail of the guest for the failure of the turn.
+    ///
+    /// The guest program writes the trail as it goes, so the host sees the
+    /// failure of a turn while the run is still going. The watcher stops
+    /// when it finds the failure, or when the run ends.
+    private func watchExchangeTrail(root: String) {
+        let trail = URL(fileURLWithPath: root)
+            .appendingPathComponent("data")
+            .appendingPathComponent("tmp")
+            .appendingPathComponent("leg-ios-fixture")
+            .appendingPathComponent("exchange.jsonl")
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
+        timer.setEventHandler { [weak self, weak timer] in
+            guard let failure = GuestHostController.turnFailure(in: trail) else { return }
+            timer?.cancel()
+            DispatchQueue.main.async { self?.reportTurnFailure(failure) }
+        }
+        trailWatcher = timer
+        timer.resume()
+    }
+
+    /// Writes the failure the guest reported for the turn into the terminal.
+    ///
+    /// The guest program of the pinned bundle does not render the failure of
+    /// a turn in the iOS host: the turn never ends there. The guest does
+    /// report the failure, in its exchange trail, and the host writes that
+    /// report into the terminal, where the guest speaks. The transcript of
+    /// the run holds it as well, because the transcript records what the
+    /// terminal showed.
+    private func reportTurnFailure(_ failure: String) {
+        writeToTerminal("\r\n\(failure)\r\n")
+    }
+
+    /// Reads the failure the guest reported for the turn out of the trail.
+    ///
+    /// The trail holds one JSON object per line. A failed turn records a
+    /// `response_error` line, and that line holds the message the guest
+    /// reported.
+    nonisolated private static func turnFailure(in trail: URL) -> String? {
+        guard let data = try? Data(contentsOf: trail),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n") {
+            guard let record = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  record["event"] as? String == "response_error",
+                  let message = record["message"] as? String, !message.isEmpty else { continue }
+            return message
+        }
+        return nil
+    }
+
     private func boot(root: String) async throws {
         let dataDirectory = root + "/data"
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -361,6 +601,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private func guestDidExit(_ status: Int) {
         let exitCode = status >> 8
         let signal = status & 0x7f
+        fixture?.stop()
+        trailWatcher?.cancel()
+        trailWatcher = nil
         if exitCode != 0 {
             phase = .exited(status)
             detail = "The guest program exited with code \(exitCode)."
@@ -374,7 +617,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     }
 
     private func startSession() async throws {
-        let program = Self.sessionProgram
+        let program = options.program
+        let guestArguments = self.guestArguments(for: program)
+        let guestEnvironment = self.guestEnvironment()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 // The kernel takes the argument vector and the environment as
@@ -383,22 +628,113 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 // process, so they are built inside the closure that runs the
                 // session.
                 let storage = CStringStorage()
-                let arguments = storage.cBuffer(program + "\0")
-                let environment = storage.cBuffer(Self.guestEnvironment.joined(separator: "\0") + "\0")
+                let arguments = storage.cBuffer(guestArguments.joined(separator: "\0") + "\0")
+                let environment = storage.cBuffer(guestEnvironment.joined(separator: "\0") + "\0")
 
                 let status = withExtendedLifetime(storage) {
                     program.withCString { programPointer in
-                        guest_runtime_start_session(programPointer, arguments, 1, environment)
+                        guest_runtime_start_session(programPointer, arguments,
+                                                   guestArguments.count, environment)
                     }
                 }
                 if status < 0 {
                     continuation.resume(throwing: GuestHostError(
-                        message: "The guest program could not be started (error \(status))."))
+                        message: "\(Self.runtimeErrorDiagnostic): the guest program could not be "
+                            + "started (error \(status))."))
                 } else {
                     continuation.resume()
                 }
             }
         }
+    }
+
+    // MARK: - Environment
+
+    /// The arguments the guest program runs with.
+    ///
+    /// The guest program finds its companion programs next to its own
+    /// executable, and it looks for its own executable through
+    /// `/proc/self/exe`. The emulator cannot answer that read for the process
+    /// it runs, and the answer takes the whole host down, so the host names
+    /// the two programs of the pinned bundle instead. A guest program that is
+    /// not the guest TUI takes no arguments.
+    private func guestArguments(for program: String) -> [String] {
+        guard program == HostLaunchOptions.defaultProgram else { return [program] }
+        return [program,
+                "--leg-bin", HostLaunchOptions.legProgram,
+                "--supervisor-bin", HostLaunchOptions.supervisorProgram]
+    }
+
+    /// The environment the guest session runs with.
+    ///
+    /// The list is an allowlist. The guest gets the terminal settings, the
+    /// provider configuration and, in a fixture run, the values that pin the
+    /// turn down. Nothing else of the host environment reaches the guest, and
+    /// the credential is never written down.
+    private func guestEnvironment() -> [String] {
+        guard let configuration else { return Self.baseEnvironment }
+        let isFixture = options.fixtureScenario != nil
+        let baseURL = fixture?.baseURL ?? configuration.baseURL
+        let model = isFixture ? ProviderConfigurationStore.fixtureModel : configuration.model
+        let window = isFixture
+            ? ProviderConfigurationStore.fixtureContextWindowTokens
+            : configuration.contextWindowTokens
+        var environment = Self.baseEnvironment
+        environment.append("LEG_PROVIDER=\(configuration.provider.rawValue)")
+        environment.append("ANTHROPIC_API_KEY=\(configuration.apiKey)")
+        environment.append("ANTHROPIC_BASE_URL=\(baseURL)")
+        environment.append("LEG_MODEL=\(model)")
+        environment.append("LEG_CONTEXT_WINDOW_TOKENS=\(window)")
+        if isFixture {
+            environment.append(contentsOf: Self.fixtureEnvironment)
+        }
+        return environment
+    }
+
+    // MARK: - Fixture
+
+    /// Starts the loopback fixture and the terminal transcript.
+    private func startFixture(scenario: LoopbackFixture.Scenario,
+                               configuration: ProviderConfiguration) throws {
+        let fixture = LoopbackFixture(scenario: scenario, expectedAPIKey: configuration.apiKey)
+        try fixture.start()
+        fixture.onObservationChanged = { [weak self] in
+            DispatchQueue.main.async { self?.refreshFixtureState() }
+        }
+        self.fixture = fixture
+        state.listeners += 1
+        try openTranscript()
+        refreshFixtureState()
+    }
+
+    /// Reads the fixture observation into the published state.
+    private func refreshFixtureState() {
+        guard let fixture else { return }
+        let observation = fixture.currentObservation
+        state.requests = observation.acceptedRequests
+        state.statuses = observation.statuses
+        state.validation = observation.validation
+    }
+
+    /// Opens the file the raw terminal output is written to.
+    ///
+    /// The transcript is written in a fixture run only. It holds the bytes the
+    /// guest produced, so it is written the way the guest produced them.
+    private func openTranscript() throws {
+        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true)
+        let artifacts = support.appendingPathComponent("LegHost/test-artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+        let transcript = artifacts.appendingPathComponent("terminal-transcript.log")
+        FileManager.default.createFile(atPath: transcript.path, contents: nil)
+        transcriptHandle = try FileHandle(forWritingTo: transcript)
+    }
+
+    /// Writes the raw guest output to the transcript.
+    private func writeToTranscript(_ text: String) {
+        guard let transcriptHandle, let data = text.data(using: .isoLatin1) else { return }
+        transcriptHandle.seekToEndOfFile()
+        try? transcriptHandle.write(contentsOf: data)
     }
 
     // MARK: - Output
@@ -432,6 +768,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     }
 
     private func writeToTerminal(_ text: String) {
+        writeToTranscript(text)
         guard terminalReady else {
             // The terminal is not ready yet: hold the output back, so the
             // first screen of the guest program is not lost.
@@ -447,10 +784,13 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     func sendInput(_ text: String) {
         var normalized = text.replacingOccurrences(of: "\n", with: "\r")
         if normalized.isEmpty { return }
-        NSLog("[LegHost] forwarding %d bytes to the guest", normalized.utf8.count)
-        normalized.withCString { pointer in
+        let bytes = Array(normalized.utf8)
+        let written = normalized.withCString { pointer in
             guest_runtime_write_input(pointer, strlen(pointer))
         }
+        NSLog("[LegHost] forwarded %d of %d bytes to the guest: %@",
+              written, bytes.count,
+              bytes.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "))
     }
 
     /// Reports the terminal size to the guest.

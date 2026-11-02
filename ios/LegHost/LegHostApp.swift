@@ -30,6 +30,7 @@ struct GuestHostScreen: View {
             case .running:
                 VStack(spacing: 0) {
                     statusBar
+                    stateRow
                     controlRow
                     GuestTerminalView(controller: controller)
                 }
@@ -38,7 +39,15 @@ struct GuestHostScreen: View {
                           detail: controller.detail,
                           identifier: "guest-exited")
             case .failed(let message):
-                statusView(title: "The guest could not start", detail: message)
+                // The terminal stays on the screen when the guest could not
+                // start: the host writes what went wrong into it, and the
+                // terminal is where the guest would have spoken.
+                VStack(spacing: 0) {
+                    statusView(title: "The guest could not start",
+                              detail: message,
+                              expands: false)
+                    GuestTerminalView(controller: controller)
+                }
             default:
                 statusView(title: title, detail: controller.detail)
             }
@@ -67,6 +76,24 @@ struct GuestHostScreen: View {
         .padding(.vertical, 4)
     }
 
+    /// What the host did in this run.
+    ///
+    /// The line holds the lifecycle counts and the fixture observation. It
+    /// carries no request data and no credential.
+    private var stateRow: some View {
+        HStack(spacing: 8) {
+            Text(controller.state.summary)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+                .accessibilityIdentifier("guest-fixture-state")
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 2)
+    }
+
     /// The keys the software keyboard cannot send.
     ///
     /// The row sits above the terminal, so it stays reachable while the
@@ -88,6 +115,25 @@ struct GuestHostScreen: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier(key.identifier)
             }
+            #if DEBUG
+            // The guest TUI submits the composer with the send key, which the
+            // software keyboard cannot send. A fixture run offers it on the
+            // screen, so the test can drive one turn reproducibly.
+            if controller.isFixtureRun {
+                Button {
+                    controller.sendInput(GuestTerminalKey.submit)
+                } label: {
+                    Text(Self.submitLabel)
+                        .font(.caption.monospaced())
+                        .frame(minWidth: 26)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.12))
+                        .foregroundStyle(Color.white)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("guest-key-submit")
+            }
+            #endif
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8)
@@ -96,6 +142,8 @@ struct GuestHostScreen: View {
 
     /// The label of the interrupt control.
     private static let interruptLabel = "ctrl-c"
+    /// The label of the send control.
+    private static let submitLabel = "ctrl-s"
 
     /// The keys the host offers, in the order they are shown.
     private static let controlKeys: [ControlKey] = [
@@ -129,7 +177,14 @@ struct GuestHostScreen: View {
         }
     }
 
-    private func statusView(title: String, detail: String, identifier: String? = nil) -> some View {
+    /// The status of the host.
+    ///
+    /// The view fills the screen unless it sits above the terminal: there the
+    /// terminal takes the room the status does not need.
+    private func statusView(title: String,
+                            detail: String,
+                            identifier: String? = nil,
+                            expands: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("LegHost")
                 .font(.largeTitle.bold())
@@ -141,7 +196,12 @@ struct GuestHostScreen: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+                    .accessibilityIdentifier("guest-status-detail")
             }
+            Text(controller.state.summary)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("guest-fixture-state")
             Divider()
             LabeledContent("Vendored iSH revision", value: HostBundle.ishRevision ?? "unknown")
             if controller.reusedVerifiedRoot {
@@ -153,7 +213,9 @@ struct GuestHostScreen: View {
             Spacer()
         }
         .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity,
+               maxHeight: expands ? .infinity : nil,
+               alignment: .topLeading)
     }
 }
 

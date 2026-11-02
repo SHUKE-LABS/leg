@@ -3,8 +3,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include "kernel/calls.h"
+#include "kernel/time.h"
 #include "fs/fd.h"
 #include "fs/inode.h"
 #include "fs/path.h"
@@ -661,6 +663,30 @@ int_t sys_shutdown(fd_t sock_fd, dword_t how) {
 
 #define DEFAULT_TCP_CONGESTION "cubic"
 
+// The guest's timeval has two 32-bit fields, while the host's has 64-bit
+// fields on a 64-bit host. The kernel checks the length of the value it is
+// given, so the timeout options have to be translated in both directions.
+static int sock_timeout_to_host(const char *value, uint_t value_len, struct timeval *host_value) {
+    if (value_len != sizeof(struct timeval_))
+        return _EINVAL;
+    struct timeval_ guest_value;
+    memcpy(&guest_value, value, sizeof(guest_value));
+    host_value->tv_sec = guest_value.sec;
+    host_value->tv_usec = guest_value.usec;
+    return 0;
+}
+
+static int sock_timeout_from_host(const struct timeval *host_value, char *value, uint_t value_len) {
+    if (value_len < sizeof(struct timeval_))
+        return _EINVAL;
+    struct timeval_ guest_value = {
+        .sec = host_value->tv_sec,
+        .usec = host_value->tv_usec,
+    };
+    memcpy(value, &guest_value, sizeof(guest_value));
+    return 0;
+}
+
 int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len) {
     STRACE("setsockopt(%d, %d, %d, 0x%x, %d)", sock_fd, level, option, value_addr, value_len);
     struct fd *sock = sock_getfd(sock_fd);
@@ -696,6 +722,16 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     // should just ignore attempts to set it.
     if (real_opt == 0)
         return 0;
+
+    if (real_level == SOL_SOCKET && (real_opt == SO_RCVTIMEO || real_opt == SO_SNDTIMEO)) {
+        struct timeval host_value;
+        int err = sock_timeout_to_host(value, value_len, &host_value);
+        if (err < 0)
+            return err;
+        if (setsockopt(sock->real_fd, real_level, real_opt, &host_value, sizeof(host_value)) < 0)
+            return errno_map();
+        return 0;
+    }
 
     int err = setsockopt(sock->real_fd, real_level, real_opt, value, value_len);
     if (err < 0)
@@ -804,9 +840,23 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         if (real_level < 0)
             return _EINVAL;
 
-        int err = getsockopt(sock->real_fd, real_level, real_opt, value, &value_len);
-        if (err < 0)
-            return errno_map();
+        if (real_level == SOL_SOCKET && (real_opt == SO_RCVTIMEO || real_opt == SO_SNDTIMEO)) {
+            // The host's timeval does not fit in the buffer the guest asked
+            // for, so it is read into its own and only the guest's part is
+            // handed back.
+            struct timeval host_value;
+            socklen_t host_value_len = sizeof(host_value);
+            if (getsockopt(sock->real_fd, real_level, real_opt, &host_value, &host_value_len) < 0)
+                return errno_map();
+            int err = sock_timeout_from_host(&host_value, value, value_len);
+            if (err < 0)
+                return err;
+            value_len = sizeof(struct timeval_);
+        } else {
+            int err = getsockopt(sock->real_fd, real_level, real_opt, value, &value_len);
+            if (err < 0)
+                return errno_map();
+        }
     }
 
     if (user_put(len_addr, value_len))

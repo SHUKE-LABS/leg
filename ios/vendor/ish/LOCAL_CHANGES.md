@@ -29,3 +29,36 @@ forms cannot be confused.
 
 This is the only instruction the pinned guest bundle needs that the
 vendored emulator did not implement.
+
+## `fs/proc`: the `exe` link of a task without an address space
+
+`fs/proc/pid.c` answers the other `/proc/<pid>` entries with a check for a
+task that has no address space: a task that is on its way out has already
+released its memory, and `task->mm` is `NULL` for it. The `exe` link did not
+have that check and dereferenced `task->mm` directly, so a `readlink` of
+`/proc/<pid>/exe` for such a task took the whole emulator down with a
+segmentation fault inside the host.
+
+The change adds the check the other handlers already have: a task without an
+address space, or without an executable in it, has no `exe` link to point at,
+so the read fails with `ESRCH` instead of crashing the emulator.
+
+## `fs/sock`: the socket timeout options
+
+A guest that set a read or a write timeout on a socket had its `setsockopt`
+refused with `EINVAL`, so every program that bounded its socket reads, a HTTP
+client among them, failed before it sent anything.
+
+Two things were wrong:
+
+- The numbers the emulator knew the timeout options by, 66 and 67, are not the
+  numbers a Linux guest uses. Linux has `SO_RCVTIMEO` at 20 and `SO_SNDTIMEO`
+  at 21, and a guest asks for those. The option was unknown, so the emulator
+  refused it.
+- The value of a timeout is a `struct timeval`, whose fields are 32-bit wide
+  in the guest and 64-bit wide in a 64-bit host. The kernel checks the length
+  of the value it is given, so the guest's eight bytes were refused as well.
+
+The change gives the two options the numbers a Linux guest uses and
+translates the timeout in both directions: the guest's timeval goes out as the
+host's, and the host's comes back as the guest's.

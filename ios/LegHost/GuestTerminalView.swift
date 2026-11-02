@@ -165,9 +165,17 @@ final class GuestTerminalUIView: UIView, GuestTerminalSink, UITextFieldDelegate 
         }
     }
 
+    /// Gives the keyboard to the guest.
+    ///
+    /// The keys go into the hidden text field, so the field takes the focus
+    /// from the terminal page. The page keeps its own focus otherwise, and
+    /// the keyboard would then reach the page instead of the field, which is
+    /// the one thing the guest should get the keys.
     @objc private func focusTerminal() {
         let focused = inputField.becomeFirstResponder()
         NSLog("[LegHost] the terminal took the keyboard focus: %d", focused)
+        webView.evaluateJavaScript("window.term && window.term.blur && window.term.blur();",
+                                   completionHandler: nil)
     }
 
     // MARK: - Keyboard

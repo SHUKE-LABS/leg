@@ -18,6 +18,13 @@ pinned guest bundle and the pinned Alpine root. On launch it
 5. boots the vendored iSH runtime on that root, opens a pseudo terminal and
    runs `/usr/local/bin/leg-tui` on it.
 
+The pinned Alpine root has no `bash`, and the guest program runs its
+commands with `bash -lc`, so the provisioner stages a shim at
+`/usr/local/bin/bash` in the guest that runs the shell the root does have
+(`/bin/busybox sh`). The shim is part of the staging archive, so it is
+verified with the other staged files, and a root that was imported before
+the shim existed is imported again.
+
 The terminal is [hterm](https://github.com/ish-app/libapps) in a `WKWebView`:
 the guest output is written into it, the keyboard (software or hardware) is
 forwarded to the guest terminal, and the terminal size is reported to the
@@ -40,6 +47,15 @@ implemented in the vendored tree, and the change is listed in
 [`vendor/ish/LOCAL_CHANGES.md`](vendor/ish/LOCAL_CHANGES.md). It is the only
 instruction the pinned guest bundle needs that the vendored emulator was
 missing.
+
+The same file lists the two other changes the vendored tree carries. A
+readlink of `/proc/<pid>/exe` for a task without an address space took the
+emulator down, so the read now fails with `ESRCH` for such a task. A guest
+that bounded its socket reads had its `setsockopt` refused with `EINVAL`,
+because the emulator knew the timeout options by other numbers than a Linux
+guest uses and because the timeout value is wider on the host than in the
+guest; the two options now have the numbers a Linux guest uses and the
+timeout is translated in both directions.
 
 ## Licensing
 
@@ -199,7 +215,235 @@ xcodebuild test -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphonesimula
 
 The tests need a booted simulator. Every test launches the app with the
 `-leghost-reset` argument, so the host imports the guest root again; the
-import takes a moment on a cold container.
+import takes a moment on a cold container. Every test of this class also
+launches the app with `-leghost-provider anthropic`, because the host reads
+its provider configuration before it touches the guest root and stops
+without one.
+
+The `LegHostFixtureUITests` class drives the app against the loopback fixture
+instead. It launches the app with the fixture arguments, so it reuses the
+verified guest root and does not import it again.
+
+## Provider configuration
+
+The host owns the provider configuration and reads it before it touches the
+guest root: a missing or an unsupported configuration is reported before
+anything is provisioned, booted or started.
+
+The configuration is one Keychain generic password. The host reads the item
+and never writes it, so the credential stays where the user put it:
+
+| Field | Value |
+| --- | --- |
+| Service | `com.shukelabs.leg.ioshost.provider` |
+| Account | `default` |
+| Accessibility | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` |
+
+Its data is UTF-8 JSON with exactly these five keys:
+
+```json
+{"provider":"anthropic","api_key":"sk-ant-...","base_url":"https://api.anthropic.com","model":"claude-sonnet-4-5","context_window_tokens":200000}
+```
+
+`context_window_tokens` has to be a positive number. The host reports two
+stable diagnostics:
+
+| Diagnostic | Meaning |
+| --- | --- |
+| `IOS_PROVIDER_CONFIG_MISSING` | There is no item, or the item does not hold exactly the five keys with usable values. |
+| `IOS_PROVIDER_CONFIG_UNSUPPORTED` | The item names `openai-chat-completions` or `openai-responses`. This host speaks the Anthropic Messages protocol. |
+
+The guest gets the configuration as an allowlist: `TERM`, `HOME`, `PATH`,
+`SHELL`, `LEG_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`,
+`LEG_MODEL` and `LEG_CONTEXT_WINDOW_TOKENS`. Nothing else of the host
+environment reaches the guest, and no `LEGHOST_*` variable is ever passed on.
+
+## The loopback fixture
+
+The fixture serves the Anthropic Messages endpoint on `127.0.0.1`, so one
+guest turn runs without a provider. It is a DEBUG-only fixture: it is
+reachable through the launch arguments below, it keeps its configuration in
+memory and it never becomes a place where a credential is stored.
+
+### Launch arguments
+
+| Argument | Meaning |
+| --- | --- |
+| `-leghost-fixture success` | The fixture answers the first request with a text and a `bash` tool call, and the second one with the final text. |
+| `-leghost-fixture provider-error` | The fixture answers the first request with HTTP 500. |
+| `-leghost-fixture unreachable` | The fixture closes its port before the turn, so the guest cannot reach it. |
+| `-leghost-provider anthropic` | The run is configured for the Anthropic Messages protocol. |
+| `-leghost-provider openai-chat-completions` | The run is configured for a provider this host refuses. |
+| `-leghost-provider openai-responses` | The run is configured for a provider this host refuses. |
+| `-leghost-no-provider` | The run has no provider configuration at all. |
+| `-leghost-runtime-failure` | The guest runtime is asked for a program that is not there. |
+
+The provider arguments configure the run in memory: the credential is
+`IOS_FIXTURE_CREDENTIAL_SENTINEL`, the model is `claude-ios-fixture` and the
+context window is `200000`. Nothing is written to the Keychain, to the user
+defaults or to the file system.
+
+A run without the fixture talks to a closed port on the loopback interface,
+so it stays on the device: a turn of such a run fails with a transport error
+instead of reaching a provider. A DEBUG run without a Keychain item needs one
+of the provider arguments, or the host stops at the configuration boundary
+with `IOS_PROVIDER_CONFIG_MISSING` before it touches the guest root.
+
+A fixture run pins the turn down with these values, which the guest gets in
+addition to the ones above:
+
+```
+LEG_MAX_TOKENS=256
+LEG_MAX_TOOL_ROUNDS=1
+LEG_MAX_RETRIES=0
+LEG_RETRY_BASE_DELAY_MS=0
+LEG_TIMEOUT_SECS=5
+LEG_STREAM_IDLE_TIMEOUT_SECS=5
+LEG_BASH_TIMEOUT_SECS=5
+LEG_EVENT_LOG=/tmp/leg-ios-fixture/exchange.jsonl
+NO_COLOR=1
+```
+
+The zero retry budget makes the number of provider requests the same on
+every run.
+
+### The turn
+
+The guest program asks for a workspace, shows the first-run warning and then
+offers the composer. The simulator test
+
+1. types `/tmp` and presses Enter to select the workspace,
+2. presses Enter to acknowledge the first-run warning, when it is shown,
+3. types `IOS_FIXTURE_TURN`,
+4. presses the send control (`ctrl-s`) the host offers above the terminal.
+
+The send control is on the screen because the software keyboard cannot send
+the key the guest TUI submits the composer with.
+
+The host names the two programs of the pinned bundle to the guest program
+(`--leg-bin` and `--supervisor-bin`). The guest program would otherwise find
+them next to its own executable, which it looks up through `/proc/self/exe`;
+the emulator cannot answer that read for the process it runs, so the host
+spells the paths out instead.
+
+A fixture run starts from the same state every time. The host removes the
+state the guest program keeps between runs: the catalog of the guest program,
+so the run asks for a workspace again and shows the first-run warning again,
+and the exchange trail of the last run, so the trail holds this run only. It
+creates the directory of the trail, because the guest appends to the trail
+file and does not make its directory.
+
+### The failure of a turn
+
+A turn that fails is reported by the guest, and the host writes what the
+guest reported into the terminal. The guest writes every turn to the
+exchange trail, and a failed turn writes a `response_error` record with the
+message the guest produced. The host reads that record while the run goes
+on and writes the message into the terminal, where the guest speaks:
+
+| Run | What the guest reported |
+| --- | --- |
+| Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
+| Unreachable | `transport error: ...` |
+
+The host does not write the message itself: it writes the message the guest
+recorded, so the class of the failure is the one the guest reported. The
+terminal transcript of the run holds the message as well, because the
+transcript records what the terminal showed. The host reads the trail of a
+fixture run only.
+
+The guest program of the pinned bundle does not render the failure of a turn
+in the iOS host: the turn never ends there, so the guest program keeps
+showing the turn as running. The guest does report the failure, in the
+trail, and the host writes that report into the terminal.
+
+The diagnostics the host produces itself are in the status of the host, under
+the `guest-status-detail` identifier: `IOS_PROVIDER_CONFIG_MISSING`,
+`IOS_PROVIDER_CONFIG_UNSUPPORTED` and `IOS_GUEST_RUNTIME_ERROR`. The runtime
+diagnostic is the host's own finding: the guest program it was asked to run
+is not there. The guest program never ran in that case, so the host writes
+the diagnostic into the terminal as well, and the terminal stays on the
+screen when the guest could not start, because it is the only place the run
+can show what went wrong:
+
+| Run | What the terminal holds |
+| --- | --- |
+| Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
+| Unreachable | `transport error: ...` |
+| Runtime failure | `IOS_GUEST_RUNTIME_ERROR: the guest program could not be started ...` |
+
+### What the fixture observes
+
+The host shows the counts of the run and the fixture observation under the
+`guest-fixture-state` identifier, and the tests read them from there:
+
+| Run | State |
+| --- | --- |
+| Success | `provision=1,boot=1,session=1,requests=2,statuses=200,200,validation=ok` |
+| Provider error | one request with the status 500 |
+| Unreachable | no accepted request |
+| Missing configuration | no provisioning, no boot, no session, no listener and no request |
+| Unsupported provider | the same as the missing configuration |
+
+The fixture validates every request in memory: the method, the path, the
+`stream` flag, the credential and the order of the requests. The second
+request has to carry the tool result of the `bash` call, and a third request
+is refused. The observation holds counts, statuses and the validation
+result only; a request header, a request body and the credential are never
+written down.
+
+### The artifacts
+
+A fixture run writes four artifacts, all inside the app container:
+
+| Artifact | Path |
+| --- | --- |
+| Terminal transcript | `Library/Application Support/LegHost/test-artifacts/terminal-transcript.log` |
+| Application log | the `LegHost` entries of the system log |
+| Guest file system | `Library/Application Support/LegHost/roots/root.active/data` |
+| Exchange trail | `tmp/leg-ios-fixture/exchange.jsonl` in the guest file system |
+
+### The verification command
+
+```
+ios/tests/run-fixture-verification.sh
+```
+
+The script runs four scenarios in the booted simulator: the success
+scenario, the provider error scenario, the unreachable scenario and the
+runtime failure scenario. Every scenario gets a simulator of its own, and
+the four artifacts of every run are scanned for the configured credential.
+The script fails when the credential shows up in any of the artifacts, when
+the turn did not reach the fixture and when the transcript of a run does not
+hold the marker of that run.
+
+| Scenario | The transcript of the run holds |
+| --- | --- |
+| Success | `IOS_FIXTURE_STREAM_TEXT`, `IOS_FIXTURE_TOOL_RESULT`, `IOS_FIXTURE_FINAL_RESPONSE` |
+| Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
+| Unreachable | `transport error:` |
+| Runtime failure | `IOS_GUEST_RUNTIME_ERROR` |
+
+The exchange trail of a run is only there when the guest program ran, so the
+runtime failure run has no trail to scan.
+
+Pass `--udid <simulator udid>` to pick the simulator, and `--skip-run` to
+scan the run that is already in the simulator: the script runs no scenario
+then, and it scans the four artifacts of the last run.
+
+### The fixture tests
+
+```
+ios/tests/run-fixture-tests.sh
+```
+
+The script runs every fixture test with a simulator of its own. The
+accessibility server of a simulator wedges when a long run of the tests
+drives the app again and again, and the test that follows the wedge fails
+with an accessibility timeout instead of an assertion, so every test starts
+from a simulator that was booted for it. Pass the names of the tests to run
+only some of them.
+
 
 ## Host fixtures
 
@@ -212,6 +456,15 @@ root.
 
 ```
 ios/tests/run-host-tests.sh
+```
+
+The provider configuration of the host has its own fixtures. They hand in
+the call into the Security framework, so they need neither a Keychain nor a
+simulator, and they cover the query of that call, the JSON of the item and
+the two diagnostics:
+
+```
+ios/tests/run-provider-tests.sh
 ```
 
 The same provisioner runs against the real pinned archives:
@@ -245,6 +498,8 @@ root must hold, not code of them.
 
 ## Out of scope
 
-Keychain and provider wiring, lifecycle and session persistence, physical
-device runtime testing, the native Photos, Files and Shortcuts adapters, and
-App Store metadata are later slices of `#255`.
+The settings UI, lifecycle and session persistence, physical device runtime
+testing, the native Photos, Files and Shortcuts adapters, and App Store
+metadata are later slices of `#255`. The provider support of this slice is
+the Anthropic Messages protocol; the OpenAI wire variants are covered only
+as the rejection cases of the fixture.
