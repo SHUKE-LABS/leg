@@ -23,6 +23,21 @@ struct GuestTerminalSize: Equatable {
     var isEmpty: Bool { columns <= 0 || rows <= 0 }
 }
 
+/// The keys a terminal program reads, but the software keyboard cannot send.
+///
+/// The host offers them in a row above the terminal, so the guest program can
+/// be driven without a hardware keyboard.
+enum GuestTerminalKey {
+    static let escape = "\u{1b}"
+    static let tab = "\t"
+    static let up = "\u{1b}[A"
+    static let down = "\u{1b}[B"
+    static let right = "\u{1b}[C"
+    static let left = "\u{1b}[D"
+    /// The interrupt.
+    static let interrupt = "\u{3}"
+}
+
 /// The terminal the guest output is written to.
 @MainActor
 protocol GuestTerminalSink: AnyObject {
@@ -192,6 +207,21 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     /// The guest program the host runs.
     private static let guestProgram = "/usr/local/bin/leg-tui"
+
+    /// The program the session runs.
+    ///
+    /// The default is the guest TUI. The simulator tests run a shell instead,
+    /// so they can make the guest spawn a helper process that exits while the
+    /// session keeps running.
+    private static var sessionProgram: String {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-leghost-program"),
+              index + 1 < arguments.count else {
+            return guestProgram
+        }
+        return arguments[index + 1]
+    }
+
     private static let guestEnvironment = [
         "TERM=xterm-256color",
         "HOME=/root",
@@ -344,6 +374,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     }
 
     private func startSession() async throws {
+        let program = Self.sessionProgram
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 // The kernel takes the argument vector and the environment as
@@ -352,12 +383,12 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 // process, so they are built inside the closure that runs the
                 // session.
                 let storage = CStringStorage()
-                let arguments = storage.cBuffer(Self.guestProgram + "\0")
+                let arguments = storage.cBuffer(program + "\0")
                 let environment = storage.cBuffer(Self.guestEnvironment.joined(separator: "\0") + "\0")
 
                 let status = withExtendedLifetime(storage) {
-                    Self.guestProgram.withCString { program in
-                        guest_runtime_start_session(program, arguments, 1, environment)
+                    program.withCString { programPointer in
+                        guest_runtime_start_session(programPointer, arguments, 1, environment)
                     }
                 }
                 if status < 0 {

@@ -30,6 +30,7 @@ struct GuestHostScreen: View {
             case .running:
                 VStack(spacing: 0) {
                     statusBar
+                    controlRow
                     GuestTerminalView(controller: controller)
                 }
             case .exited:
@@ -64,6 +65,57 @@ struct GuestHostScreen: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
+    }
+
+    /// The keys the software keyboard cannot send.
+    ///
+    /// The row sits above the terminal, so it stays reachable while the
+    /// software keyboard covers the lower half of the screen. Without it a
+    /// guest program could not be interrupted without a hardware keyboard.
+    private var controlRow: some View {
+        HStack(spacing: 6) {
+            ForEach(Self.controlKeys) { key in
+                Button {
+                    controller.sendInput(key.sequence)
+                } label: {
+                    Text(key.label)
+                        .font(.caption.monospaced())
+                        .frame(minWidth: 26)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.12))
+                        .foregroundStyle(key.label == Self.interruptLabel ? Color.red : Color.white)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(key.identifier)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+    }
+
+    /// The label of the interrupt control.
+    private static let interruptLabel = "ctrl-c"
+
+    /// The keys the host offers, in the order they are shown.
+    private static let controlKeys: [ControlKey] = [
+        ControlKey(identifier: "guest-key-escape", label: "esc", sequence: GuestTerminalKey.escape),
+        ControlKey(identifier: "guest-key-tab", label: "tab", sequence: GuestTerminalKey.tab),
+        ControlKey(identifier: "guest-key-left", label: "←", sequence: GuestTerminalKey.left),
+        ControlKey(identifier: "guest-key-up", label: "↑", sequence: GuestTerminalKey.up),
+        ControlKey(identifier: "guest-key-down", label: "↓", sequence: GuestTerminalKey.down),
+        ControlKey(identifier: "guest-key-right", label: "→", sequence: GuestTerminalKey.right),
+        ControlKey(identifier: "guest-key-interrupt", label: interruptLabel,
+                   sequence: GuestTerminalKey.interrupt),
+    ]
+
+    /// One of the keys the host offers.
+    private struct ControlKey: Identifiable {
+        let identifier: String
+        let label: String
+        let sequence: String
+
+        var id: String { identifier }
     }
 
     private var title: String {

@@ -261,9 +261,10 @@ against their SHA-256 digests, imports them into a guest root with the vendored
 iSH importer, boots the vendored runtime and runs `/usr/local/bin/leg-tui` on a
 pseudo terminal that is drawn with hterm. The terminal accepts the software
 and the hardware keyboard, reports its size to the guest and forwards
-interrupts. It is built and installed separately from the emulated bundle
-above, and it links no proprietary `leg` source: `leg` runs inside the guest,
-as a separate program.
+interrupts; the keys the software keyboard cannot send, the interrupt among
+them, are offered on the screen. It is built and installed separately from the
+emulated bundle above, and it links no proprietary `leg` source: `leg` runs
+inside the guest, as a separate program.
 
 The host pins its two inputs by URL and SHA-256:
 

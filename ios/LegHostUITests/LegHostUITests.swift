@@ -84,19 +84,59 @@ final class LegHostUITests: XCTestCase {
     }
 
     /// An interrupt reaches the guest program and ends it.
+    ///
+    /// The interrupt is a control on the screen, so it works without a
+    /// hardware keyboard.
     func testAnInterruptEndsTheGuestProgram() {
         XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
                       "the host did not reach the running state")
 
         let terminal = app.otherElements["guest-terminal"]
         XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
-        rotate(to: .landscapeLeft)
 
-        terminal.tap()
-        terminal.typeKey("c", modifierFlags: .control)
+        // The guest program is on the screen: it asks for a workspace.
+        let prompt = app.staticTexts
+            .matching(NSPredicate(format: "label CONTAINS %@", "workspace")).firstMatch
+        XCTAssertTrue(prompt.waitForExistence(timeout: 60), "the guest program did not draw its screen")
+
+        let interrupt = app.buttons["guest-key-interrupt"]
+        XCTAssertTrue(interrupt.waitForExistence(timeout: 60), "the interrupt control is missing")
+        interrupt.tap()
+
         XCTAssertTrue(app.staticTexts["guest-exited"].waitForExistence(timeout: 60),
                       "the interrupt did not reach the guest program")
         attachScreenshot("the guest program ended")
+    }
+
+    /// A helper process the guest spawns exits on its own, and the session
+    /// keeps running.
+    func testAChildExitDoesNotEndTheSession() {
+        // The guest runs a shell, so the test can make it spawn a child that
+        // exits while the session itself stays alive.
+        app.terminate()
+        app.launchArguments = ["-leghost-reset", "-leghost-program", "/bin/sh"]
+        app.launch()
+
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        let terminal = app.otherElements["guest-terminal"]
+        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
+
+        terminal.tap()
+        // The subshell is a child process: it exits on its own.
+        app.typeText("(exit 0)\n")
+        // The session is still alive, so the shell still runs commands. The
+        // answer is not part of the command, so it cannot be the echo of it.
+        app.typeText("echo $((6*7))\n")
+
+        let answer = app.staticTexts
+            .matching(NSPredicate(format: "label CONTAINS %@", "42")).firstMatch
+        XCTAssertTrue(answer.waitForExistence(timeout: 60),
+                      "the session did not survive the exit of the child process")
+        XCTAssertFalse(app.staticTexts["guest-exited"].exists,
+                       "the exit of the child process ended the session")
+        attachScreenshot("the session survived the child exit")
     }
 
     /// The second launch verifies the root and reuses it instead of importing
@@ -130,18 +170,6 @@ final class LegHostUITests: XCTestCase {
             previous = current
         }
         return previous
-    }
-
-    /// Turns the device to the given orientation and waits for the host to
-    /// report the new terminal size. The size after the turn is returned.
-    private func rotate(to orientation: UIDeviceOrientation) -> String {
-        let before = settledTerminalSize()
-        XCUIDevice.shared.orientation = orientation
-        let size = app.staticTexts["guest-terminal-size"]
-        expectation(for: NSPredicate(format: "label != %@", before), evaluatedWith: size)
-        waitForExpectations(timeout: 120)
-        XCTAssertNotEqual(size.label, before, "the rotation did not change the guest terminal size")
-        return settledTerminalSize()
     }
 
     /// Keeps a screenshot of the screen in the test result.

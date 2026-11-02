@@ -21,11 +21,14 @@ pinned guest bundle and the pinned Alpine root. On launch it
 The terminal is [hterm](https://github.com/ish-app/libapps) in a `WKWebView`:
 the guest output is written into it, the keyboard (software or hardware) is
 forwarded to the guest terminal, and the terminal size is reported to the
-guest with `TIOCSWINSZ`. The font of the terminal is scaled until the grid
-holds the 80 columns and 24 rows the guest program needs, and the guest keeps
-that size when the software keyboard covers the screen. A second launch
-verifies the guest bundle marker and the four fixed program paths and reuses
-the root instead of importing it again.
+guest with `TIOCSWINSZ`. A row of controls above the terminal sends the keys
+the software keyboard has no way to send: escape, tab, the arrow keys and the
+interrupt, so the guest program can be driven without a hardware keyboard. The
+font of the terminal is scaled until the grid holds the 80 columns and 24 rows
+the guest program needs, and the guest keeps that size when the software
+keyboard covers the screen. A second launch verifies the guest bundle marker
+and the four fixed program paths and reuses the root instead of importing it
+again.
 
 ## The vendored emulator
 
@@ -153,6 +156,15 @@ makes the host remove the provisioned root before it imports it again.
 xcrun simctl launch "iPhone 17 Pro" com.shukelabs.leg.ioshost -leghost-reset
 ```
 
+The host runs `/usr/local/bin/leg-tui` in the guest. The simulator tests need
+a guest program they can make spawn a helper process, so they launch the host
+with another program:
+
+```
+xcrun simctl launch "iPhone 17 Pro" com.shukelabs.leg.ioshost \
+    -leghost-program /bin/sh
+```
+
 ## Signing a device build
 
 The simulator build needs no signing identity. A device build uses automatic
@@ -173,9 +185,10 @@ on the command line (or set it in Xcode for the local checkout).
 The `LegHostUITests` target drives the app in a simulator. It covers the
 first launch (the guest root is imported and the guest program starts), the
 guest program drawing its screen, the keyboard reaching the guest, the
-rotation changing the size the guest was told about, an interrupt ending the
-guest program, and the second launch reusing the verified root instead of
-importing it again.
+rotation changing the size the guest was told about, the on screen interrupt
+ending the guest program without a hardware keyboard, the exit of a helper
+process leaving the session running, and the second launch reusing the
+verified root instead of importing it again.
 
 ```
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer

@@ -43,6 +43,11 @@ static void *exit_notify_context = NULL;
 
 static struct tty *session_tty = NULL;
 
+/* The pid of the process the session runs. Only its exit ends the session: a
+ * helper process the guest program spawns exits on its own, and the session
+ * has to keep running then. */
+static int session_pid = 0;
+
 /* The console driver owns its terminals, the pseudo terminal driver gets the
  * slave terminals from pty_open_fake. */
 static struct tty *guest_console_ttys[GUEST_CONSOLE_TTYS];
@@ -174,10 +179,20 @@ static const struct tty_driver_ops guest_tty_ops = {
 /* ------------------------------------------------------------------- boot */
 
 /* Reports how the guest program ended. The kernel calls this when a task
- * exits; the code is the exit status, or the signal that killed it. */
+ * exits; the code is the exit status, or the signal that killed it.
+ *
+ * The hook is called for every task that exits, so it fires for the helper
+ * processes the guest program spawns as well. Only the exit of the session
+ * itself ends the session, so the group leader of the exiting task is
+ * compared with the pid of the session: a helper has its own group and its
+ * own leader. */
 static void guest_exit_hook(struct task *task, int code) {
+    struct task *leader = task->group->leader;
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO,
-                     "[LegHost] the guest task %d (%s) exited with %d", task->pid, task->comm, code);
+                     "[LegHost] the guest task %d (%s) exited with %d", leader->pid, leader->comm, code);
+    if (leader->pid != session_pid)
+        return;
+
     guest_exit_notify_callback notify = exit_notify;
     if (notify != NULL)
         notify(code, exit_notify_context);
@@ -231,6 +246,10 @@ int guest_runtime_start_session(const char *program, const char *arguments,
     int err = become_new_init_child();
     if (err < 0)
         return err;
+
+    /* The session runs in its own process group. Its pid tells the exit hook
+     * which exit ends the session. */
+    session_pid = current->pid;
 
     struct tty *tty = pty_open_fake(&guest_pty_driver);
     if (IS_ERR(tty))

@@ -53,23 +53,23 @@ final class GuestTerminalUIView: UIView, GuestTerminalSink, UITextFieldDelegate 
 
     /// The control keys a terminal program understands.
     private static let controlKeys: [String: String] = [
-        "a": "\u{01}", "b": "\u{02}", "c": "\u{03}", "d": "\u{04}", "e": "\u{05}",
-        "f": "\u{06}", "g": "\u{07}", "h": "\u{08}", "i": "\u{09}", "j": "\u{0a}",
-        "k": "\u{0b}", "l": "\u{0c}", "m": "\u{0d}", "n": "\u{0e}", "o": "\u{0f}",
-        "p": "\u{10}", "q": "\u{11}", "r": "\u{12}", "s": "\u{13}", "t": "\u{14}",
-        "u": "\u{15}", "v": "\u{16}", "w": "\u{17}", "x": "\u{18}", "y": "\u{19}",
-        "z": "\u{1a}", "[": "\u{1b}", "\\": "\u{1c}", "]": "\u{1d}", "^": "\u{1e}",
-        "_": "\u{1f}", " ": "\u{00}", "?": "\u{7f}",
+        "a": "\u{01}", "b": "\u{02}", "c": GuestTerminalKey.interrupt, "d": "\u{04}",
+        "e": "\u{05}", "f": "\u{06}", "g": "\u{07}", "h": "\u{08}", "i": "\u{09}",
+        "j": "\u{0a}", "k": "\u{0b}", "l": "\u{0c}", "m": "\u{0d}", "n": "\u{0e}",
+        "o": "\u{0f}", "p": "\u{10}", "q": "\u{11}", "r": "\u{12}", "s": "\u{13}",
+        "t": "\u{14}", "u": "\u{15}", "v": "\u{16}", "w": "\u{17}", "x": "\u{18}",
+        "y": "\u{19}", "z": "\u{1a}", "[": "\u{1b}", "\\": "\u{1c}", "]": "\u{1d}",
+        "^": "\u{1e}", "_": "\u{1f}", " ": "\u{00}", "?": "\u{7f}",
     ]
 
     /// The keys that a terminal program reads as escape sequences.
     private static let specialKeys: [String: String] = [
-        UIKeyCommand.inputEscape: "\u{1b}",
-        "\t": "\t",
-        UIKeyCommand.inputUpArrow: "\u{1b}[A",
-        UIKeyCommand.inputDownArrow: "\u{1b}[B",
-        UIKeyCommand.inputRightArrow: "\u{1b}[C",
-        UIKeyCommand.inputLeftArrow: "\u{1b}[D",
+        UIKeyCommand.inputEscape: GuestTerminalKey.escape,
+        "\t": GuestTerminalKey.tab,
+        UIKeyCommand.inputUpArrow: GuestTerminalKey.up,
+        UIKeyCommand.inputDownArrow: GuestTerminalKey.down,
+        UIKeyCommand.inputRightArrow: GuestTerminalKey.right,
+        UIKeyCommand.inputLeftArrow: GuestTerminalKey.left,
         UIKeyCommand.inputHome: "\u{1b}[H",
         UIKeyCommand.inputEnd: "\u{1b}[F",
         UIKeyCommand.inputPageUp: "\u{1b}[5~",
