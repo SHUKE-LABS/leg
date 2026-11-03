@@ -264,15 +264,15 @@ final class LoopbackFixture {
         // request in the ledger.
         switch scenario {
         case .providerError:
-            accept(status: 500)
+            record(status: 500)
             answer(status: 500, on: connection, body: providerError())
         case .unreachable:
             reject("unexpected request \(number)", on: connection)
         case .success:
-            accept(status: 200)
+            record(status: 200)
             answerTurn(number: number, on: connection)
         case .delayed:
-            accept(status: 200)
+            record(status: 200)
             // The answer is held back, so the turn is running long enough
             // for the host to be interrupted in the middle of it.
             queue.asyncAfter(deadline: .now() + Self.delayedAnswerDelay) { [weak self] in
@@ -297,7 +297,7 @@ final class LoopbackFixture {
     ///
     /// The count of the run and the durable ledger grow here, so the two
     /// always hold the same number of requests.
-    private func accept(status: Int) {
+    private func record(status: Int) {
         lock.lock()
         observation.acceptedRequests += 1
         observation.statuses.append(status)
@@ -310,7 +310,9 @@ final class LoopbackFixture {
         turnRequestCount += 1
         let entry = FixtureRequestLedger.Entry(turn: turnID, request: turnRequestCount, status: status)
         lock.unlock()
-        try? ledger?.append(turn: entry.turn, request: entry.request, status: entry.status)
+        if let ledger {
+            try? ledger.append(turn: entry.turn, request: entry.request, status: entry.status)
+        }
         onObservationChanged?()
     }
 

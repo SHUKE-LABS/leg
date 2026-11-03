@@ -146,7 +146,8 @@ final class GuestHostLifecycle {
         didTearDown = false
         state = .active
         chain = Task { [weak self] in
-            await self?.execute()
+            guard let self else { return }
+            await self.execute()
         }
     }
 
