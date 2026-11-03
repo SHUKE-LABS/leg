@@ -314,6 +314,8 @@ final class LegHostFixtureUITests: XCTestCase {
 
         XCTAssertTrue(waitForStatus("IOS_PROVIDER_CONFIG_MISSING", timeout: startTimeout),
                       "the missing configuration diagnostic is not in the status of the host")
+        XCTAssertTrue(waitForStatus("Add a Keychain generic password", timeout: startTimeout),
+                      "the remediation of the missing configuration is not in the status of the host")
         XCTAssertTrue(waitForState("provision=0,boot=0,session=0"),
                       "the host provisioned the guest")
         XCTAssertTrue(waitForState("requests=0"), "the fixture accepted a request")
@@ -424,11 +426,15 @@ final class LegHostFixtureUITests: XCTestCase {
     /// host stops before it provisions, boots, starts a session or starts
     /// the fixture.
     func testTheDeviceFaultsAreReportedBeforeTheGuestIsProvisioned() {
-        let faults: [(control: String, identifier: String)] = [
-            ("-leghost-runtime-missing", "IOS_RUNTIME_FILES_MISSING"),
-            ("-leghost-runtime-corrupt", "IOS_RUNTIME_FILES_CORRUPT"),
-            ("-leghost-unsupported-architecture", "IOS_ARCHITECTURE_UNSUPPORTED"),
-            ("-leghost-low-storage", "IOS_STORAGE_INSUFFICIENT"),
+        let faults: [(control: String, identifier: String, remediation: String)] = [
+            ("-leghost-runtime-missing", "IOS_RUNTIME_FILES_MISSING",
+             "the pinned guest runtime files are not in the app bundle"),
+            ("-leghost-runtime-corrupt", "IOS_RUNTIME_FILES_CORRUPT",
+             "does not match its pinned digest"),
+            ("-leghost-unsupported-architecture", "IOS_ARCHITECTURE_UNSUPPORTED",
+             "which the pinned guest runtime does not support"),
+            ("-leghost-low-storage", "IOS_STORAGE_INSUFFICIENT",
+             "the import of the guest root needs"),
         ]
         for fault in faults {
             app.terminate()
@@ -437,6 +443,8 @@ final class LegHostFixtureUITests: XCTestCase {
 
             XCTAssertTrue(waitForStatus(fault.identifier, timeout: startTimeout),
                           "the diagnostic of \(fault.control) is not in the status of the host")
+            XCTAssertTrue(waitForStatus(fault.remediation, timeout: startTimeout),
+                          "the remediation of \(fault.control) is not in the status of the host")
             XCTAssertTrue(waitForState("provision=0,boot=0,session=0"),
                           "the host touched the guest for \(fault.control)")
             XCTAssertTrue(waitForState("listener=0"),
