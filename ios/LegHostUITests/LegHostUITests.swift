@@ -543,13 +543,7 @@ final class LegHostFixtureUITests: XCTestCase {
                       "the host did not reach the running state")
 
         for turn in 1...3 {
-            if turn == 1 {
-                driveOneTurn()
-            } else {
-                // The workspace of the session is in the catalog of the
-                // guest, so the guest finds it and does not ask for it again.
-                driveOneTurnOfTheKnownSession()
-            }
+            driveOneTurn()
 
             XCTAssertTrue(waitForState("requests=\(turn)"),
                           "the fixture did not accept the request of the turn")
@@ -627,18 +621,36 @@ final class LegHostFixtureUITests: XCTestCase {
 
     /// Drives one turn in the guest program.
     ///
-    /// The guest program asks for a workspace, shows the first-run warning
-    /// and then offers the composer. The test fills in the workspace,
+    /// The guest program opens the picker of the sessions when the catalog of
+    /// the guest holds a session, and it asks for a workspace when the run
+    /// starts without one. A new session is made in the picker, so the guest
+    /// asks for the workspace of that session. The guest program shows the
+    /// first-run warning then, unless a previous run already acknowledged it,
+    /// and it offers the composer after it. The test fills in the workspace,
     /// acknowledges the warning and sends the prompt with the send control.
     private func driveOneTurn() {
         let terminal = app.otherElements["guest-terminal"]
         XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
 
-        XCTAssertTrue(waitForTerminalText("Enter a path and press Enter to select it."),
-                      "the guest program did not ask for a workspace")
-        focusGuest()
-        app.typeText("/tmp")
-        app.typeText("\n")
+        switch waitForGuestScreen() {
+        case .picker:
+            // A new session is made in the picker of the sessions, and the
+            // guest asks for the workspace of that session.
+            focusGuest()
+            app.typeText("n")
+            XCTAssertTrue(waitForTerminalText("Enter a path and press Enter to select it.", timeout: 60),
+                          "the guest program did not ask for a workspace")
+            focusGuest()
+            app.typeText("/tmp")
+            app.typeText("\n")
+        case .workspace:
+            focusGuest()
+            app.typeText("/tmp")
+            app.typeText("\n")
+        case .unknown:
+            XCTFail("the guest program did not ask for a workspace")
+            return
+        }
 
         // The first-run warning comes next, unless a previous run already
         // acknowledged it.
@@ -655,21 +667,35 @@ final class LegHostFixtureUITests: XCTestCase {
         submit.tap()
     }
 
-    /// Drives one turn in a session that knows its workspace.
-    ///
-    /// The catalog of the guest holds the workspace of the session, so the
-    /// guest finds it and offers the composer without asking for it. The
-    /// first-run warning was acknowledged by the first turn of the run.
-    private func driveOneTurnOfTheKnownSession() {
-        let terminal = app.otherElements["guest-terminal"]
-        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
+    /// The screen the guest program opens with.
+    private enum GuestScreen {
+        /// The guest asks for the workspace of the session.
+        case workspace
+        /// The guest opens the picker of the sessions.
+        case picker
+        /// The guest showed neither of them.
+        case unknown
+    }
 
-        XCTAssertTrue(waitForTerminalText("catalog: "), "the composer did not appear")
-        focusGuest()
-        app.typeText(prompt)
-        let submit = app.buttons["guest-key-submit"]
-        XCTAssertTrue(submit.waitForExistence(timeout: 30), "the send control is missing")
-        submit.tap()
+    /// Waits for the screen the guest program opens with.
+    ///
+    /// The guest program opens the picker of the sessions when the catalog of
+    /// the guest holds a session, and it asks for a workspace when the run
+    /// starts without one. Both are waited for in the same loop, so a run
+    /// that starts with an empty catalog does not wait for the picker.
+    private func waitForGuestScreen() -> GuestScreen {
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
+            let text = terminalText()
+            if Self.shows("Enter a path and press Enter to select it.", in: text) {
+                return .workspace
+            }
+            if Self.shows("Enter reopen", in: text) {
+                return .picker
+            }
+            usleep(2_000_000)
+        }
+        return .unknown
     }
 
     /// Gives the keyboard to the guest.
