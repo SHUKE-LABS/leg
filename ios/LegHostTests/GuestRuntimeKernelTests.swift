@@ -16,7 +16,7 @@ final class GuestRuntimeKernelTests: XCTestCase {
     /// a table that is gone, and the run ends in a crash.
     func testTheCleanupOfAFailedSessionDoesNotRaceTheWalkOfTheTasks() {
         #if DEBUG
-        XCTAssertEqual(guestRuntimeCheckCleanupWalkRace(100, 3), 100,
+        XCTAssertEqual(guest_runtime_check_cleanup_walk_race(100, 3), 100,
                        "the check of the cleanup and the walk did not run")
         #endif
     }
