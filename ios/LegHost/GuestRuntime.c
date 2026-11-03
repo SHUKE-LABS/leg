@@ -476,8 +476,11 @@ static void guest_kill_tasks(void) {
             continue;
         /* A task that is on its way out is left alone: its thread is gone
          * and it cannot write to the trail of the guest anymore. A task that
-         * never started has no thread to signal. */
-        if (task->exiting || task->thread == 0)
+         * never started has no thread to signal. A task that holds no
+         * signals cannot be signalled at all: the host makes such a task
+         * for the check of the cleanup of a session, and the kill leaves
+         * the task alone. */
+        if (task->exiting || task->thread == 0 || task->sighand == NULL)
             continue;
         send_signal(task, SIGKILL_, SIGINFO_NIL);
     }
@@ -559,6 +562,11 @@ int guest_runtime_stop_session(void) {
  * repeats it. A walk that sees the files of a task that is let go keeps a
  * table that is gone: it reads the table of a memory that is gone, and it
  * lets the table go a second time. The run ends in a crash then.
+ *
+ * The tasks of the check are made by the host: they hold files and no
+ * signals, and they are left alone by the walk of the kill. The check runs
+ * where the guest does not run, so the walk of the tasks walks the tasks of
+ * the check only.
  *
  * The result is the number of rounds that ran. */
 struct cleanup_walk_check {
