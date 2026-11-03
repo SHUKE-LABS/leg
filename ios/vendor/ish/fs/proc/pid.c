@@ -270,6 +270,12 @@ static bool proc_pid_fd_readdir(struct proc_entry *entry, unsigned long *index, 
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    /* A task that is on its way out holds no files: it let them go. The
+     * directory of the files of such a task is empty. */
+    if (task->files == NULL) {
+        proc_put_task(task);
+        return false;
+    }
     lock(&task->files->lock);
     while (*index < task->files->size && task->files->files[*index] == NULL)
         (*index)++;
@@ -289,6 +295,11 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    /* A task that is on its way out holds no files: it let them go. */
+    if (task->files == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
     lock(&task->files->lock);
     struct fd *fd = fdtable_get(task->files, entry->fd);
     int err = generic_getpath(fd, buf);
