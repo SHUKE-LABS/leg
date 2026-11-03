@@ -164,7 +164,10 @@ walks them, so the stop of a guest does not race with the exit of a task. A
 session that could not start is let go by the kernel as well: the task of the
 session is marked as gone and its files are detached under the lock of the
 tasks, so the walk of the files of the tasks leaves the task alone, and the
-host touches no table of files of a task at all.
+host touches no table of files of a task at all. A file of a table is
+bounded by the table it is read from, and the files of a task that holds
+none are shown as none, so a task that was let go cannot take the emulator
+down.
 
 ## Licensing
 

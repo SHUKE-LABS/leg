@@ -152,3 +152,24 @@ and detaches its files under `pids_lock`, and lets the table that was
 detached go after the lock is let go. A walk that holds `pids_lock` sees
 either a task that holds its files or a task that is marked, and a table that
 is detached is not walked any more. The host touches no table of files at all.
+
+## `fs/fd.c`: the bound of a file belongs to the table that is read
+
+`fdtable_get` bounded the number of a file with the size of the table of
+files of the task that reads, and not with the size of the table that is
+read. Every caller that reads the table of the task that reads was
+unaffected, but a caller that reads the table of another task, or a table
+that was detached from its task, read past the end of the table. The
+detaching of the files of a task is such a caller: the table is read while
+the task holds no table any more, and the read took the host down.
+
+The bound is the size of the table that is read now.
+
+## `fs/proc/pid.c`: the files of a task that is let go
+
+A task that is on its way out holds no files: it let them go. The directory
+of the files of such a task was read as if the task still held a table of
+files, and the read took the host down with a segmentation fault.
+
+A task that holds no files has no files to show, and a file of it is not
+there.
