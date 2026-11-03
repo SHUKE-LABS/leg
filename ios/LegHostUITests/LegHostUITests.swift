@@ -693,7 +693,7 @@ final class LegHostFixtureUITests: XCTestCase {
             if Self.shows("Enter reopen", in: text) {
                 return .picker
             }
-            usleep(2_000_000)
+            usleep(3_000_000)
         }
         return .unknown
     }
@@ -732,9 +732,9 @@ final class LegHostFixtureUITests: XCTestCase {
             if Self.shows(text, in: terminalText()) { return true }
             // The screen is read through the accessibility tree, and the tree
             // of a simulator is read one snapshot at a time. The wait is
-            // polled every other second, so a long wait does not keep the
+            // polled every third second, so a long wait does not keep the
             // accessibility server of the simulator busy.
-            usleep(2_000_000)
+            usleep(3_000_000)
         }
         return false
     }
@@ -825,10 +825,11 @@ enum GuestKeyboard {
     /// Whether the hidden input field holds the keyboard focus.
     ///
     /// The accessibility tree marks the element that holds the focus, so the
-    /// field is looked for in it.
+    /// field is looked for in it. The tree of the field is read and not the
+    /// tree of the app: the terminal of the guest holds a thousand elements,
+    /// and reading them all made the accessibility server of the simulator
+    /// give up in the middle of a long run.
     private static func hasFocus(_ app: XCUIApplication) -> Bool {
-        app.debugDescription
-            .split(separator: "\n")
-            .contains { $0.contains("guest-input") && $0.contains("Focused") }
+        app.textFields["guest-input"].debugDescription.contains("Focused")
     }
 }
