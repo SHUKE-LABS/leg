@@ -758,7 +758,7 @@ static void *exit_walk_check_release(void *context) {
         check->tasks[index] = fresh;
         unlock(&pids_lock);
     }
-    atomic_store(&check.walking, false);
+    atomic_store(&check->walking, false);
     return NULL;
 }
 
