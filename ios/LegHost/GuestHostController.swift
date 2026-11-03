@@ -741,7 +741,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let result = finished.wait(timeout: .now() + .seconds(2))
-                continuation.resume(result == .success)
+                continuation.resume(returning: result == .success)
             }
         }
     }
@@ -755,7 +755,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let status = guest_runtime_stop_session()
-                continuation.resume(status == 0)
+                continuation.resume(returning: status == 0)
             }
         }
     }
@@ -1079,7 +1079,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             guard await self.lifecycle.endSession(generation: generation) else { return }
             // A failure of the release of the session is shown as it is: the
             // guest of the session did not stop.
-            guard self.phase != .failed else { return }
+            if case .failed = self.phase { return }
             if exitCode != 0 {
                 self.phase = .exited(status)
                 self.detail = "The guest program exited with code \(exitCode)."
