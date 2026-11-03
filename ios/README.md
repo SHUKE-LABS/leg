@@ -53,7 +53,7 @@ a boundary it controls instead.
 | The workspace catalog of the guest | `<root>/data/root/.local/state/leg-ui` | `-leghost-fixture-reset` |
 | The exchange trail of the guest | `<root>/data/tmp/leg-ios-fixture/exchange.jsonl` | `-leghost-fixture-reset` |
 | The durable request ledger | `Library/Application Support/LegHost/test-artifacts/request-ledger.jsonl` | `-leghost-fixture-reset` |
-| The trail of the stopped session | `Library/Application Support/LegHost/test-artifacts/exchange-trail.jsonl` | the next reset |
+| The trail of the stopped session | `Library/Application Support/LegHost/test-artifacts/exchange-trail.jsonl` | the next session that is stopped overwrites it |
 
 An ordinary relaunch keeps all of them: the guest program finds the
 workspace it was given, the trail of the last run is still there, and the
@@ -402,7 +402,8 @@ NO_COLOR=1
 ```
 
 The zero retry budget makes the number of provider requests the same on
-every run.
+every run. The delayed scenario raises the two timeouts of the turn to 120
+seconds, so the turn is still running when the host stops the session.
 
 ### The turn
 

@@ -58,6 +58,7 @@ struct GuestHostScreen: View {
                 VStack(spacing: 0) {
                     statusView(title: "The session was interrupted",
                               detail: controller.detail,
+                              identifier: "guest-interrupted",
                               expands: false)
                     GuestTerminalView(controller: controller)
                 }

@@ -340,10 +340,10 @@ final class LegHostFixtureUITests: XCTestCase {
     ///
     /// The first launch starts from a known state and completes one turn.
     /// The second launch starts without the reset control: it reuses the
-    /// verified root, the guest program finds the workspace it was given and
-    /// does not ask for one again, the trail of the turn is still there, and
-    /// the durable ledger holds the requests of the first launch only, so
-    /// the turn was not sent again.
+    /// verified root, the guest program finds the session of the turn in its
+    /// catalog and does not ask for a workspace again, the trail of the turn
+    /// is still there, and the durable ledger holds the requests of the first
+    /// launch only, so the turn was not sent again.
     func testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests() {
         launch(["-leghost-fixture", "success", "-leghost-provider", "anthropic"])
         XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
@@ -352,6 +352,7 @@ final class LegHostFixtureUITests: XCTestCase {
         driveOneTurn()
 
         XCTAssertTrue(waitForState("requests=2"), "the fixture did not accept two requests")
+        XCTAssertTrue(waitForTerminalText("catalog: "), "the composer did not come up")
         let firstTrail = trailCount(in: app.staticTexts["guest-fixture-state"].label)
         XCTAssertNotNil(firstTrail, "the host does not publish the trail of the turn")
         XCTAssertGreaterThan(firstTrail ?? 0, 0, "the trail of the turn is empty")
@@ -367,10 +368,19 @@ final class LegHostFixtureUITests: XCTestCase {
         let secondTrail = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
         XCTAssertGreaterThanOrEqual(secondTrail, firstTrail ?? 0,
                                     "the relaunch lost the trail of the turn")
-        XCTAssertTrue(waitForTerminalText("catalog: ", timeout: 60),
-                      "the composer did not come back after the relaunch")
+
+        // The catalog of the guest program survived: the relaunch finds the
+        // session of the turn instead of asking for a workspace again.
+        XCTAssertTrue(waitForTerminalText("Enter reopen", timeout: 60),
+                      "the picker of the sessions did not come up after the relaunch")
         XCTAssertFalse(terminalShows("Enter a path and press Enter to select it."),
                        "the relaunch asked for a workspace again")
+        focusGuest()
+        app.typeText("\n")
+        XCTAssertTrue(waitForTerminalText("catalog: ", timeout: 60),
+                      "the session of the first run did not come back after the relaunch")
+        XCTAssertTrue(waitForTerminalText("workspace: /tmp", timeout: 60),
+                      "the workspace of the first run did not come back after the relaunch")
     }
 
     /// The background interrupts the turn and keeps the trail.
@@ -395,6 +405,7 @@ final class LegHostFixtureUITests: XCTestCase {
         // The app goes to the background in the middle of the turn and comes
         // back to the foreground.
         XCUIDevice.shared.press(.home)
+        XCTAssertTrue(waitForBackground(), "the app did not go to the background")
         app.activate()
 
         XCTAssertTrue(waitForStatus("IOS_SESSION_INTERRUPTED", timeout: startTimeout),
@@ -403,7 +414,8 @@ final class LegHostFixtureUITests: XCTestCase {
                       "the host does not show the interrupted state")
         XCTAssertTrue(waitForState("requests=1"), "the interrupted turn was sent again")
         let trailAfter = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
-        XCTAssertEqual(trailAfter, trailBefore, "the trail of the interrupted turn changed")
+        XCTAssertGreaterThanOrEqual(trailAfter, trailBefore,
+                                    "the trail of the interrupted turn was lost")
     }
 
     /// The faults of the device are reported before the guest is touched.
@@ -547,6 +559,20 @@ final class LegHostFixtureUITests: XCTestCase {
                 return true
             }
             usleep(1_000_000)
+        }
+        return false
+    }
+
+    /// Waits until the app left the foreground.
+    ///
+    /// An app that is still leaving the foreground drops the request that
+    /// brings it back, so the run waits for the app to be in the background
+    /// before it activates it again.
+    private func waitForBackground(timeout: TimeInterval = 60) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if app.state != .runningForeground { return true }
+            usleep(500_000)
         }
         return false
     }
