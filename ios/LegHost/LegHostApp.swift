@@ -37,13 +37,11 @@ struct GuestHostScreen: View {
 
     /// The identity of the terminal.
     ///
-    /// The phases of the host hold the terminal in views of a different
-    /// shape, and a terminal without an identity of its own is a new view in
-    /// every one of them: the web view of the terminal is built again and
-    /// the screen of the guest is lost. The identity keeps the one web view
-    /// of the terminal across the phases, so the screen of the guest stays
-    /// on the screen when the session is interrupted and when it is started
-    /// again.
+    /// The terminal is the last child of the stack in every phase of the
+    /// host, so it is the same view in every one of them. The identity makes
+    /// that certain: the web view of the terminal is not built again when
+    /// the phase changes, and the screen of the guest is not lost when the
+    /// session is interrupted or started again.
     static let terminalID = "guest-terminal"
 
     var body: some View {
