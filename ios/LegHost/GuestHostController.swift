@@ -170,6 +170,12 @@ struct HostState: Equatable {
     var validation = "none"
     /// The number of records the exchange trail of the guest holds.
     var trail = 0
+    /// The number of tasks of the guest that run.
+    ///
+    /// The count is read when the session starts and when it stops, so it
+    /// says whether the guest of a session is gone: a guest that was
+    /// stopped does not run any more.
+    var guestTasks = 0
 
     /// The state as the tests read it.
     var summary: String {
@@ -177,7 +183,8 @@ struct HostState: Equatable {
             ? ""
             : self.statuses.map(String.init).joined(separator: ",")
         return "provision=\(provisions),boot=\(boots),session=\(sessions),requests=\(requests),"
-            + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail)"
+            + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
+            + "tasks=\(guestTasks)"
     }
 }
 
@@ -403,6 +410,12 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The stable diagnostic the host shows when the system interrupted the
     /// session.
     nonisolated static let interruptionDiagnostic = "IOS_SESSION_INTERRUPTED"
+    /// The stable diagnostic the host shows when the guest of a session did
+    /// not stop.
+    ///
+    /// The session is not released then, and no other session starts: a guest
+    /// that is still alive would run next to the session that comes next.
+    nonisolated static let sessionNotStoppedDiagnostic = "IOS_SESSION_NOT_STOPPED"
 
     /// The machine that runs the chain of operations of one session.
     private let lifecycle = GuestHostLifecycle()
@@ -646,6 +659,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         do {
             try await startSession()
             state.sessions += 1
+            state.guestTasks = Int(guest_runtime_running_tasks())
             startOutputPump()
             phase = .running
             detail = reusedVerifiedRoot ? "Guest running (reused root)" : "Guest running"
@@ -659,33 +673,91 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     ///
     /// The teardown runs exactly once per chain of the lifecycle: the
     /// callbacks of the runtime are detached, the thread of the output is
-    /// joined, the fixture and the watcher of the trail are stopped, and the
-    /// runtime releases the terminal of the guest.
-    func teardownGuest() async {
+    /// joined, the guest of the session is stopped and waited for, the
+    /// fixture and the watcher of the trail are stopped, and the runtime
+    /// releases the terminal of the guest.
+    ///
+    /// The teardown fails when the thread of the output did not stop or when
+    /// the guest of the session did not stop. A guest that is still alive
+    /// would write to the trail of the guest and would run next to the
+    /// session that comes next, so the session is not released then and no
+    /// other session starts.
+    func teardownGuest() async throws {
         guest_runtime_set_output_notify(nil, nil)
         guest_runtime_set_exit_notify(nil, nil)
         exitContext = nil
+
+        // The thread of the output is joined before the next session starts:
+        // a late read of the ring of the runtime would show the text of the
+        // session that was stopped in the terminal of the new one. The wait
+        // is checked: a thread that did not stop keeps reading the ring of
+        // the runtime.
+        let pumpStopped = await stopOutputPump()
+
+        // The guest of the session is stopped and waited for before the next
+        // session starts: a guest that is still alive would write to the
+        // trail of the guest and would run next to the session that comes
+        // next.
+        let guestStopped = await stopGuestSession()
+        state.guestTasks = Int(guest_runtime_running_tasks())
+
+        // The fixture is stopped in every case: a guest that is still alive
+        // must not do provider work anymore.
+        fixture?.stop()
+        fixture = nil
+        trailWatcher?.cancel()
+        trailWatcher = nil
+
+        guard pumpStopped, guestStopped else {
+            let reason = pumpStopped
+                ? "the guest of the session did not stop"
+                : "the thread of the output of the guest did not stop"
+            let error = GuestHostError(message: "\(Self.sessionNotStoppedDiagnostic): \(reason), "
+                + "so the session is not released and no other session starts next to it.")
+            publishFailure(error)
+            throw error
+        }
+
+        // The output of the session that stopped belongs to that session: it
+        // is cleared now that the guest and the thread of the output are
+        // quiet, so the pump of the session that comes next does not read
+        // the text of the session that was stopped.
+        guest_runtime_clear_output()
+        guest_runtime_shutdown()
+    }
+
+    /// Stops the thread of the output and waits for it to leave its loop.
+    ///
+    /// The result says whether the thread stopped. A thread that did not
+    /// stop keeps reading the ring of the runtime, so the session is not
+    /// released then.
+    private func stopOutputPump() async -> Bool {
         let finished = outputFinished
         outputFlag?.stop()
         outputFlag = nil
         outputThread = nil
         outputFinished = nil
-        // The thread of the output is joined before the next session starts:
-        // a late read of the ring of the runtime would show the text of the
-        // session that was stopped in the terminal of the new one.
-        if let finished {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    _ = finished.wait(timeout: .now() + .seconds(2))
-                    continuation.resume()
-                }
+        guard let finished else { return true }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = finished.wait(timeout: .now() + .seconds(2))
+                continuation.resume(result == .success)
             }
         }
-        fixture?.stop()
-        fixture = nil
-        trailWatcher?.cancel()
-        trailWatcher = nil
-        guest_runtime_shutdown()
+    }
+
+    /// Stops the guest of the session and waits for it to end.
+    ///
+    /// The result says whether the guest stopped. A guest that is still
+    /// alive writes to the trail of the guest and runs next to the session
+    /// that comes next, so the session is not released then.
+    private func stopGuestSession() async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let status = guest_runtime_stop_session()
+                continuation.resume(status == 0)
+            }
+        }
     }
 
     /// Writes the trail of the session out.
@@ -1005,6 +1077,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             // scheduled before a teardown, and a retry can have begun
             // since.
             guard await self.lifecycle.endSession(generation: generation) else { return }
+            // A failure of the release of the session is shown as it is: the
+            // guest of the session did not stop.
+            guard self.phase != .failed else { return }
             if exitCode != 0 {
                 self.phase = .exited(status)
                 self.detail = "The guest program exited with code \(exitCode)."

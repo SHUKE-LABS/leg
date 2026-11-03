@@ -152,6 +152,14 @@ size_t guest_runtime_read_output(void *buffer, size_t max_length) {
     return length;
 }
 
+void guest_runtime_clear_output(void) {
+    pthread_mutex_lock(&output_mutex);
+    output_head = 0;
+    output_length = 0;
+    pthread_cond_broadcast(&output_space);
+    pthread_mutex_unlock(&output_mutex);
+}
+
 void guest_runtime_set_output_notify(guest_output_notify_callback callback, void *context) {
     pthread_mutex_lock(&notify_mutex);
     output_notify = callback;
@@ -317,7 +325,13 @@ int guest_runtime_start_session(const char *program, const char *arguments,
         return err;
 
     task_start(current);
-    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] guest task %d started", current->pid);
+    int pid = current->pid;
+    /* The guest runs on a thread of its own now, and that thread knows which
+     * task it runs. The thread that started the session is a thread of the
+     * host, so it does not point at a task of the guest anymore: a task
+     * that is gone must not be reached through it. */
+    current = NULL;
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] guest task %d started", pid);
     return 0;
 }
 
@@ -357,4 +371,98 @@ void guest_runtime_shutdown(void) {
     lock(&ttys_lock);
     tty_release(tty);
     unlock(&ttys_lock);
+}
+
+/* ---------------------------------------------------------- stopping a guest */
+
+/* The time the runtime waits for the guest of a session to stop.
+ *
+ * The guest is killed before the wait starts, so the wait is short. It is
+ * bounded anyway, so a guest that does not stop cannot hold the host. */
+#define GUEST_STOP_TIMEOUT_MS 5000
+/* The step between two checks of the tasks of the guest. */
+#define GUEST_STOP_STEP_MS 20
+
+/* The number of tasks of the guest that run.
+ *
+ * The init process of the kernel is not counted: it is the parent of every
+ * session and it does not run. A task that is on its way out is not counted
+ * either: it released its files already, so it cannot write to the trail of
+ * the guest anymore. */
+int guest_runtime_running_tasks(void) {
+    int running = 0;
+    lock(&pids_lock);
+    for (int pid = 2; pid <= MAX_PID; pid++) {
+        struct task *task = pid_get_task((dword_t) pid);
+        if (task != NULL && !task->exiting)
+            running++;
+    }
+    unlock(&pids_lock);
+    return running;
+}
+
+/* Kills every task of the guest.
+ *
+ * The signal does not go through the syscall of the kernel: that path reads
+ * the current task of the calling thread, and the host has none. The kernel
+ * interrupts the syscall the guest waits in and delivers the kill before the
+ * guest runs another instruction, so the guest cannot write to the trail of
+ * the guest anymore.
+ *
+ * The kill is given again while the guest is still there: a task that the
+ * guest forked after the first kill is killed as well. */
+static void guest_kill_tasks(void) {
+    lock(&pids_lock);
+    for (int pid = 2; pid <= MAX_PID; pid++) {
+        struct task *task = pid_get_task((dword_t) pid);
+        if (task == NULL)
+            continue;
+        send_signal(task, SIGKILL_, SIGINFO_NIL);
+    }
+    unlock(&pids_lock);
+}
+
+int guest_runtime_stop_session(void) {
+    /* The kernel keeps the current task per thread, and a thread of the
+     * host is not a task of the guest. The signal of the kill has to reach
+     * the tasks that run, so the current task of this thread is cleared for
+     * the time of the stop. */
+    current = NULL;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += GUEST_STOP_TIMEOUT_MS / 1000;
+    deadline.tv_nsec += (long) (GUEST_STOP_TIMEOUT_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    bool stopped = false;
+    while (true) {
+        guest_kill_tasks();
+        if (guest_runtime_running_tasks() == 0) {
+            stopped = true;
+            break;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec
+            || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            break;
+        struct timespec step = { .tv_sec = 0, .tv_nsec = GUEST_STOP_STEP_MS * 1000000L };
+        nanosleep(&step, NULL);
+    }
+
+    if (!stopped) {
+        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_ERROR,
+                         "[LegHost] the guest of the session did not stop");
+        return -ETIMEDOUT;
+    }
+
+    /* The session is gone, so its pid is not the pid of a session any more:
+     * the exit of a task of the guest does not end a session that is not
+     * there. */
+    session_pid = 0;
+    return 0;
 }

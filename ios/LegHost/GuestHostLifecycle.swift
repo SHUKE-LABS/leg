@@ -17,7 +17,10 @@ protocol GuestHostLifecycleDelegate: AnyObject {
     /// Starts the guest session.
     func startGuestSession() async throws
     /// Ends the session and releases the runtime.
-    func teardownGuest() async
+    ///
+    /// The teardown throws when the session could not be released: a guest
+    /// that did not stop would run next to the session that comes next.
+    func teardownGuest() async throws
     /// Writes the trail of the session out.
     func persistGuestTrail() async
 }
@@ -59,6 +62,12 @@ final class GuestHostLifecycle {
     /// Whether the teardown of the current chain already ran.
     private var didTearDown = false
 
+    /// Whether the session of a chain could not be released.
+    ///
+    /// A session that could not be released keeps its guest alive, so no
+    /// other session starts next to it: the retry is refused then.
+    private var releaseFailed = false
+
     /// The number of the chain that owns the callbacks of the runtime.
     ///
     /// The number tells a callback of the runtime which chain it belongs
@@ -84,7 +93,11 @@ final class GuestHostLifecycle {
     ///
     /// A retry from any other state is refused: a chain that runs is never
     /// replaced, and a machine that never ran is started with `start`.
+    ///
+    /// A session that could not be released is not retried either: its guest
+    /// is still alive, and another session must not run next to it.
     func retry() {
+        guard !releaseFailed else { return }
         switch state {
         case .failed, .stopped, .interrupted:
             guard chain == nil else { return }
@@ -104,6 +117,10 @@ final class GuestHostLifecycle {
     /// The result says whether a session was interrupted. A machine that
     /// never ran, one that failed and one that stopped already are left
     /// alone: their state is what the user has to see.
+    ///
+    /// A session that could not be released is not interrupted either: the
+    /// guest of the session is still alive, and the host shows the failure
+    /// of the release instead.
     @discardableResult
     func interrupt() async -> Bool {
         // Only a chain that runs or a session that is up can be
@@ -121,14 +138,14 @@ final class GuestHostLifecycle {
         // ignored.
         generation += 1
         await delegate?.persistGuestTrail()
-        await tearDown()
+        let released = await tearDown()
         switch state {
         case .active, .running:
-            state = .interrupted
+            state = released ? .interrupted : .failed
         default:
             break
         }
-        return true
+        return released
     }
 
     /// The session ended: the guest program is gone.
@@ -142,18 +159,28 @@ final class GuestHostLifecycle {
     @discardableResult
     func endSession(generation: Int) async -> Bool {
         guard generation == self.generation else { return false }
-        await tearDown()
+        let released = await tearDown()
         if state == .running {
-            state = .stopped
+            state = released ? .stopped : .failed
         }
         return true
     }
 
     /// Releases the session of the current chain, once.
-    private func tearDown() async {
-        guard !didTearDown else { return }
+    ///
+    /// The result says whether the session was released. A session that
+    /// could not be released is not released at all: the guest of the
+    /// session is still alive, and another session must not run next to it.
+    private func tearDown() async -> Bool {
+        guard !didTearDown else { return !releaseFailed }
         didTearDown = true
-        await delegate?.teardownGuest()
+        do {
+            try await delegate?.teardownGuest()
+            return true
+        } catch {
+            releaseFailed = true
+            return false
+        }
     }
 
     /// Starts a chain.
@@ -186,7 +213,7 @@ final class GuestHostLifecycle {
             state = .interrupted
         } catch {
             state = .failed
-            await tearDown()
+            _ = await tearDown()
         }
         chain = nil
     }

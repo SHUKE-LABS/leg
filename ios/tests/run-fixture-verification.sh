@@ -19,7 +19,10 @@
 # across the two processes, and the background run checks the trail the host
 # writes out when it stops the session. The retry run stops the session and
 # starts the host again, so it checks that the ledger, the trail and the
-# catalog of the guest survive the retry.
+# catalog of the guest survive the retry. The stopped guest run stops the
+# session and starts the host again as well, so it checks that the guest of
+# the stopped session did not write to the trail of the guest after the
+# interruption.
 #
 # With --skip-run the script runs no scenario and scans the artifacts of the
 # run that is already in the simulator.
@@ -38,6 +41,7 @@ RUNTIME_FAILURE_TEST="LegHostUITests/LegHostFixtureUITests/testTheRuntimeFailure
 RELAUNCH_TEST="LegHostUITests/LegHostFixtureUITests/testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests"
 BACKGROUND_TEST="LegHostUITests/LegHostFixtureUITests/testTheBackgroundInterruptsTheTurnAndKeepsTheTrail"
 RETRY_TEST="LegHostUITests/LegHostFixtureUITests/testTheRetryAfterAnInterruptionKeepsTheStateOfTheTurn"
+STOPPED_GUEST_TEST="LegHostUITests/LegHostFixtureUITests/testTheStoppedGuestCannotWriteAfterTheRetry"
 PROVIDER_ERROR_MARKER="provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR"
 UNREACHABLE_MARKER="transport error:"
 RUNTIME_FAILURE_MARKER="IOS_GUEST_RUNTIME_ERROR"
@@ -322,6 +326,31 @@ check_catalog() {
     echo "ok: the catalog of ${label} holds ${sessions} sessions"
 }
 
+# The trail of the guest after the session was stopped.
+#
+# The host writes the trail of the stopped session out when it stops the
+# session. The trail of the guest itself may not hold more records then: the
+# guest of the stopped session is stopped and waited for before the fixture
+# is stopped, so it did not write to the trail of the guest anymore.
+check_untouched_trail() {
+    local label="$1"
+    if [[ ! -f "${TRAIL}" ]]; then
+        echo "error: the exchange trail of ${label} is missing at ${TRAIL}" >&2
+        status=1
+        return
+    fi
+    local live
+    live="$(grep -c . "${TRAIL}" || true)"
+    local persisted
+    persisted="$(grep -c . "${PERSISTED_TRAIL}" || true)"
+    if [[ "${live}" != "${persisted}" ]]; then
+        echo "error: the exchange trail of ${label} holds ${live} records, the trail of the stopped session holds ${persisted}: the guest of the stopped session wrote to the trail" >&2
+        status=1
+        return
+    fi
+    echo "ok: the exchange trail of ${label} holds the records of the stopped session only"
+}
+
 # Runs one scenario and scans the artifacts of that run.
 #
 # The marker is the text the transcript of the run has to hold, so the
@@ -411,6 +440,15 @@ else
     check_ledger "the retry run" 1
     check_persisted_trail "the retry run"
     check_catalog "the retry run"
+
+    # The stopped guest run stops the session in the middle of the turn and
+    # starts the host again. The guest of the stopped session is stopped and
+    # waited for, so it does not write to the trail of the guest anymore:
+    # the trail of the guest holds the records of the stopped turn only.
+    run_and_scan "${STOPPED_GUEST_TEST}" "stopped guest run" "stopped-guest" "" ""
+    check_ledger "the stopped guest run" 1
+    check_persisted_trail "the stopped guest run"
+    check_untouched_trail "the stopped guest run"
 fi
 
 if [[ "${status}" -ne 0 ]]; then

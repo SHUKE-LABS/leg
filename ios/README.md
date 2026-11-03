@@ -77,11 +77,24 @@ boundary:
 
 1. the chain is cancelled,
 2. the trail of the guest is written out to the test artifacts,
-3. the output and the exit callbacks of the runtime are detached, the thread
-   of the output is joined, the fixture and the watcher of the trail are
-   stopped and the runtime releases the terminal of the guest — each of them
-   exactly once,
-4. the host shows `IOS_SESSION_INTERRUPTED` with the recovery guidance.
+3. the output and the exit callbacks of the runtime are detached,
+4. the thread of the output is joined, and the wait for it is checked,
+5. the guest of the session is killed and the host waits for it to end: a
+   guest that waits for the provider is interrupted in the syscall it waits
+   in, so it cannot write to the trail of the guest anymore and it cannot
+   run next to the session that comes next,
+6. the output of the session that stopped is cleared, the fixture and the
+   watcher of the trail are stopped and the runtime releases the terminal of
+   the guest — each of them exactly once,
+7. the host shows `IOS_SESSION_INTERRUPTED` with the recovery guidance.
+
+The waits of the boundary are checked. When the thread of the output did not
+stop, or when the guest of the session did not stop, the host shows
+`IOS_SESSION_NOT_STOPPED` and the session is not released: a guest that is
+still alive would write to the trail of the guest and would run next to the
+session that comes next, so no other session starts. The fixture is stopped
+in that case as well, so the guest that is still alive does no provider work
+anymore.
 
 A callback of a session that was stopped belongs to a session that is gone
 and is ignored. The workers of a session belong to the chain they were made
@@ -490,12 +503,12 @@ trail, and the host writes that report into the terminal.
 
 The diagnostics the host produces itself are in the status of the host, under
 the `guest-status-detail` identifier: `IOS_PROVIDER_CONFIG_MISSING`,
-`IOS_PROVIDER_CONFIG_UNSUPPORTED` and `IOS_GUEST_RUNTIME_ERROR`. The runtime
-diagnostic is the host's own finding: the guest program it was asked to run
-is not there. The guest program never ran in that case, so the host writes
-the diagnostic into the terminal as well, and the terminal stays on the
-screen when the guest could not start, because it is the only place the run
-can show what went wrong:
+`IOS_PROVIDER_CONFIG_UNSUPPORTED`, `IOS_GUEST_RUNTIME_ERROR` and
+`IOS_SESSION_NOT_STOPPED`. The runtime diagnostic is the host's own finding:
+the guest program it was asked to run is not there. The guest program never
+ran in that case, so the host writes the diagnostic into the terminal as
+well, and the terminal stays on the screen when the guest could not start,
+because it is the only place the run can show what went wrong:
 
 | Run | What the terminal holds |
 | --- | --- |
@@ -515,6 +528,11 @@ The host shows the counts of the run and the fixture observation under the
 | Unreachable | no accepted request |
 | Missing configuration | no provisioning, no boot, no session, no listener and no request |
 | Unsupported provider | the same as the missing configuration |
+
+The state holds `tasks` as well: the number of tasks of the guest that run,
+read when the session starts and when it stops. A session that was stopped
+holds `tasks=0`, because the guest of the session was stopped and waited
+for; a session that runs holds the tasks of its guest.
 
 The fixture validates every request in memory: the method, the path, the
 `stream` flag, the credential and the order of the requests. The second
@@ -569,7 +587,11 @@ The relaunch run starts the app twice, and the script checks the durable
 ledger of the requests across the two processes: it holds the two requests
 of the first turn and nothing else, so the turn was not sent again. The
 background run stops the session in the middle of the turn, and the script
-checks the trail the host wrote out when it stopped it.
+checks the trail the host wrote out when it stopped it. The stopped guest
+run stops the session and starts the host again, and the script checks that
+the trail of the guest holds the records of the stopped turn only: the guest
+of the stopped session was stopped and waited for, so it did not write to
+the trail of the guest after the interruption.
 
 The exchange trail of a run is only there when the guest program ran, so the
 runtime failure run has no trail to scan.

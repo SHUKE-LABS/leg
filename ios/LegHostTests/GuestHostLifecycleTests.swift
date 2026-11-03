@@ -26,6 +26,8 @@ final class GuestHostLifecycleTests: XCTestCase {
         var gate: Gate?
         /// Whether the first operation fails.
         var fails = false
+        /// Whether the release of the session fails.
+        var releaseFails = false
 
         func prepareHost() async throws {
             prepares += 1
@@ -55,8 +57,11 @@ final class GuestHostLifecycleTests: XCTestCase {
             callback?()
         }
 
-        func teardownGuest() async {
+        func teardownGuest() async throws {
             teardowns += 1
+            if releaseFails {
+                throw GuestHostError(message: "the guest of the session did not stop")
+            }
         }
 
         func persistGuestTrail() async {
@@ -314,5 +319,37 @@ final class GuestHostLifecycleTests: XCTestCase {
         XCTAssertTrue(control.consume(true), "the reset of the launch was not used")
         XCTAssertFalse(control.consume(true), "the reset was used a second time")
         XCTAssertFalse(control.consume(false), "a launch without the reset asked for one")
+    }
+
+    /// A session that could not be released is not retried.
+    ///
+    /// The guest of the session is still alive when the release fails, so
+    /// another session must not run next to it. The interruption does not
+    /// report a session that is still there as interrupted either: the host
+    /// shows the failure of the release instead.
+    func testASessionThatCouldNotBeReleasedIsNotRetried() async throws {
+        let host = FakeHost()
+        host.releaseFails = true
+        let lifecycle = GuestHostLifecycle()
+        lifecycle.delegate = host
+        let started = expectation(description: "the session started")
+        host.onSessionStarted = { started.fulfill() }
+
+        lifecycle.start()
+        await fulfillment(of: [started], timeout: 5)
+
+        let interrupted = await lifecycle.interrupt()
+
+        XCTAssertFalse(interrupted, "a session that could not be released was interrupted")
+        XCTAssertEqual(lifecycle.state, .failed)
+        XCTAssertEqual(host.teardowns, 1)
+
+        // The retry is refused: the guest of the stopped session is still
+        // alive, and a session must not run next to it.
+        lifecycle.retry()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(host.sessions, 1, "a session ran next to a guest that is still alive")
+        XCTAssertEqual(lifecycle.state, .failed)
     }
 }

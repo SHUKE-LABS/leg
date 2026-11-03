@@ -477,6 +477,53 @@ final class LegHostFixtureUITests: XCTestCase {
                        "the retry asked for a workspace again")
     }
 
+    /// The guest of the stopped session cannot write after the retry.
+    ///
+    /// The run interrupts the session on its own as soon as the fixture
+    /// accepts the request of the turn, so the guest of the session is
+    /// stopped in the middle of the turn, while it waits for the answer of
+    /// the provider. The host stops the guest and waits for it to end, so
+    /// the guest of the stopped session does not run any more: it cannot
+    /// write to the trail of the guest and it cannot send another request to
+    /// the provider. The retry starts a new session on the same root, and
+    /// that session runs a guest of its own.
+    func testTheStoppedGuestCannotWriteAfterTheRetry() {
+        launch(["-leghost-fixture", "delayed", "-leghost-provider", "anthropic",
+                "-leghost-interrupt-after-request"])
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        driveOneTurn()
+
+        XCTAssertTrue(waitForState("requests=1"), "the fixture did not accept the request")
+        XCTAssertTrue(waitForTrail(), "the trail of the turn is empty")
+        let trailBefore = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+
+        XCTAssertTrue(waitForStatus("IOS_SESSION_INTERRUPTED", timeout: startTimeout),
+                      "the interruption is not in the status of the host")
+        XCTAssertTrue(app.staticTexts["guest-interrupted"].waitForExistence(timeout: 60),
+                      "the host does not show the interrupted state")
+        // The host counted the tasks of the guest when it stopped the
+        // session: the guest of the stopped session does not run any more.
+        XCTAssertTrue(waitForState("tasks=0"), "the guest of the stopped session still runs")
+
+        // The retry starts a new session on the same root.
+        let retry = app.buttons["guest-retry"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 60), "the retry control is missing")
+        retry.tap()
+        XCTAssertTrue(waitForState("session=2", timeout: startTimeout),
+                      "the retry did not start a new session")
+
+        // The guest of the stopped session had the time to write to the
+        // trail of the guest and to send another request to the provider, if
+        // it were still alive.
+        sleep(20)
+        XCTAssertTrue(waitForState("requests=1"), "the guest of the stopped session sent a request")
+        let trailAfter = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+        XCTAssertEqual(trailAfter, trailBefore,
+                       "the guest of the stopped session wrote to the trail of the guest")
+    }
+
     /// The faults of the device are reported before the guest is touched.
     ///
     /// Every fault has its own identifier and its own remediation, and the
