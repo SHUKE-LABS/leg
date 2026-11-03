@@ -465,8 +465,12 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         lifecycle.delegate = self
         Task { [weak self] in
             guard let self else { return }
-            await self.lifecycle.interrupt()
-            self.publishInterruption()
+            // A run that never started, that failed or that stopped already
+            // keeps the state it has: the interruption is only shown for a
+            // session that was running.
+            if await self.lifecycle.interrupt() {
+                self.publishInterruption()
+            }
         }
     }
 

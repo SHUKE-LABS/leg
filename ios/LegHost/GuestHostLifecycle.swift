@@ -100,12 +100,17 @@ final class GuestHostLifecycle {
     /// and the session is released, all before this returns. The session is
     /// released exactly once, so the runtime and the callbacks of the
     /// stopped session are never released twice.
-    func interrupt() async {
+    ///
+    /// The result says whether a session was interrupted. A machine that
+    /// never ran, one that failed and one that stopped already are left
+    /// alone: their state is what the user has to see.
+    @discardableResult
+    func interrupt() async -> Bool {
         // Only a chain that runs or a session that is up can be
         // interrupted: the scene of the app is in the background before it
         // is active the first time, and a session that already stopped is
         // released once and for all.
-        guard state == .active || state == .running else { return }
+        guard state == .active || state == .running else { return false }
         let running = chain
         running?.cancel()
         if let running {
@@ -123,6 +128,7 @@ final class GuestHostLifecycle {
         default:
             break
         }
+        return true
     }
 
     /// The session ended: the guest program is gone.

@@ -24,9 +24,14 @@ final class GuestHostLifecycleTests: XCTestCase {
         var onSessionStarted: (() -> Void)?
         /// The gate the chain waits at, when the test set one.
         var gate: Gate?
+        /// Whether the first operation fails.
+        var fails = false
 
         func prepareHost() async throws {
             prepares += 1
+            if fails {
+                throw GuestHostError(message: "the host could not start")
+            }
             await gate?.wait()
         }
 
@@ -232,5 +237,40 @@ final class GuestHostLifecycleTests: XCTestCase {
 
         XCTAssertEqual(host.prepares, 0)
         XCTAssertEqual(lifecycle.state, .idle)
+    }
+
+    /// An interruption of a machine that never ran changes nothing.
+    func testAnInterruptionOfAnIdleMachineChangesNothing() async throws {
+        let host = FakeHost()
+        let lifecycle = GuestHostLifecycle()
+        lifecycle.delegate = host
+
+        let interrupted = await lifecycle.interrupt()
+
+        XCTAssertFalse(interrupted, "a machine that never ran was interrupted")
+        XCTAssertEqual(lifecycle.state, .idle)
+        XCTAssertEqual(host.teardowns, 0)
+        XCTAssertEqual(host.persistedTrails, 0)
+    }
+
+    /// An interruption after a failure keeps the failure.
+    func testAnInterruptionAfterAFailureKeepsTheFailure() async throws {
+        let host = FakeHost()
+        host.fails = true
+        let lifecycle = GuestHostLifecycle()
+        lifecycle.delegate = host
+
+        lifecycle.start()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(lifecycle.state, .failed)
+
+        let interrupted = await lifecycle.interrupt()
+
+        XCTAssertFalse(interrupted, "a failed machine was interrupted")
+        XCTAssertEqual(lifecycle.state, .failed)
+        // The failure released the session once, and the interruption did
+        // not release it a second time.
+        XCTAssertEqual(host.teardowns, 1)
+        XCTAssertEqual(host.persistedTrails, 0)
     }
 }
