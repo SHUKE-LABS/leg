@@ -98,4 +98,20 @@ int guest_runtime_stop_session(void);
  */
 int guest_runtime_running_tasks(void);
 
+#if DEBUG
+/*
+ * The check of the cleanup of a session that failed and the walk of the
+ * files of the tasks.
+ *
+ * The two run at the same time in the host: the walk of the files of the
+ * tasks must not see the files of a task that is let go. The check makes
+ * tasks with tables of files, lets one of them go while the walk runs, and
+ * repeats it. A walk that sees the files of a task that is let go keeps a
+ * table that is gone, and the run ends in a crash.
+ *
+ * The result is the number of rounds that ran.
+ */
+int guest_runtime_check_cleanup_walk_race(int rounds, int tasks);
+#endif
+
 #endif /* LEGHOST_GUEST_RUNTIME_H */

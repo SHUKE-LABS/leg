@@ -194,6 +194,10 @@ void task_run_current(void);
 // pids_lock.
 void tasks_end_data_waits(void);
 
+// The task is on its way out: it is marked as exiting and its files are
+// detached under pids_lock. The caller does not hold pids_lock.
+void task_abandon(struct task *task);
+
 extern void (*exit_hook)(struct task *task, int code);
 
 #define superuser() (current != NULL && current->euid == 0)

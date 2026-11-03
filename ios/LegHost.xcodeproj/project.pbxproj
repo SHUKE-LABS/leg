@@ -33,6 +33,7 @@
 		EE11EE11EE11EE11EE110013 /* FixtureRequestLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */; };
 		EE11EE11EE11EE11EE110031 /* GuestHostLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */; };
 		EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */; };
+		EE11EE11EE11EE11EE110033 /* GuestRuntimeKernelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110023 /* GuestRuntimeKernelTests.swift */; };
 		EE11EE11EE11EE11EE110033 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE11CC11CC11CC11CC110011 /* XCTest.framework */; };
 /* End PBXBuildFile section */
 
@@ -85,6 +86,7 @@
 		EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureRequestLedger.swift; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestHostLifecycleTests.swift; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostPreflightTests.swift; sourceTree = "<group>"; };
+		EE11EE11EE11EE11EE110023 /* GuestRuntimeKernelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestRuntimeKernelTests.swift; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110023 /* LegHostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -144,6 +146,7 @@
 			children = (
 				EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */,
 				EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */,
+				EE11EE11EE11EE11EE110023 /* GuestRuntimeKernelTests.swift */,
 			);
 			path = LegHostTests;
 			sourceTree = "<group>";
@@ -423,6 +426,7 @@
 			files = (
 				EE11EE11EE11EE11EE110031 /* GuestHostLifecycleTests.swift in Sources */,
 				EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */,
+				EE11EE11EE11EE11EE110033 /* GuestRuntimeKernelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

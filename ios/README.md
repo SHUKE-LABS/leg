@@ -160,7 +160,11 @@ guest uses and because the timeout value is wider on the host than in the
 guest; the two options now have the numbers a Linux guest uses and the
 timeout is translated in both directions. The kernel ends the waits of the
 tasks that wait for data, and it keeps the files of a task alive while it
-walks them, so the stop of a guest does not race with the exit of a task.
+walks them, so the stop of a guest does not race with the exit of a task. A
+session that could not start is let go by the kernel as well: the task of the
+session is marked as gone and its files are detached under the lock of the
+tasks, so the walk of the files of the tasks leaves the task alone, and the
+host touches no table of files of a task at all.
 
 ## Licensing
 
@@ -344,6 +348,12 @@ the device with a host and a device they make up, so they need no guest:
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 ios/tests/run-lifecycle-tests.sh
 ```
+
+One of them drives the kernel of the emulator that the app carries: it lets a
+task go while the walk of the files of the tasks runs, and it repeats it, so
+the walk of the files of the tasks cannot see the files of a task that is let
+go. A walk that sees them keeps a table of files that is gone, and the run
+ends in a crash.
 
 ## Provider configuration
 

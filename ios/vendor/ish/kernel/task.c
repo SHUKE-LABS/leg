@@ -183,6 +183,25 @@ void tasks_end_data_waits(void) {
     unlock(&pids_lock);
 }
 
+/* The task is on its way out: it is marked as exiting and its files are
+ * detached under pids_lock, and the table that was detached is let go after
+ * the lock is let go.
+ *
+ * A walker of the tasks that holds pids_lock sees either a task that holds
+ * its files or a task that is marked, and a table that is detached is not
+ * walked any more: the walk cannot see the files of a task that is let go.
+ *
+ * The caller does not hold pids_lock. */
+void task_abandon(struct task *task) {
+    lock(&pids_lock);
+    task->exiting = true;
+    struct fdtable *files = task->files;
+    task->files = NULL;
+    unlock(&pids_lock);
+    if (files != NULL)
+        fdtable_release(files);
+}
+
 static pthread_attr_t task_thread_attr;
 __attribute__((constructor)) static void create_attr(void) {
     pthread_attr_init(&task_thread_attr);

@@ -10,17 +10,22 @@
 #include "GuestRuntime.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <os/log.h>
 
 #include "fs/devices.h"
+#include "fs/fd.h"
 #include "fs/path.h"
+#include "fs/real.h"
 #include "fs/tty.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
@@ -323,14 +328,10 @@ int guest_runtime_start_session(const char *program, const char *arguments,
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] exec %{public}s returned %d", program, err);
     if (err < 0) {
         /* The session could not start, so the task of the session never ran.
-         * The task is marked as gone and its files are released: it does not
-         * run, and it does not count as a task of the guest that runs. */
-        struct task *task = current;
-        fdtable_release(task->files);
-        task->files = NULL;
-        lock(&pids_lock);
-        task->exiting = true;
-        unlock(&pids_lock);
+         * The kernel lets the task go: the task is marked as gone and its
+         * files are detached under the lock of the tasks, so a walk of the
+         * files of the tasks leaves the task alone. */
+        task_abandon(current);
         current = NULL;
         session_pid = 0;
         return err;
@@ -546,3 +547,137 @@ int guest_runtime_stop_session(void) {
     session_pid = 0;
     return 0;
 }
+
+#if DEBUG
+/*
+ * The check of the cleanup of a session that failed and the walk of the files
+ * of the tasks.
+ *
+ * The two run at the same time in the host: the walk of the files of the
+ * tasks must not see the files of a task that is let go. The check makes
+ * tasks with tables of files, lets one of them go while the walk runs, and
+ * repeats it. A walk that sees the files of a task that is let go keeps a
+ * table that is gone: it reads the table of a memory that is gone, and it
+ * lets the table go a second time. The run ends in a crash then.
+ *
+ * The result is the number of rounds that ran. */
+struct cleanup_walk_check {
+    struct task **tasks;
+    int task_count;
+    int rounds;
+    atomic_bool walking;
+};
+
+/* The number of files a task of the check holds. The files make the release
+ * of the table of the task take a while, so the walk of the tasks has a
+ * chance to see the table of the task while it is let go. */
+#define CHECK_TASK_FILES 16
+
+static struct task *cleanup_walk_check_make_task(void) {
+    struct task *task = task_create_(NULL);
+    if (task == NULL)
+        return NULL;
+    task->files = fdtable_new(CHECK_TASK_FILES + 1);
+    if (IS_ERR(task->files)) {
+        task->files = NULL;
+        lock(&pids_lock);
+        task_destroy(task);
+        unlock(&pids_lock);
+        return NULL;
+    }
+    for (int index = 0; index < CHECK_TASK_FILES; index++) {
+        struct fd *file = fd_create(&realfs_fdops);
+        if (file == NULL)
+            continue;
+        file->real_fd = open("/dev/null", O_RDONLY);
+        if (file->real_fd < 0) {
+            fd_close(file);
+            continue;
+        }
+        task->files->files[index] = file;
+    }
+    /* The task runs, as far as the walk of the tasks knows: the walk leaves
+     * a task that never started alone. */
+    task->thread = (pthread_t) (uintptr_t) 1;
+    return task;
+}
+
+static void *cleanup_walk_check_walk(void *context) {
+    struct cleanup_walk_check *check = context;
+    while (atomic_load(&check->walking))
+        tasks_end_data_waits();
+    return NULL;
+}
+
+static void *cleanup_walk_check_release(void *context) {
+    struct cleanup_walk_check *check = context;
+    for (int round = 0; round < check->rounds; round++) {
+        int index = round % check->task_count;
+        struct task *task = check->tasks[index];
+        check->tasks[index] = NULL;
+        /* The task is let go the way the host lets a session that failed go:
+         * the task is marked as gone and its files are detached under the
+         * lock of the tasks. */
+        task_abandon(task);
+        lock(&pids_lock);
+        task_destroy(task);
+        unlock(&pids_lock);
+        struct task *fresh = cleanup_walk_check_make_task();
+        if (fresh == NULL)
+            break;
+        check->tasks[index] = fresh;
+    }
+    atomic_store(&check->walking, false);
+    return NULL;
+}
+
+int guest_runtime_check_cleanup_walk_race(int rounds, int tasks) {
+    if (rounds < 1 || tasks < 1)
+        return 0;
+    struct cleanup_walk_check check = {0};
+    check.task_count = tasks;
+    check.rounds = rounds;
+    check.tasks = calloc(tasks, sizeof(struct task *));
+    if (check.tasks == NULL)
+        return 0;
+    for (int index = 0; index < tasks; index++) {
+        check.tasks[index] = cleanup_walk_check_make_task();
+        if (check.tasks[index] == NULL) {
+            for (int other = 0; other < index; other++) {
+                task_abandon(check.tasks[other]);
+                lock(&pids_lock);
+                task_destroy(check.tasks[other]);
+                unlock(&pids_lock);
+            }
+            free(check.tasks);
+            return 0;
+        }
+    }
+    atomic_store(&check.walking, true);
+    pthread_t walker;
+    pthread_t releaser;
+    if (pthread_create(&walker, NULL, cleanup_walk_check_walk, &check) != 0) {
+        free(check.tasks);
+        return 0;
+    }
+    if (pthread_create(&releaser, NULL, cleanup_walk_check_release, &check) != 0) {
+        atomic_store(&check.walking, false);
+        pthread_join(walker, NULL);
+        free(check.tasks);
+        return 0;
+    }
+    pthread_join(releaser, NULL);
+    pthread_join(walker, NULL);
+    for (int index = 0; index < tasks; index++) {
+        struct task *task = check.tasks[index];
+        if (task == NULL)
+            continue;
+        task_abandon(task);
+        lock(&pids_lock);
+        task_destroy(task);
+        unlock(&pids_lock);
+    }
+    free(check.tasks);
+    return rounds;
+}
+#endif

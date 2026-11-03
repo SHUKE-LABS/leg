@@ -138,3 +138,17 @@ files.
 The API sends no signal of the guest: the guest may block a signal or ignore
 it, and a host that stops a guest does not want to change what the guest
 sees.
+
+## `kernel/task.c`: `task_abandon` lets a task go
+
+A task that never ran, a session of the host that could not start, is let go
+by the host: the task is marked as exiting and its files are let go. The host
+did that itself, outside of `pids_lock`, and it did it before the task was
+marked, so a walk of the files of the tasks could see a task that holds a
+table of files that is gone.
+
+The kernel has an API for that now: `task_abandon` marks the task as exiting
+and detaches its files under `pids_lock`, and lets the table that was
+detached go after the lock is let go. A walk that holds `pids_lock` sees
+either a task that holds its files or a task that is marked, and a table that
+is detached is not walked any more. The host touches no table of files at all.
