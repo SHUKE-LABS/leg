@@ -79,14 +79,25 @@ boundary:
 2. the trail of the guest is written out to the test artifacts,
 3. the output and the exit callbacks of the runtime are detached,
 4. the thread of the output is joined, and the wait for it is checked,
-5. the guest of the session is killed and the host waits for it to end: a
-   guest that waits for the provider is interrupted in the syscall it waits
-   in, so it cannot write to the trail of the guest anymore and it cannot
+5. the guest of the session is killed: every task of the guest is killed, and
+   the tasks that wait for data are woken, so a guest that waits for the
+   provider wakes up and is killed before it runs another instruction of the
+   guest — it cannot write to the trail of the guest anymore and it cannot
    run next to the session that comes next,
-6. the output of the session that stopped is cleared, the fixture and the
-   watcher of the trail are stopped and the runtime releases the terminal of
-   the guest — each of them exactly once,
-7. the host shows `IOS_SESSION_INTERRUPTED` with the recovery guidance.
+6. the fixture and the watcher of the trail are stopped — the connections of
+   the fixture end the waits of the guest that wait for the answer of the
+   provider — and the host waits for the guest to end,
+7. the output of the session that stopped is cleared and the runtime releases
+   the terminal of the guest — each of them exactly once,
+8. the host shows `IOS_SESSION_INTERRUPTED` with the recovery guidance.
+
+A task of the guest that waits for data sleeps in a read of the host, and the
+read of the host is not interrupted by a signal: the kill of the guest does
+not end that wait on its own. The stop of the session ends the waits of the
+guest — a byte is written into the pipes of the guest and the sockets of the
+guest are shut down — and the kill is pending while the task wakes up. The
+kernel delivers the kill before the guest runs another instruction, so the
+guest does not write to the trail of the guest anymore.
 
 The waits of the boundary are checked. When the thread of the output did not
 stop, or when the guest of the session did not stop, the host shows
