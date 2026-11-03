@@ -20,4 +20,19 @@ final class GuestRuntimeKernelTests: XCTestCase {
                        "the check of the cleanup and the walk did not run")
         #endif
     }
+
+    /// The exit of a task and the walk of its files by the /proc must not
+    /// race.
+    ///
+    /// A task that exits lets its files go, and the /proc walks the files of
+    /// a task: the walk must not see the files of a task that is let go. The
+    /// check lets a task go while the /proc walks its files and repeats it:
+    /// a walk that sees the files of a task that is let go reads a table that
+    /// is gone, and the run ends in a crash.
+    func testTheExitOfATaskDoesNotRaceTheWalkOfItsFiles() {
+        #if DEBUG
+        XCTAssertEqual(guest_runtime_check_exit_walk_race(100, 3), 100,
+                       "the check of the exit and the walk did not run")
+        #endif
+    }
 }

@@ -112,6 +112,20 @@ int guest_runtime_running_tasks(void);
  * The result is the number of rounds that ran.
  */
 int guest_runtime_check_cleanup_walk_race(int rounds, int tasks);
+
+/*
+ * The check of the exit of a task and the walk of its files by the /proc.
+ *
+ * A task that exits lets its files go, and the /proc walks the files of a
+ * task: the two run at the same time, and the walk must not see the files of
+ * a task that is let go. The check lets a task go the way a task that exits
+ * lets its files go, while the /proc walks the files of the task, and it
+ * repeats it. A walk that sees the files of a task that is let go reads a
+ * table that is gone, and the run ends in a crash.
+ *
+ * The result is the number of rounds that ran.
+ */
+int guest_runtime_check_exit_walk_race(int rounds, int tasks);
 #endif
 
 #endif /* LEGHOST_GUEST_RUNTIME_H */

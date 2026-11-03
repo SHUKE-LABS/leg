@@ -25,6 +25,7 @@
 #include "fs/devices.h"
 #include "fs/fd.h"
 #include "fs/path.h"
+#include "fs/proc.h"
 #include "fs/real.h"
 #include "fs/tty.h"
 #include "kernel/calls.h"
@@ -581,7 +582,7 @@ struct cleanup_walk_check {
  * chance to see the table of the task while it is let go. */
 #define CHECK_TASK_FILES 16
 
-static struct task *cleanup_walk_check_make_task(void) {
+static struct task *walk_check_make_task(void) {
     struct task *task = task_create_(NULL);
     if (task == NULL)
         return NULL;
@@ -594,7 +595,9 @@ static struct task *cleanup_walk_check_make_task(void) {
         return NULL;
     }
     for (int index = 0; index < CHECK_TASK_FILES; index++) {
-        struct fd *file = fd_create(&realfs_fdops);
+        /* The file is made the way the kernel makes a file of the host: it
+         * has a mount, so the walk of the /proc can read its path. */
+        struct fd *file = adhoc_fd_create(&realfs_fdops);
         if (file == NULL)
             continue;
         file->real_fd = open("/dev/null", O_RDONLY);
@@ -622,18 +625,20 @@ static void *cleanup_walk_check_release(void *context) {
     for (int round = 0; round < check->rounds; round++) {
         int index = round % check->task_count;
         struct task *task = check->tasks[index];
-        check->tasks[index] = NULL;
         /* The task is let go the way the host lets a session that failed go:
          * the task is marked as gone and its files are detached under the
          * lock of the tasks. */
         task_abandon(task);
         lock(&pids_lock);
+        check->tasks[index] = NULL;
         task_destroy(task);
         unlock(&pids_lock);
-        struct task *fresh = cleanup_walk_check_make_task();
+        struct task *fresh = walk_check_make_task();
         if (fresh == NULL)
             break;
+        lock(&pids_lock);
         check->tasks[index] = fresh;
+        unlock(&pids_lock);
     }
     atomic_store(&check->walking, false);
     return NULL;
@@ -649,7 +654,7 @@ int guest_runtime_check_cleanup_walk_race(int rounds, int tasks) {
     if (check.tasks == NULL)
         return 0;
     for (int index = 0; index < tasks; index++) {
-        check.tasks[index] = cleanup_walk_check_make_task();
+        check.tasks[index] = walk_check_make_task();
         if (check.tasks[index] == NULL) {
             for (int other = 0; other < index; other++) {
                 task_abandon(check.tasks[other]);
@@ -681,6 +686,128 @@ int guest_runtime_check_cleanup_walk_race(int rounds, int tasks) {
         if (task == NULL)
             continue;
         task_abandon(task);
+        lock(&pids_lock);
+        task_destroy(task);
+        unlock(&pids_lock);
+    }
+    free(check.tasks);
+    return rounds;
+}
+
+/*
+ * The check of the exit of a task and the walk of its files by the /proc.
+ *
+ * A task that exits lets its files go, and the /proc walks the files of a
+ * task: the two run at the same time, and the walk must not see the files of
+ * a task that is let go. The check lets a task go the way a task that exits
+ * lets its files go, while the /proc walks the files of the task, and it
+ * repeats it. A walk that sees the files of a task that is let go reads a
+ * table that is gone, and the run ends in a crash then.
+ *
+ * The result is the number of rounds that ran. */
+struct exit_walk_check {
+    struct task **tasks;
+    int task_count;
+    int rounds;
+    atomic_bool walking;
+};
+
+static void *exit_walk_check_walk(void *context) {
+    struct exit_walk_check *check = context;
+    while (atomic_load(&check->walking)) {
+        for (int index = 0; index < check->task_count; index++) {
+            /* The task is read under the lock of the tasks: the walk of the
+             * /proc takes the lock itself, and the task must not be gone
+             * while it is read. */
+            pid_t_ pid = 0;
+            lock(&pids_lock);
+            struct task *task = check->tasks[index];
+            if (task != NULL)
+                pid = task->pid;
+            unlock(&pids_lock);
+            if (pid != 0)
+                proc_pid_fd_walk(pid);
+        }
+    }
+    return NULL;
+}
+
+static void *exit_walk_check_release(void *context) {
+    struct exit_walk_check *check = context;
+    for (int round = 0; round < check->rounds; round++) {
+        int index = round % check->task_count;
+        struct task *task = check->tasks[index];
+        /* The task exits the way a task of the guest exits: the task is
+         * marked as exiting and its files are detached under the lock of the
+         * tasks, and the table that was detached is let go after the lock is
+         * let go. The pause between the two widens the window in which a
+         * walk of the /proc can come. */
+        struct fdtable *files = task_detach_files(task);
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+        nanosleep(&pause, NULL);
+        if (files != NULL)
+            fdtable_release(files);
+        lock(&pids_lock);
+        check->tasks[index] = NULL;
+        task_destroy(task);
+        unlock(&pids_lock);
+        struct task *fresh = walk_check_make_task();
+        if (fresh == NULL)
+            break;
+        lock(&pids_lock);
+        check->tasks[index] = fresh;
+        unlock(&pids_lock);
+    }
+    atomic_store(&check.walking, false);
+    return NULL;
+}
+
+int guest_runtime_check_exit_walk_race(int rounds, int tasks) {
+    if (rounds < 1 || tasks < 1)
+        return 0;
+    struct exit_walk_check check = {0};
+    check.task_count = tasks;
+    check.rounds = rounds;
+    check.tasks = calloc(tasks, sizeof(struct task *));
+    if (check.tasks == NULL)
+        return 0;
+    for (int index = 0; index < tasks; index++) {
+        check.tasks[index] = walk_check_make_task();
+        if (check.tasks[index] == NULL) {
+            for (int other = 0; other < index; other++) {
+                struct fdtable *files = task_detach_files(check.tasks[other]);
+                if (files != NULL)
+                    fdtable_release(files);
+                lock(&pids_lock);
+                task_destroy(check.tasks[other]);
+                unlock(&pids_lock);
+            }
+            free(check.tasks);
+            return 0;
+        }
+    }
+    atomic_store(&check.walking, true);
+    pthread_t walker;
+    pthread_t releaser;
+    if (pthread_create(&walker, NULL, exit_walk_check_walk, &check) != 0) {
+        free(check.tasks);
+        return 0;
+    }
+    if (pthread_create(&releaser, NULL, exit_walk_check_release, &check) != 0) {
+        atomic_store(&check.walking, false);
+        pthread_join(walker, NULL);
+        free(check.tasks);
+        return 0;
+    }
+    pthread_join(releaser, NULL);
+    pthread_join(walker, NULL);
+    for (int index = 0; index < tasks; index++) {
+        struct task *task = check.tasks[index];
+        if (task == NULL)
+            continue;
+        struct fdtable *files = task_detach_files(task);
+        if (files != NULL)
+            fdtable_release(files);
         lock(&pids_lock);
         task_destroy(task);
         unlock(&pids_lock);
