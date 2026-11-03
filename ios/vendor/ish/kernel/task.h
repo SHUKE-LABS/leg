@@ -190,6 +190,10 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 void task_start(struct task *task);
 void task_run_current(void);
 
+// Ends the waits of the tasks that wait for data. The caller does not hold
+// pids_lock.
+void tasks_end_data_waits(void);
+
 extern void (*exit_hook)(struct task *task, int code);
 
 #define superuser() (current != NULL && current->euid == 0)

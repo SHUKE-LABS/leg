@@ -73,6 +73,17 @@ struct fdtable *fdtable_new(int size) {
 
 static int fdtable_close(struct fdtable *table, fd_t f);
 
+/* Keeps the table alive.
+ *
+ * The caller lets the table go with fdtable_release. The files of the table
+ * stay open until then, even when the task that owns the table lets it go. */
+struct fdtable *fdtable_retain(struct fdtable *table) {
+    lock(&table->lock);
+    table->refcount++;
+    unlock(&table->lock);
+    return table;
+}
+
 // FIXME this looks like it has the classic refcount UAF
 void fdtable_release(struct fdtable *table) {
     lock(&table->lock);

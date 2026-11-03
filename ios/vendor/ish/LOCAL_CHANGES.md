@@ -63,27 +63,58 @@ The change gives the two options the numbers a Linux guest uses and
 translates the timeout in both directions: the guest's timeval goes out as the
 host's, and the host's comes back as the guest's.
 
-## `kernel`: the interrupt of a task that waits
+## `kernel/exit.c`: the mark of a task that is on its way out
 
-The kernel hands a signal to a task only when the signal is not pending yet,
-and the signal of a kill stays pending until the task runs the next
-instruction of the guest. A task that waits in a system call of the host
-therefore gets the interrupt of the kernel only once: the system call of the
-host does not return, the task does not run another instruction of the guest,
-and the signal stays pending.
+`do_exit` released the files of the task before it marked the task as
+exiting, and the mark was made in the part of the exit that holds
+`pids_lock`. A walker of the tasks that held `pids_lock` could therefore see
+a task that was not marked, and the files of that task could be gone already:
+the table of files of the task was freed while the walker held a pointer to
+it.
 
-A host that stops a guest needs the interrupt again and again, because a task
-that was running when the interrupt arrived waits again right away. The
-kernel has an API for that now:
+The change moves the mark to the front of the exit: the task is marked as
+exiting under `pids_lock` before it lets go of its files, and the mark that
+the exit made later is gone. A walker that holds `pids_lock` sees a task that
+holds its files, or a task that is marked. The two cannot both be true.
 
-- `kernel/signal.c`: `task_interrupt` ends the system call a task waits in
-  (the thread of the task gets the signal `SIGUSR1`) and notifies the
-  condition the task waits on. The wake of the condition is the code that
-  `deliver_signal_unlocked` had, moved into `wake_waiting_cond` and used by
-  both.
-- `kernel/signal.h`: the declaration of `task_interrupt`.
+## `fs/fd.c`: `fdtable_retain` keeps a table of files alive
+
+`fdtable_release` frees the table of files when its reference count falls to
+zero, and the count is not protected by the lock of the table on the path
+that raises it.
+
+The change adds `fdtable_retain`: it takes the lock of the table, raises the
+reference count, and lets the lock go. A caller that holds a table this way
+keeps the table and the files in it alive until it lets the table go with
+`fdtable_release`. The files of a table that a task owns stay open until then,
+even when the task that owns the table lets it go.
+
+## `kernel/task.c`: `tasks_end_data_waits` ends the waits that wait for data
+
+The signal of a kill stays pending until the task runs the next instruction
+of the guest, and a task that waits in a system call of the host does not run
+that instruction until the system call returns. A task that waits for data
+therefore stays in that wait after the kill, and a host that stops a guest
+needs to end that wait.
+
+The kernel has an API for that now:
+
+- `kernel/task.c`: `tasks_end_data_waits` walks the tables of files of the
+  tasks and ends the wait of every file that waits for data: the socket of
+  the guest is shut down, and a byte is written into the pipe of the guest.
+  The task that waits wakes up, and the kill that is pending lands before the
+  guest runs another instruction.
+- `kernel/task.h`: the declaration of `tasks_end_data_waits`.
+
+The walk is done in the kernel and not in the host, because the files of a
+task belong to the task: the task frees them when it exits, and a host that
+reads them while the task exits reads memory that is gone. The walk holds
+`pids_lock` while it collects the tables, and it keeps every table alive
+while it walks it with `fdtable_retain`, so a task that exits in the meantime
+leaves its table behind: the files of the task are closed when the last one
+that holds the table lets it go. A task that is on its way out is left alone,
+because the mark of the exit comes before the release of the files.
 
 The API sends no signal of the guest: the guest may block a signal or ignore
 it, and a host that stops a guest does not want to change what the guest
-sees. The caller holds `pids_lock`, so the thread of the task is alive while
-the interrupt is sent.
+sees.

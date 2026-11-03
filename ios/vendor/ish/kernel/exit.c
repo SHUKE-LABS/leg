@@ -49,6 +49,16 @@ noreturn void do_exit(int status) {
             futex_wake(clear_tid, 1);
     }
 
+    /* The task is marked as exiting before it lets go of its resources: a
+     * task that is on its way out does not hold its files any more, and
+     * everything that walks the tasks of the kernel has to leave such a task
+     * alone. The mark is made under pids_lock, so a walker that holds
+     * pids_lock sees either a task that holds its files or a task that is
+     * marked. */
+    lock(&pids_lock);
+    current->exiting = true;
+    unlock(&pids_lock);
+
     // release all our resources
     mm_release(current->mm);
     current->mm = NULL;
@@ -69,7 +79,6 @@ noreturn void do_exit(int status) {
 
     // the actual freeing needs pids_lock
     lock(&pids_lock);
-    current->exiting = true;
     // release the sighand
     sighand_release(current->sighand);
     current->sighand = NULL;

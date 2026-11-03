@@ -2,6 +2,11 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "debug.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/memory.h"
@@ -112,6 +117,75 @@ static void *task_thread(void *task) {
     update_thread_name();
     task_run_current();
     die("task_thread returned"); // above function call should never return
+}
+
+/* The number of tables of tasks that one round of the wake holds. */
+#define MAX_WAIT_TABLES 256
+
+/* Ends the waits of the tasks of the guest that wait for data.
+ *
+ * A task of the guest that waits for data sleeps in a read of the host, and
+ * the read of the host is not interrupted by a signal: the signal of the kill
+ * does not end that wait. The wait ends when the data comes: a byte is
+ * written into every pipe of the guest, and every socket of the guest is shut
+ * down. The task that waits wakes up, and the syscall that ends its wait
+ * runs. The kill that waits for the task lands before the task runs another
+ * instruction of the guest.
+ *
+ * The files of a task belong to the task, and the task frees them when it
+ * exits. The tables are kept alive while they are walked, so a task that
+ * exits in the meantime leaves its table behind: the files of the task are
+ * closed when the last one that holds the table lets it go.
+ *
+ * The caller does not hold pids_lock: the function takes it while it
+ * collects the tables. */
+void tasks_end_data_waits(void) {
+    struct fdtable *tables[MAX_WAIT_TABLES];
+    int count = 0;
+
+    lock(&pids_lock);
+    for (int pid = 2; pid <= MAX_PID && count < MAX_WAIT_TABLES; pid++) {
+        struct task *task = pid_get_task((dword_t) pid);
+        if (task == NULL)
+            continue;
+        /* A task that is on its way out is left alone: it does not hold its
+         * files any more. A task that never started holds no files. */
+        if (task->exiting || task->thread == 0)
+            continue;
+        struct fdtable *table = task->files;
+        if (table == NULL)
+            continue;
+        tables[count++] = fdtable_retain(table);
+    }
+    unlock(&pids_lock);
+
+    for (int i = 0; i < count; i++) {
+        struct fdtable *table = tables[i];
+        lock(&table->lock);
+        for (unsigned index = 0; index < table->size; index++) {
+            struct fd *fd = table->files[index];
+            if (fd == NULL || fd->real_fd < 0)
+                continue;
+            struct stat status;
+            if (fstat(fd->real_fd, &status) != 0)
+                continue;
+            if (S_ISSOCK(status.st_mode)) {
+                shutdown(fd->real_fd, SHUT_RDWR);
+            } else if (S_ISFIFO(status.st_mode)) {
+                /* The write does not block: a pipe that is full holds data,
+                 * and the task that waits for data is not waiting then. */
+                int flags = fcntl(fd->real_fd, F_GETFL);
+                if (flags < 0 || (flags & O_ACCMODE) == O_RDONLY)
+                    continue;
+                fcntl(fd->real_fd, F_SETFL, flags | O_NONBLOCK);
+                ssize_t written = write(fd->real_fd, "", 1);
+                fcntl(fd->real_fd, F_SETFL, flags);
+                (void) written;
+            }
+        }
+        unlock(&table->lock);
+        fdtable_release(table);
+    }
 }
 
 static pthread_attr_t task_thread_attr;

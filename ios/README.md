@@ -99,19 +99,21 @@ the guest with the things the host owns: the terminal of the session is hung
 up, so a guest that reads the terminal wakes up, and the connections of the
 fixture are closed, so a guest that waits for the provider wakes up.
 
-The kernel interrupts the tasks of the guest that wait: the thread of a task
-gets the signal that ends the system call of the host the task waits in, and
-the condition the task waits on is notified. The interrupt is given again in
-every round of the wait, because a task that was running when the interrupt
-arrived waits again right away, and the kill of a task is delivered only once.
-The kill is pending while the task wakes up, and the kernel delivers the kill
-before the guest runs another instruction, so the guest does not write to the
-trail of the guest anymore.
+The kernel ends the waits that are left: it walks the tables of files of the
+tasks, and it ends the wait of every file that waits for data — the socket of
+the guest is shut down, and a byte is written into the pipe of the guest, so
+a task that reads one of them wakes up. The wake is given again in every round
+of the wait, because a task that was running when the wake arrived waits
+again right away, and the kill of a task is delivered only once. The kill is
+pending while the task wakes up, and the kernel delivers the kill before the
+guest runs another instruction, so the guest does not write to the trail of the
+guest anymore.
 
 The host does not read the files of a task of the guest. The files of a task
 belong to the task, and the task frees them when it exits, so a host that
-reads them while the task exits reads memory that is gone. The wake of a task
-happens in the kernel, which knows the wait of the task.
+reads them while the task exits reads memory that is gone. The walk of the
+files happens in the kernel, which keeps the table of files of a task alive
+while it walks it, and which leaves a task that is on its way out alone.
 
 The stop of a session and the retry after it can happen many times in a row.
 The fixture test `testTheStoppedGuestCannotWriteAfterManyRetries` drives

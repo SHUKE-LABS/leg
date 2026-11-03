@@ -458,20 +458,12 @@ static void guest_hangup_terminal(void) {
     unlock(&tty->lock);
 }
 
-/* Kills every task of the guest and interrupts the tasks that wait.
+/* Kills every task of the guest.
  *
  * The signal does not go through the syscall of the kernel: that path reads
  * the current task of the calling thread, and the host has none. The kernel
- * interrupts the syscall the guest waits in and delivers the kill before the
- * guest runs another instruction, so the guest cannot write to the trail of
- * the guest anymore.
- *
- * A task that waits in a system call of the host only sees the kill when the
- * system call returns, so the wait has to be ended: the kernel interrupts
- * the thread of the task, and the system call of the host returns. The
- * interrupt is given again in every round: a task that was running when the
- * interrupt arrived waits again right away, and the kill of a task is
- * delivered only once.
+ * delivers the kill before the guest runs another instruction, so the guest
+ * cannot write to the trail of the guest anymore.
  *
  * The kill is given again while the guest is still there: a task that the
  * guest forked after the first kill is killed as well. */
@@ -487,7 +479,6 @@ static void guest_kill_tasks(void) {
         if (task->exiting || task->thread == 0)
             continue;
         send_signal(task, SIGKILL_, SIGINFO_NIL);
-        task_interrupt(task);
     }
     unlock(&pids_lock);
 }
@@ -501,6 +492,11 @@ void guest_runtime_kill_guest(void) {
 
     guest_kill_tasks();
     guest_hangup_terminal();
+    /* The waits of the tasks that wait for data end here: the kernel knows
+     * the files of the tasks and ends the waits that block in the host. The
+     * host does not touch the files of a task itself: the files of a task
+     * belong to the task, and the task frees them when it exits. */
+    tasks_end_data_waits();
 }
 
 int guest_runtime_stop_session(void) {
@@ -529,9 +525,12 @@ int guest_runtime_stop_session(void) {
         struct timespec step = { .tv_sec = 0, .tv_nsec = GUEST_STOP_STEP_MS * 1000000L };
         nanosleep(&step, NULL);
         /* The kill is given again while the guest is still there: a task
-         * that the guest forked after the first kill is killed as well, and
-         * a task that waits is interrupted again. */
+         * that the guest forked after the first kill is killed as well. The
+         * waits are ended again as well: a task that waits again after a
+         * wake waits for a long time, and the round that follows ends that
+         * wait as well. */
         guest_kill_tasks();
+        tasks_end_data_waits();
     }
 
     if (!stopped) {
