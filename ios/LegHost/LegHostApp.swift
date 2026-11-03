@@ -35,6 +35,17 @@ struct LegHostApp: App {
 struct GuestHostScreen: View {
     @ObservedObject var controller: GuestHostController
 
+    /// The identity of the terminal.
+    ///
+    /// The phases of the host hold the terminal in views of a different
+    /// shape, and a terminal without an identity of its own is a new view in
+    /// every one of them: the web view of the terminal is built again and
+    /// the screen of the guest is lost. The identity keeps the one web view
+    /// of the terminal across the phases, so the screen of the guest stays
+    /// on the screen when the session is interrupted and when it is started
+    /// again.
+    static let terminalID = "guest-terminal"
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -45,7 +56,7 @@ struct GuestHostScreen: View {
                     statusBar
                     stateRow
                     controlRow
-                    GuestTerminalView(controller: controller)
+                    GuestTerminalView(controller: controller).id(GuestHostScreen.terminalID)
                 }
             case .exited:
                 statusView(title: "The guest program ended",
@@ -60,7 +71,7 @@ struct GuestHostScreen: View {
                               detail: controller.detail,
                               identifier: "guest-interrupted",
                               expands: false)
-                    GuestTerminalView(controller: controller)
+                    GuestTerminalView(controller: controller).id(GuestHostScreen.terminalID)
                 }
             case .failed(let message):
                 // The terminal stays on the screen when the guest could not
@@ -70,7 +81,7 @@ struct GuestHostScreen: View {
                     statusView(title: "The guest could not start",
                               detail: message,
                               expands: false)
-                    GuestTerminalView(controller: controller)
+                    GuestTerminalView(controller: controller).id(GuestHostScreen.terminalID)
                 }
             default:
                 statusView(title: title, detail: controller.detail)
