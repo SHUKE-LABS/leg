@@ -52,18 +52,18 @@ noreturn void do_exit(int status) {
     /* The task is marked as exiting before it lets go of its resources: a
      * task that is on its way out does not hold its files any more, and
      * everything that walks the tasks of the kernel has to leave such a task
-     * alone. The mark is made under pids_lock, so a walker that holds
-     * pids_lock sees either a task that holds its files or a task that is
-     * marked. */
-    lock(&pids_lock);
-    current->exiting = true;
-    unlock(&pids_lock);
+     * alone. The mark and the detaching of the files are one step under
+     * pids_lock, so a walker that holds pids_lock sees either a task that
+     * holds its files, or a task that is marked and holds none. The table
+     * that was detached is let go after the lock is let go, so a walker that
+     * holds the table keeps it alive while it walks it. */
+    struct fdtable *files = task_detach_files(current);
 
     // release all our resources
     mm_release(current->mm);
     current->mm = NULL;
-    fdtable_release(current->files);
-    current->files = NULL;
+    if (files != NULL)
+        fdtable_release(files);
     fs_info_release(current->fs);
     current->fs = NULL;
     // sighand must be released below so it can be protected by pids_lock

@@ -167,7 +167,8 @@ tasks, so the walk of the files of the tasks leaves the task alone, and the
 host touches no table of files of a task at all. A file of a table is
 bounded by the table it is read from, and the files of a task that holds
 none are shown as none, so a task that was let go cannot take the emulator
-down.
+down. A task that exits detaches its files under the same lock of the tasks,
+so the /proc cannot read the files of a task that is on its way out either.
 
 ## Licensing
 
@@ -356,7 +357,8 @@ One of them drives the kernel of the emulator that the app carries: it lets a
 task go while the walk of the files of the tasks runs, and it repeats it, so
 the walk of the files of the tasks cannot see the files of a task that is let
 go. A walk that sees them keeps a table of files that is gone, and the run
-ends in a crash.
+ends in a crash. The other one lets a task go the way a task that exits
+lets its files go, while the /proc walks the files of the task.
 
 ## Provider configuration
 

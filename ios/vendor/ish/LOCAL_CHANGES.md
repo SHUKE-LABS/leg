@@ -77,6 +77,16 @@ exiting under `pids_lock` before it lets go of its files, and the mark that
 the exit made later is gone. A walker that holds `pids_lock` sees a task that
 holds its files, or a task that is marked. The two cannot both be true.
 
+The detaching of the files is part of the mark now. The exit released the
+table of the files outside of `pids_lock` and set the files of the task to
+none only after the release, so a walker that held `pids_lock` and came in
+between the mark and the release saw a task that holds a table that is on its
+way to be freed. The table of the files is detached under `pids_lock` with
+the mark, and the table that was detached is let go after the lock is let go.
+A walker that holds `pids_lock` sees either a task that holds its files, or
+a task that holds none, and the table of a task that is let go cannot be
+freed while such a walker holds it.
+
 ## `fs/fd.c`: `fdtable_retain` keeps a table of files alive
 
 `fdtable_release` frees the table of files when its reference count falls to
@@ -153,6 +163,30 @@ detached go after the lock is let go. A walk that holds `pids_lock` sees
 either a task that holds its files or a task that is marked, and a table that
 is detached is not walked any more. The host touches no table of files at all.
 
+## `kernel/task.c`: `task_detach_files` detaches the files of a task
+
+The mark of a task that is on its way out and the detaching of its files are
+one step under `pids_lock`, and the exit of a task and the host that lets a
+session that failed go do the same thing. The step is an API of its own now:
+`task_detach_files` marks the task as exiting, detaches its files under
+`pids_lock` and returns the table that was detached. The caller lets the
+table go with `fdtable_release` after the lock is let go.
+
+The exit of a task uses it, and `task_abandon` uses it, so the two paths
+cannot drift apart again.
+
+## `fs/proc/pid.c`: the walk of the files of a task
+
+The host checks that the exit of a task and the walk of the files of a task
+by the /proc do not race. The check needs the walk of the /proc itself: a
+walk that is written in the host would not hold the locks the way the /proc
+holds them.
+
+`proc_pid_fd_walk` walks the files of a task the way the /proc walks them:
+the lock of the tasks is held while the files of the task are read, and the
+lock of the table of the files is taken while they are read. The walk is
+bounded, so a task that is gone does not make it run forever.
+
 ## `fs/fd.c`: the bound of a file belongs to the table that is read
 
 `fdtable_get` bounded the number of a file with the size of the table of
@@ -173,3 +207,8 @@ files, and the read took the host down with a segmentation fault.
 
 A task that holds no files has no files to show, and a file of it is not
 there.
+
+The check of the host walks the files of a task with the walk of the /proc
+while the task lets its files go, and it holds for the exit of a task as
+well: the files of a task that exits are detached under the lock of the
+tasks, so the walk of the /proc sees either the files of the task or none.

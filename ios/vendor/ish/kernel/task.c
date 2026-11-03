@@ -184,8 +184,28 @@ void tasks_end_data_waits(void) {
 }
 
 /* The task is on its way out: it is marked as exiting and its files are
- * detached under pids_lock, and the table that was detached is let go after
- * the lock is let go.
+ * detached under pids_lock. The table that was detached is returned, and the
+ * caller lets it go with fdtable_release after the lock is let go.
+ *
+ * The mark and the detaching are one step under the lock: a walker of the
+ * tasks that holds pids_lock sees either a task that holds its files, or a
+ * task that is marked and holds none. The two cannot both be true, so a
+ * walker cannot see the files of a task that is let go, and the table of a
+ * task that is let go cannot be freed while such a walker holds it.
+ *
+ * The caller does not hold pids_lock. */
+struct fdtable *task_detach_files(struct task *task) {
+    lock(&pids_lock);
+    task->exiting = true;
+    struct fdtable *files = task->files;
+    task->files = NULL;
+    unlock(&pids_lock);
+    return files;
+}
+
+/* The task is let go: it is marked as exiting and its files are detached
+ * under pids_lock, and the table that was detached is let go after the lock
+ * is let go.
  *
  * A walker of the tasks that holds pids_lock sees either a task that holds
  * its files or a task that is marked, and a table that is detached is not
@@ -193,11 +213,7 @@ void tasks_end_data_waits(void) {
  *
  * The caller does not hold pids_lock. */
 void task_abandon(struct task *task) {
-    lock(&pids_lock);
-    task->exiting = true;
-    struct fdtable *files = task->files;
-    task->files = NULL;
-    unlock(&pids_lock);
+    struct fdtable *files = task_detach_files(task);
     if (files != NULL)
         fdtable_release(files);
 }

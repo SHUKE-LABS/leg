@@ -195,7 +195,14 @@ void task_run_current(void);
 void tasks_end_data_waits(void);
 
 // The task is on its way out: it is marked as exiting and its files are
-// detached under pids_lock. The caller does not hold pids_lock.
+// detached under pids_lock. The table of the files that was detached is
+// returned, and the caller lets it go with fdtable_release. The caller does
+// not hold pids_lock.
+struct fdtable *task_detach_files(struct task *task);
+
+// The task is on its way out: it is marked as exiting and its files are
+// detached under pids_lock, and the table that was detached is let go. The
+// caller does not hold pids_lock.
 void task_abandon(struct task *task);
 
 extern void (*exit_hook)(struct task *task, int code);
