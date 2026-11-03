@@ -89,6 +89,21 @@ keeps the table and the files in it alive until it lets the table go with
 `fdtable_release`. The files of a table that a task owns stay open until then,
 even when the task that owns the table lets it go.
 
+## `kernel/fork.c`: the files of a task that is made
+
+Two things in `copy_task` touched the files of a task without the lock that
+the tables of files need.
+
+- A task that is made with `CLONE_FILES_` shares the table of files of its
+  parent, and the count of the table was raised without the lock of the
+  table. The count is now raised with `fdtable_retain`, which takes the lock
+  of the table, like every other raise of the count.
+- A task that could not be made let go of its files with `fdtable_release`
+  outside of `pids_lock`, and the task kept the pointer to the table that was
+  gone until the task was destroyed. The files are now let go under
+  `pids_lock`, and the files of the task are set to none, so a walker of the
+  tasks that holds `pids_lock` skips the task.
+
 ## `kernel/task.c`: `tasks_end_data_waits` ends the waits that wait for data
 
 The signal of a kill stays pending until the task runs the next instruction
@@ -109,9 +124,11 @@ The kernel has an API for that now:
 The walk is done in the kernel and not in the host, because the files of a
 task belong to the task: the task frees them when it exits, and a host that
 reads them while the task exits reads memory that is gone. The walk holds
-`pids_lock` the whole time, and a task marks itself as exiting under that
-lock before it lets go of its files, so a task that is not marked still holds
-its files while the walk runs. The walk keeps every table alive with
+`pids_lock` the whole time, and every path that lets go of the files of a
+task holds that lock: a task that exits marks itself as exiting under the
+lock before it lets go of its files, and a task that could not be made lets
+go of its files under the lock as well. A table of files therefore cannot be
+freed while the walk runs, and the walk keeps every table alive with
 `fdtable_retain` while it walks it as well, so a task that exits in the
 meantime leaves its table behind: the files of the task are closed when the
 last one that holds the table lets it go. A task that is on its way out is

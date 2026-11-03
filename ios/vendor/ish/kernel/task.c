@@ -130,12 +130,14 @@ static void *task_thread(void *task) {
  * instruction of the guest.
  *
  * The files of a task belong to the task, and the task frees them when it
- * exits. The walk holds pids_lock, and a task marks itself as exiting under
- * that lock before it lets go of its files, so a task that is not marked
- * still holds its files while the walk runs. The table is kept alive while it
- * is walked as well, so a task that exits in the meantime leaves its table
- * behind: the files of the task are closed when the last one that holds the
- * table lets it go.
+ * exits. The walk holds pids_lock, and every path that lets go of the files
+ * of a task holds that lock: a task that exits marks itself as exiting under
+ * the lock before it lets go of its files, and a task that could not be made
+ * lets go of its files under the lock as well. A table of files is therefore
+ * not freed while the walk runs. The table is kept alive while it is walked
+ * as well, so a task that exits in the meantime leaves its table behind: the
+ * files of the task are closed when the last one that holds the table lets it
+ * go.
  *
  * The caller does not hold pids_lock. */
 void tasks_end_data_waits(void) {
