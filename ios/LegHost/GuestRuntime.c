@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -401,7 +402,52 @@ int guest_runtime_running_tasks(void) {
     return running;
 }
 
-/* Kills every task of the guest.
+/* Writes the tasks of the guest that run to the log.
+ *
+ * The tasks are the evidence of a guest that does not stop: the log says
+ * which task of the guest is still there and what it waits for. */
+static void guest_log_tasks(void) {
+    lock(&pids_lock);
+    for (int pid = 2; pid <= MAX_PID; pid++) {
+        struct task *task = pid_get_task((dword_t) pid);
+        if (task == NULL)
+            continue;
+        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_ERROR,
+                         "[LegHost] the task %d (%s) of the guest runs: exiting %d, "
+                         "pending 0x%llx, blocked 0x%llx, waits %d",
+                         pid, task->comm, task->exiting,
+                         (unsigned long long) task->pending,
+                         (unsigned long long) task->blocked,
+                         task->waiting_cond != NULL);
+    }
+    unlock(&pids_lock);
+}
+
+/* Wakes a task of the guest that waits.
+ *
+ * The kernel hands a signal to a task only when the signal is not pending
+ * yet: a task that the first signal did not wake is not woken by the next
+ * one either. The stop of the guest cannot lean on that, because a task
+ * that sleeps in a wait that no signal breaks would keep the guest alive.
+ *
+ * The wake breaks the wait of the task in the two ways a task of the guest
+ * can sleep. A signal interrupts the system call of the host the task waits
+ * in, and the condition the task waits on is notified. */
+static void guest_wake_task(struct task *task) {
+    pthread_kill(task->thread, SIGUSR1);
+
+    /* The condition is notified without the lock of the wait: the task that
+     * holds the lock of its own wait is not woken by this round, and the
+     * next round wakes it. The lock of the kernel is not taken here, so a
+     * task of the guest cannot be held up by a lock the host waits for. */
+    lock(&task->waiting_cond_lock);
+    cond_t *cond = task->waiting_cond;
+    if (cond != NULL)
+        notify(cond);
+    unlock(&task->waiting_cond_lock);
+}
+
+/* Kills every task of the guest and wakes the tasks that wait.
  *
  * The signal does not go through the syscall of the kernel: that path reads
  * the current task of the calling thread, and the host has none. The kernel
@@ -410,14 +456,20 @@ int guest_runtime_running_tasks(void) {
  * the guest anymore.
  *
  * The kill is given again while the guest is still there: a task that the
- * guest forked after the first kill is killed as well. */
+ * guest forked after the first kill is killed as well, and a task that the
+ * first kill did not wake is woken again. */
 static void guest_kill_tasks(void) {
     lock(&pids_lock);
     for (int pid = 2; pid <= MAX_PID; pid++) {
         struct task *task = pid_get_task((dword_t) pid);
         if (task == NULL)
             continue;
+        /* A task that is on its way out is left alone: its thread is gone
+         * and it cannot write to the trail of the guest anymore. */
+        if (task->exiting)
+            continue;
         send_signal(task, SIGKILL_, SIGINFO_NIL);
+        guest_wake_task(task);
     }
     unlock(&pids_lock);
 }
@@ -455,6 +507,7 @@ int guest_runtime_stop_session(void) {
     }
 
     if (!stopped) {
+        guest_log_tasks();
         os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_ERROR,
                          "[LegHost] the guest of the session did not stop");
         return -ETIMEDOUT;
