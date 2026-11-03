@@ -626,6 +626,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     /// Shows a failure of the run.
     private func publishFailure(_ error: Error) {
+        // A failure that arrives after the interruption belongs to a chain
+        // that was stopped: the session is gone, so the interruption stays
+        // what the user is shown.
+        guard phase != .interrupted else { return }
         let message = error.localizedDescription
         // The diagnostic of the guest runtime belongs in the terminal as
         // well: the guest program never ran, so the terminal is the only

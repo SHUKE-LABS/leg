@@ -62,16 +62,22 @@ final class GuestHostLifecycleTests: XCTestCase {
     /// The gate the chain of the test waits at.
     ///
     /// The gate holds the chain until the test opens it, so the test can
-    /// interrupt a chain that is still running.
+    /// interrupt a chain that is still running. A cancelled chain lets the
+    /// gate go as well, so the chain can unwind instead of hanging in the
+    /// gate while the interruption waits for it.
     private final class Gate {
+        private let lock = NSLock()
         private var waiters: [CheckedContinuation<Void, Never>] = []
         private var isOpen = false
+        private var isCancelled = false
 
         /// Lets every waiter go on.
         func open() {
+            lock.lock()
             isOpen = true
             let waiting = waiters
             waiters = []
+            lock.unlock()
             for waiter in waiting {
                 waiter.resume()
             }
@@ -79,9 +85,26 @@ final class GuestHostLifecycleTests: XCTestCase {
 
         /// Waits until the gate is open.
         func wait() async {
-            if isOpen { return }
-            await withCheckedContinuation { continuation in
-                waiters.append(continuation)
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    lock.lock()
+                    if isOpen || isCancelled {
+                        lock.unlock()
+                        continuation.resume()
+                        return
+                    }
+                    waiters.append(continuation)
+                    lock.unlock()
+                }
+            } onCancel: {
+                self.lock.lock()
+                self.isCancelled = true
+                let waiting = self.waiters
+                self.waiters = []
+                self.lock.unlock()
+                for waiter in waiting {
+                    waiter.resume()
+                }
             }
         }
     }
