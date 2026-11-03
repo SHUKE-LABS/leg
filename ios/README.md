@@ -356,6 +356,12 @@ The three checks of the device read the filesystem, the free space of the
 container and the architecture of the host. They are injected, so the unit
 tests hand the preflight the state of a device they make up.
 
+The architecture of the host is the one the app was built for: the pinned
+guest bundle runs on the emulator the app carries, and that emulator is built
+for the architecture of the build. The name a device reports is a model
+(`iPhone15,2`) and not an architecture, so the model is not what the check
+looks at.
+
 ## The loopback fixture
 
 The fixture serves the Anthropic Messages endpoint on `127.0.0.1`, so one
@@ -377,6 +383,7 @@ memory and it never becomes a place where a credential is stored.
 | `-leghost-no-provider` | The run has no provider configuration at all. |
 | `-leghost-runtime-failure` | The guest runtime is asked for a program that is not there. |
 | `-leghost-fixture-reset` | The run starts from a known state: the catalog of the guest, the exchange trail and the durable ledger of the requests are cleared. The control belongs to the launch, so a retry after an interruption keeps the state of the run that was stopped. |
+| `-leghost-interrupt-after-request` | The run stops the session as soon as the fixture accepts the request of the turn. The path is the one of the background, so the session is stopped at the boundary the host controls and the trail of the stopped turn is written out, without the app having to go to the background. |
 | `-leghost-runtime-missing` | The run reports the pinned runtime files as missing. |
 | `-leghost-runtime-corrupt` | The run reports the pinned runtime files as corrupt. |
 | `-leghost-unsupported-architecture` | The run reports an architecture the guest cannot run on. |
@@ -448,6 +455,14 @@ is used by the first chain of the process, so a retry after an interruption
 keeps the state of the run that was stopped. The host creates the directory
 of the trail either way, because the guest appends to the trail file and
 does not make its directory.
+
+The terminal is the same terminal in every phase of the host. The phases
+hold it in views of a different shape, and a terminal without an identity
+of its own would be a new terminal in every one of them: the web view
+would be built again and the screen of the guest would be lost when the
+session is interrupted. The identity keeps the one web view of the terminal
+across the phases, so the screen of the guest stays on the screen when the
+session is interrupted and when it is started again.
 
 ### The failure of a turn
 
