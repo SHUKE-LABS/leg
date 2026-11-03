@@ -29,6 +29,7 @@ ALL_TESTS=(
     testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests
     testTheBackgroundInterruptsTheTurnAndKeepsTheTrail
     testTheRetryAfterAnInterruptionKeepsTheStateOfTheTurn
+    testTheStoppedGuestCannotWriteAfterTheRetry
     testTheDeviceFaultsAreReportedBeforeTheGuestIsProvisioned
 )
 
