@@ -78,11 +78,12 @@ void guest_runtime_kill_guest(void);
 /*
  * Stops the guest of the session and waits for it to end.
  *
- * Every task of the guest is killed and the call returns when none of them
- * runs anymore: a guest that waits for the provider is interrupted in the
- * syscall it waits in, and the kernel delivers the kill before the guest
- * runs another instruction, so the guest cannot write to the trail of the
- * guest anymore and cannot run next to the session that comes next.
+ * Every task of the guest is killed and the waits of the tasks that wait for
+ * data are ended, so a guest that waits for the provider wakes up. The call
+ * returns when none of the tasks runs anymore: the kernel delivers the kill
+ * before the guest runs another instruction, so the guest cannot write to
+ * the trail of the guest anymore and cannot run next to the session that
+ * comes next.
  *
  * Returns 0 when the guest stopped, and -ETIMEDOUT when a task of the guest
  * still runs after the wait.
