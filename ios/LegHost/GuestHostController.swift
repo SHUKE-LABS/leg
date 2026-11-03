@@ -694,19 +694,27 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // the runtime.
         let pumpStopped = await stopOutputPump()
 
+        // The guest of the session is killed before the fixture is stopped:
+        // the kill is delivered before the guest runs another instruction,
+        // so a guest that waits for the answer of the provider cannot write
+        // to the trail of the guest anymore.
+        guest_runtime_kill_guest()
+
+        // The fixture is stopped in every case: a guest that is still alive
+        // must not do provider work anymore. The connections of the fixture
+        // are closed here, so a guest that waits for the answer of the
+        // provider ends its wait.
+        fixture?.stop()
+        fixture = nil
+        trailWatcher?.cancel()
+        trailWatcher = nil
+
         // The guest of the session is stopped and waited for before the next
         // session starts: a guest that is still alive would write to the
         // trail of the guest and would run next to the session that comes
         // next.
         let guestStopped = await stopGuestSession()
         state.guestTasks = Int(guest_runtime_running_tasks())
-
-        // The fixture is stopped in every case: a guest that is still alive
-        // must not do provider work anymore.
-        fixture?.stop()
-        fixture = nil
-        trailWatcher?.cancel()
-        trailWatcher = nil
 
         guard pumpStopped, guestStopped else {
             let reason = pumpStopped

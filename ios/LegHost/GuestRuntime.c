@@ -10,17 +10,21 @@
 #include "GuestRuntime.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <os/log.h>
 
 #include "fs/devices.h"
+#include "fs/fd.h"
 #include "fs/path.h"
 #include "fs/tty.h"
 #include "kernel/calls.h"
@@ -447,6 +451,58 @@ static void guest_wake_task(struct task *task) {
     unlock(&task->waiting_cond_lock);
 }
 
+/* Ends the waits of the tasks of the guest that wait for data.
+ *
+ * A task of the guest that waits for data sleeps in a read of the host, and
+ * the read of the host is not interrupted by a signal: the signal of the
+ * kill does not end that wait. The wait ends when the data comes.
+ *
+ * A byte is written into every pipe of the guest, and every socket of the
+ * guest is shut down. The task that waits wakes up, and the syscall that
+ * ends its wait runs. The kill that waits for the task lands before the
+ * task runs another instruction of the guest, so the guest does not write to
+ * the trail of the guest anymore.
+ *
+ * The write does not block: a pipe that is full holds data, and the task
+ * that waits for data is not waiting then. */
+static void guest_unblock_tasks(void) {
+    lock(&pids_lock);
+    for (int pid = 2; pid <= MAX_PID; pid++) {
+        struct task *task = pid_get_task((dword_t) pid);
+        if (task == NULL)
+            continue;
+        /* A task that is on its way out is left alone: it released its
+         * files already and it cannot write to the trail anymore. */
+        if (task->exiting)
+            continue;
+        struct fdtable *table = task->files;
+        if (table == NULL)
+            continue;
+        lock(&table->lock);
+        for (unsigned index = 0; index < table->size; index++) {
+            struct fd *fd = table->files[index];
+            if (fd == NULL || fd->real_fd < 0)
+                continue;
+            struct stat status;
+            if (fstat(fd->real_fd, &status) != 0)
+                continue;
+            if (S_ISSOCK(status.st_mode)) {
+                shutdown(fd->real_fd, SHUT_RDWR);
+            } else if (S_ISFIFO(status.st_mode)) {
+                int flags = fcntl(fd->real_fd, F_GETFL);
+                if (flags < 0 || (flags & O_ACCMODE) == O_RDONLY)
+                    continue;
+                fcntl(fd->real_fd, F_SETFL, flags | O_NONBLOCK);
+                ssize_t written = write(fd->real_fd, "", 1);
+                fcntl(fd->real_fd, F_SETFL, flags);
+                (void) written;
+            }
+        }
+        unlock(&table->lock);
+    }
+    unlock(&pids_lock);
+}
+
 /* Kills every task of the guest and wakes the tasks that wait.
  *
  * The signal does not go through the syscall of the kernel: that path reads
@@ -474,12 +530,19 @@ static void guest_kill_tasks(void) {
     unlock(&pids_lock);
 }
 
-int guest_runtime_stop_session(void) {
+void guest_runtime_kill_guest(void) {
     /* The kernel keeps the current task per thread, and a thread of the
      * host is not a task of the guest. The signal of the kill has to reach
      * the tasks that run, so the current task of this thread is cleared for
      * the time of the stop. */
     current = NULL;
+
+    guest_kill_tasks();
+    guest_unblock_tasks();
+}
+
+int guest_runtime_stop_session(void) {
+    guest_runtime_kill_guest();
 
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -492,7 +555,6 @@ int guest_runtime_stop_session(void) {
 
     bool stopped = false;
     while (true) {
-        guest_kill_tasks();
         if (guest_runtime_running_tasks() == 0) {
             stopped = true;
             break;
@@ -504,6 +566,11 @@ int guest_runtime_stop_session(void) {
             break;
         struct timespec step = { .tv_sec = 0, .tv_nsec = GUEST_STOP_STEP_MS * 1000000L };
         nanosleep(&step, NULL);
+        /* The kill is given again while the guest is still there: a task
+         * that the guest forked after the first kill is killed as well, and
+         * a task that waits for data is woken again. */
+        guest_kill_tasks();
+        guest_unblock_tasks();
     }
 
     if (!stopped) {
