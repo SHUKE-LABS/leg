@@ -326,8 +326,20 @@ int guest_runtime_start_session(const char *program, const char *arguments,
      * process, so both can be released right afterwards. */
     err = do_execve(program, argument_count, arguments, environment);
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] exec %{public}s returned %d", program, err);
-    if (err < 0)
+    if (err < 0) {
+        /* The session could not start, so the task of the session never ran.
+         * The task is marked as gone and its files are released: it does not
+         * run, and it does not count as a task of the guest that runs. */
+        struct task *task = current;
+        fdtable_release(task->files);
+        task->files = NULL;
+        lock(&pids_lock);
+        task->exiting = true;
+        unlock(&pids_lock);
+        current = NULL;
+        session_pid = 0;
         return err;
+    }
 
     task_start(current);
     int pid = current->pid;
@@ -399,7 +411,9 @@ int guest_runtime_running_tasks(void) {
     lock(&pids_lock);
     for (int pid = 2; pid <= MAX_PID; pid++) {
         struct task *task = pid_get_task((dword_t) pid);
-        if (task != NULL && !task->exiting)
+        /* A task that never started does not run: the kernel leaves the task
+         * of a session behind when the session could not start. */
+        if (task != NULL && !task->exiting && task->thread != 0)
             running++;
     }
     unlock(&pids_lock);
@@ -472,8 +486,9 @@ static void guest_unblock_tasks(void) {
         if (task == NULL)
             continue;
         /* A task that is on its way out is left alone: it released its
-         * files already and it cannot write to the trail anymore. */
-        if (task->exiting)
+         * files already and it cannot write to the trail anymore. A task
+         * that never started holds no file of a session. */
+        if (task->exiting || task->thread == 0)
             continue;
         struct fdtable *table = task->files;
         if (table == NULL)
@@ -521,8 +536,9 @@ static void guest_kill_tasks(void) {
         if (task == NULL)
             continue;
         /* A task that is on its way out is left alone: its thread is gone
-         * and it cannot write to the trail of the guest anymore. */
-        if (task->exiting)
+         * and it cannot write to the trail of the guest anymore. A task that
+         * never started has no thread to signal. */
+        if (task->exiting || task->thread == 0)
             continue;
         send_signal(task, SIGKILL_, SIGINFO_NIL);
         guest_wake_task(task);
