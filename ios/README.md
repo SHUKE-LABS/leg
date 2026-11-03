@@ -8,14 +8,17 @@ The host embeds one pinned revision of [iSH](https://github.com/ish-app/ish)
 (`de5ab2c4b1039551203c1106e75f715cd917544b`, vendored under `vendor/ish`), the
 pinned guest bundle and the pinned Alpine root. On launch it
 
-1. verifies both pinned archives against their SHA-256 digests,
-2. checks the guest bundle manifest, its file set, the ELF32 i386 headers of
+1. reads the provider configuration and checks the device: the pinned
+   runtime files, the architecture of the host and the free space of the
+   app container,
+2. verifies both pinned archives against their SHA-256 digests,
+3. checks the guest bundle manifest, its file set, the ELF32 i386 headers of
    the four guest programs and the inner `SHA256SUMS`,
-3. merges the verified Alpine root and the four guest programs into one
+4. merges the verified Alpine root and the four guest programs into one
    staging archive and imports it into a fresh fakefs root with the vendored
    iSH importer,
-4. verifies the imported root and publishes it as the persistent active root,
-5. boots the vendored iSH runtime on that root, opens a pseudo terminal and
+5. verifies the imported root and publishes it as the persistent active root,
+6. boots the vendored iSH runtime on that root, opens a pseudo terminal and
    runs `/usr/local/bin/leg-tui` on it.
 
 The pinned Alpine root has no `bash`, and the guest program runs its
@@ -36,6 +39,48 @@ the guest program needs, and the guest keeps that size when the software
 keyboard covers the screen. A second launch verifies the guest bundle marker
 and the four fixed program paths and reuses the root instead of importing it
 again.
+
+## The state of a session
+
+The guest workspace and the session trail live in the app container, so they
+survive a relaunch. The host never claims that it runs in the background:
+iOS suspends the app whenever it wants to, and the host stops the session at
+a boundary it controls instead.
+
+| What | Where | What clears it |
+| --- | --- | --- |
+| The guest root | `Library/Application Support/LegHost/roots/root.active` | `-leghost-reset`, or removing the app |
+| The workspace catalog of the guest | `<root>/data/root/.local/state/leg-ui` | `-leghost-fixture-reset` |
+| The exchange trail of the guest | `<root>/data/tmp/leg-ios-fixture/exchange.jsonl` | `-leghost-fixture-reset` |
+| The durable request ledger | `Library/Application Support/LegHost/test-artifacts/request-ledger.jsonl` | `-leghost-fixture-reset` |
+| The trail of the stopped session | `Library/Application Support/LegHost/test-artifacts/exchange-trail.jsonl` | the next reset |
+
+An ordinary relaunch keeps all of them: the guest program finds the
+workspace it was given, the trail of the last run is still there, and the
+durable ledger still holds the requests of the run before it. The host never
+sends the turn that was running again by itself.
+
+### The lifecycle
+
+The lifecycle of a session is one state machine with one gate. The chain of
+operations that prepares, provisions, boots and starts the session runs to
+its end or is cancelled, and no second chain starts while it runs. A retry
+is only accepted from a failed, a stopped or an interrupted state.
+
+When the app goes to the background, the host stops the session at this
+boundary:
+
+1. the chain is cancelled,
+2. the trail of the guest is written out to the test artifacts,
+3. the output and the exit callbacks of the runtime are detached, the
+   fixture and the watcher of the trail are stopped and the runtime
+   releases the terminal of the guest — each of them exactly once,
+4. the host shows `IOS_SESSION_INTERRUPTED` with the recovery guidance.
+
+A callback of a session that was stopped belongs to a session that is gone
+and is ignored. When the app comes back to the foreground, the interrupted
+state stays where it is: the user starts a new session with the retry
+control, and the prompt of the turn that was running is not sent again.
 
 ## The vendored emulator
 
@@ -222,7 +267,23 @@ without one.
 
 The `LegHostFixtureUITests` class drives the app against the loopback fixture
 instead. It launches the app with the fixture arguments, so it reuses the
-verified guest root and does not import it again.
+verified guest root and does not import it again. Every fixture test starts
+with `-leghost-fixture-reset`, so it starts from a known state.
+
+The fixture class covers the success, the provider error, the unreachable
+and the runtime failure scenarios, the missing and the unsupported provider
+configuration, the relaunch that keeps the workspace, the trail and the
+requests, the background that interrupts a turn, and the faults of the
+device that are reported before the guest is touched.
+
+The `LegHostTests` target holds the tests of the lifecycle and of the
+preflight. They drive the state machine of the session and the checks of
+the device with a host and a device they make up, so they need no guest:
+
+```
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+ios/tests/run-lifecycle-tests.sh
+```
 
 ## Provider configuration
 
@@ -258,6 +319,32 @@ The guest gets the configuration as an allowlist: `TERM`, `HOME`, `PATH`,
 `LEG_MODEL` and `LEG_CONTEXT_WINDOW_TOKENS`. Nothing else of the host
 environment reaches the guest, and no `LEGHOST_*` variable is ever passed on.
 
+## The checks before the guest root
+
+The host reads the provider configuration first and checks the device next.
+Both happen before the guest root is touched, so a run that fails one of
+them never provisions, boots, starts a session or starts the fixture: the
+counts of the run stay at zero.
+
+The checks run in a fixed order, and the first one that fails is the
+diagnostic the host shows:
+
+| Order | Diagnostic | What it means | What to do |
+| --- | --- | --- | --- |
+| 1 | `IOS_PROVIDER_CONFIG_MISSING` | There is no item, or the item does not hold exactly the five keys with usable values. | Add the Keychain item. |
+| 2 | `IOS_PROVIDER_CONFIG_UNSUPPORTED` | The item names `openai-chat-completions` or `openai-responses`. | Replace the item with an Anthropic one. |
+| 3 | `IOS_RUNTIME_FILES_MISSING` | The pinned runtime files are not in the app bundle. | Remove the app from the device and install it again. |
+| 4 | `IOS_RUNTIME_FILES_CORRUPT` | One of the pinned runtime files does not match its pinned digest. | Remove the app from the device and install it again. |
+| 5 | `IOS_ARCHITECTURE_UNSUPPORTED` | The host runs on an architecture the pinned guest runtime does not support. | Run the host on an `x86_64` or an `arm64` host. |
+| 6 | `IOS_STORAGE_INSUFFICIENT` | The app container holds less than 512 MB of free space. | Free space on the device and start the host again. |
+
+Every diagnostic names itself and says what to do about it, and the status of
+the host holds it under the `guest-status-detail` identifier.
+
+The three checks of the device read the filesystem, the free space of the
+container and the architecture of the host. They are injected, so the unit
+tests hand the preflight the state of a device they make up.
+
 ## The loopback fixture
 
 The fixture serves the Anthropic Messages endpoint on `127.0.0.1`, so one
@@ -272,11 +359,21 @@ memory and it never becomes a place where a credential is stored.
 | `-leghost-fixture success` | The fixture answers the first request with a text and a `bash` tool call, and the second one with the final text. |
 | `-leghost-fixture provider-error` | The fixture answers the first request with HTTP 500. |
 | `-leghost-fixture unreachable` | The fixture closes its port before the turn, so the guest cannot reach it. |
+| `-leghost-fixture delayed` | The fixture holds its answer back, so a turn stays running long enough for the host to be interrupted in the middle of it. |
 | `-leghost-provider anthropic` | The run is configured for the Anthropic Messages protocol. |
 | `-leghost-provider openai-chat-completions` | The run is configured for a provider this host refuses. |
 | `-leghost-provider openai-responses` | The run is configured for a provider this host refuses. |
 | `-leghost-no-provider` | The run has no provider configuration at all. |
 | `-leghost-runtime-failure` | The guest runtime is asked for a program that is not there. |
+| `-leghost-fixture-reset` | The run starts from a known state: the catalog of the guest, the exchange trail and the durable ledger of the requests are cleared. |
+| `-leghost-runtime-missing` | The run reports the pinned runtime files as missing. |
+| `-leghost-runtime-corrupt` | The run reports the pinned runtime files as corrupt. |
+| `-leghost-unsupported-architecture` | The run reports an architecture the guest cannot run on. |
+| `-leghost-low-storage` | The run reports the container as too small for the import. |
+
+The fault controls replace the state of the device for one run, in memory
+and for that run only. They are the way the simulator tests induce the
+faults of the preflight without breaking the device.
 
 The provider arguments configure the run in memory: the credential is
 `IOS_FIXTURE_CREDENTIAL_SENTINEL`, the model is `claude-ios-fixture` and the
@@ -326,12 +423,17 @@ them next to its own executable, which it looks up through `/proc/self/exe`;
 the emulator cannot answer that read for the process it runs, so the host
 spells the paths out instead.
 
-A fixture run starts from the same state every time. The host removes the
-state the guest program keeps between runs: the catalog of the guest program,
-so the run asks for a workspace again and shows the first-run warning again,
-and the exchange trail of the last run, so the trail holds this run only. It
-creates the directory of the trail, because the guest appends to the trail
-file and does not make its directory.
+A fixture run starts from a known state only when it is told to. The
+`-leghost-fixture-reset` control removes the state the guest program keeps
+between runs: the catalog of the guest program, so the run asks for a
+workspace again and shows the first-run warning again, the exchange trail of
+the last run, and the durable ledger of the requests, so the count of the
+requests of the run is the count of that run. Without the control the run
+keeps all of them: the guest program finds the workspace it was given, the
+trail of the last run is still there, and the count of the requests is the
+count of every run that came before. The host creates the directory of the
+trail either way, because the guest appends to the trail file and does not
+make its directory.
 
 ### The failure of a turn
 
@@ -394,14 +496,24 @@ written down.
 
 ### The artifacts
 
-A fixture run writes four artifacts, all inside the app container:
+A fixture run writes these artifacts, all inside the app container:
 
 | Artifact | Path |
 | --- | --- |
 | Terminal transcript | `Library/Application Support/LegHost/test-artifacts/terminal-transcript.log` |
+| Request ledger | `Library/Application Support/LegHost/test-artifacts/request-ledger.jsonl` |
+| Trail of the stopped session | `Library/Application Support/LegHost/test-artifacts/exchange-trail.jsonl` |
 | Application log | the `LegHost` entries of the system log |
 | Guest file system | `Library/Application Support/LegHost/roots/root.active/data` |
 | Exchange trail | `tmp/leg-ios-fixture/exchange.jsonl` in the guest file system |
+
+The request ledger holds one JSON object per accepted request, and nothing
+else: the turn the request belongs to, the ordinal of the request in that
+turn and the status it was answered with. No body, no header and no
+credential ever reaches it. The ledger is cumulative: a second run of the
+host reads the requests of the first one, so a run that starts again cannot
+hide a duplicate behind a fresh counter. The number of requests the host
+shows under `guest-fixture-state` is the number of the ledger.
 
 ### The verification command
 
@@ -409,13 +521,13 @@ A fixture run writes four artifacts, all inside the app container:
 ios/tests/run-fixture-verification.sh
 ```
 
-The script runs four scenarios in the booted simulator: the success
-scenario, the provider error scenario, the unreachable scenario and the
-runtime failure scenario. Every scenario gets a simulator of its own, and
-the four artifacts of every run are scanned for the configured credential.
-The script fails when the credential shows up in any of the artifacts, when
-the turn did not reach the fixture and when the transcript of a run does not
-hold the marker of that run.
+The script runs six scenarios in the booted simulator: the success
+scenario, the provider error scenario, the unreachable scenario, the runtime
+failure scenario, the relaunch run and the background run. Every scenario
+gets a simulator of its own, and the artifacts of every run are scanned for
+the configured credential. The script fails when the credential shows up in
+any of the artifacts, when the turn did not reach the fixture and when the
+transcript of a run does not hold the marker of that run.
 
 | Scenario | The transcript of the run holds |
 | --- | --- |
@@ -423,6 +535,12 @@ hold the marker of that run.
 | Provider error | `provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR` |
 | Unreachable | `transport error:` |
 | Runtime failure | `IOS_GUEST_RUNTIME_ERROR` |
+
+The relaunch run starts the app twice, and the script checks the durable
+ledger of the requests across the two processes: it holds the two requests
+of the first turn and nothing else, so the turn was not sent again. The
+background run stops the session in the middle of the turn, and the script
+checks the trail the host wrote out when it stopped it.
 
 The exchange trail of a run is only there when the guest program ran, so the
 runtime failure run has no trail to scan.
@@ -498,8 +616,10 @@ root must hold, not code of them.
 
 ## Out of scope
 
-The settings UI, lifecycle and session persistence, physical device runtime
-testing, the native Photos, Files and Shortcuts adapters, and App Store
-metadata are later slices of `#255`. The provider support of this slice is
-the Anthropic Messages protocol; the OpenAI wire variants are covered only
-as the rejection cases of the fixture.
+The settings UI, physical device runtime testing, the native Photos, Files
+and Shortcuts adapters, and App Store metadata are later slices of `#255`.
+The provider support of this slice is the Anthropic Messages protocol; the
+OpenAI wire variants are covered only as the rejection cases of the fixture.
+The host does not run in the background: iOS decides when the app is
+suspended, and the host stops the session at the boundary it controls
+instead.

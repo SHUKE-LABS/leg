@@ -205,7 +205,7 @@ extension HostPreflightProviders {
                 sha256_update(&context, base, raw.count)
             }
         }
-        var bytes = [UInt8](repeating: 0, count: SHA256_DIGEST_LEN)
+        var bytes = [UInt8](repeating: 0, count: Int(SHA256_DIGEST_LEN))
         sha256_final(&context, &bytes)
         return bytes.map { String(format: "%02x", Int($0)) }.joined()
     }
