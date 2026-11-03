@@ -109,11 +109,14 @@ The kernel has an API for that now:
 The walk is done in the kernel and not in the host, because the files of a
 task belong to the task: the task frees them when it exits, and a host that
 reads them while the task exits reads memory that is gone. The walk holds
-`pids_lock` while it collects the tables, and it keeps every table alive
-while it walks it with `fdtable_retain`, so a task that exits in the meantime
-leaves its table behind: the files of the task are closed when the last one
-that holds the table lets it go. A task that is on its way out is left alone,
-because the mark of the exit comes before the release of the files.
+`pids_lock` the whole time, and a task marks itself as exiting under that
+lock before it lets go of its files, so a task that is not marked still holds
+its files while the walk runs. The walk keeps every table alive with
+`fdtable_retain` while it walks it as well, so a task that exits in the
+meantime leaves its table behind: the files of the task are closed when the
+last one that holds the table lets it go. A task that is on its way out is
+left alone, because the mark of the exit comes before the release of the
+files.
 
 The API sends no signal of the guest: the guest may block a signal or ignore
 it, and a host that stops a guest does not want to change what the guest

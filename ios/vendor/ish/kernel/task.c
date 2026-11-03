@@ -119,9 +119,6 @@ static void *task_thread(void *task) {
     die("task_thread returned"); // above function call should never return
 }
 
-/* The number of tables of tasks that one round of the wake holds. */
-#define MAX_WAIT_TABLES 256
-
 /* Ends the waits of the tasks of the guest that wait for data.
  *
  * A task of the guest that waits for data sleeps in a read of the host, and
@@ -133,18 +130,17 @@ static void *task_thread(void *task) {
  * instruction of the guest.
  *
  * The files of a task belong to the task, and the task frees them when it
- * exits. The tables are kept alive while they are walked, so a task that
- * exits in the meantime leaves its table behind: the files of the task are
- * closed when the last one that holds the table lets it go.
+ * exits. The walk holds pids_lock, and a task marks itself as exiting under
+ * that lock before it lets go of its files, so a task that is not marked
+ * still holds its files while the walk runs. The table is kept alive while it
+ * is walked as well, so a task that exits in the meantime leaves its table
+ * behind: the files of the task are closed when the last one that holds the
+ * table lets it go.
  *
- * The caller does not hold pids_lock: the function takes it while it
- * collects the tables. */
+ * The caller does not hold pids_lock. */
 void tasks_end_data_waits(void) {
-    struct fdtable *tables[MAX_WAIT_TABLES];
-    int count = 0;
-
     lock(&pids_lock);
-    for (int pid = 2; pid <= MAX_PID && count < MAX_WAIT_TABLES; pid++) {
+    for (int pid = 2; pid <= MAX_PID; pid++) {
         struct task *task = pid_get_task((dword_t) pid);
         if (task == NULL)
             continue;
@@ -155,12 +151,8 @@ void tasks_end_data_waits(void) {
         struct fdtable *table = task->files;
         if (table == NULL)
             continue;
-        tables[count++] = fdtable_retain(table);
-    }
-    unlock(&pids_lock);
-
-    for (int i = 0; i < count; i++) {
-        struct fdtable *table = tables[i];
+        /* The table stays alive while it is walked. */
+        fdtable_retain(table);
         lock(&table->lock);
         for (unsigned index = 0; index < table->size; index++) {
             struct fd *fd = table->files[index];
@@ -186,6 +178,7 @@ void tasks_end_data_waits(void) {
         unlock(&table->lock);
         fdtable_release(table);
     }
+    unlock(&pids_lock);
 }
 
 static pthread_attr_t task_thread_attr;
