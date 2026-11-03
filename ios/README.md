@@ -80,10 +80,10 @@ boundary:
 3. the output and the exit callbacks of the runtime are detached,
 4. the thread of the output is joined, and the wait for it is checked,
 5. the guest of the session is killed: every task of the guest is killed, and
-   the tasks that wait for data are woken, so a guest that waits for the
-   provider wakes up and is killed before it runs another instruction of the
-   guest — it cannot write to the trail of the guest anymore and it cannot
-   run next to the session that comes next,
+   the terminal of the session is hung up, so a guest that reads the terminal
+   wakes up and is killed before it runs another instruction of the guest —
+   it cannot write to the trail of the guest anymore and it cannot run next
+   to the session that comes next,
 6. the fixture and the watcher of the trail are stopped — the connections of
    the fixture end the waits of the guest that wait for the answer of the
    provider — and the host waits for the guest to end,
@@ -94,10 +94,24 @@ boundary:
 A task of the guest that waits for data sleeps in a read of the host, and the
 read of the host is not interrupted by a signal: the kill of the guest does
 not end that wait on its own. The stop of the session ends the waits of the
-guest — a byte is written into the pipes of the guest and the sockets of the
-guest are shut down — and the kill is pending while the task wakes up. The
-kernel delivers the kill before the guest runs another instruction, so the
-guest does not write to the trail of the guest anymore.
+guest with the things the host owns: the terminal of the session is hung up,
+so a guest that reads the terminal wakes up, and the connections of the
+fixture are closed, so a guest that waits for the provider wakes up. The kill
+is pending while the task wakes up, and the kernel delivers the kill before
+the guest runs another instruction, so the guest does not write to the trail
+of the guest anymore.
+
+The host does not read the files of a task of the guest. The files of a task
+belong to the task, and the task frees them when it exits, so a host that
+reads them while the task exits reads memory that is gone. The kernel wakes
+the tasks that wait when it hands them the kill.
+
+The stop of a session and the retry after it can happen many times in a row.
+The fixture test `testTheStoppedGuestCannotWriteAfterManyRetries` drives
+three turns, stops every one of them and retries, with the allocator of the
+host scribbling the memory it frees, so a use of memory that is gone shows
+itself. Every cycle holds the same promise: the guest of the stopped session
+does not run any more, and it does not write to the trail of the guest.
 
 The waits of the boundary are checked. When the thread of the output did not
 stop, or when the guest of the session did not stop, the host shows

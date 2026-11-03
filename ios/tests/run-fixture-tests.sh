@@ -30,6 +30,7 @@ ALL_TESTS=(
     testTheBackgroundInterruptsTheTurnAndKeepsTheTrail
     testTheRetryAfterAnInterruptionKeepsTheStateOfTheTurn
     testTheStoppedGuestCannotWriteAfterTheRetry
+    testTheStoppedGuestCannotWriteAfterManyRetries
     testTheDeviceFaultsAreReportedBeforeTheGuestIsProvisioned
 )
 

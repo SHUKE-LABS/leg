@@ -524,6 +524,61 @@ final class LegHostFixtureUITests: XCTestCase {
                        "the guest of the stopped session wrote to the trail of the guest")
     }
 
+    /// The stop of a session and the retry after it can happen many times.
+    ///
+    /// The host stops the guest of the session and waits for it to end, and
+    /// the guest of the stopped session must not write to the trail of the
+    /// guest and must not run next to the session that comes next. The
+    /// allocator of the host scribbles the memory it frees, so a use of
+    /// memory that is gone shows itself.
+    func testTheStoppedGuestCannotWriteAfterManyRetries() {
+        // The allocator of the host scribbles the memory it frees: the
+        // memory of a task of the guest is freed when the task exits, and a
+        // host that reads it afterwards reads a scribbled page.
+        app.launchEnvironment["MallocScribble"] = "1"
+        app.launchEnvironment["MallocPreScribble"] = "1"
+        launch(["-leghost-fixture", "delayed", "-leghost-provider", "anthropic",
+                "-leghost-interrupt-after-request"])
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        for turn in 1...3 {
+            if turn == 1 {
+                driveOneTurn()
+            } else {
+                // The workspace of the session is in the catalog of the
+                // guest, so the guest finds it and does not ask for it again.
+                driveOneTurnOfTheKnownSession()
+            }
+
+            XCTAssertTrue(waitForState("requests=\(turn)"),
+                          "the fixture did not accept the request of the turn")
+            XCTAssertTrue(waitForStatus("IOS_SESSION_INTERRUPTED", timeout: startTimeout),
+                          "the interruption is not in the status of the host")
+            // The host counted the tasks of the guest when it stopped the
+            // session: the guest of the stopped session does not run any more.
+            XCTAssertTrue(waitForState("tasks=0"), "the guest of the stopped session still runs")
+            let trailBefore = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+
+            // The retry starts a new session on the same root.
+            let retry = app.buttons["guest-retry"]
+            XCTAssertTrue(retry.waitForExistence(timeout: 60), "the retry control is missing")
+            retry.tap()
+            XCTAssertTrue(waitForState("session=\(turn + 1)", timeout: startTimeout),
+                          "the retry did not start a new session")
+
+            // The guest of the stopped session had the time to write to the
+            // trail of the guest and to send another request to the provider,
+            // if it were still alive.
+            sleep(20)
+            XCTAssertTrue(waitForState("requests=\(turn)"),
+                          "the guest of the stopped session sent a request")
+            let trailAfter = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+            XCTAssertEqual(trailAfter, trailBefore,
+                           "the guest of the stopped session wrote to the trail of the guest")
+        }
+    }
+
     /// The faults of the device are reported before the guest is touched.
     ///
     /// Every fault has its own identifier and its own remediation, and the
@@ -591,6 +646,23 @@ final class LegHostFixtureUITests: XCTestCase {
             focusGuest()
             app.typeText("\n")
         }
+
+        XCTAssertTrue(waitForTerminalText("catalog: "), "the composer did not appear")
+        focusGuest()
+        app.typeText(prompt)
+        let submit = app.buttons["guest-key-submit"]
+        XCTAssertTrue(submit.waitForExistence(timeout: 30), "the send control is missing")
+        submit.tap()
+    }
+
+    /// Drives one turn in a session that knows its workspace.
+    ///
+    /// The catalog of the guest holds the workspace of the session, so the
+    /// guest finds it and offers the composer without asking for it. The
+    /// first-run warning was acknowledged by the first turn of the run.
+    private func driveOneTurnOfTheKnownSession() {
+        let terminal = app.otherElements["guest-terminal"]
+        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
 
         XCTAssertTrue(waitForTerminalText("catalog: "), "the composer did not appear")
         focusGuest()
