@@ -50,44 +50,61 @@ struct GuestHostScreen: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            switch controller.phase {
-            case .running:
-                VStack(spacing: 0) {
-                    statusBar
-                    stateRow
-                    controlRow
-                    GuestTerminalView(controller: controller).id(GuestHostScreen.terminalID)
-                }
-            case .exited:
-                statusView(title: "The guest program ended",
-                          detail: controller.detail,
-                          identifier: "guest-exited")
-            case .interrupted:
-                // The terminal stays on the screen when the session was
-                // interrupted: it holds the screen of the guest as it was
-                // when the session stopped.
-                VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                switch controller.phase {
+                case .running:
+                    runningHeader
+                case .exited:
+                    statusView(title: "The guest program ended",
+                              detail: controller.detail,
+                              identifier: "guest-exited")
+                case .interrupted:
+                    // The terminal stays on the screen when the session was
+                    // interrupted: it holds the screen of the guest as it
+                    // was when the session stopped.
                     statusView(title: "The session was interrupted",
                               detail: controller.detail,
                               identifier: "guest-interrupted",
                               expands: false)
-                    GuestTerminalView(controller: controller).id(GuestHostScreen.terminalID)
-                }
-            case .failed(let message):
-                // The terminal stays on the screen when the guest could not
-                // start: the host writes what went wrong into it, and the
-                // terminal is where the guest would have spoken.
-                VStack(spacing: 0) {
+                case .failed(let message):
+                    // The terminal stays on the screen when the guest could
+                    // not start: the host writes what went wrong into it,
+                    // and the terminal is where the guest would have spoken.
                     statusView(title: "The guest could not start",
                               detail: message,
                               expands: false)
-                    GuestTerminalView(controller: controller).id(GuestHostScreen.terminalID)
+                default:
+                    statusView(title: title, detail: controller.detail)
                 }
-            default:
-                statusView(title: title, detail: controller.detail)
+                // The terminal is the last child of the stack in every phase
+                // of the host, so it is the same view in every one of them:
+                // the web view of the terminal is not built again when the
+                // phase changes, and the screen of the guest is not lost.
+                GuestTerminalView(controller: controller)
+                    .id(GuestHostScreen.terminalID)
+                    .frame(height: showsTerminal ? nil : 0)
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    /// The rows above the terminal of a guest that runs.
+    private var runningHeader: some View {
+        VStack(spacing: 0) {
+            statusBar
+            stateRow
+            controlRow
+        }
+    }
+
+    /// Whether the terminal is on the screen in this phase.
+    private var showsTerminal: Bool {
+        switch controller.phase {
+        case .running, .interrupted, .failed:
+            return true
+        default:
+            return false
+        }
     }
 
     /// The bar above the terminal. It records whether this launch imported

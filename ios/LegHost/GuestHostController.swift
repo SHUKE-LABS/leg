@@ -1255,16 +1255,20 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     // MARK: - Terminal
 
     func attach(sink: GuestTerminalSink) {
+        NSLog("[LegHost] the terminal was attached to the host")
         self.sink = sink
-        if terminalReady {
-            sink.reportSize()
-        }
+        // The terminal that is attached now is not the terminal that was
+        // ready before: its page has to load before it can take the output
+        // of the guest. The output is held back until it does, so the first
+        // screen of the guest is not lost.
+        terminalReady = false
     }
 
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
         switch message.name {
         case "load":
+            NSLog("[LegHost] the terminal of the guest loaded")
             terminalReady = true
             if !pendingOutput.isEmpty {
                 sink?.write(pendingOutput)
