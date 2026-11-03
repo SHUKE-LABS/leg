@@ -50,6 +50,36 @@ static int signal_action(struct sighand *sighand, int sig) {
     }
 }
 
+/* Wakes the task that waits on a condition of the kernel.
+ *
+ * The caller holds the lock of the sighand. The lock is released while the
+ * condition is notified, because the task that waits holds the lock of its
+ * own wait and the lock of the sighand cannot be held while the task holds
+ * that one.
+ *
+ * actual madness, I hope to god it's correct */
+static void wake_waiting_cond(struct task *task) {
+    unlock(&task->sighand->lock);
+retry:
+    lock(&task->waiting_cond_lock);
+    if (task->waiting_cond != NULL) {
+        bool mine = false;
+        if (trylock(task->waiting_lock) == EBUSY) {
+            if (pthread_equal(task->waiting_lock->owner, pthread_self()))
+                mine = true;
+            if (!mine) {
+                unlock(&task->waiting_cond_lock);
+                goto retry;
+            }
+        }
+        notify(task->waiting_cond);
+        if (!mine)
+            unlock(task->waiting_lock);
+    }
+    unlock(&task->waiting_cond_lock);
+    lock(&task->sighand->lock);
+}
+
 static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ info) {
     if (sigset_has(task->pending, sig))
         return;
@@ -67,28 +97,33 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
         pthread_kill(task->thread, SIGUSR1);
 
         // wake up any pthread condition waiters
-        // actual madness, I hope to god it's correct
-        // must release the sighand lock while going insane, to avoid a deadlock
-        unlock(&task->sighand->lock);
-retry:
-        lock(&task->waiting_cond_lock);
-        if (task->waiting_cond != NULL) {
-            bool mine = false;
-            if (trylock(task->waiting_lock) == EBUSY) {
-                if (pthread_equal(task->waiting_lock->owner, pthread_self()))
-                    mine = true;
-                if (!mine) {
-                    unlock(&task->waiting_cond_lock);
-                    goto retry;
-                }
-            }
-            notify(task->waiting_cond);
-            if (!mine)
-                unlock(task->waiting_lock);
-        }
-        unlock(&task->waiting_cond_lock);
-        lock(&task->sighand->lock);
+        wake_waiting_cond(task);
     }
+}
+
+/* Interrupts a task that waits.
+ *
+ * The system call of the host that a task waits in ends when the thread of
+ * the task gets the signal SIGUSR1, and a task that waits on a condition of
+ * the kernel wakes up when the condition is notified.
+ *
+ * No signal of the guest is sent here. The guest may block a signal or
+ * ignore it, and the kernel hands a signal to a task only when the signal is
+ * not pending yet, so a task that waits is interrupted only once. A host
+ * that stops a guest needs the interrupt again and again: a task that was
+ * running when the interrupt arrived waits again right away.
+ *
+ * The caller holds pids_lock, so the thread of the task is alive while the
+ * interrupt is sent. */
+void task_interrupt(struct task *task) {
+    if (task == current || task->thread == 0)
+        return;
+    pthread_kill(task->thread, SIGUSR1);
+    if (task->sighand == NULL)
+        return;
+    lock(&task->sighand->lock);
+    wake_waiting_cond(task);
+    unlock(&task->sighand->lock);
 }
 
 void deliver_signal(struct task *task, int sig, struct siginfo_ info) {

@@ -62,3 +62,28 @@ Two things were wrong:
 The change gives the two options the numbers a Linux guest uses and
 translates the timeout in both directions: the guest's timeval goes out as the
 host's, and the host's comes back as the guest's.
+
+## `kernel`: the interrupt of a task that waits
+
+The kernel hands a signal to a task only when the signal is not pending yet,
+and the signal of a kill stays pending until the task runs the next
+instruction of the guest. A task that waits in a system call of the host
+therefore gets the interrupt of the kernel only once: the system call of the
+host does not return, the task does not run another instruction of the guest,
+and the signal stays pending.
+
+A host that stops a guest needs the interrupt again and again, because a task
+that was running when the interrupt arrived waits again right away. The
+kernel has an API for that now:
+
+- `kernel/signal.c`: `task_interrupt` ends the system call a task waits in
+  (the thread of the task gets the signal `SIGUSR1`) and notifies the
+  condition the task waits on. The wake of the condition is the code that
+  `deliver_signal_unlocked` had, moved into `wake_waiting_cond` and used by
+  both.
+- `kernel/signal.h`: the declaration of `task_interrupt`.
+
+The API sends no signal of the guest: the guest may block a signal or ignore
+it, and a host that stops a guest does not want to change what the guest
+sees. The caller holds `pids_lock`, so the thread of the task is alive while
+the interrupt is sent.

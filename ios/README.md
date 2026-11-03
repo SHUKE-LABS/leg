@@ -92,19 +92,26 @@ boundary:
 8. the host shows `IOS_SESSION_INTERRUPTED` with the recovery guidance.
 
 A task of the guest that waits for data sleeps in a read of the host, and the
-read of the host is not interrupted by a signal: the kill of the guest does
-not end that wait on its own. The stop of the session ends the waits of the
-guest with the things the host owns: the terminal of the session is hung up,
-so a guest that reads the terminal wakes up, and the connections of the
-fixture are closed, so a guest that waits for the provider wakes up. The kill
-is pending while the task wakes up, and the kernel delivers the kill before
-the guest runs another instruction, so the guest does not write to the trail
-of the guest anymore.
+kill of the guest does not end that wait on its own: the kill is pending until
+the task runs the next instruction of the guest, and the task runs that
+instruction only when its wait ends. The stop of the session ends the waits of
+the guest with the things the host owns: the terminal of the session is hung
+up, so a guest that reads the terminal wakes up, and the connections of the
+fixture are closed, so a guest that waits for the provider wakes up.
+
+The kernel interrupts the tasks of the guest that wait: the thread of a task
+gets the signal that ends the system call of the host the task waits in, and
+the condition the task waits on is notified. The interrupt is given again in
+every round of the wait, because a task that was running when the interrupt
+arrived waits again right away, and the kill of a task is delivered only once.
+The kill is pending while the task wakes up, and the kernel delivers the kill
+before the guest runs another instruction, so the guest does not write to the
+trail of the guest anymore.
 
 The host does not read the files of a task of the guest. The files of a task
 belong to the task, and the task frees them when it exits, so a host that
-reads them while the task exits reads memory that is gone. The kernel wakes
-the tasks that wait when it hands them the kill.
+reads them while the task exits reads memory that is gone. The wake of a task
+happens in the kernel, which knows the wait of the task.
 
 The stop of a session and the retry after it can happen many times in a row.
 The fixture test `testTheStoppedGuestCannotWriteAfterManyRetries` drives

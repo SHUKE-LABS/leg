@@ -436,35 +436,6 @@ static void guest_log_tasks(void) {
     unlock(&pids_lock);
 }
 
-/* Wakes the tasks of the guest that wait, again.
- *
- * The kernel hands a signal to a task only when the signal is not pending
- * yet: the kill of a task is not sent twice, so the kernel does not wake the
- * task a second time. The wake is a signal of its own, so the kernel wakes
- * the task that waits: the signal interrupts the system call the task waits
- * in, and the condition the task waits on is notified.
- *
- * The signal the kernel sends to the thread of a task to interrupt it is not
- * the signal of this wake: this wake is a signal of the guest, and the guest
- * has a handler for it that does nothing. The kill that waits for the task
- * lands before the task runs another instruction of the guest, so the guest
- * does not write to the trail of the guest anymore. */
-static void guest_wake_tasks(void) {
-    lock(&pids_lock);
-    for (int pid = 2; pid <= MAX_PID; pid++) {
-        struct task *task = pid_get_task((dword_t) pid);
-        if (task == NULL)
-            continue;
-        /* A task that is on its way out is left alone: its thread is gone
-         * and it cannot write to the trail of the guest anymore. A task that
-         * never started has no thread to signal. */
-        if (task->exiting || task->thread == 0)
-            continue;
-        send_signal(task, SIGUSR1_, SIGINFO_NIL);
-    }
-    unlock(&pids_lock);
-}
-
 /* Ends the wait of the tasks of the guest that read the terminal.
  *
  * The terminal belongs to the host, so the host may hang it up: a task that
@@ -487,13 +458,20 @@ static void guest_hangup_terminal(void) {
     unlock(&tty->lock);
 }
 
-/* Kills every task of the guest.
+/* Kills every task of the guest and interrupts the tasks that wait.
  *
  * The signal does not go through the syscall of the kernel: that path reads
  * the current task of the calling thread, and the host has none. The kernel
  * interrupts the syscall the guest waits in and delivers the kill before the
  * guest runs another instruction, so the guest cannot write to the trail of
  * the guest anymore.
+ *
+ * A task that waits in a system call of the host only sees the kill when the
+ * system call returns, so the wait has to be ended: the kernel interrupts
+ * the thread of the task, and the system call of the host returns. The
+ * interrupt is given again in every round: a task that was running when the
+ * interrupt arrived waits again right away, and the kill of a task is
+ * delivered only once.
  *
  * The kill is given again while the guest is still there: a task that the
  * guest forked after the first kill is killed as well. */
@@ -509,6 +487,7 @@ static void guest_kill_tasks(void) {
         if (task->exiting || task->thread == 0)
             continue;
         send_signal(task, SIGKILL_, SIGINFO_NIL);
+        task_interrupt(task);
     }
     unlock(&pids_lock);
 }
@@ -551,9 +530,8 @@ int guest_runtime_stop_session(void) {
         nanosleep(&step, NULL);
         /* The kill is given again while the guest is still there: a task
          * that the guest forked after the first kill is killed as well, and
-         * a task that waits is woken again. */
+         * a task that waits is interrupted again. */
         guest_kill_tasks();
-        guest_wake_tasks();
     }
 
     if (!stopped) {
