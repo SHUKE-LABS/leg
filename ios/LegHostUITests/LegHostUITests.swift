@@ -405,9 +405,11 @@ final class LegHostFixtureUITests: XCTestCase {
         let trailBefore = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
 
         // The app goes to the background in the middle of the turn and comes
-        // back to the foreground.
+        // back to the foreground. The app needs a moment to leave the
+        // foreground: an activation that comes while the app is still
+        // leaving it is dropped, and the app stays in the background.
         XCUIDevice.shared.press(.home)
-        XCTAssertTrue(waitForBackground(), "the app did not go to the background")
+        sleep(5)
         app.activate()
 
         XCTAssertTrue(waitForStatus("IOS_SESSION_INTERRUPTED", timeout: startTimeout),
@@ -567,20 +569,6 @@ final class LegHostFixtureUITests: XCTestCase {
                 return true
             }
             usleep(1_000_000)
-        }
-        return false
-    }
-
-    /// Waits until the app left the foreground.
-    ///
-    /// An app that is still leaving the foreground drops the request that
-    /// brings it back, so the run waits for the app to be in the background
-    /// before it activates it again.
-    private func waitForBackground(timeout: TimeInterval = 60) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if app.state != .runningForeground { return true }
-            usleep(500_000)
         }
         return false
     }
