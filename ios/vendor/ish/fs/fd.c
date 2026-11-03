@@ -154,7 +154,11 @@ static int fdtable_expand(struct fdtable *table, fd_t max) {
 }
 
 struct fd *fdtable_get(struct fdtable *table, fd_t f) {
-    if (f < 0 || (unsigned) f >= current->files->size)
+    /* The bound is the size of the table that is read, not the size of the
+     * table of the task that reads: a caller that reads the files of
+     * another task, or a table that was detached from its task, must not
+     * read past the end of the table it reads. */
+    if (f < 0 || (unsigned) f >= table->size)
         return NULL;
     return table->files[f];
 }
