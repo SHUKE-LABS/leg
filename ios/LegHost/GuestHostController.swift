@@ -81,6 +81,13 @@ struct HostLaunchOptions {
     var lowStorage = false
     /// Whether the run resets the state of the fixture.
     var fixtureReset = false
+    /// Whether the run interrupts the session on its own.
+    ///
+    /// The control belongs to the simulator tests: they interrupt the
+    /// session without the app going to the background, so the recovery of a
+    /// stopped turn is tested on a run that does not wait for the
+    /// activation of a simulator.
+    var interruptAfterRequest = false
 
     /// The guest program the host runs.
     static let defaultProgram = "/usr/local/bin/leg-tui"
@@ -129,6 +136,8 @@ struct HostLaunchOptions {
                 options.lowStorage = true
             case "-leghost-fixture-reset":
                 options.fixtureReset = true
+            case "-leghost-interrupt-after-request":
+                options.interruptAfterRequest = true
             #endif
             default:
                 break
@@ -418,6 +427,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The launch controls of this run.
     private var options = HostLaunchOptions.current()
 
+    /// Whether the run still has to interrupt the session on its own.
+    ///
+    /// The control is the one of the simulator tests: the run stops the
+    /// session as soon as the fixture accepts the request of the turn, so the
+    /// recovery of a stopped turn is tested without the app going to the
+    /// background.
+    private var interruptsOnItsOwn = false
+
     /// Whether the run is a fixture run.
     ///
     /// A fixture run offers the send control on the screen: the software
@@ -544,6 +561,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // process uses it, and a chain that starts again keeps the state of
         // the run that was stopped.
         resetsFixtureState = fixtureReset.consume(options.fixtureReset)
+        #if DEBUG
+        interruptsOnItsOwn = options.interruptAfterRequest
+        #endif
         do {
             detail = "Reading the provider configuration"
             let configuration = try ProviderConfigurationStore.load(
@@ -1114,6 +1134,24 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let observation = fixture.currentObservation
         state.statuses = observation.statuses
         state.validation = observation.validation
+        interruptOnItsOwnIfAsked()
+    }
+
+    /// Stops the session on its own when the run asked for it.
+    ///
+    /// The control of the run stops the session as soon as the fixture
+    /// accepts the request of the turn, so the test sees the interruption of
+    /// a session that was running without the app having to go to the
+    /// background. The path is the one of the background: the chain is
+    /// cancelled, the trail of the stopped turn is written out and the
+    /// interrupted state is shown.
+    private func interruptOnItsOwnIfAsked() {
+        #if DEBUG
+        guard interruptsOnItsOwn else { return }
+        guard state.requests > 0, phase == .running else { return }
+        interruptsOnItsOwn = false
+        handleBackground()
+        #endif
     }
 
     /// Opens the file the raw terminal output is written to.

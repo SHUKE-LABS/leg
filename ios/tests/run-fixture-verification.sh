@@ -18,8 +18,8 @@
 # run starts the app twice and checks the durable ledger of the requests
 # across the two processes, and the background run checks the trail the host
 # writes out when it stops the session. The retry run stops the session and
-# starts the host again, so it checks that the ledger and the trail of the
-# stopped turn survive the retry.
+# starts the host again, so it checks that the ledger, the trail and the
+# catalog of the guest survive the retry.
 #
 # With --skip-run the script runs no scenario and scans the artifacts of the
 # run that is already in the simulator.
@@ -294,6 +294,34 @@ check_persisted_trail() {
     echo "ok: the persisted trail of ${label} holds no credential"
 }
 
+# The catalog of the guest.
+#
+# The catalog holds the sessions the guest knows about. A run that starts
+# again has to leave the catalog of the stopped turn alone, so the guest
+# finds its session again instead of asking for a workspace. Every session
+# of the catalog holds the workspace it runs in.
+check_catalog() {
+    local label="$1"
+    local catalog="${GUEST_TREE}/root/.local/state/leg-ui/catalog.json"
+    if [[ ! -f "${catalog}" ]]; then
+        echo "error: the catalog of ${label} is missing at ${catalog}" >&2
+        status=1
+        return
+    fi
+    if grep -F -q "${SENTINEL}" "${catalog}"; then
+        echo "error: the catalog of ${label} holds the configured credential" >&2
+        status=1
+    fi
+    local sessions
+    sessions="$(grep -c '"cwd"' "${catalog}" || true)"
+    if [[ "${sessions}" -lt 1 ]]; then
+        echo "error: the catalog of ${label} holds no session" >&2
+        status=1
+        return
+    fi
+    echo "ok: the catalog of ${label} holds ${sessions} sessions"
+}
+
 # Runs one scenario and scans the artifacts of that run.
 #
 # The marker is the text the transcript of the run has to hold, so the
@@ -367,6 +395,7 @@ else
     # and nothing else.
     run_and_scan "${RELAUNCH_TEST}" "relaunch run" "relaunch" "" ""
     check_ledger "the relaunch run" 2
+    check_catalog "the relaunch run"
 
     # The background run stops the session in the middle of the turn, so the
     # host writes the trail of the stopped turn out.
@@ -375,11 +404,13 @@ else
 
     # The retry run stops the session in the middle of the turn and starts
     # the host again. The reset belongs to the launch, so the retry keeps the
-    # ledger and the trail of the stopped turn: the ledger holds the one
-    # request of that turn and nothing else.
+    # ledger, the trail and the catalog of the stopped turn: the ledger holds
+    # the one request of that turn and nothing else, and the guest finds its
+    # session in the catalog again.
     run_and_scan "${RETRY_TEST}" "retry run" "retry" "" ""
     check_ledger "the retry run" 1
     check_persisted_trail "the retry run"
+    check_catalog "the retry run"
 fi
 
 if [[ "${status}" -ne 0 ]]; then
