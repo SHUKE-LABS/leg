@@ -17,7 +17,9 @@
 # The script runs the relaunch and the background run as well: the relaunch
 # run starts the app twice and checks the durable ledger of the requests
 # across the two processes, and the background run checks the trail the host
-# writes out when it stops the session.
+# writes out when it stops the session. The retry run stops the session and
+# starts the host again, so it checks that the ledger and the trail of the
+# stopped turn survive the retry.
 #
 # With --skip-run the script runs no scenario and scans the artifacts of the
 # run that is already in the simulator.
@@ -35,6 +37,7 @@ UNREACHABLE_TEST="LegHostUITests/LegHostFixtureUITests/testTheUnreachableScenari
 RUNTIME_FAILURE_TEST="LegHostUITests/LegHostFixtureUITests/testTheRuntimeFailureScenarioReportsTheRuntimeDiagnostic"
 RELAUNCH_TEST="LegHostUITests/LegHostFixtureUITests/testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests"
 BACKGROUND_TEST="LegHostUITests/LegHostFixtureUITests/testTheBackgroundInterruptsTheTurnAndKeepsTheTrail"
+RETRY_TEST="LegHostUITests/LegHostFixtureUITests/testTheRetryAfterAnInterruptionKeepsTheStateOfTheTurn"
 PROVIDER_ERROR_MARKER="provider server error (500, api_error): IOS_FIXTURE_PROVIDER_ERROR"
 UNREACHABLE_MARKER="transport error:"
 RUNTIME_FAILURE_MARKER="IOS_GUEST_RUNTIME_ERROR"
@@ -369,6 +372,14 @@ else
     # host writes the trail of the stopped turn out.
     run_and_scan "${BACKGROUND_TEST}" "background run" "background" "" ""
     check_persisted_trail "the background run"
+
+    # The retry run stops the session in the middle of the turn and starts
+    # the host again. The reset belongs to the launch, so the retry keeps the
+    # ledger and the trail of the stopped turn: the ledger holds the one
+    # request of that turn and nothing else.
+    run_and_scan "${RETRY_TEST}" "retry run" "retry" "" ""
+    check_ledger "the retry run" 1
+    check_persisted_trail "the retry run"
 fi
 
 if [[ "${status}" -ne 0 ]]; then

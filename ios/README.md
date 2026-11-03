@@ -60,6 +60,11 @@ workspace it was given, the trail of the last run is still there, and the
 durable ledger still holds the requests of the run before it. The host never
 sends the turn that was running again by itself.
 
+A retry after an interruption keeps them as well. The reset control belongs
+to the launch: the first chain of a launch uses it, and every chain after it
+— a retry — keeps the catalog, the trail and the ledger of the run that was
+stopped, so the evidence of a stopped turn is not thrown away.
+
 ### The lifecycle
 
 The lifecycle of a session is one state machine with one gate. The chain of
@@ -72,15 +77,21 @@ boundary:
 
 1. the chain is cancelled,
 2. the trail of the guest is written out to the test artifacts,
-3. the output and the exit callbacks of the runtime are detached, the
-   fixture and the watcher of the trail are stopped and the runtime
-   releases the terminal of the guest — each of them exactly once,
+3. the output and the exit callbacks of the runtime are detached, the thread
+   of the output is joined, the fixture and the watcher of the trail are
+   stopped and the runtime releases the terminal of the guest — each of them
+   exactly once,
 4. the host shows `IOS_SESSION_INTERRUPTED` with the recovery guidance.
 
 A callback of a session that was stopped belongs to a session that is gone
-and is ignored. When the app comes back to the foreground, the interrupted
-state stays where it is: the user starts a new session with the retry
-control, and the prompt of the turn that was running is not sent again.
+and is ignored. The workers of a session belong to the chain they were made
+for as well: the thread of the output is joined before the next session
+starts, and the watcher of the trail and the callback of the exit are
+ignored when the chain that runs now is another one. The text and the
+records of a stopped session never reach the session that runs now. When the
+app comes back to the foreground, the interrupted state stays where it is:
+the user starts a new session with the retry control, and the prompt of the
+turn that was running is not sent again.
 
 ## The vendored emulator
 
@@ -365,7 +376,7 @@ memory and it never becomes a place where a credential is stored.
 | `-leghost-provider openai-responses` | The run is configured for a provider this host refuses. |
 | `-leghost-no-provider` | The run has no provider configuration at all. |
 | `-leghost-runtime-failure` | The guest runtime is asked for a program that is not there. |
-| `-leghost-fixture-reset` | The run starts from a known state: the catalog of the guest, the exchange trail and the durable ledger of the requests are cleared. |
+| `-leghost-fixture-reset` | The run starts from a known state: the catalog of the guest, the exchange trail and the durable ledger of the requests are cleared. The control belongs to the launch, so a retry after an interruption keeps the state of the run that was stopped. |
 | `-leghost-runtime-missing` | The run reports the pinned runtime files as missing. |
 | `-leghost-runtime-corrupt` | The run reports the pinned runtime files as corrupt. |
 | `-leghost-unsupported-architecture` | The run reports an architecture the guest cannot run on. |
@@ -432,9 +443,11 @@ the last run, and the durable ledger of the requests, so the count of the
 requests of the run is the count of that run. Without the control the run
 keeps all of them: the guest program finds the workspace it was given, the
 trail of the last run is still there, and the count of the requests is the
-count of every run that came before. The host creates the directory of the
-trail either way, because the guest appends to the trail file and does not
-make its directory.
+count of every run that came before. The control belongs to the launch: it
+is used by the first chain of the process, so a retry after an interruption
+keeps the state of the run that was stopped. The host creates the directory
+of the trail either way, because the guest appends to the trail file and
+does not make its directory.
 
 ### The failure of a turn
 

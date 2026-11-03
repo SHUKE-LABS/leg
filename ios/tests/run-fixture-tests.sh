@@ -28,6 +28,7 @@ ALL_TESTS=(
     testTheOpenAIProvidersAreRefusedBeforeTheGuestIsProvisioned
     testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests
     testTheBackgroundInterruptsTheTurnAndKeepsTheTrail
+    testTheRetryAfterAnInterruptionKeepsTheStateOfTheTurn
     testTheDeviceFaultsAreReportedBeforeTheGuestIsProvisioned
 )
 

@@ -234,9 +234,11 @@ struct GuestHostScreen: View {
             }
             if case .failed = controller.phase {
                 Button("Try again") { controller.retry() }
+                    .accessibilityIdentifier("guest-retry")
             }
             if case .interrupted = controller.phase {
                 Button("Try again") { controller.retry() }
+                    .accessibilityIdentifier("guest-retry")
             }
             Spacer()
         }

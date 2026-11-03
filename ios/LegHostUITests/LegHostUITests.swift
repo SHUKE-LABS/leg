@@ -422,6 +422,56 @@ final class LegHostFixtureUITests: XCTestCase {
                                     "the trail of the interrupted turn was lost")
     }
 
+    /// The retry after an interruption keeps the state of the stopped turn.
+    ///
+    /// The reset control belongs to the launch, so the retry does not clear
+    /// the durable ledger of the requests and does not delete the catalog and
+    /// the trail of the guest again: the evidence of the stopped turn stays
+    /// where it is, and the guest finds its session again.
+    func testTheRetryAfterAnInterruptionKeepsTheStateOfTheTurn() {
+        launch(["-leghost-fixture", "delayed", "-leghost-provider", "anthropic"])
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        driveOneTurn()
+
+        XCTAssertTrue(waitForState("requests=1"), "the fixture did not accept the request")
+        XCTAssertTrue(waitForTrail(), "the trail of the turn is empty")
+        let trailBefore = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+
+        XCUIDevice.shared.press(.home)
+        sleep(5)
+        app.activate()
+
+        XCTAssertTrue(waitForStatus("IOS_SESSION_INTERRUPTED", timeout: startTimeout),
+                      "the interruption is not in the status of the host")
+        XCTAssertTrue(app.staticTexts["guest-interrupted"].waitForExistence(timeout: 60),
+                      "the host does not show the interrupted state")
+
+        let retry = app.buttons["guest-retry"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 60), "the retry control is missing")
+        retry.tap()
+
+        // The host runs the chain again on the verified root. The reset
+        // belongs to the launch, so the ledger of the requests and the trail
+        // of the stopped turn stay.
+        let root = app.staticTexts["guest-root-state"]
+        XCTAssertTrue(root.waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state again")
+        XCTAssertEqual(root.label, "reused verified root")
+        XCTAssertTrue(waitForState("requests=1"), "the retry cleared the ledger of the requests")
+        let trailAfter = trailCount(in: app.staticTexts["guest-fixture-state"].label) ?? 0
+        XCTAssertGreaterThanOrEqual(trailAfter, trailBefore,
+                                    "the retry lost the trail of the stopped turn")
+
+        // The catalog of the guest survived: the retry finds the session of
+        // the stopped turn instead of asking for a workspace again.
+        XCTAssertTrue(waitForTerminalText("Enter reopen", timeout: 120),
+                      "the retry cleared the catalog of the guest")
+        XCTAssertFalse(terminalShows("Enter a path and press Enter to select it."),
+                       "the retry asked for a workspace again")
+    }
+
     /// The faults of the device are reported before the guest is touched.
     ///
     /// Every fault has its own identifier and its own remediation, and the

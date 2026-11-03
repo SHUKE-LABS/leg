@@ -273,4 +273,46 @@ final class GuestHostLifecycleTests: XCTestCase {
         XCTAssertEqual(host.teardowns, 1)
         XCTAssertEqual(host.persistedTrails, 0)
     }
+
+    /// A callback of a chain that was stopped does not release the session
+    /// of the chain that runs now.
+    ///
+    /// The callback of the guest that was stopped can arrive after the retry
+    /// began. It must not tear down the new session.
+    func testAStaleCallbackDoesNotEndTheNewSession() async throws {
+        let host = FakeHost()
+        let lifecycle = GuestHostLifecycle()
+        lifecycle.delegate = host
+        let started = expectation(description: "the session started")
+        host.onSessionStarted = { started.fulfill() }
+
+        lifecycle.start()
+        await fulfillment(of: [started], timeout: 5)
+        await lifecycle.interrupt()
+
+        let retried = expectation(description: "the session started again")
+        host.onSessionStarted = { retried.fulfill() }
+        lifecycle.retry()
+        await fulfillment(of: [retried], timeout: 5)
+
+        // The callback of the chain that was stopped arrives late.
+        let ended = await lifecycle.endSession(generation: lifecycle.generation - 1)
+
+        XCTAssertFalse(ended, "a stale callback ended the new session")
+        XCTAssertEqual(lifecycle.state, .running)
+        XCTAssertEqual(host.teardowns, 1)
+    }
+
+    /// The reset control belongs to the launch.
+    ///
+    /// The first chain of a launch uses it, and a chain that starts again -
+    /// a retry after an interruption - keeps the state of the run that was
+    /// stopped.
+    func testTheResetControlIsUsedOncePerLaunch() {
+        var control = FixtureResetControl()
+
+        XCTAssertTrue(control.consume(true), "the reset of the launch was not used")
+        XCTAssertFalse(control.consume(true), "the reset was used a second time")
+        XCTAssertFalse(control.consume(false), "a launch without the reset asked for one")
+    }
 }

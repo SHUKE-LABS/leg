@@ -235,7 +235,30 @@ extension HostPreflightProviders {
     }
 
     /// The architecture the host runs on.
+    ///
+    /// The architecture that matters is the one the app was built for: the
+    /// pinned guest bundle runs on the emulator the app carries, and that
+    /// emulator is built for the architecture of the build. The name a
+    /// device reports is a model (`iPhone15,2`) and not an architecture, so
+    /// the model is only reported when the build itself is on an
+    /// architecture the pinned guest runtime does not support.
     static func hostArchitecture() -> HostArchitecture {
+        #if arch(arm64)
+        let architecture = "arm64"
+        #elseif arch(x86_64)
+        let architecture = "x86_64"
+        #else
+        let architecture = deviceArchitecture()
+        #endif
+        guard HostPreflight.supportedArchitectures.contains(architecture) else {
+            return .unsupported(architecture)
+        }
+        return .supported
+    }
+
+    /// The name the device reports, for the diagnostic of a build on an
+    /// architecture the pinned guest runtime does not support.
+    private static func deviceArchitecture() -> String {
         #if canImport(Darwin)
         var system = utsname()
         uname(&system)
@@ -243,12 +266,9 @@ extension HostPreflightProviders {
             guard let base = raw.baseAddress else { return "" }
             return String(cString: base.assumingMemoryBound(to: CChar.self))
         }
-        if HostPreflight.supportedArchitectures.contains(machine) {
-            return .supported
-        }
-        return .unsupported(machine.isEmpty ? "an unknown architecture" : machine)
+        return machine.isEmpty ? "an unknown architecture" : machine
         #else
-        return .supported
+        return "an unknown architecture"
         #endif
     }
 }

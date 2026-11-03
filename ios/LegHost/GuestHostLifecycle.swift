@@ -132,11 +132,21 @@ final class GuestHostLifecycle {
     }
 
     /// The session ended: the guest program is gone.
-    func endSession() async {
+    ///
+    /// The generation says which chain the callback belongs to. A callback of
+    /// a chain that was stopped arrives late, after a retry began, and must
+    /// not release the session of the chain that runs now.
+    ///
+    /// The result says whether the session was ended. A callback of an older
+    /// chain ends nothing.
+    @discardableResult
+    func endSession(generation: Int) async -> Bool {
+        guard generation == self.generation else { return false }
         await tearDown()
         if state == .running {
             state = .stopped
         }
+        return true
     }
 
     /// Releases the session of the current chain, once.

@@ -354,6 +354,27 @@ private final class GuestOutputFlag {
     }
 }
 
+/// The one-time reset control of the fixture.
+///
+/// The control belongs to the launch: the first chain of the process uses
+/// it, and a chain that starts again - a retry after an interruption - keeps
+/// the catalog, the trail and the ledger of the run that was stopped. The
+/// evidence of a stopped turn is not thrown away by a retry.
+struct FixtureResetControl {
+    /// Whether the control was already used by this process.
+    private var isUsed = false
+
+    /// Whether the next chain resets the state of the fixture.
+    ///
+    /// The control is used once: the first chain that asks for it gets it,
+    /// every later chain does not.
+    mutating func consume(_ requested: Bool) -> Bool {
+        guard requested, !isUsed else { return false }
+        isUsed = true
+        return true
+    }
+}
+
 /// The guest host: it provisions the pinned root, boots the vendored iSH
 /// runtime and keeps the terminal in sync with the guest.
 @MainActor
@@ -382,6 +403,12 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private var outputThread: Thread?
     /// The flag of the thread that drains the guest output.
     private var outputFlag: GuestOutputFlag?
+    /// The signal the thread of the output gives when it left its loop.
+    ///
+    /// The teardown waits for it, so the thread of a session that was
+    /// stopped does not read the ring of the runtime while the next session
+    /// runs.
+    private var outputFinished: DispatchSemaphore?
     private var terminalReady = false
     /// The output the guest produced before the terminal was ready. It is
     /// written to the terminal as soon as it loads, so the first screen of
@@ -406,6 +433,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private var fixture: LoopbackFixture?
     /// The durable ledger of the requests the fixture accepted.
     private var ledger: FixtureRequestLedger?
+    /// The one-time reset control of the fixture.
+    ///
+    /// The control belongs to the launch: the first chain of the process
+    /// uses it, and a chain that starts again keeps the state of the run
+    /// that was stopped.
+    private var fixtureReset = FixtureResetControl()
+    /// Whether the chain of this run resets the state of the fixture.
+    private var resetsFixtureState = false
     /// The file the raw terminal output is written to, in a fixture run.
     private var transcriptHandle: FileHandle?
     /// The watcher of the guest's exchange trail, in a fixture run.
@@ -505,6 +540,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     func prepareHost() async throws {
         phase = .preparing
         options = HostLaunchOptions.current()
+        // The reset control belongs to the launch: the first chain of the
+        // process uses it, and a chain that starts again keeps the state of
+        // the run that was stopped.
+        resetsFixtureState = fixtureReset.consume(options.fixtureReset)
         do {
             detail = "Reading the provider configuration"
             let configuration = try ProviderConfigurationStore.load(
@@ -599,16 +638,29 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// Ends the session and releases the runtime.
     ///
     /// The teardown runs exactly once per chain of the lifecycle: the
-    /// callbacks of the runtime are detached, the fixture and the watcher of
-    /// the trail are stopped, and the runtime releases the terminal of the
-    /// guest.
+    /// callbacks of the runtime are detached, the thread of the output is
+    /// joined, the fixture and the watcher of the trail are stopped, and the
+    /// runtime releases the terminal of the guest.
     func teardownGuest() async {
         guest_runtime_set_output_notify(nil, nil)
         guest_runtime_set_exit_notify(nil, nil)
         exitContext = nil
+        let finished = outputFinished
         outputFlag?.stop()
         outputFlag = nil
         outputThread = nil
+        outputFinished = nil
+        // The thread of the output is joined before the next session starts:
+        // a late read of the ring of the runtime would show the text of the
+        // session that was stopped in the terminal of the new one.
+        if let finished {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = finished.wait(timeout: .now() + .seconds(2))
+                    continuation.resume()
+                }
+            }
+        }
         fixture?.stop()
         fixture = nil
         trailWatcher?.cancel()
@@ -729,15 +781,18 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     ///
     /// The ledger is cleared on the reset launch only. An ordinary relaunch
     /// counts on top of the requests of the run before it, so a run that
-    /// starts again cannot hide a duplicate behind a fresh counter.
+    /// starts again cannot hide a duplicate behind a fresh counter. A retry
+    /// after an interruption is such a run: the requests of the turn that
+    /// was stopped stay in the ledger.
     private func openLedger() {
         guard options.fixtureScenario != nil else { return }
         guard let url = try? Self.requestLedgerURL() else { return }
         let ledger = FixtureRequestLedger(url: url)
-        if options.fixtureReset {
+        if resetsFixtureState {
             try? ledger.clear()
         }
         self.ledger = ledger
+        refreshFixtureState()
     }
 
     // MARK: - Runtime
@@ -747,15 +802,16 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The state the guest program keeps between runs is the catalog of the
     /// guest program, so it asks for a workspace again, and the exchange
     /// trail of the last run. Both are removed on the reset launch only: an
-    /// ordinary relaunch keeps the workspace and the trail of the run before
-    /// it, so a session can be picked up where it stopped.
+    /// ordinary relaunch and a retry after an interruption keep the
+    /// workspace and the trail of the run before them, so a session can be
+    /// picked up where it stopped.
     private func prepareFixtureState(root: String) throws {
         let data = URL(fileURLWithPath: root).appendingPathComponent("data")
         let trailDirectory = data
             .appendingPathComponent("tmp")
             .appendingPathComponent("leg-ios-fixture")
         let trail = trailDirectory.appendingPathComponent("exchange.jsonl")
-        if options.fixtureReset {
+        if resetsFixtureState {
             let guestState = data
                 .appendingPathComponent("root")
                 .appendingPathComponent(".local")
@@ -796,20 +852,40 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             .appendingPathComponent("leg-ios-fixture")
             .appendingPathComponent("exchange.jsonl")
         let seen = GuestTrailCounter()
+        // The watcher belongs to the chain it was made for: a record of the
+        // trail of a session that was stopped belongs to a session that is
+        // gone, and is not published in the session that runs now.
+        let generation = lifecycle.generation
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
         timer.setEventHandler { [weak self, weak timer] in
             let snapshot = GuestHostController.trailSnapshot(in: trail)
             if let failure = snapshot.failure {
                 timer?.cancel()
-                DispatchQueue.main.async { self?.reportTurnFailure(failure) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isCurrentGeneration(generation) else { return }
+                    self.reportTurnFailure(failure)
+                }
                 return
             }
             guard seen.update(snapshot.records) else { return }
-            DispatchQueue.main.async { self?.publishTrailRecords(snapshot.records) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCurrentGeneration(generation) else { return }
+                self.publishTrailRecords(snapshot.records)
+            }
         }
         trailWatcher = timer
         timer.resume()
+    }
+
+    /// Whether the chain that runs now is the chain a callback belongs to.
+    ///
+    /// The workers of a session - the thread of the output and the watcher
+    /// of the trail - belong to the chain they were made for. A callback of
+    /// a chain that was stopped belongs to a session that is gone, and is
+    /// ignored.
+    private func isCurrentGeneration(_ generation: Int) -> Bool {
+        lifecycle.generation == generation
     }
 
     /// Publishes the number of records the trail of the guest holds.
@@ -904,7 +980,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let signal = status & 0x7f
         Task { [weak self] in
             guard let self else { return }
-            await self.lifecycle.endSession()
+            // The generation is checked again inside the lifecycle, right
+            // before the session is released: the callback can have been
+            // scheduled before a teardown, and a retry can have begun
+            // since.
+            guard await self.lifecycle.endSession(generation: generation) else { return }
             if exitCode != 0 {
                 self.phase = .exited(status)
                 self.detail = "The guest program exited with code \(exitCode)."
@@ -1027,11 +1107,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     /// Reads the fixture observation into the published state.
     private func refreshFixtureState() {
-        guard let fixture else { return }
-        let observation = fixture.currentObservation
         // The number of requests is the number the durable ledger holds: a
         // run that starts again counts the requests of the run before it.
-        state.requests = ledger?.count ?? observation.acceptedRequests
+        state.requests = ledger?.count ?? fixture?.currentObservation.acceptedRequests ?? 0
+        guard let fixture else { return }
+        let observation = fixture.currentObservation
         state.statuses = observation.statuses
         state.validation = observation.validation
     }
@@ -1059,6 +1139,12 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private func startOutputPump() {
         let flag = GuestOutputFlag()
         outputFlag = flag
+        let finished = DispatchSemaphore(value: 0)
+        outputFinished = finished
+        // The pump belongs to the chain it was made for: the text of a
+        // session that was stopped belongs to a session that is gone, and
+        // is not shown in the terminal of the session that runs now.
+        let generation = lifecycle.generation
         guest_runtime_set_output_notify({ context in
             guard let context else { return }
             let semaphore = Unmanaged<DispatchSemaphore>.fromOpaque(context).takeUnretainedValue()
@@ -1077,9 +1163,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 let text = GuestOutputText.latin1(Array(buffer[0..<length]))
                 guard !text.isEmpty else { continue }
                 DispatchQueue.main.async { [weak self] in
-                    self?.writeToTerminal(text)
+                    guard let self, self.isCurrentGeneration(generation) else { return }
+                    self.writeToTerminal(text)
                 }
             }
+            finished.signal()
         }
         thread.stackSize = 512 * 1024
         outputThread = thread

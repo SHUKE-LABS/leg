@@ -41,6 +41,16 @@ static void *output_notify_context = NULL;
 static guest_exit_notify_callback exit_notify = NULL;
 static void *exit_notify_context = NULL;
 
+/* The callbacks of the runtime are registered by the host and called by the
+ * guest thread. The lock keeps a registration from racing a call: the
+ * registration waits for a call that is running, so the host can release the
+ * context of a callback only after the callback is done with it. */
+static pthread_mutex_t notify_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* The runtime is booted once per process. A session that was stopped and
+ * started again runs on the kernel and on the root that are already there. */
+static bool runtime_booted = false;
+
 static struct tty *session_tty = NULL;
 
 /* The pid of the process the session runs. Only its exit ends the session: a
@@ -111,13 +121,15 @@ static void deliver_output(const void *data, size_t length) {
         memcpy(output_buffer, (const uint8_t *) data + first, length - first);
     output_length += length;
 
-    guest_output_notify_callback notify = output_notify;
-    void *notify_context = output_notify_context;
-
     pthread_mutex_unlock(&output_mutex);
 
-    if (notify != NULL)
-        notify(notify_context);
+    /* The callback runs under the lock of the callbacks: a registration that
+     * comes while it runs waits for it, so the host releases the context of
+     * the callback only after the callback is done with it. */
+    pthread_mutex_lock(&notify_mutex);
+    if (output_notify != NULL)
+        output_notify(output_notify_context);
+    pthread_mutex_unlock(&notify_mutex);
 }
 
 size_t guest_runtime_read_output(void *buffer, size_t max_length) {
@@ -141,15 +153,17 @@ size_t guest_runtime_read_output(void *buffer, size_t max_length) {
 }
 
 void guest_runtime_set_output_notify(guest_output_notify_callback callback, void *context) {
-    pthread_mutex_lock(&output_mutex);
+    pthread_mutex_lock(&notify_mutex);
     output_notify = callback;
     output_notify_context = context;
-    pthread_mutex_unlock(&output_mutex);
+    pthread_mutex_unlock(&notify_mutex);
 }
 
 void guest_runtime_set_exit_notify(guest_exit_notify_callback callback, void *context) {
+    pthread_mutex_lock(&notify_mutex);
     exit_notify = callback;
     exit_notify_context = context;
+    pthread_mutex_unlock(&notify_mutex);
 }
 
 /* ------------------------------------------------------------ tty drivers */
@@ -193,12 +207,21 @@ static void guest_exit_hook(struct task *task, int code) {
     if (leader->pid != session_pid)
         return;
 
-    guest_exit_notify_callback notify = exit_notify;
-    if (notify != NULL)
-        notify(code, exit_notify_context);
+    /* The callback runs under the lock of the callbacks: a registration that
+     * comes while it runs waits for it, so the host releases the context of
+     * the callback only after the callback is done with it. */
+    pthread_mutex_lock(&notify_mutex);
+    if (exit_notify != NULL)
+        exit_notify(code, exit_notify_context);
+    pthread_mutex_unlock(&notify_mutex);
 }
 
 int guest_runtime_boot(const char *root_data_dir) {
+    /* The kernel and the root of the guest are set up once per process. A
+     * session that starts again after it was stopped runs on them. */
+    if (runtime_booted)
+        return 0;
+
     exit_hook = guest_exit_hook;
 
     guest_console_driver.ops = &guest_tty_ops;
@@ -229,6 +252,7 @@ int guest_runtime_boot(const char *root_data_dir) {
     if (err < 0)
         return err;
 
+    runtime_booted = true;
     return 0;
 }
 
