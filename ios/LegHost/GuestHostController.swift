@@ -316,6 +316,23 @@ enum GuestOutputText {
     }
 }
 
+/// The context of the exit callback of the runtime.
+///
+/// The callback of the runtime is a C function pointer and cannot capture
+/// anything, so the chain the callback belongs to travels with it in the
+/// context of the callback.
+private final class GuestExitContext {
+    /// The host the callback reports to.
+    unowned let controller: GuestHostController
+    /// The chain the callback belongs to.
+    let generation: Int
+
+    init(controller: GuestHostController, generation: Int) {
+        self.controller = controller
+        self.generation = generation
+    }
+}
+
 /// The flag that tells the output thread of a session to leave its loop.
 ///
 /// The flag is a box of its own, so the thread of an earlier session cannot
@@ -393,6 +410,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private var transcriptHandle: FileHandle?
     /// The watcher of the guest's exchange trail, in a fixture run.
     private var trailWatcher: DispatchSourceTimer?
+    /// The context of the exit callback of the runtime.
+    private var exitContext: GuestExitContext?
 
     /// The environment every guest session gets.
     private static let baseEnvironment = [
@@ -582,6 +601,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     func teardownGuest() async {
         guest_runtime_set_output_notify(nil, nil)
         guest_runtime_set_exit_notify(nil, nil)
+        exitContext = nil
         outputFlag?.stop()
         outputFlag = nil
         outputThread = nil
@@ -849,13 +869,20 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     }
 
     /// Reports the end of the guest program to the user.
+    ///
+    /// The callback of the runtime is a C function pointer, so it cannot
+    /// capture anything: the chain the callback belongs to travels with it
+    /// in the context of the callback.
     private func watchGuestExit() {
-        let generation = lifecycle.generation
-        guest_runtime_set_exit_notify({ status, context in
-            guard let context = context else { return }
-            let controller = Unmanaged<GuestHostController>.fromOpaque(context).takeUnretainedValue()
-            DispatchQueue.main.async { controller.guestDidExit(Int(status), generation: generation) }
-        }, Unmanaged.passUnretained(self).toOpaque())
+        let context = GuestExitContext(controller: self, generation: lifecycle.generation)
+        exitContext = context
+        guest_runtime_set_exit_notify({ status, pointer in
+            guard let pointer else { return }
+            let context = Unmanaged<GuestExitContext>.fromOpaque(pointer).takeUnretainedValue()
+            DispatchQueue.main.async {
+                context.controller.guestDidExit(Int(status), generation: context.generation)
+            }
+        }, Unmanaged.passUnretained(context).toOpaque())
     }
 
     /// The guest program ended. `status` is the wait status of the process: an
@@ -863,7 +890,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     ///
     /// A callback of a session that was stopped belongs to a session that is
     /// gone, so it is ignored.
-    private func guestDidExit(_ status: Int, generation: Int) {
+    fileprivate func guestDidExit(_ status: Int, generation: Int) {
         guard generation == lifecycle.generation else { return }
         let exitCode = status >> 8
         let signal = status & 0x7f
