@@ -87,6 +87,7 @@
 		EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestHostLifecycleTests.swift; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostPreflightTests.swift; sourceTree = "<group>"; };
 		FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestRuntimeKernelTests.swift; sourceTree = "<group>"; };
+		FF11FF11FF11FF11FF110003 /* LegHostTests-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "LegHostTests-Bridging-Header.h"; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110023 /* LegHostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -147,6 +148,7 @@
 				EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */,
 				EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */,
 				FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */,
+				FF11FF11FF11FF11FF110003 /* LegHostTests-Bridging-Header.h */,
 			);
 			path = LegHostTests;
 			sourceTree = "<group>";
@@ -630,11 +632,16 @@
 					"$(PLATFORM_DIR)/Developer/Library/Frameworks",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/LegHost",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "LegHostTests/LegHostTests-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/LegHost.app/LegHost";
@@ -653,11 +660,16 @@
 					"$(PLATFORM_DIR)/Developer/Library/Frameworks",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/LegHost",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shukelabs.leg.ioshost.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "LegHostTests/LegHostTests-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/LegHost.app/LegHost";
