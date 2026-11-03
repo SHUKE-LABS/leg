@@ -151,14 +151,16 @@ implemented in the vendored tree, and the change is listed in
 instruction the pinned guest bundle needs that the vendored emulator was
 missing.
 
-The same file lists the two other changes the vendored tree carries. A
+The same file lists the other changes the vendored tree carries. A
 readlink of `/proc/<pid>/exe` for a task without an address space took the
 emulator down, so the read now fails with `ESRCH` for such a task. A guest
 that bounded its socket reads had its `setsockopt` refused with `EINVAL`,
 because the emulator knew the timeout options by other numbers than a Linux
 guest uses and because the timeout value is wider on the host than in the
 guest; the two options now have the numbers a Linux guest uses and the
-timeout is translated in both directions.
+timeout is translated in both directions. The kernel ends the waits of the
+tasks that wait for data, and it keeps the files of a task alive while it
+walks them, so the stop of a guest does not race with the exit of a task.
 
 ## Licensing
 
