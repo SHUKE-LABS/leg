@@ -177,6 +177,7 @@ struct fdtable {
 };
 
 struct fdtable *fdtable_new(int size);
+struct fdtable *fdtable_retain(struct fdtable *table);
 void fdtable_release(struct fdtable *table);
 struct fdtable *fdtable_copy(struct fdtable *table);
 void fdtable_free(struct fdtable *table);

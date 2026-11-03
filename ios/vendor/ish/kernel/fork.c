@@ -71,7 +71,10 @@ static int copy_task(struct task *task, dword_t flags, addr_t stack, addr_t ptid
     }
 
     if (flags & CLONE_FILES_) {
-        task->files->refcount++;
+        /* The count of the table is raised under the lock of the table, like
+         * every other raise of the count: a table that is walked keeps its
+         * count up while it is walked. */
+        fdtable_retain(task->files);
     } else {
         task->files = fdtable_copy(task->files);
         if (IS_ERR(task->files)) {
@@ -134,7 +137,14 @@ fail_free_sighand:
 fail_free_fs:
     fs_info_release(task->fs);
 fail_free_files:
+    /* The files of the task are let go under pids_lock, like the files of a
+     * task that exits: a walker of the tasks that holds pids_lock walks the
+     * files of the tasks, and it must not find a table that is gone. The
+     * files of the task are set to none, so the walker skips the task. */
+    lock(&pids_lock);
     fdtable_release(task->files);
+    task->files = NULL;
+    unlock(&pids_lock);
 fail_free_mem:
     mm_release(task->mm);
     return err;

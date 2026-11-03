@@ -38,6 +38,16 @@
                ReferencedContainer = "container:LegHost.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "EE11EE11EE11EE11EE110040"
+               BuildableName = "LegHostTests.xctest"
+               BlueprintName = "LegHostTests"
+               ReferencedContainer = "container:LegHost.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

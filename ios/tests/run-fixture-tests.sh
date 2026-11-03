@@ -26,6 +26,12 @@ ALL_TESTS=(
     testTheRuntimeFailureScenarioReportsTheRuntimeDiagnostic
     testAMissingConfigurationIsReportedBeforeTheGuestIsProvisioned
     testTheOpenAIProvidersAreRefusedBeforeTheGuestIsProvisioned
+    testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests
+    testTheBackgroundInterruptsTheTurnAndKeepsTheTrail
+    testTheRetryAfterAnInterruptionKeepsTheStateOfTheTurn
+    testTheStoppedGuestCannotWriteAfterTheRetry
+    testTheStoppedGuestCannotWriteAfterManyRetries
+    testTheDeviceFaultsAreReportedBeforeTheGuestIsProvisioned
 )
 
 udid=""

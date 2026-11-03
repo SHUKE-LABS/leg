@@ -72,6 +72,11 @@ void proc_entry_cleanup(struct proc_entry *entry);
 
 void free_string_array(char **array);
 
+/* The walk of the files of a task, the way the /proc walks them: the lock of
+ * the tasks is held while the files of the task are read. The host uses it
+ * to walk the files of a task while the task lets them go. */
+int proc_pid_fd_walk(pid_t_ pid);
+
 bool proc_dir_read(struct proc_entry *entry, unsigned long *index, struct proc_entry *next_entry);
 
 void proc_buf_append(struct proc_data *buf, const void *data, size_t size);

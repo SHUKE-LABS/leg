@@ -73,6 +73,17 @@ struct fdtable *fdtable_new(int size) {
 
 static int fdtable_close(struct fdtable *table, fd_t f);
 
+/* Keeps the table alive.
+ *
+ * The caller lets the table go with fdtable_release. The files of the table
+ * stay open until then, even when the task that owns the table lets it go. */
+struct fdtable *fdtable_retain(struct fdtable *table) {
+    lock(&table->lock);
+    table->refcount++;
+    unlock(&table->lock);
+    return table;
+}
+
 // FIXME this looks like it has the classic refcount UAF
 void fdtable_release(struct fdtable *table) {
     lock(&table->lock);
@@ -143,7 +154,11 @@ static int fdtable_expand(struct fdtable *table, fd_t max) {
 }
 
 struct fd *fdtable_get(struct fdtable *table, fd_t f) {
-    if (f < 0 || (unsigned) f >= current->files->size)
+    /* The bound is the size of the table that is read, not the size of the
+     * table of the task that reads: a caller that reads the files of
+     * another task, or a table that was detached from its task, must not
+     * read past the end of the table it reads. */
+    if (f < 0 || (unsigned) f >= table->size)
         return NULL;
     return table->files[f];
 }

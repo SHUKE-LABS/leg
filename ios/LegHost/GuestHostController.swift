@@ -9,6 +9,9 @@ enum GuestHostPhase: Equatable {
     case running
     case exited(Int)
     case failed(String)
+    /// The app went to the background while the session ran, so the session
+    /// was stopped at the boundary of the host.
+    case interrupted
 }
 
 /// The size the guest terminal has, in character cells.
@@ -25,8 +28,8 @@ struct GuestTerminalSize: Equatable {
 
 /// The keys a terminal program reads, but the software keyboard cannot send.
 ///
-/// The host offers them in a row above the terminal, so the guest program can
-/// be driven without a hardware keyboard.
+/// The host offers them in a row above the terminal, so the guest program
+/// can be driven without a hardware keyboard.
 enum GuestTerminalKey {
     static let escape = "\u{1b}"
     static let tab = "\t"
@@ -56,10 +59,9 @@ struct GuestHostError: LocalizedError {
 
 /// The launch controls of one run of the host.
 ///
-/// The provider, the fixture and the guest program are named on the command
-/// line. The provider and the fixture controls are DEBUG-only: they configure
-/// one run in memory and never write to the Keychain, to the user defaults or
-/// to the file system.
+/// The provider, the fixture and the fault controls are DEBUG-only: they
+/// configure one run in memory and never write to the Keychain, to the user
+/// defaults or to the file system.
 struct HostLaunchOptions {
     /// The fixture scenario, when the run is a fixture run.
     var fixtureScenario: LoopbackFixture.Scenario?
@@ -69,6 +71,23 @@ struct HostLaunchOptions {
     var hasNoProvider = false
     /// The guest program the session runs.
     var program = HostLaunchOptions.defaultProgram
+    /// Whether the run reports the runtime files as missing.
+    var runtimeFilesMissing = false
+    /// Whether the run reports the runtime files as corrupt.
+    var runtimeFilesCorrupt = false
+    /// Whether the run reports an architecture the guest cannot run on.
+    var unsupportedArchitecture = false
+    /// Whether the run reports the container as too small for the import.
+    var lowStorage = false
+    /// Whether the run resets the state of the fixture.
+    var fixtureReset = false
+    /// Whether the run interrupts the session on its own.
+    ///
+    /// The control belongs to the simulator tests: they interrupt the
+    /// session without the app going to the background, so the recovery of a
+    /// stopped turn is tested on a run that does not wait for the
+    /// activation of a simulator.
+    var interruptAfterRequest = false
 
     /// The guest program the host runs.
     static let defaultProgram = "/usr/local/bin/leg-tui"
@@ -107,6 +126,18 @@ struct HostLaunchOptions {
                 }
             case "-leghost-runtime-failure":
                 options.program = HostLaunchOptions.missingProgram
+            case "-leghost-runtime-missing":
+                options.runtimeFilesMissing = true
+            case "-leghost-runtime-corrupt":
+                options.runtimeFilesCorrupt = true
+            case "-leghost-unsupported-architecture":
+                options.unsupportedArchitecture = true
+            case "-leghost-low-storage":
+                options.lowStorage = true
+            case "-leghost-fixture-reset":
+                options.fixtureReset = true
+            case "-leghost-interrupt-after-request":
+                options.interruptAfterRequest = true
             #endif
             default:
                 break
@@ -131,12 +162,20 @@ struct HostState: Equatable {
     var sessions = 0
     /// The number of times the loopback fixture was started.
     var listeners = 0
-    /// The number of requests the fixture accepted.
+    /// The number of requests the durable ledger of the fixture holds.
     var requests = 0
     /// The HTTP statuses the fixture answered with, in order.
     var statuses: [Int] = []
     /// The fixture validation result.
     var validation = "none"
+    /// The number of records the exchange trail of the guest holds.
+    var trail = 0
+    /// The number of tasks of the guest that run.
+    ///
+    /// The count is read when the session starts and when it stops, so it
+    /// says whether the guest of a session is gone: a guest that was
+    /// stopped does not run any more.
+    var guestTasks = 0
 
     /// The state as the tests read it.
     var summary: String {
@@ -144,7 +183,8 @@ struct HostState: Equatable {
             ? ""
             : self.statuses.map(String.init).joined(separator: ",")
         return "provision=\(provisions),boot=\(boots),session=\(sessions),requests=\(requests),"
-            + "statuses=\(statuses),validation=\(validation),listener=\(listeners)"
+            + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
+            + "tasks=\(guestTasks)"
     }
 }
 
@@ -242,6 +282,16 @@ struct HostPins {
         return HostPins(inputs: inputs, compatibility: compatibility)
     }
 
+    /// The file of a pinned input in the app bundle.
+    static func embeddedInputURL(named filename: String) throws -> URL {
+        guard let url = Bundle.main.url(forResource: filename, withExtension: nil,
+                                        subdirectory: "PinnedInputs")
+                ?? Bundle.main.url(forResource: filename, withExtension: nil) else {
+            throw GuestHostError(message: "The pinned input \(filename) is missing from the app bundle.")
+        }
+        return url
+    }
+
     /// Runs `body` with the pins in the shape the provisioner expects.
     func withCPins<R>(_ body: (UnsafePointer<guest_pins>) -> R) -> R {
         let storage = CStringStorage()
@@ -282,10 +332,70 @@ enum GuestOutputText {
     }
 }
 
+/// The context of the exit callback of the runtime.
+///
+/// The callback of the runtime is a C function pointer and cannot capture
+/// anything, so the chain the callback belongs to travels with it in the
+/// context of the callback.
+private final class GuestExitContext {
+    /// The host the callback reports to.
+    unowned let controller: GuestHostController
+    /// The chain the callback belongs to.
+    let generation: Int
+
+    init(controller: GuestHostController, generation: Int) {
+        self.controller = controller
+        self.generation = generation
+    }
+}
+
+/// The flag that tells the output thread of a session to leave its loop.
+///
+/// The flag is a box of its own, so the thread of an earlier session cannot
+/// see the flag of a later one and keeps on reading the ring buffer.
+private final class GuestOutputFlag {
+    private let lock = NSLock()
+    private var running = true
+
+    var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return running
+    }
+
+    func stop() {
+        lock.lock()
+        running = false
+        lock.unlock()
+    }
+}
+
+/// The one-time reset control of the fixture.
+///
+/// The control belongs to the launch: the first chain of the process uses
+/// it, and a chain that starts again - a retry after an interruption - keeps
+/// the catalog, the trail and the ledger of the run that was stopped. The
+/// evidence of a stopped turn is not thrown away by a retry.
+struct FixtureResetControl {
+    /// Whether the control was already used by this process.
+    private var isUsed = false
+
+    /// Whether the next chain resets the state of the fixture.
+    ///
+    /// The control is used once: the first chain that asks for it gets it,
+    /// every later chain does not.
+    mutating func consume(_ requested: Bool) -> Bool {
+        guard requested, !isUsed else { return false }
+        isUsed = true
+        return true
+    }
+}
+
 /// The guest host: it provisions the pinned root, boots the vendored iSH
 /// runtime and keeps the terminal in sync with the guest.
 @MainActor
-final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHandler {
+final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHandler,
+                                 GuestHostLifecycleDelegate {
     @Published private(set) var phase: GuestHostPhase = .preparing
     @Published private(set) var detail: String = ""
     @Published private(set) var reusedVerifiedRoot = false
@@ -297,10 +407,30 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The stable diagnostic the host shows when the guest runtime cannot run
     /// the guest program.
     nonisolated static let runtimeErrorDiagnostic = "IOS_GUEST_RUNTIME_ERROR"
+    /// The stable diagnostic the host shows when the system interrupted the
+    /// session.
+    nonisolated static let interruptionDiagnostic = "IOS_SESSION_INTERRUPTED"
+    /// The stable diagnostic the host shows when the guest of a session did
+    /// not stop.
+    ///
+    /// The session is not released then, and no other session starts: a guest
+    /// that is still alive would run next to the session that comes next.
+    nonisolated static let sessionNotStoppedDiagnostic = "IOS_SESSION_NOT_STOPPED"
+
+    /// The machine that runs the chain of operations of one session.
+    private let lifecycle = GuestHostLifecycle()
 
     private weak var sink: GuestTerminalSink?
     private let outputSignal = DispatchSemaphore(value: 0)
     private var outputThread: Thread?
+    /// The flag of the thread that drains the guest output.
+    private var outputFlag: GuestOutputFlag?
+    /// The signal the thread of the output gives when it left its loop.
+    ///
+    /// The teardown waits for it, so the thread of a session that was
+    /// stopped does not read the ring of the runtime while the next session
+    /// runs.
+    private var outputFinished: DispatchSemaphore?
     private var terminalReady = false
     /// The output the guest produced before the terminal was ready. It is
     /// written to the terminal as soon as it loads, so the first screen of
@@ -310,6 +440,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The launch controls of this run.
     private var options = HostLaunchOptions.current()
 
+    /// Whether the run still has to interrupt the session on its own.
+    ///
+    /// The control is the one of the simulator tests: the run stops the
+    /// session as soon as the fixture accepts the request of the turn, so the
+    /// recovery of a stopped turn is tested without the app going to the
+    /// background.
+    private var interruptsOnItsOwn = false
+
     /// Whether the run is a fixture run.
     ///
     /// A fixture run offers the send control on the screen: the software
@@ -317,12 +455,28 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     var isFixtureRun: Bool { options.fixtureScenario != nil }
     /// The provider configuration this run uses.
     private var configuration: ProviderConfiguration?
+    /// The pins of the guest inputs this run uses.
+    private var pins: HostPins?
+    /// The root the guest runs in.
+    private var activeRoot = ""
     /// The loopback fixture, in a fixture run.
     private var fixture: LoopbackFixture?
+    /// The durable ledger of the requests the fixture accepted.
+    private var ledger: FixtureRequestLedger?
+    /// The one-time reset control of the fixture.
+    ///
+    /// The control belongs to the launch: the first chain of the process
+    /// uses it, and a chain that starts again keeps the state of the run
+    /// that was stopped.
+    private var fixtureReset = FixtureResetControl()
+    /// Whether the chain of this run resets the state of the fixture.
+    private var resetsFixtureState = false
     /// The file the raw terminal output is written to, in a fixture run.
     private var transcriptHandle: FileHandle?
     /// The watcher of the guest's exchange trail, in a fixture run.
     private var trailWatcher: DispatchSourceTimer?
+    /// The context of the exit callback of the runtime.
+    private var exitContext: GuestExitContext?
 
     /// The environment every guest session gets.
     private static let baseEnvironment = [
@@ -353,17 +507,77 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     /// Provisions the guest and starts the session.
     func start() {
-        Task { await prepare() }
+        lifecycle.delegate = self
+        lifecycle.start()
     }
 
-    private func prepare() async {
-        do {
-            phase = .preparing
-            options = HostLaunchOptions.current()
+    /// Starts the session again after a failure, a stop or an interruption.
+    ///
+    /// The turn that was running is not sent again: the guest program is
+    /// started from the state it kept, and the user sends the turn again.
+    func retry() {
+        lifecycle.delegate = self
+        lifecycle.retry()
+    }
 
-            // The provider configuration is read before the host touches the
-            // guest root: a missing or an unsupported configuration has to be
-            // reported before anything is provisioned.
+    /// The app went to the background.
+    ///
+    /// iOS does not run the guest in the background, so the session stops at
+    /// a boundary the host controls: the chain is cancelled, the trail of the
+    /// stopped turn is written out, and the runtime and the callbacks of the
+    /// session are released exactly once.
+    func handleBackground() {
+        lifecycle.delegate = self
+        Task { [weak self] in
+            guard let self else { return }
+            // A run that never started, that failed or that stopped already
+            // keeps the state it has: the interruption is only shown for a
+            // session that was running.
+            if await self.lifecycle.interrupt() {
+                self.publishInterruption()
+            }
+        }
+    }
+
+    /// The app came back to the foreground.
+    ///
+    /// The session stays where the interruption left it. The host shows the
+    /// interrupted state and the trail of the stopped turn, and the user
+    /// starts a new session with the retry control. The prompt of the turn
+    /// that was running is not sent again.
+    func handleForeground() {
+        refreshFixtureState()
+    }
+
+    /// Shows the interruption of the session.
+    private func publishInterruption() {
+        phase = .interrupted
+        detail = "\(Self.interruptionDiagnostic): the session was stopped when the app went to "
+            + "the background. iOS does not run the guest in the background, so the turn that was "
+            + "running was not finished and its prompt is not sent again. The exchange trail of "
+            + "the stopped turn was kept with \(state.trail) records. Start the host again to "
+            + "reopen the verified root."
+    }
+
+    // MARK: - The chain of the lifecycle
+
+    /// Reads the configuration of the run and checks the device.
+    ///
+    /// The provider configuration is read before the host touches the guest
+    /// root: a missing or an unsupported configuration has to be reported
+    /// before anything is provisioned. The preflight runs next and reports
+    /// the state of the device the same way.
+    func prepareHost() async throws {
+        phase = .preparing
+        options = HostLaunchOptions.current()
+        // The reset control belongs to the launch: the first chain of the
+        // process uses it, and a chain that starts again keeps the state of
+        // the run that was stopped.
+        resetsFixtureState = fixtureReset.consume(options.fixtureReset)
+        #if DEBUG
+        interruptsOnItsOwn = options.interruptAfterRequest
+        #endif
+        do {
             detail = "Reading the provider configuration"
             let configuration = try ProviderConfigurationStore.load(
                 providerOverride: options.provider,
@@ -373,53 +587,215 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             }
             self.configuration = configuration
 
+            detail = "Checking the guest runtime files"
+            let pins: HostPins
+            do {
+                pins = try HostPins.load()
+            } catch {
+                // The manifest of the pins is one of the runtime files: a
+                // manifest that cannot be read means the runtime files are
+                // not there.
+                throw HostPreflightDiagnostic.runtimeFilesMissing
+            }
+            try HostPreflight.check(HostPreflightProviders.live(options: options, pins: pins))
+            self.pins = pins
+            openLedger()
+        } catch {
+            publishFailure(error)
+            throw error
+        }
+    }
+
+    /// Provisions the guest root.
+    func provisionGuest() async throws {
+        do {
             try Self.removeProvisionedRootIfRequested()
             phase = .provisioning
             detail = "Verifying the pinned guest inputs"
-            let pins = try HostPins.load()
-            let provisioned = try await provision(pins)
+            guard let pins else {
+                throw HostPreflightDiagnostic.runtimeFilesMissing
+            }
+            let provisioned = try await provisionRoot(pins)
+            activeRoot = provisioned.activeRoot
             state.provisions += 1
             reusedVerifiedRoot = provisioned.reused
             detail = provisioned.reused ? "Reusing the verified guest root" : "Imported the guest root"
+        } catch {
+            publishFailure(error)
+            throw error
+        }
+    }
 
+    /// Boots the guest runtime and starts the fixture.
+    func bootGuest() async throws {
+        do {
             phase = .booting
             detail = "Booting the guest"
             if options.fixtureScenario != nil {
                 // The guest appends its exchange trail to a file, so the
                 // directory of the trail has to be there before the session
-                // starts, and the state of the last run has to be gone, so
-                // this run is the same run every time.
-                try prepareFixtureState(root: provisioned.activeRoot)
-                watchExchangeTrail(root: provisioned.activeRoot)
+                // starts.
+                try prepareFixtureState(root: activeRoot)
+                watchExchangeTrail(root: activeRoot)
             }
-            try await boot(root: provisioned.activeRoot)
+            try await bootRuntime(root: activeRoot)
             state.boots += 1
             watchGuestExit()
 
             // The fixture is the provider the guest talks to. It starts after
             // the configuration is accepted and before the session, so the
             // guest reaches it from its first request.
-            if let scenario = options.fixtureScenario {
+            if let scenario = options.fixtureScenario, let configuration {
                 try startFixture(scenario: scenario, configuration: configuration)
             }
+        } catch {
+            publishFailure(error)
+            throw error
+        }
+    }
 
+    /// Starts the guest session.
+    func startGuestSession() async throws {
+        do {
             try await startSession()
             state.sessions += 1
+            state.guestTasks = Int(guest_runtime_running_tasks())
             startOutputPump()
             phase = .running
-            detail = provisioned.reused ? "Guest running (reused root)" : "Guest running"
+            detail = reusedVerifiedRoot ? "Guest running (reused root)" : "Guest running"
         } catch {
-            let message = error.localizedDescription
-            // The diagnostic of the guest runtime belongs in the terminal as
-            // well: the guest program never ran, so the terminal is the only
-            // place where the run can show what went wrong. The transcript
-            // of a fixture run holds it as well.
-            if message.contains(Self.runtimeErrorDiagnostic) {
-                writeToTerminal("\r\n\(message)\r\n")
-            }
-            phase = .failed(message)
-            detail = message
+            publishFailure(error)
+            throw error
         }
+    }
+
+    /// Ends the session and releases the runtime.
+    ///
+    /// The teardown runs exactly once per chain of the lifecycle: the
+    /// callbacks of the runtime are detached, the thread of the output is
+    /// joined, the guest of the session is stopped and waited for, the
+    /// fixture and the watcher of the trail are stopped, and the runtime
+    /// releases the terminal of the guest.
+    ///
+    /// The teardown fails when the thread of the output did not stop or when
+    /// the guest of the session did not stop. A guest that is still alive
+    /// would write to the trail of the guest and would run next to the
+    /// session that comes next, so the session is not released then and no
+    /// other session starts.
+    func teardownGuest() async throws {
+        guest_runtime_set_output_notify(nil, nil)
+        guest_runtime_set_exit_notify(nil, nil)
+        exitContext = nil
+
+        // The thread of the output is joined before the next session starts:
+        // a late read of the ring of the runtime would show the text of the
+        // session that was stopped in the terminal of the new one. The wait
+        // is checked: a thread that did not stop keeps reading the ring of
+        // the runtime.
+        let pumpStopped = await stopOutputPump()
+
+        // The guest of the session is killed before the fixture is stopped:
+        // the kill is delivered before the guest runs another instruction,
+        // so a guest that waits for the answer of the provider cannot write
+        // to the trail of the guest anymore.
+        guest_runtime_kill_guest()
+
+        // The fixture is stopped in every case: a guest that is still alive
+        // must not do provider work anymore. The connections of the fixture
+        // are closed here, so a guest that waits for the answer of the
+        // provider ends its wait.
+        fixture?.stop()
+        fixture = nil
+        trailWatcher?.cancel()
+        trailWatcher = nil
+
+        // The guest of the session is stopped and waited for before the next
+        // session starts: a guest that is still alive would write to the
+        // trail of the guest and would run next to the session that comes
+        // next.
+        let guestStopped = await stopGuestSession()
+        state.guestTasks = Int(guest_runtime_running_tasks())
+
+        guard pumpStopped, guestStopped else {
+            let reason = pumpStopped
+                ? "the guest of the session did not stop"
+                : "the thread of the output of the guest did not stop"
+            let error = GuestHostError(message: "\(Self.sessionNotStoppedDiagnostic): \(reason), "
+                + "so the session is not released and no other session starts next to it.")
+            publishFailure(error)
+            throw error
+        }
+
+        // The output of the session that stopped belongs to that session: it
+        // is cleared now that the guest and the thread of the output are
+        // quiet, so the pump of the session that comes next does not read
+        // the text of the session that was stopped.
+        guest_runtime_clear_output()
+        guest_runtime_shutdown()
+    }
+
+    /// Stops the thread of the output and waits for it to leave its loop.
+    ///
+    /// The result says whether the thread stopped. A thread that did not
+    /// stop keeps reading the ring of the runtime, so the session is not
+    /// released then.
+    private func stopOutputPump() async -> Bool {
+        let finished = outputFinished
+        outputFlag?.stop()
+        outputFlag = nil
+        outputThread = nil
+        outputFinished = nil
+        guard let finished else { return true }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = finished.wait(timeout: .now() + .seconds(2))
+                continuation.resume(returning: result == .success)
+            }
+        }
+    }
+
+    /// Stops the guest of the session and waits for it to end.
+    ///
+    /// The result says whether the guest stopped. A guest that is still
+    /// alive writes to the trail of the guest and runs next to the session
+    /// that comes next, so the session is not released then.
+    private func stopGuestSession() async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let status = guest_runtime_stop_session()
+                continuation.resume(returning: status == 0)
+            }
+        }
+    }
+
+    /// Writes the trail of the session out.
+    ///
+    /// The trail of the guest lives in the guest root. It is copied into the
+    /// test artifacts of the app container, so the trail of a turn that was
+    /// interrupted is kept outside the guest root as well.
+    func persistGuestTrail() async {
+        guard let trail = exchangeTrailURL(), let data = try? Data(contentsOf: trail) else { return }
+        state.trail = data.split(separator: 0x0A).count
+        guard let destination = try? Self.persistedTrailURL() else { return }
+        try? data.write(to: destination, options: .atomic)
+    }
+
+    /// Shows a failure of the run.
+    private func publishFailure(_ error: Error) {
+        // A failure that arrives after the interruption belongs to a chain
+        // that was stopped: the session is gone, so the interruption stays
+        // what the user is shown.
+        guard phase != .interrupted else { return }
+        let message = error.localizedDescription
+        // The diagnostic of the guest runtime belongs in the terminal as
+        // well: the guest program never ran, so the terminal is the only
+        // place where the run can show what went wrong. The transcript of
+        // a fixture run holds it as well.
+        if message.contains(Self.runtimeErrorDiagnostic) {
+            writeToTerminal("\r\n\(message)\r\n")
+        }
+        phase = .failed(message)
+        detail = message
     }
 
     // MARK: - Provisioning
@@ -429,9 +805,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let activeRoot: String
     }
 
-    private func provision(_ pins: HostPins) async throws -> Provisioned {
-        let bundle = try Self.embeddedInputURL(named: pins.inputs[GUEST_INPUT_LEG_BUNDLE].filename)
-        let alpine = try Self.embeddedInputURL(named: pins.inputs[GUEST_INPUT_ALPINE_ROOT].filename)
+    private func provisionRoot(_ pins: HostPins) async throws -> Provisioned {
+        let bundle = try HostPins.embeddedInputURL(named: pins.inputs[GUEST_INPUT_LEG_BUNDLE].filename)
+        let alpine = try HostPins.embeddedInputURL(named: pins.inputs[GUEST_INPUT_ALPINE_ROOT].filename)
         let roots = try Self.rootsDirectory()
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -462,21 +838,31 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         }
     }
 
-    private static func embeddedInputURL(named filename: String) throws -> URL {
-        guard let url = Bundle.main.url(forResource: filename, withExtension: nil,
-                                        subdirectory: "PinnedInputs")
-                ?? Bundle.main.url(forResource: filename, withExtension: nil) else {
-            throw GuestHostError(message: "The pinned input \(filename) is missing from the app bundle.")
-        }
-        return url
-    }
-
     private static func rootsDirectory() throws -> URL {
         let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                  appropriateFor: nil, create: true)
         let roots = support.appendingPathComponent("LegHost/roots", isDirectory: true)
         try FileManager.default.createDirectory(at: roots, withIntermediateDirectories: true)
         return roots
+    }
+
+    /// The directory the artifacts of a run are written to.
+    static func testArtifactsDirectory() throws -> URL {
+        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true)
+        let artifacts = support.appendingPathComponent("LegHost/test-artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+        return artifacts
+    }
+
+    /// The file the trail of the session is written to.
+    static func persistedTrailURL() throws -> URL {
+        try testArtifactsDirectory().appendingPathComponent("exchange-trail.jsonl")
+    }
+
+    /// The file the durable ledger of the requests is written to.
+    static func requestLedgerURL() throws -> URL {
+        try testArtifactsDirectory().appendingPathComponent("request-ledger.jsonl")
     }
 
     /// Removes the provisioned root when the app was started with
@@ -491,56 +877,123 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         }
     }
 
+    /// Opens the durable ledger of the requests the fixture accepts.
+    ///
+    /// The ledger is cleared on the reset launch only. An ordinary relaunch
+    /// counts on top of the requests of the run before it, so a run that
+    /// starts again cannot hide a duplicate behind a fresh counter. A retry
+    /// after an interruption is such a run: the requests of the turn that
+    /// was stopped stay in the ledger.
+    private func openLedger() {
+        guard options.fixtureScenario != nil else { return }
+        guard let url = try? Self.requestLedgerURL() else { return }
+        let ledger = FixtureRequestLedger(url: url)
+        if resetsFixtureState {
+            try? ledger.clear()
+        }
+        self.ledger = ledger
+        refreshFixtureState()
+    }
+
     // MARK: - Runtime
 
     /// The state a fixture run starts from.
     ///
-    /// A fixture run has to be the same run every time, so the state the
-    /// guest program keeps between runs is removed: the catalog of the guest
-    /// program, so it asks for a workspace again and shows the first-run
-    /// warning again, and the exchange trail of the last run, so the trail
-    /// holds this run only. The directory of the trail is created, because
-    /// the guest appends to the trail file and does not make its directory.
+    /// The state the guest program keeps between runs is the catalog of the
+    /// guest program, so it asks for a workspace again, and the exchange
+    /// trail of the last run. Both are removed on the reset launch only: an
+    /// ordinary relaunch and a retry after an interruption keep the
+    /// workspace and the trail of the run before them, so a session can be
+    /// picked up where it stopped.
     private func prepareFixtureState(root: String) throws {
         let data = URL(fileURLWithPath: root).appendingPathComponent("data")
-        let guestState = data
-            .appendingPathComponent("root")
-            .appendingPathComponent(".local")
-            .appendingPathComponent("state")
-            .appendingPathComponent("leg-ui")
-        if FileManager.default.fileExists(atPath: guestState.path) {
-            try FileManager.default.removeItem(at: guestState)
-        }
         let trailDirectory = data
             .appendingPathComponent("tmp")
             .appendingPathComponent("leg-ios-fixture")
         let trail = trailDirectory.appendingPathComponent("exchange.jsonl")
-        if FileManager.default.fileExists(atPath: trail.path) {
-            try FileManager.default.removeItem(at: trail)
+        if resetsFixtureState {
+            let guestState = data
+                .appendingPathComponent("root")
+                .appendingPathComponent(".local")
+                .appendingPathComponent("state")
+                .appendingPathComponent("leg-ui")
+            if FileManager.default.fileExists(atPath: guestState.path) {
+                try FileManager.default.removeItem(at: guestState)
+            }
+            if FileManager.default.fileExists(atPath: trail.path) {
+                try FileManager.default.removeItem(at: trail)
+            }
         }
+        // The guest appends to the trail file and does not make its
+        // directory, so the directory is there before the session starts.
         try FileManager.default.createDirectory(at: trailDirectory, withIntermediateDirectories: true)
+    }
+
+    /// The trail of the exchange of the guest.
+    private func exchangeTrailURL() -> URL? {
+        guard !activeRoot.isEmpty else { return nil }
+        return URL(fileURLWithPath: activeRoot)
+            .appendingPathComponent("data")
+            .appendingPathComponent("tmp")
+            .appendingPathComponent("leg-ios-fixture")
+            .appendingPathComponent("exchange.jsonl")
     }
 
     /// Watches the exchange trail of the guest for the failure of the turn.
     ///
     /// The guest program writes the trail as it goes, so the host sees the
-    /// failure of a turn while the run is still going. The watcher stops
-    /// when it finds the failure, or when the run ends.
+    /// failure of a turn while the run is still going, and the number of
+    /// records the trail holds. The watcher stops when it finds the failure,
+    /// or when the run ends.
     private func watchExchangeTrail(root: String) {
         let trail = URL(fileURLWithPath: root)
             .appendingPathComponent("data")
             .appendingPathComponent("tmp")
             .appendingPathComponent("leg-ios-fixture")
             .appendingPathComponent("exchange.jsonl")
+        let seen = GuestTrailCounter()
+        // The watcher belongs to the chain it was made for: a record of the
+        // trail of a session that was stopped belongs to a session that is
+        // gone, and is not published in the session that runs now.
+        let generation = lifecycle.generation
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
         timer.setEventHandler { [weak self, weak timer] in
-            guard let failure = GuestHostController.turnFailure(in: trail) else { return }
-            timer?.cancel()
-            DispatchQueue.main.async { self?.reportTurnFailure(failure) }
+            let snapshot = GuestHostController.trailSnapshot(in: trail)
+            if let failure = snapshot.failure {
+                timer?.cancel()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isCurrentGeneration(generation) else { return }
+                    self.reportTurnFailure(failure)
+                }
+                return
+            }
+            guard seen.update(snapshot.records) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCurrentGeneration(generation) else { return }
+                self.publishTrailRecords(snapshot.records)
+            }
         }
         trailWatcher = timer
         timer.resume()
+    }
+
+    /// Whether the chain that runs now is the chain a callback belongs to.
+    ///
+    /// The workers of a session - the thread of the output and the watcher
+    /// of the trail - belong to the chain they were made for. A callback of
+    /// a chain that was stopped belongs to a session that is gone, and is
+    /// ignored.
+    private func isCurrentGeneration(_ generation: Int) -> Bool {
+        lifecycle.generation == generation
+    }
+
+    /// Publishes the number of records the trail of the guest holds.
+    private func publishTrailRecords(_ records: Int) {
+        // A trail that was written out at the boundary of the session stays
+        // as it was: a watcher that is still running must not change it.
+        guard phase != .interrupted else { return }
+        state.trail = records
     }
 
     /// Writes the failure the guest reported for the turn into the terminal.
@@ -555,24 +1008,36 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         writeToTerminal("\r\n\(failure)\r\n")
     }
 
-    /// Reads the failure the guest reported for the turn out of the trail.
+    /// What the host reads out of the exchange trail of the guest.
+    nonisolated private struct TrailSnapshot {
+        /// The number of records the trail holds.
+        var records: Int
+        /// The failure the guest reported, when it reported one.
+        var failure: String?
+    }
+
+    /// Reads the trail of the guest.
     ///
     /// The trail holds one JSON object per line. A failed turn records a
     /// `response_error` line, and that line holds the message the guest
     /// reported.
-    nonisolated private static func turnFailure(in trail: URL) -> String? {
+    nonisolated private static func trailSnapshot(in trail: URL) -> TrailSnapshot {
         guard let data = try? Data(contentsOf: trail),
-              let text = String(data: data, encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n") {
+              let text = String(data: data, encoding: .utf8) else {
+            return TrailSnapshot(records: 0, failure: nil)
+        }
+        let lines = text.split(separator: "\n")
+        var failure: String?
+        for line in lines {
             guard let record = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                   record["event"] as? String == "response_error",
                   let message = record["message"] as? String, !message.isEmpty else { continue }
-            return message
+            failure = message
         }
-        return nil
+        return TrailSnapshot(records: lines.count, failure: failure)
     }
 
-    private func boot(root: String) async throws {
+    private func bootRuntime(root: String) async throws {
         let dataDirectory = root + "/data"
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -588,31 +1053,51 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     }
 
     /// Reports the end of the guest program to the user.
+    ///
+    /// The callback of the runtime is a C function pointer, so it cannot
+    /// capture anything: the chain the callback belongs to travels with it
+    /// in the context of the callback.
     private func watchGuestExit() {
-        guest_runtime_set_exit_notify({ status, context in
-            guard let context = context else { return }
-            let controller = Unmanaged<GuestHostController>.fromOpaque(context).takeUnretainedValue()
-            DispatchQueue.main.async { controller.guestDidExit(Int(status)) }
-        }, Unmanaged.passUnretained(self).toOpaque())
+        let context = GuestExitContext(controller: self, generation: lifecycle.generation)
+        exitContext = context
+        guest_runtime_set_exit_notify({ status, pointer in
+            guard let pointer else { return }
+            let context = Unmanaged<GuestExitContext>.fromOpaque(pointer).takeUnretainedValue()
+            DispatchQueue.main.async {
+                context.controller.guestDidExit(Int(status), generation: context.generation)
+            }
+        }, Unmanaged.passUnretained(context).toOpaque())
     }
 
     /// The guest program ended. `status` is the wait status of the process: an
     /// exit code in the high byte, or the signal that stopped it.
-    private func guestDidExit(_ status: Int) {
+    ///
+    /// A callback of a session that was stopped belongs to a session that is
+    /// gone, so it is ignored.
+    fileprivate func guestDidExit(_ status: Int, generation: Int) {
+        guard generation == lifecycle.generation else { return }
         let exitCode = status >> 8
         let signal = status & 0x7f
-        fixture?.stop()
-        trailWatcher?.cancel()
-        trailWatcher = nil
-        if exitCode != 0 {
-            phase = .exited(status)
-            detail = "The guest program exited with code \(exitCode)."
-        } else if signal != 0 {
-            phase = .exited(status)
-            detail = "The guest program was stopped by signal \(signal)."
-        } else {
-            phase = .exited(status)
-            detail = "The guest program exited."
+        Task { [weak self] in
+            guard let self else { return }
+            // The generation is checked again inside the lifecycle, right
+            // before the session is released: the callback can have been
+            // scheduled before a teardown, and a retry can have begun
+            // since.
+            guard await self.lifecycle.endSession(generation: generation) else { return }
+            // A failure of the release of the session is shown as it is: the
+            // guest of the session did not stop.
+            if case .failed = self.phase { return }
+            if exitCode != 0 {
+                self.phase = .exited(status)
+                self.detail = "The guest program exited with code \(exitCode)."
+            } else if signal != 0 {
+                self.phase = .exited(status)
+                self.detail = "The guest program was stopped by signal \(signal)."
+            } else {
+                self.phase = .exited(status)
+                self.detail = "The guest program exited."
+            }
         }
     }
 
@@ -655,8 +1140,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The guest program finds its companion programs next to its own
     /// executable, and it looks for its own executable through
     /// `/proc/self/exe`. The emulator cannot answer that read for the process
-    /// it runs, and the answer takes the whole host down, so the host names
-    /// the two programs of the pinned bundle instead. A guest program that is
+    /// it runs, and the answer takes the whole host down, so the host names the
+    /// two programs of the pinned bundle instead. A guest program that is
     /// not the guest TUI takes no arguments.
     private func guestArguments(for program: String) -> [String] {
         guard program == HostLaunchOptions.defaultProgram else { return [program] }
@@ -686,8 +1171,22 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         environment.append("LEG_MODEL=\(model)")
         environment.append("LEG_CONTEXT_WINDOW_TOKENS=\(window)")
         if isFixture {
-            environment.append(contentsOf: Self.fixtureEnvironment)
+            environment.append(contentsOf: Self.fixtureEnvironment(for: options.fixtureScenario))
         }
+        return environment
+    }
+
+    /// The values that pin a fixture turn down.
+    ///
+    /// The delayed scenario holds its answer back, so the turn has to outlast
+    /// the timeout of the guest as well.
+    private static func fixtureEnvironment(for scenario: LoopbackFixture.Scenario?) -> [String] {
+        var environment = fixtureEnvironment
+        guard scenario == .delayed else { return environment }
+        environment.removeAll { $0.hasPrefix("LEG_TIMEOUT_SECS=")
+            || $0.hasPrefix("LEG_STREAM_IDLE_TIMEOUT_SECS=") }
+        environment.append("LEG_TIMEOUT_SECS=120")
+        environment.append("LEG_STREAM_IDLE_TIMEOUT_SECS=120")
         return environment
     }
 
@@ -696,7 +1195,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// Starts the loopback fixture and the terminal transcript.
     private func startFixture(scenario: LoopbackFixture.Scenario,
                                configuration: ProviderConfiguration) throws {
-        let fixture = LoopbackFixture(scenario: scenario, expectedAPIKey: configuration.apiKey)
+        let fixture = LoopbackFixture(scenario: scenario,
+                                      expectedAPIKey: configuration.apiKey,
+                                      ledger: ledger)
         try fixture.start()
         fixture.onObservationChanged = { [weak self] in
             DispatchQueue.main.async { self?.refreshFixtureState() }
@@ -709,11 +1210,31 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     /// Reads the fixture observation into the published state.
     private func refreshFixtureState() {
+        // The number of requests is the number the durable ledger holds: a
+        // run that starts again counts the requests of the run before it.
+        state.requests = ledger?.count ?? fixture?.currentObservation.acceptedRequests ?? 0
         guard let fixture else { return }
         let observation = fixture.currentObservation
-        state.requests = observation.acceptedRequests
         state.statuses = observation.statuses
         state.validation = observation.validation
+        interruptOnItsOwnIfAsked()
+    }
+
+    /// Stops the session on its own when the run asked for it.
+    ///
+    /// The control of the run stops the session as soon as the fixture
+    /// accepts the request of the turn, so the test sees the interruption of
+    /// a session that was running without the app having to go to the
+    /// background. The path is the one of the background: the chain is
+    /// cancelled, the trail of the stopped turn is written out and the
+    /// interrupted state is shown.
+    private func interruptOnItsOwnIfAsked() {
+        #if DEBUG
+        guard interruptsOnItsOwn else { return }
+        guard state.requests > 0, phase == .running else { return }
+        interruptsOnItsOwn = false
+        handleBackground()
+        #endif
     }
 
     /// Opens the file the raw terminal output is written to.
@@ -721,11 +1242,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The transcript is written in a fixture run only. It holds the bytes the
     /// guest produced, so it is written the way the guest produced them.
     private func openTranscript() throws {
-        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                                 appropriateFor: nil, create: true)
-        let artifacts = support.appendingPathComponent("LegHost/test-artifacts", isDirectory: true)
-        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
-        let transcript = artifacts.appendingPathComponent("terminal-transcript.log")
+        let transcript = try Self.testArtifactsDirectory()
+            .appendingPathComponent("terminal-transcript.log")
         FileManager.default.createFile(atPath: transcript.path, contents: nil)
         transcriptHandle = try FileHandle(forWritingTo: transcript)
     }
@@ -740,8 +1258,16 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     // MARK: - Output
 
     private func startOutputPump() {
+        let flag = GuestOutputFlag()
+        outputFlag = flag
+        let finished = DispatchSemaphore(value: 0)
+        outputFinished = finished
+        // The pump belongs to the chain it was made for: the text of a
+        // session that was stopped belongs to a session that is gone, and
+        // is not shown in the terminal of the session that runs now.
+        let generation = lifecycle.generation
         guest_runtime_set_output_notify({ context in
-            guard let context = context else { return }
+            guard let context else { return }
             let semaphore = Unmanaged<DispatchSemaphore>.fromOpaque(context).takeUnretainedValue()
             semaphore.signal()
         }, Unmanaged.passUnretained(outputSignal).toOpaque())
@@ -749,7 +1275,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let signal = outputSignal
         let thread = Thread { [weak self] in
             var buffer = [UInt8](repeating: 0, count: 16 * 1024)
-            while true {
+            while flag.isRunning {
                 let length = guest_runtime_read_output(&buffer, buffer.count)
                 if length == 0 {
                     _ = signal.wait(timeout: .now() + .milliseconds(100))
@@ -758,9 +1284,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 let text = GuestOutputText.latin1(Array(buffer[0..<length]))
                 guard !text.isEmpty else { continue }
                 DispatchQueue.main.async { [weak self] in
-                    self?.writeToTerminal(text)
+                    guard let self, self.isCurrentGeneration(generation) else { return }
+                    self.writeToTerminal(text)
                 }
             }
+            finished.signal()
         }
         thread.stackSize = 512 * 1024
         outputThread = thread
@@ -810,16 +1338,20 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     // MARK: - Terminal
 
     func attach(sink: GuestTerminalSink) {
+        NSLog("[LegHost] the terminal was attached to the host")
         self.sink = sink
-        if terminalReady {
-            sink.reportSize()
-        }
+        // The terminal that is attached now is not the terminal that was
+        // ready before: its page has to load before it can take the output
+        // of the guest. The output is held back until it does, so the first
+        // screen of the guest is not lost.
+        terminalReady = false
     }
 
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
         switch message.name {
         case "load":
+            NSLog("[LegHost] the terminal of the guest loaded")
             terminalReady = true
             if !pendingOutput.isEmpty {
                 sink?.write(pendingOutput)
@@ -848,6 +1380,21 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         default:
             break
         }
+    }
+}
+
+/// The number of records the watcher of the trail saw last.
+///
+/// The watcher reads the trail on its own queue, so the number it compares
+/// against is kept in a box of its own.
+private final class GuestTrailCounter {
+    private var records = -1
+
+    /// Remembers the number of records and reports whether it changed.
+    func update(_ records: Int) -> Bool {
+        guard records != self.records else { return false }
+        self.records = records
+        return true
     }
 }
 

@@ -9,11 +9,24 @@ import SwiftUI
 @main
 struct LegHostApp: App {
     @StateObject private var controller = GuestHostController()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             GuestHostScreen(controller: controller)
                 .onAppear { controller.start() }
+                .onChange(of: scenePhase) { phase in
+                    switch phase {
+                    case .background:
+                        // iOS does not run the guest in the background, so
+                        // the session stops at the boundary of the host.
+                        controller.handleBackground()
+                    case .active:
+                        controller.handleForeground()
+                    default:
+                        break
+                    }
+                }
         }
     }
 }
@@ -22,37 +35,74 @@ struct LegHostApp: App {
 struct GuestHostScreen: View {
     @ObservedObject var controller: GuestHostController
 
+    /// The identity of the terminal.
+    ///
+    /// The terminal is the last child of the stack in every phase of the
+    /// host, so it is the same view in every one of them. The identity makes
+    /// that certain: the web view of the terminal is not built again when
+    /// the phase changes, and the screen of the guest is not lost when the
+    /// session is interrupted or started again.
+    static let terminalID = "guest-terminal"
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            switch controller.phase {
-            case .running:
-                VStack(spacing: 0) {
-                    statusBar
-                    stateRow
-                    controlRow
-                    GuestTerminalView(controller: controller)
-                }
-            case .exited:
-                statusView(title: "The guest program ended",
-                          detail: controller.detail,
-                          identifier: "guest-exited")
-            case .failed(let message):
-                // The terminal stays on the screen when the guest could not
-                // start: the host writes what went wrong into it, and the
-                // terminal is where the guest would have spoken.
-                VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                switch controller.phase {
+                case .running:
+                    runningHeader
+                case .exited:
+                    statusView(title: "The guest program ended",
+                              detail: controller.detail,
+                              identifier: "guest-exited")
+                case .interrupted:
+                    // The terminal stays on the screen when the session was
+                    // interrupted: it holds the screen of the guest as it
+                    // was when the session stopped.
+                    statusView(title: "The session was interrupted",
+                              detail: controller.detail,
+                              identifier: "guest-interrupted",
+                              expands: false)
+                case .failed(let message):
+                    // The terminal stays on the screen when the guest could
+                    // not start: the host writes what went wrong into it,
+                    // and the terminal is where the guest would have spoken.
                     statusView(title: "The guest could not start",
                               detail: message,
                               expands: false)
-                    GuestTerminalView(controller: controller)
+                default:
+                    statusView(title: title, detail: controller.detail)
                 }
-            default:
-                statusView(title: title, detail: controller.detail)
+                // The terminal is the last child of the stack in every phase
+                // of the host, so it is the same view in every one of them:
+                // the web view of the terminal is not built again when the
+                // phase changes, and the screen of the guest is not lost.
+                GuestTerminalView(controller: controller)
+                    .id(GuestHostScreen.terminalID)
+                    .frame(height: showsTerminal ? nil : 0)
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    /// The rows above the terminal of a guest that runs.
+    private var runningHeader: some View {
+        VStack(spacing: 0) {
+            statusBar
+            stateRow
+            controlRow
+        }
+    }
+
+    /// Whether the terminal is on the screen in this phase.
+    private var showsTerminal: Bool {
+        switch controller.phase {
+        case .running, .interrupted, .failed:
+            return true
+        default:
+            return false
+        }
     }
 
     /// The bar above the terminal. It records whether this launch imported
@@ -174,6 +224,7 @@ struct GuestHostScreen: View {
         case .running: return "Running the guest"
         case .exited: return "The guest program ended"
         case .failed: return "The guest could not start"
+        case .interrupted: return "The session was interrupted"
         }
     }
 
@@ -208,7 +259,12 @@ struct GuestHostScreen: View {
                 LabeledContent("Guest root", value: "reused the verified root")
             }
             if case .failed = controller.phase {
-                Button("Try again") { controller.start() }
+                Button("Try again") { controller.retry() }
+                    .accessibilityIdentifier("guest-retry")
+            }
+            if case .interrupted = controller.phase {
+                Button("Try again") { controller.retry() }
+                    .accessibilityIdentifier("guest-retry")
             }
             Spacer()
         }

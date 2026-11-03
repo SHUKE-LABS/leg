@@ -9,6 +9,10 @@
 #include "kernel/vdso.h"
 #include "util/sync.h"
 
+/* The number of files the walk of the files of a task reads at most. The
+ * walk of a task of the host is a check, and a check does not run forever. */
+#define PROC_FD_WALK_MAX 256
+
 static void proc_pid_getname(struct proc_entry *entry, char *buf) {
     sprintf(buf, "%d", entry->pid);
 }
@@ -270,6 +274,12 @@ static bool proc_pid_fd_readdir(struct proc_entry *entry, unsigned long *index, 
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    /* A task that is on its way out holds no files: it let them go. The
+     * directory of the files of such a task is empty. */
+    if (task->files == NULL) {
+        proc_put_task(task);
+        return false;
+    }
     lock(&task->files->lock);
     while (*index < task->files->size && task->files->files[*index] == NULL)
         (*index)++;
@@ -289,12 +299,41 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    /* A task that is on its way out holds no files: it let them go. */
+    if (task->files == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
     lock(&task->files->lock);
     struct fd *fd = fdtable_get(task->files, entry->fd);
     int err = generic_getpath(fd, buf);
     unlock(&task->files->lock);
     proc_put_task(task);
     return err;
+}
+
+/* The walk of the files of a task, the way the /proc walks them: the lock of
+ * the tasks is held while the files of the task are read, and the lock of the
+ * table of the files is taken while they are read.
+ *
+ * The host walks the files of a task with it while the task lets them go: a
+ * walk that sees the files of a task that is let go reads a table that is
+ * gone, and the run ends in a crash. The walk is bounded, so a task that is
+ * gone does not make it run forever. */
+int proc_pid_fd_walk(pid_t_ pid) {
+    struct proc_entry entry = {.pid = pid};
+    unsigned long index = 0;
+    int count = 0;
+    while (count < PROC_FD_WALK_MAX) {
+        struct proc_entry next_entry = {0};
+        if (!proc_pid_fd_readdir(&entry, &index, &next_entry))
+            break;
+        count++;
+        char path[MAX_PATH];
+        path[0] = 0;
+        proc_pid_fd_readlink(&next_entry, path);
+    }
+    return count;
 }
 
 static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
