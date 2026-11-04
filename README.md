@@ -288,7 +288,58 @@ xcrun simctl uninstall "iPhone 17 Pro" com.shukelabs.leg.ioshost
 The last command resets the host: it removes the provisioned guest root, so
 the next launch imports it again. See [ios/README.md](ios/README.md) for the
 pinned inputs, the build, install and signing commands, the host fixtures and
-the simulator UI tests.
+the UI tests.
+
+### On a physical iPhone
+
+The same host runs on a physical iPhone. The device build needs a signing team,
+and the signing needs the GUI session of the console user: a plain ssh session
+cannot use its login keychain, and `codesign` fails with
+`errSecInternalComponent`. Run the whole device build in that session, with
+the complete command inside the wrapper:
+
+```
+u=$(id -u); n=$(id -un)
+sudo -n launchctl asuser "$u" sudo -n -u "$n" env \
+    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOME="/Users/$n" \
+    /bin/bash -c 'cd <repo> && xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost \
+        -sdk iphoneos -configuration Release -derivedDataPath build/dd-device \
+        -destination "generic/platform=iOS" -allowProvisioningUpdates \
+        DEVELOPMENT_TEAM=<team-id> build'
+```
+
+The install, the launch and the uninstall go through `devicectl`, and they work
+from a plain ssh session:
+
+```
+xcrun devicectl device install app --device <device> \
+    build/dd-device/Build/Products/Release-iphoneos/LegHost.app
+xcrun devicectl device process launch --device <device> com.shukelabs.leg.ioshost
+xcrun devicectl device uninstall app --device <device> com.shukelabs.leg.ioshost
+```
+
+The launch controls of the host follow a `--`, or `devicectl` reads them as
+options of its own:
+
+```
+xcrun devicectl device process launch --device <device> \
+    com.shukelabs.leg.ioshost -- -leghost-fixture success -leghost-provider anthropic
+```
+
+A Release build on a clean device stops at the provider boundary with
+`IOS_PROVIDER_CONFIG_MISSING`: the host reads the provider configuration from
+the Keychain of the device, and it has no UI to write that item yet (the
+settings UI is a later slice), so nothing is provisioned, booted or started.
+The guest path on a device is proved with the DEBUG build and the loopback
+fixture.
+
+The guest data lives in the container of the app. A relaunch keeps it: the
+verified root, the workspace of the guest, the trail and the durable ledger of
+the requests. An uninstall clears it: the next launch imports the root again
+and the guest asks for a workspace again.
+
+The checklist of a run on an iPhone 12, with the evidence of every item, is in
+[ios/physical-device-validation.md](ios/physical-device-validation.md).
 
 ## Experimental TUI trial
 
