@@ -308,33 +308,24 @@ not cover.
 ## Signing a device build
 
 The simulator build needs no signing identity. A device build uses automatic
-development signing and needs a team:
-
-```
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphoneos \
-    -configuration Release -derivedDataPath build/dd-device \
-    -destination 'generic/platform=iOS' -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM=<team-id> build
-```
-
-The project ships `DEVELOPMENT_TEAM` empty so no team id is committed; pass it
-on the command line (or set it in Xcode for the local checkout).
-
-### The signing needs the GUI session of the console user
-
-A plain ssh session cannot use the login keychain of the console user, and
-codesign fails with `errSecInternalComponent`. Run the build in the GUI
-security session of that user:
+development signing and needs a team, and the signing needs the GUI security
+session of the console user: a plain ssh session cannot use its login
+keychain, and `codesign` fails with `errSecInternalComponent`. Run the whole
+device build in that session, with the complete command inside the wrapper:
 
 ```
 u=$(id -u); n=$(id -un)
 sudo -n launchctl asuser "$u" sudo -n -u "$n" env \
     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOME="/Users/$n" \
-    /bin/bash -c 'cd <repo>/ios && xcodebuild ...'
+    /bin/bash -c 'cd <repo> && xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost \
+        -sdk iphoneos -configuration Release -derivedDataPath build/dd-device \
+        -destination "generic/platform=iOS" -allowProvisioningUpdates \
+        DEVELOPMENT_TEAM=<team-id> build'
 ```
 
-The install and the launch work from a plain ssh session.
+The project ships `DEVELOPMENT_TEAM` empty so no team id is committed; pass it
+on the command line (or set it in Xcode for the local checkout). The install
+and the launch work from a plain ssh session.
 
 ### The install, the launch and the uninstall on the device
 

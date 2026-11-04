@@ -25,23 +25,19 @@ checkout was empty.
 
 ### The build
 
-```
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphoneos \
-    -configuration Release -derivedDataPath build/dd-device \
-    -destination 'generic/platform=iOS' -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM=<team-id> build
-```
-
 The signing needs the GUI security session of the console user, because a plain
 ssh session cannot use its login keychain and `codesign` fails with
-`errSecInternalComponent`:
+`errSecInternalComponent`. The whole device build runs in that session, with
+the complete command inside the wrapper:
 
 ```
 u=$(id -u); n=$(id -un)
 sudo -n launchctl asuser "$u" sudo -n -u "$n" env \
     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOME="/Users/$n" \
-    /bin/bash -c 'cd <repo>/ios && xcodebuild ...'
+    /bin/bash -c 'cd <repo> && xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost \
+        -sdk iphoneos -configuration Release -derivedDataPath build/dd-device \
+        -destination "generic/platform=iOS" -allowProvisioningUpdates \
+        DEVELOPMENT_TEAM=<team-id> build'
 ```
 
 The install and the launch work from a plain ssh session.

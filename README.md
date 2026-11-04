@@ -295,21 +295,17 @@ the UI tests.
 The same host runs on a physical iPhone. The device build needs a signing team,
 and the signing needs the GUI session of the console user: a plain ssh session
 cannot use its login keychain, and `codesign` fails with
-`errSecInternalComponent`.
-
-```
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphoneos \
-    -configuration Release -derivedDataPath build/dd-device \
-    -destination 'generic/platform=iOS' -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM=<team-id> build
-```
+`errSecInternalComponent`. Run the whole device build in that session, with
+the complete command inside the wrapper:
 
 ```
 u=$(id -u); n=$(id -un)
 sudo -n launchctl asuser "$u" sudo -n -u "$n" env \
     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOME="/Users/$n" \
-    /bin/bash -c 'cd <repo>/ios && xcodebuild ...'
+    /bin/bash -c 'cd <repo> && xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost \
+        -sdk iphoneos -configuration Release -derivedDataPath build/dd-device \
+        -destination "generic/platform=iOS" -allowProvisioningUpdates \
+        DEVELOPMENT_TEAM=<team-id> build'
 ```
 
 The install, the launch and the uninstall go through `devicectl`, and they work
