@@ -202,6 +202,9 @@ each of the four programs.
   used for this slice is `mbp15` (Intel, macOS 15.7.2).
 - `xcode-select` may point at the Command Line Tools; every build command sets
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+- A physical iOS device and a signing team for a device build. The device
+  validation runs on an iPhone 12 (iOS 18.6.2); its checklist is in
+  [`physical-device-validation.md`](physical-device-validation.md).
 - An ELF linker for the i386 vDSO that the vendored runtime embeds: `ld.lld`
   (Homebrew `lld`) or the `rust-lld` that ships with a rustup toolchain. Xcode
   itself only ships `ld64`, which cannot produce an i386 ELF object.
@@ -216,7 +219,7 @@ each of the four programs.
 | Device family | iPhone and iPad (`TARGETED_DEVICE_FAMILY = 1,2`) |
 | Bundled identifier | `com.shukelabs.leg.ioshost` |
 | Signing | Automatic development signing (`CODE_SIGN_STYLE = Automatic`) |
-| Architectures | `x86_64` and `arm64` simulator slices, `arm64` device slice (no device is attached yet, see `#265`) |
+| Architectures | `x86_64` and `arm64` simulator slices, `arm64` device slice (the device slice is built and validated on an iPhone 12, iOS 18.6.2, see [`physical-device-validation.md`](physical-device-validation.md)) |
 
 ## Build
 
@@ -294,6 +297,14 @@ xcrun simctl launch "iPhone 17 Pro" com.shukelabs.leg.ioshost \
     -leghost-program /bin/sh
 ```
 
+## The physical device
+
+The device build, the install and the launch, and the checklist of a run on an
+iPhone 12 are in
+[`physical-device-validation.md`](physical-device-validation.md). That file
+records the evidence of every item of the checklist, and what a device run does
+not cover.
+
 ## Signing a device build
 
 The simulator build needs no signing identity. A device build uses automatic
@@ -302,12 +313,74 @@ development signing and needs a team:
 ```
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 xcodebuild -project ios/LegHost.xcodeproj -scheme LegHost -sdk iphoneos \
-    -configuration Release -derivedDataPath build/dd \
+    -configuration Release -derivedDataPath build/dd-device \
+    -destination 'generic/platform=iOS' -allowProvisioningUpdates \
     DEVELOPMENT_TEAM=<team-id> build
 ```
 
 The project ships `DEVELOPMENT_TEAM` empty so no team id is committed; pass it
 on the command line (or set it in Xcode for the local checkout).
+
+### The signing needs the GUI session of the console user
+
+A plain ssh session cannot use the login keychain of the console user, and
+codesign fails with `errSecInternalComponent`. Run the build in the GUI
+security session of that user:
+
+```
+u=$(id -u); n=$(id -un)
+sudo -n launchctl asuser "$u" sudo -n -u "$n" env \
+    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOME="/Users/$n" \
+    /bin/bash -c 'cd <repo>/ios && xcodebuild ...'
+```
+
+The install and the launch work from a plain ssh session.
+
+### The install, the launch and the uninstall on the device
+
+```
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+xcrun devicectl device install app --device <device> \
+    build/dd-device/Build/Products/Release-iphoneos/LegHost.app
+xcrun devicectl device process launch --device <device> com.shukelabs.leg.ioshost
+xcrun devicectl device uninstall app --device <device> com.shukelabs.leg.ioshost
+```
+
+The launch controls of the host follow a `--`, or `devicectl` reads them as
+options of its own:
+
+```
+xcrun devicectl device process launch --device <device> \
+    com.shukelabs.leg.ioshost -- -leghost-fixture success -leghost-provider anthropic
+```
+
+### The provider configuration of a device build
+
+A build without the DEBUG controls reads the provider configuration from the
+Keychain of the device, and a device without that item stops at the
+configuration boundary with `IOS_PROVIDER_CONFIG_MISSING` before it touches
+the guest root: nothing is provisioned, booted or started. The host has no UI
+to add the item yet (the settings UI is a later slice), so a device run with a
+Release build proves the install, the launch and that boundary, and the guest
+path is proved with the DEBUG build and the loopback fixture.
+
+### The tests on the device
+
+The UI tests of the host run on a device as well, and they drive the same
+paths a person drives on the phone: the touch, the software keyboard, the
+rotation, the on screen interrupt and the turn against the fixture.
+
+```
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+xcodebuild test -project ios/LegHost.xcodeproj -scheme LegHost \
+    -destination 'platform=iOS,id=<device-udid>' \
+    -derivedDataPath build/dd-device
+```
+
+A device suspends the app when the system wants the screen for something
+else, and the host stops the session at its boundary when the app goes to the
+background. A test that waits for minutes without touching the screen can
+therefore see the interrupted state instead of the state it waits for.
 
 ## Simulator UI tests
 
@@ -718,8 +791,8 @@ root must hold, not code of them.
 
 ## Out of scope
 
-The settings UI, physical device runtime testing, the native Photos, Files
-and Shortcuts adapters, and App Store metadata are later slices of `#255`.
+The settings UI, the native Photos, Files and Shortcuts adapters, and App
+Store metadata are later slices of `#255`.
 The provider support of this slice is the Anthropic Messages protocol; the
 OpenAI wire variants are covered only as the rejection cases of the fixture.
 The host does not run in the background: iOS decides when the app is

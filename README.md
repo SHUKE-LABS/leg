@@ -288,7 +288,11 @@ xcrun simctl uninstall "iPhone 17 Pro" com.shukelabs.leg.ioshost
 The last command resets the host: it removes the provisioned guest root, so
 the next launch imports it again. See [ios/README.md](ios/README.md) for the
 pinned inputs, the build, install and signing commands, the host fixtures and
-the simulator UI tests.
+the UI tests.
+
+The same host runs on a physical iPhone. The device build, the `devicectl`
+install, launch and uninstall, and the checklist of a run on an iPhone 12 are
+in [ios/physical-device-validation.md](ios/physical-device-validation.md).
 
 ## Experimental TUI trial
 
