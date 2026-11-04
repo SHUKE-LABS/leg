@@ -149,6 +149,17 @@ class took 108 s instead of 16 s), and the guest did not reach the composer
 within the deadline of the test. Neither is a fault of the guest path: every
 one of the tests passed on the device when it ran on its own.
 
+## The checks of the host on the build host
+
+The checks that already existed for the host ran on the build host, against the
+same commit:
+
+| Check | Result |
+| --- | --- |
+| `ios/tests/run-host-tests.sh` (the fixtures of the provisioner) | pass |
+| `ios/tests/run-provider-tests.sh` (the fixtures of the provider configuration) | 26 checks, 0 failures |
+| `ios/tests/run-lifecycle-tests.sh` (the lifecycle and the preflight tests) | 20 tests, 0 failures |
+
 ## What the run does not cover
 
 - A turn against a real provider on the device. Every turn of the run went to
