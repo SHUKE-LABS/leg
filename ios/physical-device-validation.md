@@ -159,6 +159,14 @@ same commit:
 | `ios/tests/run-host-tests.sh` (the fixtures of the provisioner) | pass |
 | `ios/tests/run-provider-tests.sh` (the fixtures of the provider configuration) | 26 checks, 0 failures |
 | `ios/tests/run-lifecycle-tests.sh` (the lifecycle and the preflight tests) | 20 tests, 0 failures |
+| `ios/tests/run-fixture-tests.sh` (the fixture UI tests in the simulator) | 11 of 12 passed |
+
+The fixture test that failed in the simulator is
+`testTheStoppedGuestCannotWriteAfterManyRetries`, and it failed there with the
+accessibility server of the simulator giving up ("failed to get list of
+active..."), also when it ran on its own after the simulator was booted again.
+The same test passed on the physical device three times: in both runs of the
+suite and on its own.
 
 ## What the run does not cover
 
