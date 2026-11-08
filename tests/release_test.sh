@@ -281,6 +281,176 @@ NODE
     assert_rc_nonzero "${status}"
 )
 
+# The mobile fixture starts from every binary the i686 build produces, so the
+# bundle has to pick exactly its own four and leave leg-web out.
+make_ish_mobile_fixture() {
+    local repo="${1}" version="${2}" name
+
+    mkdir -p "${repo}/binaries"
+    for name in leg leg-tui leg-web leg-ui-supervisor leg-bridge; do
+        make_ish_binary_fixture "${repo}/binaries" "${name}"
+    done
+    release_ish_bundle "${version}" "${repo}/binaries" "${repo}/mobile.tar.gz" ios-mobile
+    mkdir "${repo}/good"
+    tar -xzf "${repo}/mobile.tar.gz" -C "${repo}/good"
+}
+
+# Runs a node edit against the manifest of an unpacked bundle; the script
+# sees the parsed manifest as `manifest`.
+edit_ish_manifest() {
+    local bundle_dir="${1}" script="${2}"
+
+    node - "${bundle_dir}/ish-compatibility-v1.json" "${script}" <<'NODE'
+const fs = require('node:fs');
+const [, , path, script] = process.argv;
+const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
+new Function('manifest', script)(manifest);
+fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+}
+
+# Copies the good bundle, applies one mutation in it, and expects the mobile
+# verifier to reject the result with the given message.
+expect_ish_mobile_rejection() {
+    local repo="${1}" label="${2}" expected="${3}" mutation="${4}"
+    local dir="${repo}/case-${label}" status=0 output=""
+
+    cp -R "${repo}/good" "${dir}"
+    (cd -- "${dir}" && eval "${mutation}")
+    output="$(release_ish_verify_bundle "${dir}" "${version}" ios-mobile 2>&1)" || status="$?"
+    (( status != 0 )) || fail "${label}: the mobile verifier accepted the bundle"
+    [[ "${output}" == *"${expected}"* ]] || \
+        fail "${label}: expected '${expected}' in: ${output}"
+}
+
+test_ish_mobile_bundle_is_reproducible_and_verified() (
+    set -euo pipefail
+    local repo version second entries manifest
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.40.0"
+
+    make_ish_mobile_fixture "${repo}" "${version}"
+    release_ish_verify_archive "${repo}/mobile.tar.gz" "${version}" ios-mobile
+    release_main verify-ish-mobile-archive "${repo}/mobile.tar.gz" "${version}"
+
+    entries="$(tar -tzf "${repo}/mobile.tar.gz" | LC_ALL=C sort)"
+    assert_eq "SHA256SUMS
+ish-compatibility-v1.json
+leg
+leg-bridge
+leg-tui
+leg-ui-supervisor" "${entries}" \
+        "the mobile archive carries the four mobile binaries, the manifest, and SHA256SUMS"
+
+    second="${repo}/second.tar.gz"
+    release_main ish-mobile-bundle "${version}" "${repo}/binaries" "${second}"
+    assert_eq "$(release_sha256_sum -- "${repo}/mobile.tar.gz" | cut -d' ' -f1)" \
+        "$(release_sha256_sum -- "${second}" | cut -d' ' -f1)" \
+        "the mobile archive is byte-for-byte reproducible"
+
+    manifest="${repo}/good/ish-compatibility-v1.json"
+    assert_eq "ios-mobile ${version} i686-unknown-linux-musl" \
+        "$(node -e 'const m = require(process.argv[1]); console.log(m.bundle_kind, m.leg_version, m.target)' "${manifest}")" \
+        "the mobile manifest records its kind, the release version, and the target"
+    assert_eq "leg leg-tui leg-ui-supervisor leg-bridge" \
+        "$(node -e 'console.log(require(process.argv[1]).binaries.map((b) => b.name).join(" "))' "${manifest}")" \
+        "the mobile manifest lists the four mobile binaries"
+    assert_eq "leg --version leg-tui --version leg-ui-supervisor --version leg-bridge --version" \
+        "$(node -e 'console.log(require(process.argv[1]).binaries.map((b) => b.version_command).join(" "))' "${manifest}")" \
+        "the mobile manifest records the exact version command for every binary"
+)
+
+test_ish_mobile_bundle_rejects_wrong_inputs() (
+    set -euo pipefail
+    local repo version status output generic
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.40.0"
+
+    make_ish_mobile_fixture "${repo}" "${version}"
+
+    # Packaging needs leg-bridge but never leg-web.
+    mkdir "${repo}/no-bridge"
+    cp "${repo}/binaries/"* "${repo}/no-bridge/"
+    rm "${repo}/no-bridge/leg-bridge" "${repo}/no-bridge/leg-web"
+    status=0
+    output="$(release_ish_bundle "${version}" "${repo}/no-bridge" "${repo}/no-bridge.tar.gz" ios-mobile 2>&1)" \
+        || status="$?"
+    assert_rc_nonzero "${status}"
+    [[ "${output}" == *"iSH binary 'leg-bridge' missing"* ]] || \
+        fail "the mobile bundle must name the missing leg-bridge: ${output}"
+    [[ ! -e "${repo}/no-bridge.tar.gz" ]] || fail "a rejected mobile bundle leaves no archive behind"
+
+    status=0
+    output="$(release_ish_bundle "${version}" "${repo}/binaries" "${repo}/unknown.tar.gz" ios 2>&1)" \
+        || status="$?"
+    assert_rc_nonzero "${status}"
+    [[ "${output}" == *"unknown iSH bundle kind 'ios'"* ]] || \
+        fail "an unknown bundle kind must be rejected: ${output}"
+
+    expect_ish_mobile_rejection "${repo}" missing-binary "must contain exactly" \
+        'rm leg-bridge'
+    expect_ish_mobile_rejection "${repo}" missing-manifest "must contain exactly" \
+        'rm ish-compatibility-v1.json'
+    expect_ish_mobile_rejection "${repo}" extra-file "must contain exactly" \
+        'cp leg leg-web'
+    expect_ish_mobile_rejection "${repo}" wrong-target "target 'x86_64-unknown-linux-musl'" \
+        'edit_ish_manifest . "manifest.target = \"x86_64-unknown-linux-musl\"" && release_ish_write_checksums . ios-mobile'
+    expect_ish_mobile_rejection "${repo}" stale-version "leg_version '0.39.0'" \
+        'edit_ish_manifest . "manifest.leg_version = \"0.39.0\"" && release_ish_write_checksums . ios-mobile'
+    expect_ish_mobile_rejection "${repo}" missing-kind "bundle_kind 'undefined'" \
+        'edit_ish_manifest . "delete manifest.bundle_kind" && release_ish_write_checksums . ios-mobile'
+    expect_ish_mobile_rejection "${repo}" wrong-kind "bundle_kind 'generic'" \
+        'edit_ish_manifest . "manifest.bundle_kind = \"generic\"" && release_ish_write_checksums . ios-mobile'
+    expect_ish_mobile_rejection "${repo}" wrong-version-command "must record 'leg-bridge --version'" \
+        'edit_ish_manifest . "manifest.binaries[3].version_command = \"leg-bridge --help\"" && release_ish_write_checksums . ios-mobile'
+    expect_ish_mobile_rejection "${repo}" wrong-binary-digest "binary 'leg-bridge' digest does not match" \
+        'edit_ish_manifest . "manifest.binaries[3].sha256 = \"0\".repeat(64)" && release_ish_write_checksums . ios-mobile'
+    expect_ish_mobile_rejection "${repo}" changed-binary "checksums do not verify" \
+        'printf x >>leg-bridge'
+    expect_ish_mobile_rejection "${repo}" not-elf32 "is not an ELF32 executable" \
+        'make_elf_fixture leg-bridge 2 62 && release_ish_write_checksums . ios-mobile'
+    expect_ish_mobile_rejection "${repo}" malformed-sums "must cover every bundle file" \
+        'printf "not a checksum line\n" >>SHA256SUMS'
+    expect_ish_mobile_rejection "${repo}" incomplete-sums "must cover every bundle file" \
+        'grep -v "[ *]leg-bridge$" SHA256SUMS >sums.tmp; mv sums.tmp SHA256SUMS'
+    expect_ish_mobile_rejection "${repo}" duplicate-sums "must cover every bundle file" \
+        'grep "[ *]leg$" SHA256SUMS >sums.tmp; cat sums.tmp >>SHA256SUMS; rm sums.tmp'
+    expect_ish_mobile_rejection "${repo}" unknown-sums "checksums do not verify" \
+        'printf "%064d  leg-web\n" 0 >>SHA256SUMS'
+    # This unknown name resolves to a bundle file, so its digest verifies and
+    # only the coverage check can catch it.
+    expect_ish_mobile_rejection "${repo}" aliased-sums "must cover every bundle file" \
+        'release_sha256_sum -- leg | sed "s|[ *]leg$| ./leg|" >>SHA256SUMS'
+
+    # The generic bundle cannot stand in for the mobile one, nor the other way
+    # round.
+    generic="${repo}/generic.tar.gz"
+    release_ish_bundle "${version}" "${repo}/binaries" "${generic}"
+    status=0
+    output="$(release_main verify-ish-mobile-archive "${generic}" "${version}" 2>&1)" || status="$?"
+    assert_rc_nonzero "${status}"
+    [[ "${output}" == *"must contain exactly"* ]] || \
+        fail "the mobile verifier must reject the generic archive: ${output}"
+    status=0
+    release_ish_verify_archive "${repo}/mobile.tar.gz" "${version}" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
+    # Nor can a self-consistent generic bundle that claims the mobile kind.
+    cp -R "${repo}/good" "${repo}/kind-in-generic"
+    rm "${repo}/kind-in-generic/leg-bridge"
+    cp "${repo}/binaries/leg-web" "${repo}/kind-in-generic/leg-web"
+    release_ish_write_manifest "${version}" "${repo}/kind-in-generic" generic
+    edit_ish_manifest "${repo}/kind-in-generic" 'manifest.bundle_kind = "ios-mobile"'
+    release_ish_write_checksums "${repo}/kind-in-generic"
+    status=0
+    output="$(release_ish_verify_bundle "${repo}/kind-in-generic" "${version}" 2>&1)" || status="$?"
+    assert_rc_nonzero "${status}"
+    [[ "${output}" == *"must not declare bundle_kind"* ]] || \
+        fail "the generic verifier must reject a bundle_kind: ${output}"
+)
+
 test_ish_elf_validation() (
     set -euo pipefail
     local repo status
@@ -322,6 +492,15 @@ test_ish_version_output_check() (
     release_ish_verify_version_output leg 0.41.0 "leg 0.41.0 (dirty)" >/dev/null 2>&1 || status="$?"
     assert_rc_nonzero "${status}"
 
+    # `leg-bridge` is built from the release crate as well.
+    status=0
+    release_ish_verify_version_output leg-bridge 0.41.0 "leg-bridge 0.41.0" >/dev/null || status="$?"
+    (( status == 0 )) || fail "leg-bridge must report the release version"
+
+    status=0
+    release_ish_verify_version_output leg-bridge 0.41.0 "leg-bridge 0.40.0" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+
     # The companions keep their own crate versions, so the bundle only requires
     # a semver from them, the same contract the desktop release rows enforce.
     for name in leg-tui leg-web leg-ui-supervisor; do
@@ -353,6 +532,20 @@ leg-ui-supervisor 0.1.0"
         release_ish_verify_version_output "${name}" 0.41.0 "${output}" >/dev/null || status="$?"
         (( status == 0 )) || fail "${name} must be recognised in the smoke transcript"
     done
+
+    # Only the usage line proves that the bridge started; the echoed command
+    # line alone does not.
+    status=0
+    release_ish_verify_bridge_help "+ leg-bridge --help
+usage: leg-bridge [--version|-V] [--help|-h]
+
+Reads one capability-bridge request" >/dev/null || status="$?"
+    (( status == 0 )) || fail "the bridge usage must be recognised in the smoke transcript"
+
+    status=0
+    release_ish_verify_bridge_help "+ leg-bridge --help
+sh: leg-bridge: not found" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
 )
 
 test_manifest_and_lockfile_version_reads() (
@@ -1035,6 +1228,8 @@ test_web_trial_notices_cover_companion_graph() (
 tests=(
     test_ish_bundle_is_reproducible_and_verified
     test_ish_bundle_rejects_wrong_binaries
+    test_ish_mobile_bundle_is_reproducible_and_verified
+    test_ish_mobile_bundle_rejects_wrong_inputs
     test_ish_elf_validation
     test_ish_version_output_check
     test_manifest_and_lockfile_version_reads

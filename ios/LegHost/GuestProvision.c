@@ -37,11 +37,11 @@
 #include "tools/fakefs.h"
 
 const char *const guest_program_names[GUEST_PROGRAM_COUNT] = {
-    "leg", "leg-tui", "leg-web", "leg-ui-supervisor",
+    "leg", "leg-tui", "leg-ui-supervisor", "leg-bridge",
 };
 
 const char *const guest_bundle_file_names[GUEST_BUNDLE_FILE_COUNT] = {
-    "SHA256SUMS", "ish-compatibility-v1.json", "leg", "leg-tui", "leg-web", "leg-ui-supervisor",
+    "SHA256SUMS", "ish-compatibility-v1.json", "leg", "leg-tui", "leg-ui-supervisor", "leg-bridge",
 };
 
 /*
@@ -61,6 +61,28 @@ static const char guest_shell_shim[] =
 #define GUEST_ACTIVE_DIR_NAME "root.active"
 #define GUEST_MAX_PATH_FIELD 1024
 #define GUEST_MAX_TEXT_FIELD (64 * 1024)
+
+/*
+ * The compatibility fields, in the order the manifest check, the marker and
+ * the marker check use them.
+ */
+#define GUEST_COMPATIBILITY_FIELD_COUNT 8
+static const char *const compatibility_keys[GUEST_COMPATIBILITY_FIELD_COUNT] = {
+    "bundle_kind", "leg_version", "target", "architecture",
+    "os", "libc", "alpine_release", "docker_platform",
+};
+
+static void compatibility_values(const struct guest_compatibility *compatibility,
+                                 const char *values[GUEST_COMPATIBILITY_FIELD_COUNT]) {
+    values[0] = compatibility->bundle_kind;
+    values[1] = compatibility->leg_version;
+    values[2] = compatibility->target;
+    values[3] = compatibility->architecture;
+    values[4] = compatibility->os;
+    values[5] = compatibility->libc;
+    values[6] = compatibility->alpine_release;
+    values[7] = compatibility->docker_platform;
+}
 
 /* ------------------------------------------------------------------ errors */
 
@@ -953,14 +975,13 @@ static bool check_compatibility_manifest(const struct guest_bundle *bundle,
         return false;
     }
 
-    const char *keys[] = {"target", "architecture", "os", "libc", "alpine_release", "docker_platform"};
-    const char *values[] = {expected->target, expected->architecture, expected->os, expected->libc,
-                            expected->alpine_release, expected->docker_platform};
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        const char *actual = json_as_string(json_member_get(root, keys[i]));
+    const char *values[GUEST_COMPATIBILITY_FIELD_COUNT];
+    compatibility_values(expected, values);
+    for (size_t i = 0; i < GUEST_COMPATIBILITY_FIELD_COUNT; i++) {
+        const char *actual = json_as_string(json_member_get(root, compatibility_keys[i]));
         if (actual == NULL || strcmp(actual, values[i]) != 0) {
             set_error(error, error_size, "the guest bundle manifest declares %s = %s, expected %s",
-                      keys[i], actual != NULL ? actual : "(missing)", values[i]);
+                      compatibility_keys[i], actual != NULL ? actual : "(missing)", values[i]);
             json_free(root);
             return false;
         }
@@ -990,6 +1011,18 @@ static bool check_compatibility_manifest(const struct guest_bundle *bundle,
             return false;
         }
 
+        /* The release smoke runs exactly this command, so the host only
+         * accepts the command the release verified. */
+        char version_command[64];
+        snprintf(version_command, sizeof(version_command), "%s --version", guest_program_names[i]);
+        const char *command = json_as_string(json_member_get(entry, "version_command"));
+        if (command == NULL || strcmp(command, version_command) != 0) {
+            set_error(error, error_size, "the guest bundle manifest declares the wrong version command for %s",
+                      guest_program_names[i]);
+            json_free(root);
+            return false;
+        }
+
         double size = 0;
         if (!json_as_number(json_member_get(entry, "size"), &size) ||
             (uint64_t) size != bundle->entries[index].size) {
@@ -1012,9 +1045,13 @@ static bool check_compatibility_manifest(const struct guest_bundle *bundle,
     return true;
 }
 
+/*
+ * SHA256SUMS has to list every other bundle file exactly once, with the digest
+ * the archive entry has, and nothing else.
+ */
 static bool check_inner_sums(const struct guest_bundle *bundle, char *error, size_t error_size) {
     const char *cursor = bundle->sums;
-    bool seen[GUEST_PROGRAM_COUNT] = {false, false, false, false};
+    bool seen[GUEST_BUNDLE_FILE_COUNT] = {false};
 
     while (*cursor != '\0') {
         const char *line_end = strchr(cursor, '\n');
@@ -1048,6 +1085,10 @@ static bool check_inner_sums(const struct guest_bundle *bundle, char *error, siz
             }
 
             const char *name = line + SHA256_HEX_LEN;
+            if (*name != ' ') {
+                set_error(error, error_size, "the guest bundle SHA256SUMS has a malformed line");
+                return false;
+            }
             while (*name == ' ' || *name == '*')
                 name++;
             if (*name == '\0') {
@@ -1056,17 +1097,19 @@ static bool check_inner_sums(const struct guest_bundle *bundle, char *error, siz
             }
 
             int index = bundle_file_index(name);
-            if (index < 0) {
+            if (index < 0 || strcmp(name, GUEST_COMPATIBILITY_SUMS) == 0) {
                 set_error(error, error_size, "the guest bundle SHA256SUMS lists the unknown file %s", name);
+                return false;
+            }
+            if (seen[index]) {
+                set_error(error, error_size, "the guest bundle SHA256SUMS lists %s twice", name);
                 return false;
             }
             if (strcmp(digest, bundle->entries[index].sha256) != 0) {
                 set_error(error, error_size, "the guest bundle SHA256SUMS disagrees about %s", name);
                 return false;
             }
-            for (int i = 0; i < GUEST_PROGRAM_COUNT; i++)
-                if (strcmp(name, guest_program_names[i]) == 0)
-                    seen[i] = true;
+            seen[index] = true;
         }
 
         if (line_end == NULL)
@@ -1074,10 +1117,10 @@ static bool check_inner_sums(const struct guest_bundle *bundle, char *error, siz
         cursor = line_end + 1;
     }
 
-    for (int i = 0; i < GUEST_PROGRAM_COUNT; i++) {
-        if (!seen[i]) {
+    for (int i = 0; i < GUEST_BUNDLE_FILE_COUNT; i++) {
+        if (!seen[i] && strcmp(guest_bundle_file_names[i], GUEST_COMPATIBILITY_SUMS) != 0) {
             set_error(error, error_size, "the guest bundle SHA256SUMS does not list %s",
-                      guest_program_names[i]);
+                      guest_bundle_file_names[i]);
             return false;
         }
     }
@@ -1276,15 +1319,12 @@ static bool build_marker(const struct guest_pins *pins, const struct staged_list
     }
     if (!append_to_buffer(&buffer, &length, &capacity, "  ],\n")) goto oom;
 
-    const struct guest_compatibility *compatibility = pins->compatibility;
-    const char *keys[] = {"target", "architecture", "os", "libc", "alpine_release", "docker_platform"};
-    const char *values[] = {compatibility->target, compatibility->architecture, compatibility->os,
-                            compatibility->libc, compatibility->alpine_release,
-                            compatibility->docker_platform};
+    const char *values[GUEST_COMPATIBILITY_FIELD_COUNT];
+    compatibility_values(pins->compatibility, values);
     if (!append_to_buffer(&buffer, &length, &capacity, "  \"compatibility\": {")) goto oom;
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+    for (size_t i = 0; i < GUEST_COMPATIBILITY_FIELD_COUNT; i++) {
         if (!append_to_buffer(&buffer, &length, &capacity, i == 0 ? "" : ", ")) goto oom;
-        if (!append_json_string(&buffer, &length, &capacity, keys[i])) goto oom;
+        if (!append_json_string(&buffer, &length, &capacity, compatibility_keys[i])) goto oom;
         if (!append_to_buffer(&buffer, &length, &capacity, ": ")) goto oom;
         if (!append_json_string(&buffer, &length, &capacity, values[i])) goto oom;
     }
@@ -1671,16 +1711,14 @@ static bool marker_matches_pins(const struct json_value *marker, const struct gu
         }
     }
 
-    const struct guest_compatibility *compatibility = pins->compatibility;
-    const char *keys[] = {"target", "architecture", "os", "libc", "alpine_release", "docker_platform"};
-    const char *values[] = {compatibility->target, compatibility->architecture, compatibility->os,
-                            compatibility->libc, compatibility->alpine_release,
-                            compatibility->docker_platform};
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        const struct json_value *object = json_member_get(marker, "compatibility");
-        const char *value = json_as_string(json_member_get(object, keys[i]));
+    const char *values[GUEST_COMPATIBILITY_FIELD_COUNT];
+    compatibility_values(pins->compatibility, values);
+    const struct json_value *object = json_member_get(marker, "compatibility");
+    for (size_t i = 0; i < GUEST_COMPATIBILITY_FIELD_COUNT; i++) {
+        const char *value = json_as_string(json_member_get(object, compatibility_keys[i]));
         if (value == NULL || strcmp(value, values[i]) != 0) {
-            set_error(error, error_size, "the guest bundle marker records a different %s", keys[i]);
+            set_error(error, error_size, "the guest bundle marker records a different %s",
+                      compatibility_keys[i]);
             return false;
         }
     }
@@ -1894,6 +1932,16 @@ int guest_provision(const struct guest_pins *pins, const char *guest_bundle_path
         alpine_root_path == NULL || roots_dir == NULL || result == NULL) {
         set_error(error, error_size, "the provisioner was called with missing arguments");
         return GUEST_PROVISION_ERR_USAGE;
+    }
+    {
+        const char *values[GUEST_COMPATIBILITY_FIELD_COUNT];
+        compatibility_values(pins->compatibility, values);
+        for (size_t i = 0; i < GUEST_COMPATIBILITY_FIELD_COUNT; i++) {
+            if (values[i] == NULL) {
+                set_error(error, error_size, "the pins do not declare %s", compatibility_keys[i]);
+                return GUEST_PROVISION_ERR_USAGE;
+            }
+        }
     }
 
     memset(result, 0, sizeof(*result));

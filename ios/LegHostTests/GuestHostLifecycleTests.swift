@@ -350,6 +350,22 @@ final class GuestHostLifecycleTests: XCTestCase {
         XCTAssertFalse(control.consume(false), "a launch without the reset asked for one")
     }
 
+    /// The program arguments of a launch keep their order, and a control
+    /// without its value is dropped.
+    func testTheProgramArgumentsKeepTheirOrder() {
+        let options = HostLaunchOptions.current(arguments: [
+            "LegHost",
+            "-leghost-program", "/usr/local/bin/leg-bridge",
+            "-leghost-program-arg", "--help",
+            "-leghost-program-arg", "-leghost-reset",
+            "-leghost-program-arg",
+        ])
+
+        XCTAssertEqual(options.program, "/usr/local/bin/leg-bridge")
+        XCTAssertEqual(options.programArguments, ["--help", "-leghost-reset"])
+        XCTAssertEqual(HostLaunchOptions.current(arguments: ["LegHost"]).programArguments, [])
+    }
+
     /// A session that could not be released is not retried.
     ///
     /// The guest of the session is still alive when the release fails, so

@@ -186,15 +186,26 @@ downloads exactly those files.
 
 | Input | URL | SHA-256 |
 | --- | --- | --- |
-| leg guest bundle `v0.43.1` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.43.1/leg-0.43.1-i686-unknown-linux-musl.tar.gz` | `c7ba65aa24e127039d0292ae1db8b8573fbc07565e5ea40805630dd58305277d` |
+| leg ios-mobile bundle `v0.45.0` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.45.0/leg-0.45.0-i686-unknown-linux-musl-mobile.tar.gz` | pending: set from the published asset |
 | Alpine i386 root `3.20.3` | `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz` | `4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9` |
 
-The guest bundle holds exactly six files: `leg`, `leg-tui`, `leg-web`,
-`leg-ui-supervisor`, `ish-compatibility-v1.json` and `SHA256SUMS`. Its
-manifest has to declare the target `i686-unknown-linux-musl`, the
-architecture `i386`, the operating system `linux`, the C library `musl`, the
-Alpine release `3.20.3`, the platform `linux/386`, and the size and SHA-256 of
-each of the four programs.
+The guest bundle is the ios-mobile release asset, not the generic iSH bundle.
+It holds exactly six files: `leg`, `leg-tui`, `leg-ui-supervisor`,
+`leg-bridge`, `ish-compatibility-v1.json` and `SHA256SUMS`. Its manifest has
+to declare the `bundle_kind` `ios-mobile` and the `leg_version` of the pins,
+the target `i686-unknown-linux-musl`, the architecture `i386`, the operating
+system `linux`, the C library `musl`, the Alpine release `3.20.3`, the
+platform `linux/386`, and for each of the four programs its size, its SHA-256
+and the version command `<name> --version`. `SHA256SUMS` has to list every
+other file exactly once and nothing else. The pins carry `bundle_kind` and
+`leg_version` under `compatibility`, and the guest bundle marker records them,
+so a root staged from another bundle is imported again. The host stages the
+programs under `/usr/local/bin`, `leg-bridge` among them; `leg-web` is not
+part of the guest.
+
+The SHA-256 of the `v0.45.0` asset is set once that release publishes it.
+Until then the plist holds a placeholder digest, and the build and
+`ios/tests/run-pinned-inputs.sh` fail closed on it.
 
 ## Prerequisites
 
@@ -297,6 +308,15 @@ xcrun simctl launch "iPhone 17 Pro" com.shukelabs.leg.ioshost \
     -leghost-program /bin/sh
 ```
 
+A debug build also takes arguments for that program, one per repeated
+`-leghost-program-arg`, in order. The simulator tests run the bridge of the
+bundle with them:
+
+```
+xcrun simctl launch "iPhone 17 Pro" com.shukelabs.leg.ioshost \
+    -leghost-program /usr/local/bin/leg-bridge -leghost-program-arg --help
+```
+
 ## The physical device
 
 The device build, the install and the launch, and the checklist of a run on an
@@ -381,8 +401,9 @@ first launch (the guest root is imported and the guest program starts), the
 guest program drawing its screen, the keyboard reaching the guest, the
 rotation changing the size the guest was told about, the on screen interrupt
 ending the guest program without a hardware keyboard, the exit of a helper
-process leaving the session running, and the second launch reusing the
-verified root instead of importing it again.
+process leaving the session running, `leg-bridge --help` running in the
+imported guest and exiting 0 while an unknown argument exits 2, and the
+second launch reusing the verified root instead of importing it again.
 
 ```
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
@@ -752,10 +773,15 @@ only some of them.
 
 The provisioner is covered by host side fixtures that need neither the
 network nor a simulator: they build their own pinned inputs and exercise the
-valid path, a one byte corruption of each input, a bundle for the wrong
-target, a program that is not an ELF32 i386 binary, a failed import, stale
-staging state, a corrupted active root and the verified reuse of an existing
-root.
+valid path, a one byte corruption of each input, every bundle off the
+ios-mobile contract (a missing manifest or `leg-bridge`, an extra file, the
+generic bundle, a wrong target, `leg_version`, `bundle_kind` or version
+command, a manifest digest that disagrees with the archive, a malformed,
+incomplete, duplicate, unknown or self-listing `SHA256SUMS`, a program that
+is not an ELF32 i386 binary), a failed import, stale staging state, a
+corrupted active root, a marker that records another `bundle_kind` or
+`leg_version`, a root without `leg-bridge`, and the verified reuse of an
+existing root.
 
 ```
 ios/tests/run-host-tests.sh
@@ -797,7 +823,7 @@ The first two commands show the vendored runtime: its symbols in the host
 binary and its objects in the link map. The last two must print nothing,
 because no proprietary leg crate or source is linked into the host. The host
 names the four guest programs by file name, so the strings `leg-tui` and
-`leg-web` are in the binary; they are the names of the programs the guest
+`leg-bridge` are in the binary; they are the names of the programs the guest
 root must hold, not code of them.
 
 ## Out of scope

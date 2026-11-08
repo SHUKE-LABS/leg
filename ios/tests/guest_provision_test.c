@@ -5,7 +5,9 @@
  * need the network. They cover the paths the plan calls out: valid inputs,
  * one byte corruption of each input, a bundle for the wrong target, a
  * checksum failure, a failed import, stale staging cleanup, a reload with no
- * partial state, and a verified reuse of an existing root.
+ * partial state, and a verified reuse of an existing root. The ios-mobile
+ * contract cases reject every bundle that differs from the six-file mobile
+ * bundle the pins describe, including the generic iSH bundle.
  */
 
 #include <dirent.h>
@@ -127,32 +129,72 @@ static bool write_fixture_alpine(const char *path) {
     return ok;
 }
 
+#define FIXTURE_BUNDLE_KIND "ios-mobile"
+#define FIXTURE_LEG_VERSION "0.44.0"
+#define FIXTURE_MANIFEST "ish-compatibility-v1.json"
+
+/* The programs of the generic iSH bundle, which LegHost must not import. */
+static const char *const generic_program_names[GUEST_PROGRAM_COUNT] = {
+    "leg", "leg-tui", "leg-web", "leg-ui-supervisor",
+};
+
+/*
+ * What a fixture bundle looks like. The zero value plus a target is the valid
+ * ios-mobile bundle; every other field builds one rejected variant.
+ */
+struct fixture_bundle {
+    const char *target;
+    bool elf64;
+    bool generic;                   /* the generic program set, with no bundle kind */
+    bool omit_bundle_kind;
+    const char *bundle_kind;        /* NULL means FIXTURE_BUNDLE_KIND */
+    const char *leg_version;        /* NULL means FIXTURE_LEG_VERSION */
+    const char *wrong_version_command; /* the program whose version command is wrong */
+    const char *omit_file;          /* the archive entry that is left out */
+    const char *extra_file;         /* an archive entry that is not in the contract */
+    const char *omit_sum;           /* the SHA256SUMS line that is left out */
+    const char *duplicate_sum;      /* the SHA256SUMS line that is listed twice */
+    const char *unknown_sum;        /* a SHA256SUMS line for a file the bundle lacks */
+    const char *sums_suffix;        /* raw text appended to SHA256SUMS */
+};
+
 /*
  * A guest bundle with the four programs, the compatibility manifest and the
- * inner SHA256SUMS. `target` and `elf64` let the fixtures build the rejected
- * variants.
+ * inner SHA256SUMS, shaped by `fixture`.
  */
-static bool write_fixture_bundle(const char *path, const char *target, bool elf64,
+static bool write_fixture_bundle(const char *path, const struct fixture_bundle *fixture,
                                  const char program_sha256[GUEST_PROGRAM_COUNT][SHA256_HEX_LEN + 1],
                                  const uint64_t program_size[GUEST_PROGRAM_COUNT]) {
+    const char *const *names = fixture->generic ? generic_program_names : guest_program_names;
     uint8_t program[FIXTURE_PROGRAM_SIZE];
     char manifest[4096];
     size_t manifest_length = 0;
 
     manifest_length += (size_t) snprintf(manifest + manifest_length, sizeof(manifest) - manifest_length,
-                                         "{\n  \"schema_version\": 1,\n  \"leg_version\": \"0.43.1\",\n"
+                                         "{\n  \"schema_version\": 1,\n");
+    if (!fixture->generic && !fixture->omit_bundle_kind)
+        manifest_length += (size_t) snprintf(
+            manifest + manifest_length, sizeof(manifest) - manifest_length, "  \"bundle_kind\": \"%s\",\n",
+            fixture->bundle_kind != NULL ? fixture->bundle_kind : FIXTURE_BUNDLE_KIND);
+    manifest_length += (size_t) snprintf(manifest + manifest_length, sizeof(manifest) - manifest_length,
+                                         "  \"leg_version\": \"%s\",\n"
                                          "  \"target\": \"%s\",\n  \"architecture\": \"%s\",\n"
                                          "  \"os\": \"linux\",\n  \"libc\": \"musl\",\n  \"host\": \"ish\",\n"
                                          "  \"alpine_release\": \"3.20.3\",\n"
                                          "  \"docker_platform\": \"linux/386\",\n  \"binaries\": [\n",
-                                         target, elf64 ? "x86_64" : "i386");
+                                         fixture->leg_version != NULL ? fixture->leg_version
+                                                                      : FIXTURE_LEG_VERSION,
+                                         fixture->target, fixture->elf64 ? "x86_64" : "i386");
     for (int i = 0; i < GUEST_PROGRAM_COUNT; i++) {
+        bool wrong_command = fixture->wrong_version_command != NULL &&
+                             strcmp(fixture->wrong_version_command, names[i]) == 0;
         manifest_length += (size_t) snprintf(
             manifest + manifest_length, sizeof(manifest) - manifest_length,
-            "    {\"name\": \"%s\", \"version_command\": \"%s --version\", \"size\": %llu, "
+            "    {\"name\": \"%s\", \"version_command\": \"%s %s\", \"size\": %llu, "
             "\"sha256\": \"%s\"}%s\n",
-            guest_program_names[i], guest_program_names[i], (unsigned long long) program_size[i],
-            program_sha256[i], i + 1 < GUEST_PROGRAM_COUNT ? "," : "");
+            names[i], names[i], wrong_command ? "--help" : "--version",
+            (unsigned long long) program_size[i], program_sha256[i],
+            i + 1 < GUEST_PROGRAM_COUNT ? "," : "");
     }
     manifest_length += (size_t) snprintf(manifest + manifest_length,
                                          sizeof(manifest) - manifest_length, "  ]\n}\n");
@@ -160,14 +202,24 @@ static bool write_fixture_bundle(const char *path, const char *target, bool elf6
     char manifest_sha[SHA256_HEX_LEN + 1];
     sha256_hex(manifest, manifest_length, manifest_sha);
 
-    char sums[1024];
+    char sums[2048];
     size_t sums_length = 0;
-    for (int i = 0; i < GUEST_PROGRAM_COUNT; i++) {
-        sums_length += (size_t) snprintf(sums + sums_length, sizeof(sums) - sums_length,
-                                         "%s  %s\n", program_sha256[i], guest_program_names[i]);
+    for (int i = 0; i <= GUEST_PROGRAM_COUNT; i++) {
+        const char *name = i < GUEST_PROGRAM_COUNT ? names[i] : FIXTURE_MANIFEST;
+        const char *sha = i < GUEST_PROGRAM_COUNT ? program_sha256[i] : manifest_sha;
+        if (fixture->omit_sum != NULL && strcmp(fixture->omit_sum, name) == 0)
+            continue;
+        int copies = fixture->duplicate_sum != NULL && strcmp(fixture->duplicate_sum, name) == 0 ? 2 : 1;
+        for (int copy = 0; copy < copies; copy++)
+            sums_length += (size_t) snprintf(sums + sums_length, sizeof(sums) - sums_length, "%s  %s\n",
+                                             sha, name);
     }
-    sums_length += (size_t) snprintf(sums + sums_length, sizeof(sums) - sums_length, "%s  %s\n",
-                                     manifest_sha, "ish-compatibility-v1.json");
+    if (fixture->unknown_sum != NULL)
+        sums_length += (size_t) snprintf(sums + sums_length, sizeof(sums) - sums_length, "%s  %s\n",
+                                         program_sha256[0], fixture->unknown_sum);
+    if (fixture->sums_suffix != NULL)
+        sums_length += (size_t) snprintf(sums + sums_length, sizeof(sums) - sums_length, "%s",
+                                         fixture->sums_suffix);
 
     struct archive *archive = archive_write_new();
     archive_write_set_format_pax(archive);
@@ -177,13 +229,20 @@ static bool write_fixture_bundle(const char *path, const char *target, bool elf6
         return false;
     }
 
-    bool ok = write_archive_entry(archive, "SHA256SUMS", sums, sums_length, AE_IFREG, 0644, NULL) &&
-              write_archive_entry(archive, "ish-compatibility-v1.json", manifest, manifest_length,
-                                  AE_IFREG, 0644, NULL);
+    bool ok = write_archive_entry(archive, "SHA256SUMS", sums, sums_length, AE_IFREG, 0644, NULL);
+    if (ok && (fixture->omit_file == NULL || strcmp(fixture->omit_file, FIXTURE_MANIFEST) != 0))
+        ok = write_archive_entry(archive, FIXTURE_MANIFEST, manifest, manifest_length, AE_IFREG, 0644,
+                                 NULL);
     for (int i = 0; ok && i < GUEST_PROGRAM_COUNT; i++) {
-        write_elf_header(program, elf64);
-        ok = write_archive_entry(archive, guest_program_names[i], program, sizeof(program), AE_IFREG,
-                                 0755, NULL);
+        if (fixture->omit_file != NULL && strcmp(fixture->omit_file, names[i]) == 0)
+            continue;
+        write_elf_header(program, fixture->elf64);
+        ok = write_archive_entry(archive, names[i], program, sizeof(program), AE_IFREG, 0755, NULL);
+    }
+    if (ok && fixture->extra_file != NULL) {
+        write_elf_header(program, fixture->elf64);
+        ok = write_archive_entry(archive, fixture->extra_file, program, sizeof(program), AE_IFREG, 0755,
+                                 NULL);
     }
 
     if (archive_write_close(archive) != ARCHIVE_OK)
@@ -292,6 +351,8 @@ static void fill_pins(struct guest_pins *pins, const struct guest_pinned_input *
 }
 
 static const struct guest_compatibility fixture_compatibility = {
+    .bundle_kind = FIXTURE_BUNDLE_KIND,
+    .leg_version = FIXTURE_LEG_VERSION,
     .target = "i686-unknown-linux-musl",
     .architecture = "i386",
     .os = "linux",
@@ -310,6 +371,71 @@ static void write_file(const char *path, const char *contents) {
     fclose(file);
 }
 
+static char *read_file(const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (file == NULL)
+        return NULL;
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    char *contents = malloc((size_t) size + 1);
+    size_t got = fread(contents, 1, (size_t) size, file);
+    contents[got] = '\0';
+    fclose(file);
+    return contents;
+}
+
+/* Replaces the first `from` in the file with `to`, which has the same length. */
+static bool rewrite_in_file(const char *path, const char *from, const char *to) {
+    char *contents = read_file(path);
+    if (contents == NULL)
+        return false;
+    char *found = strstr(contents, from);
+    bool ok = found != NULL && strlen(from) == strlen(to);
+    if (ok) {
+        memcpy(found, to, strlen(to));
+        write_file(path, contents);
+    }
+    free(contents);
+    return ok;
+}
+
+/*
+ * Builds the bundle `fixture` describes, pins it as it is, and expects the
+ * provisioner to reject it with `expected` before it publishes anything.
+ */
+static void expect_bundle_rejected(const char *work, const char *label, const struct fixture_bundle *fixture,
+                                   const struct guest_compatibility *compatibility,
+                                   const struct guest_pinned_input *inputs, const char *alpine_path,
+                                   const char program_sha256[GUEST_PROGRAM_COUNT][SHA256_HEX_LEN + 1],
+                                   const uint64_t program_size[GUEST_PROGRAM_COUNT], int expected,
+                                   const char *message) {
+    char bundle[1024];
+    snprintf(bundle, sizeof(bundle), "%s/%s.tar.gz", work, label);
+    if (!write_fixture_bundle(bundle, fixture, program_sha256, program_size)) {
+        CHECK(false, "%s: cannot build the fixture bundle", label);
+        return;
+    }
+
+    struct guest_pinned_input pinned[GUEST_INPUT_COUNT];
+    memcpy(pinned, inputs, sizeof(pinned));
+    char bundle_sha[SHA256_HEX_LEN + 1];
+    digest_of(bundle, bundle_sha);
+    pinned[GUEST_INPUT_LEG_BUNDLE].sha256 = bundle_sha;
+    struct guest_pins pins;
+    fill_pins(&pins, pinned, compatibility);
+
+    char roots[1024];
+    snprintf(roots, sizeof(roots), "%s/roots-%s", work, label);
+    char error[1024] = {0};
+    struct guest_provision_result result;
+    int status = guest_provision(&pins, bundle, alpine_path, roots, NULL, &result, error, sizeof(error));
+    CHECK(status == expected, "%s: expected status %d, got %d (%s)", label, expected, status, error);
+    CHECK(strstr(error, message) != NULL, "%s: expected '%s' in '%s'", label, message, error);
+    CHECK(!path_exists(roots) || directory_is_empty(roots), "%s: a rejected bundle must leave no state",
+          label);
+}
+
 /* ------------------------------------------------------------------ main */
 
 /*
@@ -318,6 +444,8 @@ static void write_file(const char *path, const char *contents) {
  * script writes from the pin manifest, so there is one source of truth.
  */
 struct pinned_values {
+    char bundle_kind[128];
+    char leg_version[128];
     char target[128];
     char architecture[128];
     char os[128];
@@ -349,7 +477,11 @@ static bool read_pinned_values(const char *path, struct pinned_values *values) {
 
         char *target = NULL;
         size_t size = 0;
-        if (strcmp(line, "target") == 0)
+        if (strcmp(line, "bundle_kind") == 0)
+            target = values->bundle_kind, size = sizeof(values->bundle_kind);
+        else if (strcmp(line, "leg_version") == 0)
+            target = values->leg_version, size = sizeof(values->leg_version);
+        else if (strcmp(line, "target") == 0)
             target = values->target, size = sizeof(values->target);
         else if (strcmp(line, "architecture") == 0)
             target = values->architecture, size = sizeof(values->architecture);
@@ -375,7 +507,8 @@ static bool read_pinned_values(const char *path, struct pinned_values *values) {
     }
     fclose(file);
 
-    return complete && values->target[0] != '\0' && values->bundle_sha256[0] != '\0' &&
+    return complete && values->bundle_kind[0] != '\0' && values->leg_version[0] != '\0' &&
+           values->target[0] != '\0' && values->bundle_sha256[0] != '\0' &&
            values->alpine_sha256[0] != '\0';
 }
 
@@ -396,7 +529,7 @@ static int run_pinned_mode(int argc, char **argv) {
     struct guest_pinned_input inputs[GUEST_INPUT_COUNT];
     inputs[GUEST_INPUT_LEG_BUNDLE].name = "leg_guest_bundle";
     inputs[GUEST_INPUT_LEG_BUNDLE].url = "https://example.invalid/leg-guest-bundle.tar.gz";
-    inputs[GUEST_INPUT_LEG_BUNDLE].filename = "leg-0.43.1-i686-unknown-linux-musl.tar.gz";
+    inputs[GUEST_INPUT_LEG_BUNDLE].filename = "leg-i686-unknown-linux-musl-mobile.tar.gz";
     inputs[GUEST_INPUT_LEG_BUNDLE].sha256 = values.bundle_sha256;
     inputs[GUEST_INPUT_ALPINE_ROOT].name = "alpine_root";
     inputs[GUEST_INPUT_ALPINE_ROOT].url = "https://example.invalid/alpine.tar.gz";
@@ -404,6 +537,8 @@ static int run_pinned_mode(int argc, char **argv) {
     inputs[GUEST_INPUT_ALPINE_ROOT].sha256 = values.alpine_sha256;
 
     struct guest_compatibility compatibility = {
+        .bundle_kind = values.bundle_kind,
+        .leg_version = values.leg_version,
         .target = values.target,
         .architecture = values.architecture,
         .os = values.os,
@@ -431,6 +566,11 @@ static int run_pinned_mode(int argc, char **argv) {
         snprintf(path, sizeof(path), "%s/root.active/data%s/%s", argv[5], GUEST_PROGRAMS_DIR,
                  guest_program_names[i]);
         CHECK(path_exists(path), "%s is missing from the pinned root", guest_program_names[i]);
+    }
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/root.active/data%s/leg-web", argv[5], GUEST_PROGRAMS_DIR);
+        CHECK(!path_exists(path), "the pinned root must not stage leg-web");
     }
     CHECK(path_under(argv[5], "root.active/data/etc/leg/guest-bundle.json"),
           "the guest bundle marker is missing");
@@ -491,8 +631,8 @@ int main(int argc, char **argv) {
         sha256_hex(program[i], sizeof(program[i]), program_sha256[i]);
         program_size[i] = sizeof(program[i]);
     }
-    if (!write_fixture_bundle(bundle_path, "i686-unknown-linux-musl", false,
-                              program_sha256, program_size)) {
+    const struct fixture_bundle valid = {.target = "i686-unknown-linux-musl"};
+    if (!write_fixture_bundle(bundle_path, &valid, program_sha256, program_size)) {
         fprintf(stderr, "cannot build the guest bundle fixture\n");
         return 2;
     }
@@ -529,27 +669,26 @@ int main(int argc, char **argv) {
     CHECK(path_exists("roots/root.active/data/usr/local/bin/leg"), "leg is missing from the guest");
     CHECK(path_exists("roots/root.active/data/usr/local/bin/leg-tui"),
           "leg-tui is missing from the guest");
-    CHECK(path_exists("roots/root.active/data/usr/local/bin/leg-web"),
-          "leg-web is missing from the guest");
     CHECK(path_exists("roots/root.active/data/usr/local/bin/leg-ui-supervisor"),
           "leg-ui-supervisor is missing from the guest");
+    CHECK(path_exists("roots/root.active/data/usr/local/bin/leg-bridge"),
+          "leg-bridge is missing from the guest");
+    CHECK(!path_exists("roots/root.active/data/usr/local/bin/leg-web"),
+          "the mobile guest must not stage leg-web");
     CHECK(path_exists("roots/root.active/data/etc/leg/guest-bundle.json"),
           "the guest bundle marker is missing");
 
     /* The marker has to record both input digests and every staged file. */
     {
-        char *marker = NULL;
-        FILE *file = fopen("roots/root.active/data/etc/leg/guest-bundle.json", "rb");
-        CHECK(file != NULL, "the guest bundle marker cannot be opened");
-        if (file != NULL) {
-            fseek(file, 0, SEEK_END);
-            long size = ftell(file);
-            fseek(file, 0, SEEK_SET);
-            marker = malloc((size_t) size + 1);
-            size_t got = fread(marker, 1, (size_t) size, file);
-            marker[got] = '\0';
-            fclose(file);
-
+        char *marker = read_file("roots/root.active/data/etc/leg/guest-bundle.json");
+        CHECK(marker != NULL, "the guest bundle marker cannot be opened");
+        if (marker != NULL) {
+            CHECK(strstr(marker, "\"bundle_kind\": \"" FIXTURE_BUNDLE_KIND "\"") != NULL,
+                  "the marker does not record the bundle kind");
+            CHECK(strstr(marker, "\"leg_version\": \"" FIXTURE_LEG_VERSION "\"") != NULL,
+                  "the marker does not record the leg version");
+            CHECK(strstr(marker, "/usr/local/bin/leg-bridge") != NULL,
+                  "the marker does not record leg-bridge");
             CHECK(strstr(marker, inputs[GUEST_INPUT_LEG_BUNDLE].sha256) != NULL,
                   "the marker does not record the guest bundle digest");
             CHECK(strstr(marker, inputs[GUEST_INPUT_ALPINE_ROOT].sha256) != NULL,
@@ -618,56 +757,73 @@ int main(int argc, char **argv) {
               "a corrupted Alpine root must leave no staging state");
     }
 
-    /* --- a bundle for the wrong target is rejected -------------------- */
+    /* --- every bundle off the ios-mobile contract is rejected ---------- */
     {
-        char wrong[1024];
-        snprintf(wrong, sizeof(wrong), "%s/wrong-target.tar.gz", work);
-        if (write_fixture_bundle(wrong, "x86_64-unknown-linux-musl", false,
-                                 program_sha256, program_size)) {
-            struct guest_pinned_input wrong_inputs[GUEST_INPUT_COUNT];
-            memcpy(wrong_inputs, inputs, sizeof(inputs));
-            char wrong_sha[SHA256_HEX_LEN + 1];
-            digest_of(wrong, wrong_sha);
-            wrong_inputs[GUEST_INPUT_LEG_BUNDLE].sha256 = wrong_sha;
+        const char *target = "i686-unknown-linux-musl";
+        char other_hex[SHA256_HEX_LEN + 1];
+        memset(other_hex, 'a', SHA256_HEX_LEN);
+        other_hex[SHA256_HEX_LEN] = '\0';
+        char self_listed[SHA256_HEX_LEN + 32];
+        snprintf(self_listed, sizeof(self_listed), "%s  SHA256SUMS\n", other_hex);
+        char wrong_digest[GUEST_PROGRAM_COUNT][SHA256_HEX_LEN + 1];
+        memcpy(wrong_digest, program_sha256, sizeof(wrong_digest));
+        memcpy(wrong_digest[3], other_hex, sizeof(other_hex));
 
-            struct guest_pins wrong_pins;
-            fill_pins(&wrong_pins, wrong_inputs, &fixture_compatibility);
+        struct {
+            const char *label;
+            struct fixture_bundle fixture;
+            int status;
+            const char *message;
+        } cases[] = {
+            {"missing-manifest", {.target = target, .omit_file = FIXTURE_MANIFEST},
+             GUEST_PROVISION_ERR_ARCHIVE, "is missing ish-compatibility-v1.json"},
+            {"missing-bridge", {.target = target, .omit_file = "leg-bridge"},
+             GUEST_PROVISION_ERR_ARCHIVE, "is missing leg-bridge"},
+            {"extra-file", {.target = target, .extra_file = "leg-web"},
+             GUEST_PROVISION_ERR_ARCHIVE, "unexpected file: leg-web"},
+            {"generic-bundle", {.target = target, .generic = true},
+             GUEST_PROVISION_ERR_ARCHIVE, "unexpected file: leg-web"},
+            {"wrong-target", {.target = "x86_64-unknown-linux-musl"},
+             GUEST_PROVISION_ERR_MANIFEST, "declares target = x86_64-unknown-linux-musl"},
+            {"stale-version", {.target = target, .leg_version = "0.43.6"},
+             GUEST_PROVISION_ERR_MANIFEST, "declares leg_version = 0.43.6"},
+            {"missing-kind", {.target = target, .omit_bundle_kind = true},
+             GUEST_PROVISION_ERR_MANIFEST, "declares bundle_kind = (missing)"},
+            {"wrong-kind", {.target = target, .bundle_kind = "generic"},
+             GUEST_PROVISION_ERR_MANIFEST, "declares bundle_kind = generic"},
+            {"wrong-version-command", {.target = target, .wrong_version_command = "leg-bridge"},
+             GUEST_PROVISION_ERR_MANIFEST, "wrong version command for leg-bridge"},
+            {"malformed-sums", {.target = target, .sums_suffix = "not a checksum line\n"},
+             GUEST_PROVISION_ERR_MANIFEST, "has a malformed line"},
+            {"incomplete-sums", {.target = target, .omit_sum = "leg-bridge"},
+             GUEST_PROVISION_ERR_MANIFEST, "does not list leg-bridge"},
+            {"manifest-not-summed", {.target = target, .omit_sum = FIXTURE_MANIFEST},
+             GUEST_PROVISION_ERR_MANIFEST, "does not list ish-compatibility-v1.json"},
+            {"duplicate-sums", {.target = target, .duplicate_sum = "leg"},
+             GUEST_PROVISION_ERR_MANIFEST, "lists leg twice"},
+            {"unknown-sums", {.target = target, .unknown_sum = "leg-web"},
+             GUEST_PROVISION_ERR_MANIFEST, "lists the unknown file leg-web"},
+            {"self-listed-sums", {.target = target, .sums_suffix = self_listed},
+             GUEST_PROVISION_ERR_MANIFEST, "lists the unknown file SHA256SUMS"},
+            {"elf64", {.target = target, .elf64 = true},
+             GUEST_PROVISION_ERR_ARCHIVE, "is not an ELF32 i386 executable"},
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+            expect_bundle_rejected(work, cases[i].label, &cases[i].fixture, &fixture_compatibility, inputs,
+                                   alpine_path, program_sha256, program_size, cases[i].status,
+                                   cases[i].message);
 
-            char wrong_roots[1024];
-            snprintf(wrong_roots, sizeof(wrong_roots), "%s/roots-wrong-target", work);
-            struct guest_provision_result wrong_result;
-            status = guest_provision(&wrong_pins, wrong, alpine_path, wrong_roots, NULL,
-                                     &wrong_result, error, sizeof(error));
-            CHECK(status == GUEST_PROVISION_ERR_MANIFEST,
-                  "a bundle for the wrong target must be rejected, got %d", status);
-            CHECK(!path_exists(wrong_roots) || directory_is_empty(wrong_roots),
-                  "a rejected bundle must leave no staging state");
-        }
-    }
+        /* The manifest digest of leg-bridge disagrees with the archive. */
+        expect_bundle_rejected(work, "wrong-binary-digest", &valid, &fixture_compatibility, inputs,
+                               alpine_path, wrong_digest, program_size, GUEST_PROVISION_ERR_MANIFEST,
+                               "wrong digest for leg-bridge");
 
-    /* --- a program that is not an ELF32 i386 binary is rejected -------- */
-    {
-        char wrong[1024];
-        snprintf(wrong, sizeof(wrong), "%s/wrong-elf.tar.gz", work);
-        if (write_fixture_bundle(wrong, "i686-unknown-linux-musl", true,
-                                 program_sha256, program_size)) {
-            struct guest_pinned_input wrong_inputs[GUEST_INPUT_COUNT];
-            memcpy(wrong_inputs, inputs, sizeof(inputs));
-            char wrong_sha[SHA256_HEX_LEN + 1];
-            digest_of(wrong, wrong_sha);
-            wrong_inputs[GUEST_INPUT_LEG_BUNDLE].sha256 = wrong_sha;
-
-            struct guest_pins wrong_pins;
-            fill_pins(&wrong_pins, wrong_inputs, &fixture_compatibility);
-
-            char wrong_roots[1024];
-            snprintf(wrong_roots, sizeof(wrong_roots), "%s/roots-wrong-elf", work);
-            struct guest_provision_result wrong_result;
-            status = guest_provision(&wrong_pins, wrong, alpine_path, wrong_roots, NULL,
-                                     &wrong_result, error, sizeof(error));
-            CHECK(status == GUEST_PROVISION_ERR_ARCHIVE,
-                  "a bundle with a 64 bit program must be rejected, got %d", status);
-        }
+        /* Pins without a bundle kind are a caller error, not a bundle error. */
+        struct guest_compatibility unpinned = fixture_compatibility;
+        unpinned.bundle_kind = NULL;
+        expect_bundle_rejected(work, "unpinned-kind", &valid, &unpinned, inputs, alpine_path,
+                               program_sha256, program_size, GUEST_PROVISION_ERR_USAGE,
+                               "the pins do not declare bundle_kind");
     }
 
     /* --- a failed import rolls back every piece of its state ---------- */
@@ -733,6 +889,62 @@ int main(int argc, char **argv) {
         CHECK(!reused_result.reused, "a corrupted active root must not be reused");
         CHECK(path_under(replaced_roots, "root.active/data/usr/local/bin/leg-tui"),
               "the corrupted active root was not replaced");
+    }
+
+    /* --- a root whose marker records another contract is replaced ------ */
+    {
+        struct {
+            const char *label;
+            const char *from;
+            const char *to;
+        } edits[] = {
+            {"marker-kind", "\"bundle_kind\": \"ios-mobile\"", "\"bundle_kind\": \"ios-mobilf\""},
+            {"marker-version", "\"leg_version\": \"0.44.0\"", "\"leg_version\": \"0.44.1\""},
+        };
+        for (size_t i = 0; i < sizeof(edits) / sizeof(edits[0]); i++) {
+            char edited_roots[1024];
+            snprintf(edited_roots, sizeof(edited_roots), "%s/roots-%s", work, edits[i].label);
+            struct guest_provision_result first;
+            status = guest_provision(&pins, bundle_path, alpine_path, edited_roots, NULL, &first, error,
+                                     sizeof(error));
+            CHECK(status == GUEST_PROVISION_OK, "%s: the first run failed: %s", edits[i].label, error);
+
+            char marker[1024];
+            snprintf(marker, sizeof(marker), "%s/root.active/data/etc/leg/guest-bundle.json", edited_roots);
+            CHECK(rewrite_in_file(marker, edits[i].from, edits[i].to), "%s: cannot edit the marker",
+                  edits[i].label);
+
+            struct guest_provision_result again;
+            status = guest_provision(&pins, bundle_path, alpine_path, edited_roots, NULL, &again, error,
+                                     sizeof(error));
+            CHECK(status == GUEST_PROVISION_OK, "%s: the run after the edit failed: %s", edits[i].label,
+                  error);
+            CHECK(!again.reused, "%s: a root with another marker contract must not be reused",
+                  edits[i].label);
+            CHECK(strcmp(again.marker_sha256, first.marker_sha256) == 0,
+                  "%s: the replaced root must record the pinned contract again", edits[i].label);
+        }
+    }
+
+    /* --- a root without leg-bridge is replaced ------------------------- */
+    {
+        char bridgeless_roots[1024];
+        snprintf(bridgeless_roots, sizeof(bridgeless_roots), "%s/roots-bridgeless", work);
+        struct guest_provision_result first;
+        status = guest_provision(&pins, bundle_path, alpine_path, bridgeless_roots, NULL, &first, error,
+                                 sizeof(error));
+        CHECK(status == GUEST_PROVISION_OK, "the first run for the bridgeless root failed: %s", error);
+
+        char bridge[1024];
+        snprintf(bridge, sizeof(bridge), "%s/root.active/data/usr/local/bin/leg-bridge", bridgeless_roots);
+        CHECK(unlink(bridge) == 0, "cannot remove leg-bridge from the active root");
+
+        struct guest_provision_result again;
+        status = guest_provision(&pins, bundle_path, alpine_path, bridgeless_roots, NULL, &again, error,
+                                 sizeof(error));
+        CHECK(status == GUEST_PROVISION_OK, "the run without leg-bridge failed: %s", error);
+        CHECK(!again.reused, "a root without leg-bridge must not be reused");
+        CHECK(path_exists(bridge), "the replaced root has no leg-bridge");
     }
 
     if (failures == 0) {
