@@ -186,7 +186,7 @@ downloads exactly those files.
 
 | Input | URL | SHA-256 |
 | --- | --- | --- |
-| leg ios-mobile bundle `v0.45.0` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.45.0/leg-0.45.0-i686-unknown-linux-musl-mobile.tar.gz` | pending: set from the published asset |
+| leg ios-mobile bundle `v0.44.1` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.44.1/leg-0.44.1-i686-unknown-linux-musl-mobile.tar.gz` | `83da3e66693dc8a20b8d8d910e86ec694984ad35adffa24cd3d7476215509b52` |
 | Alpine i386 root `3.20.3` | `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz` | `4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9` |
 
 The guest bundle is the ios-mobile release asset, not the generic iSH bundle.
@@ -203,9 +203,9 @@ so a root staged from another bundle is imported again. The host stages the
 programs under `/usr/local/bin`, `leg-bridge` among them; `leg-web` is not
 part of the guest.
 
-The SHA-256 of the `v0.45.0` asset is set once that release publishes it.
-Until then the plist holds a placeholder digest, and the build and
-`ios/tests/run-pinned-inputs.sh` fail closed on it.
+The pinned SHA-256 is the `SHA256SUMS` entry the `v0.44.1` release publishes
+for the ios-mobile asset. The build and `ios/tests/run-pinned-inputs.sh` fail
+closed on an archive that does not match it.
 
 ## Prerequisites
 
