@@ -27,6 +27,7 @@ ALL_TESTS=(
     testAMissingConfigurationIsReportedBeforeTheGuestIsProvisioned
     testTheProviderSetupSavesAndStartsTheFixture
     testTheProviderSetupRejectsInvalidValuesBeforeProvisioning
+    testProviderSettingsReplacementIsReadAfterRelaunch
     testProviderSettingsCancelKeepsTheSavedConfiguration
     testClearingProviderSettingsBlocksTheNextLaunch
     testTheOpenAIProvidersAreRefusedBeforeTheGuestIsProvisioned

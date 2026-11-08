@@ -130,8 +130,17 @@ struct ProviderConfigurationFixtures {
         }
         check(Set(object.keys) == Set(ProviderConfigurationStore.keys),
               "the saved item does not hold exactly the five documented keys")
-        check(object["api_key"] as? String == "sk-ant-test",
+        check(object["provider"] as? String == Self.validDraft.provider.rawValue,
+              "the saved item has the wrong provider value")
+        check(object["api_key"] as? String == Self.validDraft.apiKey,
               "the saved item has the wrong API key value")
+        check(object["base_url"] as? String == Self.validDraft.baseURL,
+              "the saved item has the wrong base URL value")
+        check(object["model"] as? String == Self.validDraft.model,
+              "the saved item has the wrong model value")
+        check((object["context_window_tokens"] as? NSNumber)?.intValue
+              == Int(Self.validDraft.contextWindowTokens),
+              "the saved item has the wrong context window value")
     }
 
     /// A duplicate add is followed by an in-place update with the same item identity.
@@ -160,19 +169,56 @@ struct ProviderConfigurationFixtures {
               "the update has no replacement data")
     }
 
-    /// A failed update is reported without a delete or a second write.
+    /// A failed update is reported while the existing item's bytes remain.
     private mutating func anUpdateFailureLeavesTheExistingItemAlone() {
+        let previousBytes = Data(Self.validItem.utf8)
+        var keychainBytes: Data? = previousBytes
+        var attemptedBytes: Data?
         do {
             _ = try ProviderConfigurationStore.save(
                 Self.validDraft,
-                add: { _, _ in errSecDuplicateItem },
-                update: { _, _ in errSecIO })
+                add: { attributes, _ in
+                    // The injected Keychain already has an item, so add finds
+                    // the existing identity and the store takes the update path.
+                    guard keychainBytes == nil else { return errSecDuplicateItem }
+                    keychainBytes = (attributes as? [String: Any])?[kSecValueData as String] as? Data
+                    return keychainBytes == nil ? errSecParam : errSecSuccess
+                },
+                update: { _, attributes in
+                    attemptedBytes = (attributes as? [String: Any])?[kSecValueData as String] as? Data
+                    // Model a failed Security update: the old item is not
+                    // replaced when the operation returns an error.
+                    return errSecIO
+                })
             check(false, "the failed update was accepted")
         } catch let error as ProviderConfigurationStoreError {
             check(error == .keychain(operation: .update, status: errSecIO),
                   "the failed update reported \(error)")
+            check(error.localizedDescription
+                  == "The provider configuration could not be saved. The previous configuration was kept.",
+                  "the failed update exposed a non-generic message: \(error.localizedDescription)")
+            check(!error.localizedDescription.contains("sk-ant-test"),
+                  "the failed update exposed the previous credential")
         } catch {
             check(false, "the failed update reported the wrong error")
+        }
+        check(attemptedBytes != nil, "the failed update did not receive replacement bytes")
+        if let attemptedBytes {
+            check(attemptedBytes != previousBytes,
+                  "the failed update did not attempt to replace the item")
+        }
+        check(keychainBytes == previousBytes,
+              "the failed update changed the injected Keychain bytes")
+        guard let keychainBytes else {
+            check(false, "the previous item could not be read after the failed update")
+            return
+        }
+        if let readBack = try? ProviderConfigurationStore.readKeychainItem(
+            copyMatching: Self.copying(keychainBytes)) {
+            check(readBack == previousBytes,
+                  "the failed update did not leave the previous item readable")
+        } else {
+            check(false, "the previous item could not be read after the failed update")
         }
     }
 
@@ -358,6 +404,14 @@ struct ProviderConfigurationFixtures {
     private static func copying(_ item: String) -> ProviderConfigurationStore.ItemCopier {
         { _, result in
             result.pointee = (item.data(using: .utf8) ?? Data()) as NSData
+            return errSecSuccess
+        }
+    }
+
+    /// A call into Security that answers with existing item bytes.
+    private static func copying(_ data: Data) -> ProviderConfigurationStore.ItemCopier {
+        { _, result in
+            result.pointee = data as NSData
             return errSecSuccess
         }
     }
