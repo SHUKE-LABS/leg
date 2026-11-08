@@ -150,8 +150,9 @@ final class LegHostUITests: XCTestCase {
     /// The bridge of the ios-mobile bundle runs in the imported guest.
     ///
     /// `leg-bridge --help` exits 0 and an unknown argument exits 2, so the
-    /// exit codes prove the program got its arguments; the help text proves
-    /// it ran to the end.
+    /// exit codes prove the program got its arguments. The host hides the
+    /// terminal once the guest program exited, so the help text is read from
+    /// a shell that runs the bridge and stays alive.
     func testTheBridgeRunsInTheImportedGuest() {
         XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
                       "the host did not reach the running state")
@@ -164,10 +165,6 @@ final class LegHostUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["guest-exited"].waitForExistence(timeout: startTimeout),
                       "leg-bridge --help did not exit")
         XCTAssertEqual(app.staticTexts["guest-status-detail"].label, "The guest program exited.")
-        let terminal = app.otherElements["guest-terminal"]
-        XCTAssertTrue(terminal.debugDescription.contains("usage: leg-bridge"),
-                      "the terminal does not show the help of leg-bridge")
-        attachScreenshot("leg-bridge --help")
 
         app.terminate()
         app.launchArguments = Self.launchArguments + ["-leghost-program", "/usr/local/bin/leg-bridge",
@@ -178,6 +175,20 @@ final class LegHostUITests: XCTestCase {
                       "leg-bridge --unknown did not exit")
         XCTAssertEqual(app.staticTexts["guest-status-detail"].label,
                        "The guest program exited with code 2.")
+
+        app.terminate()
+        app.launchArguments = Self.launchArguments + ["-leghost-program", "/bin/sh"]
+        app.launch()
+
+        XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
+                      "the terminal is missing")
+        GuestKeyboard.focus(app)
+        app.typeText("/usr/local/bin/leg-bridge --help\n")
+        // The usage line is output, not the echo of the command.
+        let usage = app.staticTexts
+            .matching(NSPredicate(format: "label CONTAINS %@", "usage: leg-bridge")).firstMatch
+        XCTAssertTrue(usage.waitForExistence(timeout: 60), "the terminal does not show the help of leg-bridge")
+        attachScreenshot("leg-bridge --help")
     }
 
     /// The second launch verifies the root and reuses it instead of importing

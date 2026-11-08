@@ -400,8 +400,9 @@ first launch (the guest root is imported and the guest program starts), the
 guest program drawing its screen, the keyboard reaching the guest, the
 rotation changing the size the guest was told about, the on screen interrupt
 ending the guest program without a hardware keyboard, the exit of a helper
-process leaving the session running, and the second launch reusing the
-verified root instead of importing it again.
+process leaving the session running, `leg-bridge --help` running in the
+imported guest and exiting 0 while an unknown argument exits 2, and the
+second launch reusing the verified root instead of importing it again.
 
 ```
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
