@@ -110,7 +110,7 @@ jobs:
             archive: tar.gz
             cross: true
           # iSH runs an Alpine i386 userland on iOS; this row builds the
-          # ELF32 guest bundle the iSH host consumes.
+          # ELF32 generic iSH bundle and the ios-mobile bundle LegHost imports.
           - runner: ubuntu-latest
             target: i686-unknown-linux-musl
             archive: tar.gz
@@ -198,7 +198,7 @@ jobs:
           done
           tar -C "${staging}" -czf "${archive}" leg leg-tui leg-web leg-ui-supervisor
 
-      - name: Archive the iSH bundle
+      - name: Archive the iSH bundles
         if: ${{ matrix.ish == true }}
         shell: bash
         run: |
@@ -206,14 +206,19 @@ jobs:
           version="${RELEASE_TAG#v}"
           staging="$(mktemp -d)"
           trap 'rm -rf "${staging}"' EXIT
-          cp "target/${TARGET}/release/leg" "${staging}/leg"
+          for name in leg leg-bridge; do
+            cp "target/${TARGET}/release/${name}" "${staging}/${name}"
+          done
           for name in leg-tui leg-web leg-ui-supervisor; do
             cp "companions/target/${TARGET}/release/${name}" "${staging}/${name}"
           done
-          # The helper refuses to package anything that is not an ELF32 i386
-          # executable or that carries a manifest for another target.
+          # The helpers refuse to package anything that is not an ELF32 i386
+          # executable or that carries a manifest for another target. Each
+          # bundle takes only its own binaries from the shared staging dir.
           bash scripts/release.sh ish-bundle "${version}" "${staging}" \
             "leg-${version}-${TARGET}.tar.gz"
+          bash scripts/release.sh ish-mobile-bundle "${version}" "${staging}" \
+            "leg-${version}-${TARGET}-mobile.tar.gz"
 
       - name: Archive Windows binaries
         if: ${{ matrix.archive == 'zip' }}
@@ -236,7 +241,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: leg-${{ matrix.target }}
-          path: leg-*-${{ matrix.target }}.${{ matrix.archive }}
+          path: |
+            leg-*-${{ matrix.target }}.${{ matrix.archive }}
+            leg-*-${{ matrix.target }}-mobile.${{ matrix.archive }}
           if-no-files-found: error
 
   smoke:
@@ -284,19 +291,22 @@ jobs:
         with:
           ref: ${{ needs.tag.outputs.tag }}
 
-      - name: Download the iSH bundle
+      - name: Download the iSH bundles
         uses: actions/download-artifact@v7
         with:
           name: leg-i686-unknown-linux-musl
           path: dist
 
-      - name: Run the iSH bundle in an i386 Alpine container
+      - name: Run the iSH bundles in an i386 Alpine container
         shell: bash
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           bash scripts/release.sh ish-smoke \
             "dist/leg-${version}-${TARGET}.tar.gz" "${version}"
+          # The mobile smoke also runs `leg-bridge --help`.
+          bash scripts/release.sh ish-mobile-smoke \
+            "dist/leg-${version}-${TARGET}-mobile.tar.gz" "${version}"
 
   publish:
     needs: [tag, build, smoke, smoke-ish]
@@ -328,6 +338,7 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           ish_asset="leg-${version}-i686-unknown-linux-musl.tar.gz"
+          ish_mobile_asset="leg-${version}-i686-unknown-linux-musl-mobile.tar.gz"
           assets=(
             "leg-${version}-x86_64-unknown-linux-musl.tar.gz"
             "leg-${version}-aarch64-unknown-linux-musl.tar.gz"
@@ -336,6 +347,7 @@ jobs:
             "leg-${version}-aarch64-apple-darwin.tar.gz"
             "leg-${version}-x86_64-pc-windows-msvc.zip"
             "${ish_asset}"
+            "${ish_mobile_asset}"
           )
 
           for asset in "${assets[@]}"; do
@@ -344,6 +356,18 @@ jobs:
               # The iSH bundle carries the four binaries plus its compatibility
               # manifest and inner checksums.
               bash scripts/release.sh verify-ish-archive "dist/${asset}" "${version}"
+              continue
+            fi
+            if [[ "${asset}" == "${ish_mobile_asset}" ]]; then
+              # The mobile bundle swaps leg-web for leg-bridge and declares
+              # bundle_kind "ios-mobile"; the generic bundle must not pass
+              # as a mobile one.
+              bash scripts/release.sh verify-ish-mobile-archive "dist/${asset}" "${version}"
+              if bash scripts/release.sh verify-ish-mobile-archive \
+                "dist/${ish_asset}" "${version}" 2>/dev/null; then
+                echo "::error::the mobile verifier accepted the generic iSH bundle"
+                exit 1
+              fi
               continue
             fi
             case "${asset}" in
@@ -383,6 +407,7 @@ jobs:
             "leg-${version}-aarch64-apple-darwin.tar.gz"
             "leg-${version}-x86_64-pc-windows-msvc.zip"
             "leg-${version}-i686-unknown-linux-musl.tar.gz"
+            "leg-${version}-i686-unknown-linux-musl-mobile.tar.gz"
           )
           upload_paths=(SHA256SUMS)
           for asset in "${assets[@]}"; do

@@ -80,21 +80,40 @@ licenses of the bundled third-party Rust crates and vendored material.
 
 ## iSH bundle for iOS
 
-Each release also attaches `leg-<version>-i686-unknown-linux-musl.tar.gz` for
-hosts that run a Linux i386 userland, such as the [iSH](https://ish.app)
-emulator on iOS. Unpack it inside the iSH filesystem and check the inner
-checksums:
+Each release also attaches two i386 bundles for hosts that run a Linux i386
+userland, such as the [iSH](https://ish.app) emulator on iOS:
+
+- `leg-<version>-i686-unknown-linux-musl.tar.gz`, the generic bundle, for the
+  iSH app;
+- `leg-<version>-i686-unknown-linux-musl-mobile.tar.gz`, the ios-mobile
+  bundle, which the native iOS host below imports.
+
+Unpack one inside the iSH filesystem and check the inner checksums:
 
 ```
 sha256sum --check SHA256SUMS
 ```
 
-The archive holds `leg`, `leg-tui`, `leg-web`, and `leg-ui-supervisor`, the
-compatibility manifest `ish-compatibility-v1.json`, and the inner
-`SHA256SUMS`. The manifest records the exact target
-(`i686-unknown-linux-musl`), the pinned Alpine release the bundle is tested
-against (Alpine 3.20.3, image `alpine:3.20.3`, run under `linux/386`), and the
-`--version` command for each binary.
+The generic archive holds `leg`, `leg-tui`, `leg-web`, and
+`leg-ui-supervisor`, the compatibility manifest `ish-compatibility-v1.json`,
+and the inner `SHA256SUMS`. The manifest records the `leg_version`, the exact
+target (`i686-unknown-linux-musl`), the pinned Alpine release the bundle is
+tested against (Alpine 3.20.3, image `alpine:3.20.3`, run under `linux/386`),
+and the size, SHA-256 and `--version` command of each binary.
+
+The ios-mobile archive holds exactly six files: `leg`, `leg-tui`,
+`leg-ui-supervisor`, `leg-bridge`, `ish-compatibility-v1.json`, and
+`SHA256SUMS`. It drops `leg-web` and adds the capability bridge, and its
+manifest declares `"bundle_kind": "ios-mobile"`; the generic manifest has no
+`bundle_kind`. Check either archive against the release helpers:
+
+```
+scripts/release.sh verify-ish-archive leg-<version>-i686-unknown-linux-musl.tar.gz <version>
+scripts/release.sh verify-ish-mobile-archive leg-<version>-i686-unknown-linux-musl-mobile.tar.gz <version>
+```
+
+Each verifier rejects the other bundle, a wrong file set, target, version,
+`bundle_kind` or `version_command`, and any checksum, digest or ELF mismatch.
 
 This is an emulated Linux artifact, not a native iOS binary: it ships no iOS
 SDK or Swift code, and the binaries cannot reach the Photos, Files, Shortcuts,
@@ -256,7 +275,7 @@ platform adapter has to keep.
 
 The repository also carries a native iOS host under [`ios/`](ios/README.md):
 a standalone Xcode project (`LegHost`) that embeds one pinned iSH revision. On
-launch it verifies the pinned guest bundle and the pinned Alpine i386 root
+launch it verifies the pinned ios-mobile bundle and the pinned Alpine i386 root
 against their SHA-256 digests, imports them into a guest root with the vendored
 iSH importer, boots the vendored runtime and runs `/usr/local/bin/leg-tui` on a
 pseudo terminal that is drawn with hterm. The terminal accepts the software
@@ -270,7 +289,7 @@ The host pins its two inputs by URL and SHA-256:
 
 | Input | URL | SHA-256 |
 | --- | --- | --- |
-| leg guest bundle `v0.43.1` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.43.1/leg-0.43.1-i686-unknown-linux-musl.tar.gz` | `c7ba65aa24e127039d0292ae1db8b8573fbc07565e5ea40805630dd58305277d` |
+| leg ios-mobile bundle `v0.44.0` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.44.0/leg-0.44.0-i686-unknown-linux-musl-mobile.tar.gz` | pending: set from the published asset |
 | Alpine i386 root `3.20.3` | `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz` | `4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9` |
 
 Build, install, run and reset it with:

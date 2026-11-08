@@ -1323,12 +1323,32 @@ release_ish_manifest_name() {
     printf 'ish-compatibility-v1.json\n'
 }
 
+# Two bundles share this machinery. The generic bundle is the interactive iSH
+# install and keeps leg-web. The iOS LegHost imports the "ios-mobile" bundle
+# instead: the programs the host runs plus leg-bridge, and no leg-web. Only
+# the mobile manifest carries `bundle_kind`, so the two cannot stand in for
+# each other.
+release_ish_mobile_bundle_kind() {
+    printf 'ios-mobile\n'
+}
+
+release_ish_validate_kind() {
+    case "${1:-}" in
+        generic | ios-mobile) return 0 ;;
+    esac
+    printf "release: unknown iSH bundle kind '%s'\n" "${1:-}" >&2
+    return 1
+}
+
 release_ish_binary_names() {
-    printf '%s\n' leg leg-tui leg-web leg-ui-supervisor
+    case "${1:-generic}" in
+        ios-mobile) printf '%s\n' leg leg-tui leg-ui-supervisor leg-bridge ;;
+        *) printf '%s\n' leg leg-tui leg-web leg-ui-supervisor ;;
+    esac
 }
 
 release_ish_bundle_file_names() {
-    release_ish_binary_names
+    release_ish_binary_names "${1:-generic}"
     printf '%s\n' "$(release_ish_manifest_name)" SHA256SUMS
 }
 
@@ -1366,10 +1386,11 @@ release_ish_validate_elf_i386() {
 }
 
 release_ish_write_manifest() {
-    local version="${1:-}" bundle_dir="${2:-}"
+    local version="${1:-}" bundle_dir="${2:-}" kind="${3:-generic}"
     local manifest_path="" name="" sha256="" size="" separator=""
 
     release_validate_version "${version}" || return 1
+    release_ish_validate_kind "${kind}" || return 1
     [[ -d "${bundle_dir}" ]] || {
         printf "release: iSH bundle directory not found '%s'\n" "${bundle_dir}" >&2
         return 1
@@ -1378,6 +1399,9 @@ release_ish_write_manifest() {
     {
         printf '{\n'
         printf '  "schema_version": 1,\n'
+        if [[ "${kind}" != generic ]]; then
+            printf '  "bundle_kind": "%s",\n' "${kind}"
+        fi
         printf '  "leg_version": "%s",\n' "${version}"
         printf '  "target": "%s",\n' "$(release_ish_target)"
         printf '  "architecture": "i386",\n'
@@ -1399,16 +1423,18 @@ release_ish_write_manifest() {
             printf '      "sha256": "%s"\n' "${sha256}"
             printf '    }'
             separator=",\n"
-        done < <(release_ish_binary_names)
+        done < <(release_ish_binary_names "${kind}")
         printf '\n  ]\n'
         printf '}\n'
     } >"${manifest_path}"
 }
 
 release_ish_validate_manifest() {
-    local bundle_dir="${1:-}" expected_version="${2:-}"
-    local manifest_path=""
+    local bundle_dir="${1:-}" expected_version="${2:-}" kind="${3:-generic}"
+    local manifest_path="" expected_names=""
     manifest_path="${bundle_dir}/$(release_ish_manifest_name)"
+    release_ish_validate_kind "${kind}" || return 1
+    expected_names="$(release_ish_binary_names "${kind}" | paste -sd ' ' -)"
 
     [[ -f "${manifest_path}" ]] || {
         printf "release: iSH manifest not found '%s'\n" "${manifest_path}" >&2
@@ -1421,13 +1447,14 @@ release_ish_validate_manifest() {
 
     node - "${manifest_path}" "${bundle_dir}" "${expected_version}" \
         "$(release_ish_target)" "$(release_ish_alpine_release)" \
-        "$(release_ish_alpine_image)" "$(release_ish_docker_platform)" <<'NODE'
+        "$(release_ish_alpine_image)" "$(release_ish_docker_platform)" \
+        "${kind}" "${expected_names}" <<'NODE'
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
 const [, , manifestPath, bundleDir, expectedVersion, expectedTarget, expectedAlpineRelease,
-    expectedAlpineImage, expectedPlatform] = process.argv;
+    expectedAlpineImage, expectedPlatform, kind, expectedNameList] = process.argv;
 
 function fail(message) {
   console.error(`release: ${manifestPath}: ${message}`);
@@ -1442,6 +1469,11 @@ try {
 }
 
 if (manifest.schema_version !== 1) fail('schema_version must be 1');
+if (kind === 'generic') {
+  if (Object.hasOwn(manifest, 'bundle_kind')) fail('the generic bundle must not declare bundle_kind');
+} else if (manifest.bundle_kind !== kind) {
+  fail(`bundle_kind '${manifest.bundle_kind}' does not match '${kind}'`);
+}
 if (expectedVersion && manifest.leg_version !== expectedVersion) {
   fail(`leg_version '${manifest.leg_version}' does not match '${expectedVersion}'`);
 }
@@ -1462,7 +1494,7 @@ if (manifest.docker_platform !== expectedPlatform) {
   fail(`docker_platform '${manifest.docker_platform}' does not match '${expectedPlatform}'`);
 }
 
-const expectedNames = ['leg', 'leg-tui', 'leg-web', 'leg-ui-supervisor'];
+const expectedNames = expectedNameList.split(' ');
 if (!Array.isArray(manifest.binaries)) fail('binaries must be an array');
 if (manifest.binaries.length !== expectedNames.length) {
   fail(`binaries must list exactly ${expectedNames.length} entries`);
@@ -1490,16 +1522,17 @@ NODE
 }
 
 release_ish_write_checksums() {
-    local bundle_dir="${1:-}" name=""
+    local bundle_dir="${1:-}" kind="${2:-generic}" name=""
     local -a names=()
 
+    release_ish_validate_kind "${kind}" || return 1
     [[ -d "${bundle_dir}" ]] || {
         printf "release: iSH bundle directory not found '%s'\n" "${bundle_dir}" >&2
         return 1
     }
     while read -r name; do
         names+=("${name}")
-    done < <(release_ish_binary_names)
+    done < <(release_ish_binary_names "${kind}")
     names+=("$(release_ish_manifest_name)")
     (
         cd -- "${bundle_dir}" || exit 1
@@ -1508,10 +1541,11 @@ release_ish_write_checksums() {
 }
 
 release_ish_stage_bundle() {
-    local version="${1:-}" binaries_dir="${2:-}" bundle_dir="${3:-}"
+    local version="${1:-}" binaries_dir="${2:-}" bundle_dir="${3:-}" kind="${4:-generic}"
     local name=""
 
     release_validate_version "${version}" || return 1
+    release_ish_validate_kind "${kind}" || return 1
     [[ -d "${binaries_dir}" ]] || {
         printf "release: iSH binary directory not found '%s'\n" "${binaries_dir}" >&2
         return 1
@@ -1528,21 +1562,22 @@ release_ish_stage_bundle() {
         }
         cp -- "${binaries_dir}/${name}" "${bundle_dir}/${name}" || return 1
         chmod 755 "${bundle_dir}/${name}"
-    done < <(release_ish_binary_names)
-    release_ish_write_manifest "${version}" "${bundle_dir}" || return 1
-    release_ish_write_checksums "${bundle_dir}"
+    done < <(release_ish_binary_names "${kind}")
+    release_ish_write_manifest "${version}" "${bundle_dir}" "${kind}" || return 1
+    release_ish_write_checksums "${bundle_dir}" "${kind}"
 }
 
 release_ish_verify_bundle() {
-    local bundle_dir="${1:-}" expected_version="${2:-}"
+    local bundle_dir="${1:-}" expected_version="${2:-}" kind="${3:-generic}"
     local name="" actual="" expected="" listed=""
 
+    release_ish_validate_kind "${kind}" || return 1
     [[ -d "${bundle_dir}" ]] || {
         printf "release: iSH bundle directory not found '%s'\n" "${bundle_dir}" >&2
         return 1
     }
     actual="$(cd -- "${bundle_dir}" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)"
-    expected="$(release_ish_bundle_file_names | LC_ALL=C sort)"
+    expected="$(release_ish_bundle_file_names "${kind}" | LC_ALL=C sort)"
     if [[ "${actual}" != "${expected}" ]]; then
         printf 'release: the iSH bundle must contain exactly the four binaries, the manifest, and SHA256SUMS\n' >&2
         printf 'release: expected:\n%s\nrelease: found:\n%s\n' "${expected}" "${actual}" >&2
@@ -1550,7 +1585,7 @@ release_ish_verify_bundle() {
     fi
     while read -r name; do
         release_ish_validate_elf_i386 "${bundle_dir}/${name}" || return 1
-    done < <(release_ish_binary_names)
+    done < <(release_ish_binary_names "${kind}")
     (
         cd -- "${bundle_dir}" || exit 1
         release_sha256_check SHA256SUMS >/dev/null
@@ -1561,18 +1596,18 @@ release_ish_verify_bundle() {
     # sha256sum marks binary-mode entries with a leading '*'; the file names
     # themselves never contain whitespace.
     listed="$(awk '{print $2}' "${bundle_dir}/SHA256SUMS" | sed 's/^\*//' | LC_ALL=C sort)"
-    expected="$( { release_ish_binary_names; printf '%s\n' "$(release_ish_manifest_name)"; } | LC_ALL=C sort)"
+    expected="$( { release_ish_binary_names "${kind}"; printf '%s\n' "$(release_ish_manifest_name)"; } | LC_ALL=C sort)"
     [[ "${listed}" == "${expected}" ]] || {
         printf 'release: the iSH SHA256SUMS must cover every bundle file except itself\n' >&2
         return 1
     }
-    release_ish_validate_manifest "${bundle_dir}" "${expected_version}"
+    release_ish_validate_manifest "${bundle_dir}" "${expected_version}" "${kind}"
 }
 
 # Fixed metadata, sorted entries, and a timestamp-free gzip stream make the
 # archive byte-for-byte reproducible for identical inputs.
 release_ish_write_archive() {
-    local bundle_dir="${1:-}" archive_path="${2:-}"
+    local bundle_dir="${1:-}" archive_path="${2:-}" kind="${3:-generic}"
     local name=""
     local -a entries=()
 
@@ -1582,35 +1617,36 @@ release_ish_write_archive() {
     }
     while read -r name; do
         entries+=("${name}")
-    done < <(release_ish_bundle_file_names | LC_ALL=C sort)
+    done < <(release_ish_bundle_file_names "${kind}" | LC_ALL=C sort)
     tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' --format=gnu \
         -C "${bundle_dir}" -cf - -- "${entries[@]}" \
         | gzip -n -9 >"${archive_path}"
 }
 
 release_ish_bundle() {
-    local version="${1:-}" binaries_dir="${2:-}" archive_path="${3:-}"
+    local version="${1:-}" binaries_dir="${2:-}" archive_path="${3:-}" kind="${4:-generic}"
     local staging="" status=0
 
     release_validate_version "${version}" || return 1
+    release_ish_validate_kind "${kind}" || return 1
     [[ -n "${archive_path}" ]] || {
         printf 'release: the iSH bundle needs an archive path\n' >&2
         return 1
     }
     staging="$(mktemp -d)" || return 1
-    release_ish_stage_bundle "${version}" "${binaries_dir}" "${staging}/bundle" || status="$?"
+    release_ish_stage_bundle "${version}" "${binaries_dir}" "${staging}/bundle" "${kind}" || status="$?"
     if (( status == 0 )); then
-        release_ish_verify_bundle "${staging}/bundle" "${version}" || status="$?"
+        release_ish_verify_bundle "${staging}/bundle" "${version}" "${kind}" || status="$?"
     fi
     if (( status == 0 )); then
-        release_ish_write_archive "${staging}/bundle" "${archive_path}" || status="$?"
+        release_ish_write_archive "${staging}/bundle" "${archive_path}" "${kind}" || status="$?"
     fi
     rm -rf -- "${staging}"
     return "${status}"
 }
 
 release_ish_verify_archive() {
-    local archive_path="${1:-}" expected_version="${2:-}"
+    local archive_path="${1:-}" expected_version="${2:-}" kind="${3:-generic}"
     local staging="" status=0
 
     [[ -f "${archive_path}" ]] || {
@@ -1620,7 +1656,7 @@ release_ish_verify_archive() {
     staging="$(mktemp -d)" || return 1
     tar -xzf "${archive_path}" -C "${staging}" || status="$?"
     if (( status == 0 )); then
-        release_ish_verify_bundle "${staging}" "${expected_version}" || status="$?"
+        release_ish_verify_bundle "${staging}" "${expected_version}" "${kind}" || status="$?"
     fi
     rm -rf -- "${staging}"
     return "${status}"
@@ -1640,19 +1676,20 @@ for (const entry of manifest.binaries) console.log(entry.version_command);
 ' "${manifest_path}"
 }
 
-# `leg` is versioned together with the release, so it has to report the
-# release version. The companions keep their own crate versions, so they only
-# have to report a semver, the same contract the desktop release rows enforce
-# for the very same binaries.
+# `leg` and `leg-bridge` are built from the release crate, so they have to
+# report the release version. The companions keep their own crate versions,
+# so they only have to report a semver, the same contract the desktop release
+# rows enforce for the very same binaries.
 release_ish_verify_version_output() {
     local name="${1:-}" expected_version="${2:-}" output="${3:-}"
 
     [[ -n "${name}" && -n "${expected_version}" ]] || return 1
-    if [[ "${name}" == "leg" ]]; then
-        if grep -qxF "leg ${expected_version}" <<<"${output}"; then
+    if [[ "${name}" == "leg" || "${name}" == "leg-bridge" ]]; then
+        if grep -qxF "${name} ${expected_version}" <<<"${output}"; then
             return 0
         fi
-        printf "release: 'leg --version' did not report 'leg %s'\n" "${expected_version}" >&2
+        printf "release: '%s --version' did not report '%s %s'\n" \
+            "${name}" "${name}" "${expected_version}" >&2
         return 1
     fi
     if grep -qxE "${name} [0-9]+\.[0-9]+\.[0-9]+" <<<"${output}"; then
@@ -1662,14 +1699,26 @@ release_ish_verify_version_output() {
     return 1
 }
 
+# The smoke transcript echoes "+ leg-bridge --help" before the usage, so only
+# the usage line itself proves that the bridge started.
+release_ish_verify_bridge_help() {
+    if grep -qxF 'usage: leg-bridge [--version|-V] [--help|-h]' <<<"${1:-}"; then
+        return 0
+    fi
+    printf "release: 'leg-bridge --help' did not print the bridge usage\n" >&2
+    return 1
+}
+
 # Run the bundle in the pinned i386 Alpine image. The manifest records the
 # target and the exact command for each binary; the harness runs those
-# commands and checks that each one reports a version.
+# commands and checks that each one reports a version. The mobile bundle also
+# has to print the leg-bridge usage, the command a mobile Skill starts from.
 release_ish_smoke() {
-    local archive_path="${1:-}" expected_version="${2:-}"
+    local archive_path="${1:-}" expected_version="${2:-}" kind="${3:-generic}"
     local staging="" status=0 manifest="" volume="" output="" name=""
     local -a commands=()
 
+    release_ish_validate_kind "${kind}" || return 1
     [[ -f "${archive_path}" ]] || {
         printf "release: iSH archive not found '%s'\n" "${archive_path}" >&2
         return 1
@@ -1681,7 +1730,7 @@ release_ish_smoke() {
     staging="$(mktemp -d)" || return 1
     tar -xzf "${archive_path}" -C "${staging}" || status="$?"
     if (( status == 0 )); then
-        release_ish_verify_bundle "${staging}" "${expected_version}" || status="$?"
+        release_ish_verify_bundle "${staging}" "${expected_version}" "${kind}" || status="$?"
     fi
     if (( status == 0 )); then
         manifest="${staging}/$(release_ish_manifest_name)"
@@ -1689,6 +1738,9 @@ release_ish_smoke() {
         if (( ${#commands[@]} == 0 )); then
             printf 'release: the iSH manifest records no version commands\n' >&2
             status=1
+        fi
+        if [[ "${kind}" == ios-mobile ]]; then
+            commands+=("leg-bridge --help")
         fi
     fi
     if (( status == 0 )); then
@@ -1709,7 +1761,10 @@ release_ish_smoke() {
     if (( status == 0 )) && [[ -n "${expected_version}" ]]; then
         while read -r name; do
             release_ish_verify_version_output "${name}" "${expected_version}" "${output}" || status=1
-        done < <(release_ish_binary_names)
+        done < <(release_ish_binary_names "${kind}")
+    fi
+    if (( status == 0 )) && [[ "${kind}" == ios-mobile ]]; then
+        release_ish_verify_bridge_help "${output}" || status=1
     fi
     rm -rf -- "${staging}"
     return "${status}"
@@ -1759,6 +1814,10 @@ usage:
   scripts/release.sh verify-ish-bundle <bundle-dir> [version]
   scripts/release.sh verify-ish-archive <archive-path> [version]
   scripts/release.sh ish-smoke <archive-path> [version]
+  scripts/release.sh ish-mobile-bundle <version> <binaries-dir> <archive-path>
+  scripts/release.sh verify-ish-mobile-bundle <bundle-dir> [version]
+  scripts/release.sh verify-ish-mobile-archive <archive-path> [version]
+  scripts/release.sh ish-mobile-smoke <archive-path> [version]
   scripts/release.sh third-party-notices
   scripts/release.sh verify-third-party-notices
   scripts/release.sh web-trial-notices <target-triple>
@@ -1821,6 +1880,18 @@ release_main() {
             ;;
         ish-smoke)
             release_ish_smoke "${1:-}" "${2:-}"
+            ;;
+        ish-mobile-bundle)
+            release_ish_bundle "${1:-}" "${2:-}" "${3:-}" "$(release_ish_mobile_bundle_kind)"
+            ;;
+        verify-ish-mobile-bundle)
+            release_ish_verify_bundle "${1:-}" "${2:-}" "$(release_ish_mobile_bundle_kind)"
+            ;;
+        verify-ish-mobile-archive)
+            release_ish_verify_archive "${1:-}" "${2:-}" "$(release_ish_mobile_bundle_kind)"
+            ;;
+        ish-mobile-smoke)
+            release_ish_smoke "${1:-}" "${2:-}" "$(release_ish_mobile_bundle_kind)"
             ;;
         third-party-notices)
             release_third_party_notices_generate
