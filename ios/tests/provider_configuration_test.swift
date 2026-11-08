@@ -25,6 +25,11 @@ struct ProviderConfigurationFixtures {
     private mutating func run() {
         aValidItemIsRead()
         theQueryFindsTheItemOfTheProvider()
+        aValidDraftIsSavedAsTheFiveKeyItem()
+        anExistingItemIsUpdatedInPlace()
+        anUpdateFailureLeavesTheExistingItemAlone()
+        clearingUsesTheProviderQuery()
+        invalidDraftsDoNotCallTheKeychain()
         anItemThatIsNotThereIsMissing()
         anItemWithoutDataIsMissing()
         anItemWithoutOneOfTheKeysIsMissing()
@@ -86,6 +91,182 @@ struct ProviderConfigurationFixtures {
               "the query does not ask for the data of the item")
         check(query[kSecMatchLimit as String] as? String == (kSecMatchLimitOne as String),
               "the match limit of the query is \(String(describing: query[kSecMatchLimit as String]))")
+    }
+
+    /// A valid draft is encoded with exactly the documented item attributes.
+    private mutating func aValidDraftIsSavedAsTheFiveKeyItem() {
+        var attributes: [String: Any]?
+        var updated = false
+        let configuration = try? ProviderConfigurationStore.save(
+            Self.validDraft,
+            add: { item, _ in
+                attributes = item as? [String: Any]
+                return errSecSuccess
+            },
+            update: { _, _ in
+                updated = true
+                return errSecSuccess
+            })
+        check(configuration?.provider == .anthropic, "the saved provider is not Anthropic")
+        check(!updated, "the new item was unexpectedly updated")
+        guard let attributes else {
+            check(false, "the save did not provide Keychain attributes")
+            return
+        }
+        check(attributes[kSecClass as String] as? String == (kSecClassGenericPassword as String),
+              "the saved item is not a generic password")
+        check(attributes[kSecAttrService as String] as? String == ProviderConfigurationStore.service,
+              "the saved item has the wrong service")
+        check(attributes[kSecAttrAccount as String] as? String == ProviderConfigurationStore.account,
+              "the saved item has the wrong account")
+        check(attributes[kSecAttrAccessible as String] as? String
+              == (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String),
+              "the saved item has the wrong accessibility")
+        guard let data = attributes[kSecValueData as String] as? Data,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            check(false, "the saved item has no JSON data")
+            return
+        }
+        check(Set(object.keys) == Set(ProviderConfigurationStore.keys),
+              "the saved item does not hold exactly the five documented keys")
+        check(object["provider"] as? String == Self.validDraft.provider.rawValue,
+              "the saved item has the wrong provider value")
+        check(object["api_key"] as? String == Self.validDraft.apiKey,
+              "the saved item has the wrong API key value")
+        check(object["base_url"] as? String == Self.validDraft.baseURL,
+              "the saved item has the wrong base URL value")
+        check(object["model"] as? String == Self.validDraft.model,
+              "the saved item has the wrong model value")
+        check((object["context_window_tokens"] as? NSNumber)?.intValue
+              == Int(Self.validDraft.contextWindowTokens),
+              "the saved item has the wrong context window value")
+    }
+
+    /// A duplicate add is followed by an in-place update with the same item identity.
+    private mutating func anExistingItemIsUpdatedInPlace() {
+        var updateQuery: [String: Any]?
+        var updateAttributes: [String: Any]?
+        let configuration = try? ProviderConfigurationStore.save(
+            Self.validDraft,
+            add: { _, _ in errSecDuplicateItem },
+            update: { query, attributes in
+                updateQuery = query as? [String: Any]
+                updateAttributes = attributes as? [String: Any]
+                return errSecSuccess
+            })
+        check(configuration != nil, "the existing item was not updated")
+        check(updateQuery?[kSecClass as String] as? String == (kSecClassGenericPassword as String),
+              "the update query has the wrong class")
+        check(updateQuery?[kSecAttrService as String] as? String == ProviderConfigurationStore.service,
+              "the update query has the wrong service")
+        check(updateQuery?[kSecAttrAccount as String] as? String == ProviderConfigurationStore.account,
+              "the update query has the wrong account")
+        check(updateAttributes?[kSecAttrAccessible as String] as? String
+              == (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String),
+              "the update has the wrong accessibility")
+        check(updateAttributes?[kSecValueData as String] is Data,
+              "the update has no replacement data")
+    }
+
+    /// A failed update is reported while the existing item's bytes remain.
+    private mutating func anUpdateFailureLeavesTheExistingItemAlone() {
+        let previousBytes = Data(Self.validItem.utf8)
+        var keychainBytes: Data? = previousBytes
+        var attemptedBytes: Data?
+        do {
+            _ = try ProviderConfigurationStore.save(
+                Self.validDraft,
+                add: { attributes, _ in
+                    // The injected Keychain already has an item, so add finds
+                    // the existing identity and the store takes the update path.
+                    guard keychainBytes == nil else { return errSecDuplicateItem }
+                    keychainBytes = (attributes as? [String: Any])?[kSecValueData as String] as? Data
+                    return keychainBytes == nil ? errSecParam : errSecSuccess
+                },
+                update: { _, attributes in
+                    attemptedBytes = (attributes as? [String: Any])?[kSecValueData as String] as? Data
+                    // Model a failed Security update: the old item is not
+                    // replaced when the operation returns an error.
+                    return errSecIO
+                })
+            check(false, "the failed update was accepted")
+        } catch let error as ProviderConfigurationStoreError {
+            check(error == .keychain(operation: .update, status: errSecIO),
+                  "the failed update reported \(error)")
+            check(error.localizedDescription
+                  == "The provider configuration could not be saved. The previous configuration was kept.",
+                  "the failed update exposed a non-generic message: \(error.localizedDescription)")
+            check(!error.localizedDescription.contains("sk-ant-test"),
+                  "the failed update exposed the previous credential")
+        } catch {
+            check(false, "the failed update reported the wrong error")
+        }
+        check(attemptedBytes != nil, "the failed update did not receive replacement bytes")
+        if let attemptedBytes {
+            check(attemptedBytes != previousBytes,
+                  "the failed update did not attempt to replace the item")
+        }
+        check(keychainBytes == previousBytes,
+              "the failed update changed the injected Keychain bytes")
+        guard let keychainBytes else {
+            check(false, "the previous item could not be read after the failed update")
+            return
+        }
+        if let readBack = try? ProviderConfigurationStore.readKeychainItem(
+            copyMatching: Self.copying(keychainBytes)) {
+            check(readBack == previousBytes,
+                  "the failed update did not leave the previous item readable")
+        } else {
+            check(false, "the previous item could not be read after the failed update")
+        }
+    }
+
+    /// Clearing identifies the same service and account and does not read data.
+    private mutating func clearingUsesTheProviderQuery() {
+        var query: [String: Any]?
+        do {
+            try ProviderConfigurationStore.clear { item in
+                query = item as? [String: Any]
+                return errSecSuccess
+            }
+            check(query?[kSecClass as String] as? String == (kSecClassGenericPassword as String),
+                  "the clear query has the wrong class")
+            check(query?[kSecAttrService as String] as? String == ProviderConfigurationStore.service,
+                  "the clear query has the wrong service")
+            check(query?[kSecAttrAccount as String] as? String == ProviderConfigurationStore.account,
+                  "the clear query has the wrong account")
+        } catch {
+            check(false, "the clear failed")
+        }
+    }
+
+    /// Invalid fields are rejected before any Security operation is attempted.
+    private mutating func invalidDraftsDoNotCallTheKeychain() {
+        let cases: [(ProviderConfigurationDraft, ProviderConfigurationValidationError)] = [
+            (Self.validDraft.with(apiKey: ""), .emptyAPIKey),
+            (Self.validDraft.with(baseURL: "ftp://example.com"), .invalidBaseURL),
+            (Self.validDraft.with(baseURL: "/relative"), .invalidBaseURL),
+            (Self.validDraft.with(model: ""), .emptyModel),
+            (Self.validDraft.with(contextWindowTokens: "0"), .invalidContextWindow),
+            (Self.validDraft.with(contextWindowTokens: "not-a-number"), .invalidContextWindow),
+            (Self.validDraft.with(provider: .openAIResponses), .unsupportedProvider),
+        ]
+        for (draft, expected) in cases {
+            var calls = 0
+            do {
+                _ = try ProviderConfigurationStore.save(
+                    draft,
+                    add: { _, _ in calls += 1; return errSecSuccess },
+                    update: { _, _ in calls += 1; return errSecSuccess })
+                check(false, "the invalid draft was accepted")
+            } catch let error as ProviderConfigurationValidationError {
+                check(error == expected, "the invalid draft reported the wrong field")
+            } catch {
+                check(false, "the invalid draft reported the wrong error")
+            }
+            check(calls == 0, "the invalid draft called Security")
+        }
     }
 
     /// There is no item, so the configuration is missing.
@@ -227,11 +408,27 @@ struct ProviderConfigurationFixtures {
         }
     }
 
+    /// A call into Security that answers with existing item bytes.
+    private static func copying(_ data: Data) -> ProviderConfigurationStore.ItemCopier {
+        { _, result in
+            result.pointee = data as NSData
+            return errSecSuccess
+        }
+    }
+
     /// An item that holds a usable configuration.
     private static let validItem = """
     {"provider":"anthropic","api_key":"sk-ant-test","base_url":"https://api.anthropic.com",\
     "model":"claude-test","context_window_tokens":200000}
     """
+
+    /// A usable form used by the write-side fixtures.
+    private static let validDraft = ProviderConfigurationDraft(
+        provider: .anthropic,
+        apiKey: "sk-ant-test",
+        baseURL: "https://api.anthropic.com",
+        model: "claude-test",
+        contextWindowTokens: "200000")
 
     /// An item that does not hold every key.
     private static let itemWithoutKey = """
@@ -275,5 +472,20 @@ struct ProviderConfigurationFixtures {
             .map { key in "\"\(key)\":\"\(values[key] ?? "")\"" }
             .joined(separator: ",")
         return "{\(pairs)}"
+    }
+}
+
+private extension ProviderConfigurationDraft {
+    /// Returns a copy with one field replaced for a validation fixture.
+    func with(provider: HostProvider? = nil,
+              apiKey: String? = nil,
+              baseURL: String? = nil,
+              model: String? = nil,
+              contextWindowTokens: String? = nil) -> ProviderConfigurationDraft {
+        ProviderConfigurationDraft(provider: provider ?? self.provider,
+                                   apiKey: apiKey ?? self.apiKey,
+                                   baseURL: baseURL ?? self.baseURL,
+                                   model: model ?? self.model,
+                                   contextWindowTokens: contextWindowTokens ?? self.contextWindowTokens)
     }
 }

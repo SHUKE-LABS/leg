@@ -34,6 +34,7 @@ struct LegHostApp: App {
 /// The screen: the terminal once the guest runs, the progress before that.
 struct GuestHostScreen: View {
     @ObservedObject var controller: GuestHostController
+    @State private var showingProviderSettings = false
 
     /// The identity of the terminal.
     ///
@@ -50,6 +51,8 @@ struct GuestHostScreen: View {
 
             VStack(spacing: 0) {
                 switch controller.phase {
+                case .providerSetupRequired:
+                    ProviderSetupView(controller: controller, required: true)
                 case .running:
                     runningHeader
                 case .exited:
@@ -84,6 +87,11 @@ struct GuestHostScreen: View {
             }
         }
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showingProviderSettings) {
+            ProviderSetupView(controller: controller,
+                              required: false,
+                              onDismiss: { showingProviderSettings = false })
+        }
     }
 
     /// The rows above the terminal of a guest that runs.
@@ -121,6 +129,9 @@ struct GuestHostScreen: View {
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("guest-terminal-size")
             }
+            Button("Provider") { showingProviderSettings = true }
+                .font(.caption2.monospaced())
+                .accessibilityIdentifier("provider-settings")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
@@ -219,6 +230,7 @@ struct GuestHostScreen: View {
     private var title: String {
         switch controller.phase {
         case .preparing: return "Preparing the guest"
+        case .providerSetupRequired: return "Provider setup required"
         case .provisioning: return "Verifying the pinned inputs"
         case .booting: return "Booting the guest"
         case .running: return "Running the guest"
@@ -255,6 +267,8 @@ struct GuestHostScreen: View {
                 .accessibilityIdentifier("guest-fixture-state")
             Divider()
             LabeledContent("Vendored iSH revision", value: HostBundle.ishRevision ?? "unknown")
+            Button("Provider settings") { showingProviderSettings = true }
+                .accessibilityIdentifier("provider-settings")
             if controller.reusedVerifiedRoot {
                 LabeledContent("Guest root", value: "reused the verified root")
             }

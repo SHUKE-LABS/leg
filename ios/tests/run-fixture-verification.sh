@@ -3,10 +3,11 @@
 # Verify the iOS provider fixture and scan the run for the credential.
 #
 # The script runs the scenarios of the loopback fixture in the simulator and
-# then looks at the four artifacts of every run: the raw terminal
-# transcript, the application log, the guest file system and the exchange
-# trail. The run fails when the configured credential shows up in any of
-# them, and when the turn did not reach the fixture.
+# starts with the provider-setup UI scenario, whose UI test also checks the
+# accessibility diagnostics. It then looks at the four artifacts of every
+# run: the raw terminal transcript, the application log, the guest file system
+# and the exchange trail. The run fails when the configured credential shows up
+# in any of them, and when the turn did not reach the fixture.
 #
 # The script runs the provider error, the unreachable and the runtime failure
 # scenario as well, because the failure of a turn is reported by the guest in
@@ -34,7 +35,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUNDLE_ID="com.shukelabs.leg.ioshost"
 SENTINEL="IOS_FIXTURE_CREDENTIAL_SENTINEL"
-SUCCESS_TEST="LegHostUITests/LegHostFixtureUITests/testTheSuccessScenarioCompletesOneTurn"
+SETUP_TEST="LegHostUITests/LegHostFixtureUITests/testTheProviderSetupSavesAndStartsTheFixture"
 PROVIDER_ERROR_TEST="LegHostUITests/LegHostFixtureUITests/testTheProviderErrorScenarioReportsAServerError"
 UNREACHABLE_TEST="LegHostUITests/LegHostFixtureUITests/testTheUnreachableScenarioReportsATransportError"
 RUNTIME_FAILURE_TEST="LegHostUITests/LegHostFixtureUITests/testTheRuntimeFailureScenarioReportsTheRuntimeDiagnostic"
@@ -403,8 +404,12 @@ if [[ "${skip_run}" -eq 1 ]]; then
     resolve_artifacts "${container}" "existing"
     scan_artifacts "the run that is already there" optional
 else
-    run_and_scan "${SUCCESS_TEST}" "success run" "success" "" ""
-    check_turn_markers "the success run"
+    # The setup scenario enters the credential through the UI before it runs
+    # the turn. Scanning this run proves the first-run path is redacted too;
+    # the in-memory provider override used by the ordinary success test would
+    # bypass the setup form and could not prove that property.
+    run_and_scan "${SETUP_TEST}" "provider setup run" "provider-setup" "" ""
+    check_turn_markers "the provider setup run"
 
     # The failure of a turn is reported by the guest in its exchange trail,
     # and the host writes that report into the terminal. The transcript of

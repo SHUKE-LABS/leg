@@ -68,6 +68,9 @@ final class GuestHostLifecycle {
     /// other session starts next to it: the retry is refused then.
     private var releaseFailed = false
 
+    /// Whether a retry waits for the active failing chain to finish unwinding.
+    private var retryRequested = false
+
     /// The number of the chain that owns the callbacks of the runtime.
     ///
     /// The number tells a callback of the runtime which chain it belongs
@@ -92,7 +95,9 @@ final class GuestHostLifecycle {
     /// Starts a chain again after a failure, a stop or an interruption.
     ///
     /// A retry from any other state is refused: a chain that runs is never
-    /// replaced, and a machine that never ran is started with `start`.
+    /// replaced, and a machine that never ran is started with `start`. If a
+    /// retry is requested while a failing chain is still unwinding, it starts
+    /// after that chain has released its resources.
     ///
     /// A session that could not be released is not retried either: its guest
     /// is still alive, and another session must not run next to it.
@@ -100,9 +105,14 @@ final class GuestHostLifecycle {
         guard !releaseFailed else { return }
         switch state {
         case .failed, .stopped, .interrupted:
-            guard chain == nil else { return }
+            guard chain == nil else {
+                retryRequested = true
+                return
+            }
             begin()
-        case .idle, .active, .running:
+        case .active:
+            retryRequested = true
+        case .idle, .running:
             return
         }
     }
@@ -216,5 +226,11 @@ final class GuestHostLifecycle {
             _ = await tearDown()
         }
         chain = nil
+        guard retryRequested, state == .failed, !releaseFailed else {
+            retryRequested = false
+            return
+        }
+        retryRequested = false
+        begin()
     }
 }

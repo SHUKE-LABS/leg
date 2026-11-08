@@ -350,10 +350,11 @@ xcrun devicectl device process launch --device <device> \
 A build without the DEBUG controls reads the provider configuration from the
 Keychain of the device, and a device without that item stops at the
 configuration boundary with `IOS_PROVIDER_CONFIG_MISSING` before it touches
-the guest root: nothing is provisioned, booted or started. The host has no UI
-to add the item yet (the settings UI is a later slice), so a device run with a
-Release build proves the install, the launch and that boundary, and the guest
-path is proved with the DEBUG build and the loopback fixture.
+the guest root: nothing is provisioned, booted or started. The first-run setup
+screen can create the item, and the Provider button in the host can replace or
+clear it. Saving a valid form resumes the normal preflight and guest launch;
+clearing takes effect on the next launch. The guest path is also proved with
+the DEBUG build and the loopback fixture.
 
 ### The tests on the device
 
@@ -402,11 +403,12 @@ instead. It launches the app with the fixture arguments, so it reuses the
 verified guest root and does not import it again. Every fixture test starts
 with `-leghost-fixture-reset`, so it starts from a known state.
 
-The fixture class covers the success, the provider error, the unreachable
-and the runtime failure scenarios, the missing and the unsupported provider
-configuration, the relaunch that keeps the workspace, the trail and the
-requests, the background that interrupts a turn, and the faults of the
-device that are reported before the guest is touched.
+The fixture class covers the success, the provider error, the unreachable and
+the runtime failure scenarios, the missing and unsupported provider
+configuration, first-run setup and field validation, cancellation and clear,
+the relaunch that keeps the workspace, trail and requests, the background that
+interrupts a turn, and the faults of the device that are reported before the
+guest is touched.
 
 The `LegHostTests` target holds the tests of the lifecycle and of the
 preflight. They drive the state machine of the session and the checks of
@@ -430,8 +432,13 @@ The host owns the provider configuration and reads it before it touches the
 guest root: a missing or an unsupported configuration is reported before
 anything is provisioned, booted or started.
 
-The configuration is one Keychain generic password. The host reads the item
-and never writes it, so the credential stays where the user put it:
+The configuration is one Keychain generic password. On first launch the host
+shows a setup form when the item is missing. The form accepts only the
+Anthropic Messages provider, an API key, an absolute HTTP(S) base URL, a model
+and a positive context-window token count. The API key is a secure field and
+never appears in diagnostics. Provider settings can replace or clear the item;
+the running guest keeps its already loaded configuration, and the next launch
+reads the newly stored item.
 
 | Field | Value |
 | --- | --- |
@@ -457,6 +464,15 @@ The guest gets the configuration as an allowlist: `TERM`, `HOME`, `PATH`,
 `SHELL`, `LEG_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`,
 `LEG_MODEL` and `LEG_CONTEXT_WINDOW_TOKENS`. Nothing else of the host
 environment reaches the guest, and no `LEGHOST_*` variable is ever passed on.
+
+The save path validates the fields before calling Security. A new item uses
+`SecItemAdd`; a replacement uses `SecItemUpdate` after the duplicate-item
+response. A failed validation or update leaves the previous item unchanged.
+Clear uses `SecItemDelete`, and an already absent item is treated as cleared.
+The JSON data always contains exactly the five keys above. The API key is held
+by the host setup form and loaded configuration, then passed in memory only as
+the allowlisted guest environment's `ANTHROPIC_API_KEY`; it is not written to
+the guest root, session trail, terminal transcript or ordinary logs.
 
 ## The checks before the guest root
 
@@ -509,6 +525,7 @@ memory and it never becomes a place where a credential is stored.
 | `-leghost-provider openai-chat-completions` | The run is configured for a provider this host refuses. |
 | `-leghost-provider openai-responses` | The run is configured for a provider this host refuses. |
 | `-leghost-no-provider` | The run has no provider configuration at all. |
+| `-leghost-provider-reset` | A DEBUG UI test clears the provider item once before its first launch; the retry after a successful setup keeps the newly saved item. |
 | `-leghost-runtime-failure` | The guest runtime is asked for a program that is not there. |
 | `-leghost-fixture-reset` | The run starts from a known state: the catalog of the guest, the exchange trail and the durable ledger of the requests are cleared. The control belongs to the launch, so a retry after an interruption keeps the state of the run that was stopped. |
 | `-leghost-interrupt-after-request` | The run stops the session as soon as the fixture accepts the request of the turn. The path is the one of the background, so the session is stopped at the boundary the host controls and the trail of the stopped turn is written out, without the app having to go to the background. |
@@ -521,16 +538,18 @@ The fault controls replace the state of the device for one run, in memory
 and for that run only. They are the way the simulator tests induce the
 faults of the preflight without breaking the device.
 
-The provider arguments configure the run in memory: the credential is
+The provider argument configures a fixture run in memory: the credential is
 `IOS_FIXTURE_CREDENTIAL_SENTINEL`, the model is `claude-ios-fixture` and the
-context window is `200000`. Nothing is written to the Keychain, to the user
-defaults or to the file system.
+context window is `200000`. The provider-reset control is the only DEBUG test
+control that clears the Keychain; ordinary fixture provider arguments never
+write to the Keychain, user defaults or file system.
 
 A run without the fixture talks to a closed port on the loopback interface,
 so it stays on the device: a turn of such a run fails with a transport error
-instead of reaching a provider. A DEBUG run without a Keychain item needs one
-of the provider arguments, or the host stops at the configuration boundary
-with `IOS_PROVIDER_CONFIG_MISSING` before it touches the guest root.
+instead of reaching a provider. A DEBUG run without a Keychain item can use
+the setup form, or one of the provider arguments for an in-memory fixture;
+otherwise the host stops at the configuration boundary with
+`IOS_PROVIDER_CONFIG_MISSING` before it touches the guest root.
 
 A fixture run pins the turn down with these values, which the guest gets in
 addition to the ones above:
@@ -744,8 +763,9 @@ ios/tests/run-host-tests.sh
 
 The provider configuration of the host has its own fixtures. They hand in
 the call into the Security framework, so they need neither a Keychain nor a
-simulator, and they cover the query of that call, the JSON of the item and
-the two diagnostics:
+simulator, and they cover the query and write attributes, exact JSON, field
+validation, replacement/clear, update failure preservation and the two
+diagnostics:
 
 ```
 ios/tests/run-provider-tests.sh
@@ -782,8 +802,8 @@ root must hold, not code of them.
 
 ## Out of scope
 
-The settings UI, the native Photos, Files and Shortcuts adapters, and App
-Store metadata are later slices of `#255`.
+The native Photos, Files and Shortcuts adapters, and App Store metadata are
+later slices of `#255`.
 The provider support of this slice is the Anthropic Messages protocol; the
 OpenAI wire variants are covered only as the rejection cases of the fixture.
 The host does not run in the background: iOS decides when the app is
