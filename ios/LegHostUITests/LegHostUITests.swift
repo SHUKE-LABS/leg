@@ -322,6 +322,89 @@ final class LegHostFixtureUITests: XCTestCase {
         XCTAssertTrue(waitForState("listener=0"), "the host started the fixture")
     }
 
+    /// A clean provider store opens the setup form and starts the fixture only
+    /// after a valid form is saved.
+    func testTheProviderSetupSavesAndStartsTheFixture() {
+        launch(["-leghost-fixture", "success", "-leghost-provider-reset"])
+
+        XCTAssertTrue(waitForStatus("IOS_PROVIDER_CONFIG_MISSING", timeout: startTimeout),
+                      "the missing provider diagnostic is not shown")
+        XCTAssertTrue(app.secureTextFields["provider-api-key"].waitForExistence(timeout: 60),
+                      "the provider setup form is missing")
+        XCTAssertTrue(waitForState("provision=0,boot=0,session=0,requests=0"),
+                      "the guest was touched before setup")
+
+        fillProviderForm()
+        app.buttons["provider-save"].tap()
+
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the valid provider did not resume the guest launch")
+        driveOneTurn()
+        XCTAssertTrue(waitForState("requests=2"), "the fixture did not receive the saved setup")
+    }
+
+    /// Invalid values show field guidance and do not provision the guest.
+    func testTheProviderSetupRejectsInvalidValuesBeforeProvisioning() {
+        launch(["-leghost-fixture", "success", "-leghost-provider-reset"])
+
+        XCTAssertTrue(app.secureTextFields["provider-api-key"].waitForExistence(timeout: 60),
+                      "the provider setup form is missing")
+        app.buttons["provider-save"].tap()
+
+        XCTAssertTrue(app.staticTexts["provider-api-key-error"].waitForExistence(timeout: 30),
+                      "the empty API key has no field guidance")
+        XCTAssertTrue(app.staticTexts["provider-model-error"].waitForExistence(timeout: 30),
+                      "the empty model has no field guidance")
+        XCTAssertTrue(waitForState("provision=0,boot=0,session=0,requests=0"),
+                      "invalid setup touched the guest")
+    }
+
+    /// Cancelling the edit sheet leaves the currently loaded configuration alone.
+    func testProviderSettingsCancelKeepsTheSavedConfiguration() {
+        launch(["-leghost-fixture", "success", "-leghost-provider", "anthropic"])
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        app.buttons["provider-settings"].tap()
+        let model = app.textFields["provider-model"]
+        XCTAssertTrue(model.waitForExistence(timeout: 30), "the provider settings form is missing")
+        let original = model.value as? String
+        app.buttons["provider-cancel"].tap()
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: 30),
+                      "cancelling settings stopped the guest")
+
+        app.buttons["provider-settings"].tap()
+        XCTAssertTrue(model.waitForExistence(timeout: 30), "the provider settings did not reopen")
+        XCTAssertEqual(model.value as? String, original, "cancel changed the saved configuration")
+        app.buttons["provider-cancel"].tap()
+    }
+
+    /// Clearing the item leaves the current run alive but blocks its next launch.
+    func testClearingProviderSettingsBlocksTheNextLaunch() {
+        launch(["-leghost-fixture", "success", "-leghost-provider-reset"])
+        XCTAssertTrue(app.secureTextFields["provider-api-key"].waitForExistence(timeout: 60),
+                      "the provider setup form is missing")
+        fillProviderForm()
+        app.buttons["provider-save"].tap()
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the saved provider did not start the guest")
+
+        app.buttons["provider-settings"].tap()
+        XCTAssertTrue(app.buttons["provider-clear"].waitForExistence(timeout: 30),
+                      "the clear control is missing")
+        app.buttons["provider-clear"].tap()
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: 30),
+                      "clearing settings interrupted the current guest")
+
+        app.terminate()
+        app.launchArguments = ["-leghost-fixture", "success"]
+        app.launch()
+        XCTAssertTrue(waitForStatus("IOS_PROVIDER_CONFIG_MISSING", timeout: startTimeout),
+                      "the next launch did not read the cleared provider item")
+        XCTAssertTrue(waitForState("provision=0,boot=0,session=0"),
+                      "the next launch touched the guest after clear")
+    }
+
     /// The two OpenAI wire variants are refused at the same boundary as a
     /// missing configuration.
     func testTheOpenAIProvidersAreRefusedBeforeTheGuestIsProvisioned() {
@@ -608,6 +691,19 @@ final class LegHostFixtureUITests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// Fills the deterministic fixture configuration without ever asserting
+    /// or printing the credential value.
+    private func fillProviderForm() {
+        let apiKey = app.secureTextFields["provider-api-key"]
+        let model = app.textFields["provider-model"]
+        XCTAssertTrue(apiKey.waitForExistence(timeout: 30), "the API key field is missing")
+        XCTAssertTrue(model.waitForExistence(timeout: 30), "the model field is missing")
+        apiKey.tap()
+        apiKey.typeText("IOS_FIXTURE_CREDENTIAL_SENTINEL")
+        model.tap()
+        model.typeText("claude-ios-fixture")
+    }
 
     /// Starts the app with the given launch arguments.
     ///

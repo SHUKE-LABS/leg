@@ -4,6 +4,8 @@ import WebKit
 /// The phases the guest host goes through.
 enum GuestHostPhase: Equatable {
     case preparing
+    /// The host needs a provider item before it may touch the guest root.
+    case providerSetupRequired
     case provisioning
     case booting
     case running
@@ -59,9 +61,9 @@ struct GuestHostError: LocalizedError {
 
 /// The launch controls of one run of the host.
 ///
-/// The provider, the fixture and the fault controls are DEBUG-only: they
-/// configure one run in memory and never write to the Keychain, to the user
-/// defaults or to the file system.
+/// The provider, the fixture and the fault controls are DEBUG-only. Provider
+/// overrides configure one run in memory; the separate provider-reset control
+/// clears the host-owned item once for a UI test.
 struct HostLaunchOptions {
     /// The fixture scenario, when the run is a fixture run.
     var fixtureScenario: LoopbackFixture.Scenario?
@@ -69,6 +71,8 @@ struct HostLaunchOptions {
     var provider: HostProvider?
     /// Whether the run has no provider configuration at all.
     var hasNoProvider = false
+    /// Whether a DEBUG test launch clears the persisted provider item first.
+    var resetProvider = false
     /// The guest program the session runs.
     var program = HostLaunchOptions.defaultProgram
     /// Whether the run reports the runtime files as missing.
@@ -114,6 +118,8 @@ struct HostLaunchOptions {
             #if DEBUG
             case "-leghost-no-provider":
                 options.hasNoProvider = true
+            case "-leghost-provider-reset":
+                options.resetProvider = true
             case "-leghost-provider":
                 if index + 1 < arguments.count {
                     options.provider = HostProvider(rawValue: arguments[index + 1])
@@ -469,6 +475,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// uses it, and a chain that starts again keeps the state of the run
     /// that was stopped.
     private var fixtureReset = FixtureResetControl()
+    /// The one-time provider reset control of a DEBUG UI test launch.
+    private var providerReset = FixtureResetControl()
+    /// Whether the current controller cleared the persisted item.
+    private var providerWasCleared = false
     /// Whether the chain of this run resets the state of the fixture.
     private var resetsFixtureState = false
     /// The file the raw terminal output is written to, in a fixture run.
@@ -518,6 +528,44 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     func retry() {
         lifecycle.delegate = self
         lifecycle.retry()
+    }
+
+    /// The values the provider form should show without writing them anywhere.
+    var providerDraft: ProviderConfigurationDraft {
+        if !providerWasCleared,
+           let saved = try? ProviderConfigurationStore.load(
+               providerOverride: nil,
+               hasNoProvider: false) {
+            return ProviderConfigurationDraft(configuration: saved)
+        }
+        if !providerWasCleared, let configuration {
+            return ProviderConfigurationDraft(configuration: configuration)
+        }
+        return .empty
+    }
+
+    /// Validates and persists a provider form.
+    ///
+    /// When the first launch stopped at the setup boundary, the normal
+    /// lifecycle retry reads the item again and continues through preflight.
+    func saveProviderConfiguration(_ draft: ProviderConfigurationDraft) throws {
+        _ = try ProviderConfigurationStore.save(draft)
+        providerWasCleared = false
+        switch phase {
+        case .providerSetupRequired:
+            retry()
+        case .failed(let message) where message.hasPrefix("IOS_PROVIDER_CONFIG_UNSUPPORTED"):
+            retry()
+        default:
+            break
+        }
+    }
+
+    /// Removes the persisted provider item. A running guest keeps its already
+    /// loaded configuration until the next launch.
+    func clearProviderConfiguration() throws {
+        try ProviderConfigurationStore.clear()
+        providerWasCleared = true
     }
 
     /// The app went to the background.
@@ -578,6 +626,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         interruptsOnItsOwn = options.interruptAfterRequest
         #endif
         do {
+            #if DEBUG
+            if providerReset.consume(options.resetProvider) {
+                try ProviderConfigurationStore.clear()
+            }
+            #endif
             detail = "Reading the provider configuration"
             let configuration = try ProviderConfigurationStore.load(
                 providerOverride: options.provider,
@@ -600,6 +653,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             try HostPreflight.check(HostPreflightProviders.live(options: options, pins: pins))
             self.pins = pins
             openLedger()
+        } catch let error as ProviderConfigurationError where error == .missing {
+            phase = .providerSetupRequired
+            detail = error.localizedDescription ?? error.diagnostic
+            throw error
         } catch {
             publishFailure(error)
             throw error
