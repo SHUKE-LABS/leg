@@ -25,6 +25,11 @@ ALL_TESTS=(
     testTheUnreachableScenarioReportsATransportError
     testTheRuntimeFailureScenarioReportsTheRuntimeDiagnostic
     testAMissingConfigurationIsReportedBeforeTheGuestIsProvisioned
+    testTheProviderSetupSavesAndStartsTheFixture
+    testTheProviderSetupRejectsInvalidValuesBeforeProvisioning
+    testProviderSettingsReplacementIsReadAfterRelaunch
+    testProviderSettingsCancelKeepsTheSavedConfiguration
+    testClearingProviderSettingsBlocksTheNextLaunch
     testTheOpenAIProvidersAreRefusedBeforeTheGuestIsProvisioned
     testTheRelaunchKeepsTheWorkspaceTheTrailAndTheRequests
     testTheBackgroundInterruptsTheTurnAndKeepsTheTrail

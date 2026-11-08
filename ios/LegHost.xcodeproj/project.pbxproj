@@ -26,6 +26,7 @@
 		BB11BB11BB11BB11BB11001B /* PinnedInputs in Resources */ = {isa = PBXBuildFile; fileRef = BB11BB11BB11BB11BB11000C /* PinnedInputs */; };
 		DD11DD11DD11DD11DD110001 /* ProviderConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110011 /* ProviderConfiguration.swift */; };
 		DD11DD11DD11DD11DD110002 /* LoopbackFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */; };
+		DD11DD11DD11DD11DD110003 /* ProviderSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */; };
 		CC11CC11CC11CC11CC110001 /* LegHostUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */; };
 		CC11CC11CC11CC11CC110002 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CC11CC11CC11CC11CC110011 /* XCTest.framework */; };
 		EE11EE11EE11EE11EE110011 /* HostPreflight.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110001 /* HostPreflight.swift */; };
@@ -78,6 +79,7 @@
 		BB11BB11BB11BB11BB11000C /* PinnedInputs */ = {isa = PBXFileReference; lastKnownFileType = folder; path = PinnedInputs; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110011 /* ProviderConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderConfiguration.swift; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoopbackFixture.swift; sourceTree = "<group>"; };
+		DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderSetupView.swift; sourceTree = "<group>"; };
 		CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegHostUITests.swift; sourceTree = "<group>"; };
 		CC11CC11CC11CC11CC110011 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Developer/Library/Frameworks/XCTest.framework; sourceTree = SDKROOT; };
 		CC11CC11CC11CC11CC110012 /* LegHostUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -165,6 +167,7 @@
 				BB11BB11BB11BB11BB110005 /* GuestTerminalView.swift */,
 				DD11DD11DD11DD11DD110011 /* ProviderConfiguration.swift */,
 				DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */,
+				DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */,
 				EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */,
 				BB11BB11BB11BB11BB110001 /* Sha256.c */,
 				BB11BB11BB11BB11BB110002 /* GuestProvision.c */,
@@ -410,6 +413,7 @@
 				BB11BB11BB11BB11BB110015 /* GuestTerminalView.swift in Sources */,
 				DD11DD11DD11DD11DD110001 /* ProviderConfiguration.swift in Sources */,
 				DD11DD11DD11DD11DD110002 /* LoopbackFixture.swift in Sources */,
+				DD11DD11DD11DD11DD110003 /* ProviderSetupView.swift in Sources */,
 				EE11EE11EE11EE11EE110013 /* FixtureRequestLedger.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

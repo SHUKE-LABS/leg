@@ -28,6 +28,8 @@ final class GuestHostLifecycleTests: XCTestCase {
         var fails = false
         /// Whether the release of the session fails.
         var releaseFails = false
+        /// The gate that can hold resource release while a retry is requested.
+        var teardownGate: Gate?
 
         func prepareHost() async throws {
             prepares += 1
@@ -59,6 +61,7 @@ final class GuestHostLifecycleTests: XCTestCase {
 
         func teardownGuest() async throws {
             teardowns += 1
+            await teardownGate?.wait()
             if releaseFails {
                 throw GuestHostError(message: "the guest of the session did not stop")
             }
@@ -229,6 +232,32 @@ final class GuestHostLifecycleTests: XCTestCase {
 
         await lifecycle.interrupt()
         XCTAssertEqual(host.teardowns, 2)
+    }
+
+    /// A retry requested while a failure is releasing resources starts after
+    /// that release, rather than being lost to the lifecycle gate.
+    func testARetryDuringFailureReleaseRunsAfterTheRelease() async throws {
+        let host = FakeHost()
+        host.fails = true
+        let teardownGate = Gate()
+        host.teardownGate = teardownGate
+        let lifecycle = GuestHostLifecycle()
+        lifecycle.delegate = host
+
+        lifecycle.start()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(host.prepares, 1)
+        XCTAssertEqual(host.teardowns, 1)
+        XCTAssertEqual(lifecycle.state, .failed)
+
+        lifecycle.retry()
+        XCTAssertEqual(host.prepares, 1, "the retry started before release")
+        teardownGate.open()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(host.prepares, 2, "the queued retry was lost")
+        XCTAssertEqual(host.teardowns, 2)
+        XCTAssertEqual(lifecycle.state, .failed)
     }
 
     /// A retry before anything ran is refused.
