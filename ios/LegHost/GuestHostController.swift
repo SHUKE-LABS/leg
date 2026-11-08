@@ -71,6 +71,11 @@ struct HostLaunchOptions {
     var hasNoProvider = false
     /// The guest program the session runs.
     var program = HostLaunchOptions.defaultProgram
+    /// The arguments the guest program gets after its own, in order.
+    ///
+    /// The control is DEBUG-only: the simulator tests start a program of the
+    /// pinned bundle with arguments, such as `leg-bridge --help`.
+    var programArguments: [String] = []
     /// Whether the run reports the runtime files as missing.
     var runtimeFilesMissing = false
     /// Whether the run reports the runtime files as corrupt.
@@ -112,6 +117,11 @@ struct HostLaunchOptions {
                     consumed = 2
                 }
             #if DEBUG
+            case "-leghost-program-arg":
+                if index + 1 < arguments.count {
+                    options.programArguments.append(arguments[index + 1])
+                    consumed = 2
+                }
             case "-leghost-no-provider":
                 options.hasNoProvider = true
             case "-leghost-provider":
@@ -229,6 +239,8 @@ struct HostPins {
     }
 
     struct Compatibility {
+        let bundleKind: String
+        let legVersion: String
         let target: String
         let architecture: String
         let os: String
@@ -273,6 +285,8 @@ struct HostPins {
         }
 
         let compatibility = Compatibility(
+            bundleKind: try value("bundle_kind"),
+            legVersion: try value("leg_version"),
             target: try value("target"),
             architecture: try value("architecture"),
             os: try value("os"),
@@ -302,6 +316,8 @@ struct HostPins {
                                sha256: storage.cString(input.sha256))
         }
         var cCompatibility = guest_compatibility(
+            bundle_kind: storage.cString(compatibility.bundleKind),
+            leg_version: storage.cString(compatibility.legVersion),
             target: storage.cString(compatibility.target),
             architecture: storage.cString(compatibility.architecture),
             os: storage.cString(compatibility.os),
@@ -1142,12 +1158,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// `/proc/self/exe`. The emulator cannot answer that read for the process
     /// it runs, and the answer takes the whole host down, so the host names the
     /// two programs of the pinned bundle instead. A guest program that is
-    /// not the guest TUI takes no arguments.
+    /// not the guest TUI takes only the arguments of the launch.
     private func guestArguments(for program: String) -> [String] {
-        guard program == HostLaunchOptions.defaultProgram else { return [program] }
+        guard program == HostLaunchOptions.defaultProgram else {
+            return [program] + options.programArguments
+        }
         return [program,
                 "--leg-bin", HostLaunchOptions.legProgram,
-                "--supervisor-bin", HostLaunchOptions.supervisorProgram]
+                "--supervisor-bin", HostLaunchOptions.supervisorProgram] + options.programArguments
     }
 
     /// The environment the guest session runs with.

@@ -66,6 +66,8 @@ fi
 
 pins="${WORK_DIR}/pins.txt"
 {
+    echo "bundle_kind=$(plutil -extract compatibility.bundle_kind raw -o - "${MANIFEST}")"
+    echo "leg_version=$(plutil -extract compatibility.leg_version raw -o - "${MANIFEST}")"
     echo "target=$(plutil -extract compatibility.target raw -o - "${MANIFEST}")"
     echo "architecture=$(plutil -extract compatibility.architecture raw -o - "${MANIFEST}")"
     echo "os=$(plutil -extract compatibility.os raw -o - "${MANIFEST}")"

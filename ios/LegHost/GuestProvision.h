@@ -1,8 +1,8 @@
 /*
  * Deterministic guest provisioning for the LegHost iOS host.
  *
- * The host ships two pinned archives (the leg guest bundle for i386 and an
- * Alpine i386 root) as app resources. On first launch this provisioner
+ * The host ships two pinned archives (the ios-mobile leg guest bundle for
+ * i386 and an Alpine i386 root) as app resources. On first launch this provisioner
  * verifies both archives, merges them into one staging archive, imports that
  * archive into a fresh fakefs root with the vendored iSH importer, verifies
  * the result, and only then publishes it as the persistent active root.
@@ -37,8 +37,14 @@ struct guest_pinned_input {
     const char *sha256;
 };
 
-/* The compatibility contract the guest bundle manifest has to declare. */
+/*
+ * The compatibility contract the guest bundle manifest has to declare. The
+ * bundle kind tells the ios-mobile bundle apart from the generic iSH bundle,
+ * which ships leg-web instead of leg-bridge and declares no kind.
+ */
 struct guest_compatibility {
+    const char *bundle_kind;
+    const char *leg_version;
     const char *target;
     const char *architecture;
     const char *os;
@@ -52,7 +58,7 @@ struct guest_pins {
     const struct guest_compatibility *compatibility;
 };
 
-/* The guest programs staged into the guest root. */
+/* The guest programs of the ios-mobile bundle staged into the guest root. */
 #define GUEST_PROGRAM_COUNT 4
 extern const char *const guest_program_names[GUEST_PROGRAM_COUNT];
 

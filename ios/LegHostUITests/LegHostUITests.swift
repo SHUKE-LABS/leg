@@ -147,6 +147,39 @@ final class LegHostUITests: XCTestCase {
         attachScreenshot("the session survived the child exit")
     }
 
+    /// The bridge of the ios-mobile bundle runs in the imported guest.
+    ///
+    /// `leg-bridge --help` exits 0 and an unknown argument exits 2, so the
+    /// exit codes prove the program got its arguments; the help text proves
+    /// it ran to the end.
+    func testTheBridgeRunsInTheImportedGuest() {
+        XCTAssertTrue(app.staticTexts["guest-root-state"].waitForExistence(timeout: startTimeout),
+                      "the host did not reach the running state")
+
+        app.terminate()
+        app.launchArguments = Self.launchArguments + ["-leghost-program", "/usr/local/bin/leg-bridge",
+                                                      "-leghost-program-arg", "--help"]
+        app.launch()
+
+        XCTAssertTrue(app.staticTexts["guest-exited"].waitForExistence(timeout: startTimeout),
+                      "leg-bridge --help did not exit")
+        XCTAssertEqual(app.staticTexts["guest-status-detail"].label, "The guest program exited.")
+        let terminal = app.otherElements["guest-terminal"]
+        XCTAssertTrue(terminal.debugDescription.contains("usage: leg-bridge"),
+                      "the terminal does not show the help of leg-bridge")
+        attachScreenshot("leg-bridge --help")
+
+        app.terminate()
+        app.launchArguments = Self.launchArguments + ["-leghost-program", "/usr/local/bin/leg-bridge",
+                                                      "-leghost-program-arg", "--unknown"]
+        app.launch()
+
+        XCTAssertTrue(app.staticTexts["guest-exited"].waitForExistence(timeout: startTimeout),
+                      "leg-bridge --unknown did not exit")
+        XCTAssertEqual(app.staticTexts["guest-status-detail"].label,
+                       "The guest program exited with code 2.")
+    }
+
     /// The second launch verifies the root and reuses it instead of importing
     /// it again.
     func testTheSecondLaunchReusesTheVerifiedRoot() {

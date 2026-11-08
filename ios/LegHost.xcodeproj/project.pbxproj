@@ -385,7 +385,7 @@
 			);
 			name = "Fetch pinned inputs";
 			outputPaths = (
-				"$(SRCROOT)/resources/PinnedInputs/leg-0.43.1-i686-unknown-linux-musl.tar.gz",
+				"$(SRCROOT)/resources/PinnedInputs/leg-0.44.0-i686-unknown-linux-musl-mobile.tar.gz",
 				"$(SRCROOT)/resources/PinnedInputs/alpine-minirootfs-3.20.3-x86.tar.gz",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
