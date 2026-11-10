@@ -586,7 +586,7 @@ fn acquire_creation_lock(store_dir: &Path) -> Result<File, String> {
             drop(coordination);
             Ok(lock)
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+        Err(error) if is_lock_contended(&error) => {
             drop(coordination);
             // Wait without the sidecar; the exclusive primary lock marks ownership to probes.
             lock.lock_exclusive()
@@ -1243,5 +1243,17 @@ mod tests {
         FileExt::unlock(&lock).expect("release session lock");
         resume_tx.send(()).expect("resume probe");
         assert!(!probe.join().expect("join probe").expect("probe succeeds"));
+    }
+
+    #[test]
+    fn lock_contention_sentinel_is_recognized_on_all_platforms() {
+        assert!(is_lock_contended(&fs2::lock_contended_error()));
+        assert!(is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock,
+        )));
+        assert!(!is_lock_contended(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unrelated I/O failure",
+        )));
     }
 }

@@ -2674,31 +2674,6 @@ mod tests {
         host
     }
 
-    static REDACTION_ENV_LOCK: std::sync::OnceLock<AsyncMutex<()>> = std::sync::OnceLock::new();
-
-    struct EnvRestore {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(name: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(name);
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            if let Some(value) = self.previous.take() {
-                unsafe { std::env::set_var(self.name, value) };
-            } else {
-                unsafe { std::env::remove_var(self.name) };
-            }
-        }
-    }
-
     #[test]
     fn restart_recovers_pending_incomplete_draft_receipt() {
         let (host, temp) = test_host();
@@ -3867,12 +3842,25 @@ mod tests {
     async fn fresh_retry_uses_private_prompt_after_public_redaction() {
         use std::process::Command;
 
-        let _environment_lock = REDACTION_ENV_LOCK
-            .get_or_init(|| AsyncMutex::new(()))
-            .lock()
-            .await;
-        let secret = "web-retry-secret-288";
-        let _environment = EnvRestore::set("LEG_WEB_RETRY_SECRET", secret);
+        const CHILD_MARKER: &str = "LEG_WEB_RETRY_FIXTURE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::fresh_retry_uses_private_prompt_after_public_redaction",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env("LEG_WEB_RETRY_SECRET", "web-retry-secret-288")
+                .status()
+                .expect("start isolated redaction fixture test");
+            assert!(
+                status.success(),
+                "isolated redaction fixture failed: {status}"
+            );
+            return;
+        }
+        let secret = std::env::var("LEG_WEB_RETRY_SECRET").expect("fixture secret is set");
         let temp = TempDir::new().unwrap();
         let workspace = temp.path().join("workspace");
         let fixture_dir = workspace.join("fixture");
@@ -4029,7 +4017,7 @@ fn main() {{
         let snapshot = wait_for_receipt(&host, &router, id, 1).await;
         assert_eq!(snapshot["session"]["turns"][0]["prompt"], visible_prompt);
         let serialized = snapshot.to_string();
-        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains(&secret));
 
         let input = fs::read_to_string(log_path).unwrap();
         assert!(
