@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use leg_ui_client::{
     CatalogError, Client, ClientConfig, DraftBlock, LegSession, ResolveError, SessionCatalog,
-    SessionCatalogConfig, SessionInterface, StartError, StreamEvent, TurnOutcome, TurnRequest,
+    SessionCatalogConfig, SessionInterface, StartError, StreamEvent, SubmissionClaim,
+    SubmissionResolution, TurnOutcome, TurnRequest,
 };
 use serde_json::{Value, json};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -817,8 +818,9 @@ fn shared_catalog_controller_contract(
         .expect("export failed trail");
     assert!(!failed_transcript.contains(sentinel));
 
-    // An ordered text/image/text draft reaches the provider; staged bytes are
-    // released once the turn ends and the draft no longer holds the image.
+    // An ordered text/image/text draft, including whitespace between images,
+    // reaches the provider under one recorded request identity; staged bytes
+    // are released once the turn ends and the draft no longer holds the image.
     let image_bytes: &[u8] = b"\x89PNG\r\n\x1a\ncontroller-image";
     let image = second_controller
         .stage_draft_image(image_bytes, Some("image/png"), "/private/shot.png", &[])
@@ -826,6 +828,11 @@ fn shared_catalog_controller_contract(
     assert_eq!(image.label, "shot.png");
     let image_blocks = vec![
         DraftBlock::text("before image "),
+        DraftBlock::Image(image.clone()),
+        DraftBlock::text(
+            "
+",
+        ),
         DraftBlock::Image(image.clone()),
         DraftBlock::text(" after image"),
     ];
@@ -835,6 +842,17 @@ fn shared_catalog_controller_contract(
     second_controller
         .save_draft_content(&image_draft.id, SessionInterface::Tui, image_blocks.clone())
         .expect("save image draft");
+    assert_eq!(
+        second_controller
+            .claim_submission(
+                &image_draft.id,
+                SessionInterface::Tui,
+                "controller-image-request",
+                &image_blocks,
+            )
+            .expect("record the image send"),
+        SubmissionClaim::Fresh
+    );
     let mut image_turn = second_controller
         .start_draft_turn(&image_draft.id, SessionInterface::Tui, &image_blocks)
         .expect("start image turn");
@@ -844,6 +862,16 @@ fn shared_catalog_controller_contract(
         .session_id()
         .expect("image turn binds a session id")
         .to_string();
+    assert_eq!(
+        second_controller
+            .resolve_submission(&image_session_id, SessionInterface::Tui)
+            .expect("resolve the image send"),
+        SubmissionResolution::Accepted {
+            request_id: "controller-image-request".into(),
+            turn_index: 0,
+            outcome: leg_ui_client::TrailOutcome::Succeeded,
+        }
+    );
 
     // An unknown model's explicit unsupported-image 4xx is non-retryable and
     // leaves the draft image for an explicit switch or removal.
@@ -903,22 +931,36 @@ fn shared_catalog_controller_contract(
     let retry_request = records[6].body.to_string();
     assert_eq!(retry_request.matches(failed_prompt).count(), 1);
     assert!(retry_request.contains("first final answer"));
-    let image_request = records[8].body["messages"]
+    let image_message = records[8].body["messages"]
         .as_array()
         .and_then(|messages| messages.last())
-        .expect("image request has a final message")
-        .to_string();
-    let positions = [
+        .expect("image request has a final message");
+    let image_parts = image_message["content"]
+        .as_array()
+        .expect("image request content blocks")
+        .iter()
+        .map(|block| {
+            block["text"]
+                .as_str()
+                .or_else(|| block["source"]["data"].as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let png = "iVBORw0KGgpjb250cm9sbGVyLWltYWdl";
+    let expected = [
         "before image ",
-        "iVBORw0KGgpjb250cm9sbGVyLWltYWdl",
+        png,
+        "
+",
+        png,
         " after image",
-    ]
-    .map(|part| {
-        image_request
-            .find(part)
-            .expect("ordered image request part")
-    });
-    assert!(positions.is_sorted(), "{image_request}");
+    ];
+    assert!(
+        image_parts
+            .windows(expected.len())
+            .any(|parts| parts == expected),
+        "{image_message}"
+    );
     for record in &records[8..] {
         let request = record.body.to_string();
         assert!(!request.contains(&image.attachment.id));

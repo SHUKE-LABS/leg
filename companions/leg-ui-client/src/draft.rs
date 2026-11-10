@@ -175,14 +175,15 @@ pub fn draft_images(blocks: &[DraftBlock]) -> impl Iterator<Item = &DraftImage> 
 }
 
 /// Ordered request content, or `None` for a text-only draft so the legacy
-/// text request shape is preserved. Whitespace-only text segments are omitted.
+/// text request shape is preserved. Only empty text segments are omitted;
+/// whitespace between images is part of the prompt.
 pub fn draft_content(blocks: &[DraftBlock]) -> Option<Vec<ContentBlock>> {
     draft_images(blocks).next()?;
     Some(
         blocks
             .iter()
             .filter_map(|block| match block {
-                DraftBlock::Text { text } if text.trim().is_empty() => None,
+                DraftBlock::Text { text } if text.is_empty() => None,
                 DraftBlock::Text { text } => Some(ContentBlock::text(text.clone())),
                 DraftBlock::Image(image) => Some(ContentBlock::image(image.attachment.clone())),
             })
@@ -227,10 +228,13 @@ mod tests {
         ];
         assert_eq!(draft_prompt(&blocks), "before   after");
         let content = draft_content(&blocks).unwrap();
-        assert_eq!(content.len(), 4);
+        assert_eq!(content.len(), 5);
         assert!(matches!(&content[0], ContentBlock::Text { text } if text == "before "));
         assert!(content[1].is_managed_attachment());
-        assert!(content[2].is_managed_attachment());
+        assert!(matches!(&content[2], ContentBlock::Text { text } if text == " "));
+        assert!(content[3].is_managed_attachment());
+        let with_empty = vec![DraftBlock::text(""), image("a", '1'), DraftBlock::text("x")];
+        assert_eq!(draft_content(&with_empty).unwrap().len(), 2);
 
         let same_with_new_ids = vec![
             DraftBlock::text("before "),

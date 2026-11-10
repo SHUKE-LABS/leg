@@ -726,7 +726,7 @@ impl SessionCatalog {
             let mut encoded_total = 0u64;
             for block in blocks {
                 let image = match block {
-                    DraftBlock::Text { text } if text.trim().is_empty() => continue,
+                    DraftBlock::Text { text } if text.is_empty() => continue,
                     DraftBlock::Text { text } => {
                         content.push(ContentBlock::text(text.clone()));
                         continue;
@@ -2410,12 +2410,26 @@ fn new_attachment_id(prefix: &str, sha256: &str) -> String {
     )
 }
 
-/// The draft-send identity of a recorded turn: its unredacted prompt and the
-/// visible content projection, whose images keep their MIME/length/digest.
+/// The draft-send identity of a recorded turn: its unredacted prompt and
+/// content. Text comes from the private resolved content, since the visible
+/// projection may be redacted; images keep their MIME/length/digest identity.
 fn submission_fingerprint(turn: &TrailTurn) -> String {
+    let content = match (turn.resolved_content.as_deref(), turn.content.as_deref()) {
+        (Some(resolved), Some(visible)) => Some(
+            resolved
+                .iter()
+                .zip(visible)
+                .map(|(raw, shown)| match raw {
+                    ContentBlock::Text { .. } => raw.clone(),
+                    _ => shown.clone(),
+                })
+                .collect::<Vec<_>>(),
+        ),
+        (_, visible) => visible.map(<[ContentBlock]>::to_vec),
+    };
     turn_fingerprint(
         turn.retry_prompt.as_deref().unwrap_or(&turn.prompt),
-        turn.content.as_deref(),
+        content.as_deref(),
     )
 }
 
@@ -3333,6 +3347,23 @@ mod tests {
     }
 
     #[test]
+    fn submission_fingerprint_uses_unredacted_text_and_image_identity() {
+        let scratch = tempdir().unwrap();
+        let catalog = open_catalog(scratch.path());
+        let image = catalog.stage_draft_image(PNG, None, "a.png", &[]).unwrap();
+        let prompt = "key sk-fixture ";
+        let blocks = vec![DraftBlock::text(prompt), DraftBlock::Image(image)];
+        write_image_trail(&catalog, "sess-1-4", prompt, false);
+        let mut turn = catalog.get("sess-1-4").unwrap().turns.remove(0);
+        assert_eq!(submission_fingerprint(&turn), draft_fingerprint(&blocks));
+
+        // A credential redacted from the visible projection does not hide
+        // the accepted send from reconnect resolution.
+        turn.content.as_mut().unwrap()[0] = ContentBlock::text("key [REDACTED] ");
+        assert_eq!(submission_fingerprint(&turn), draft_fingerprint(&blocks));
+    }
+
+    #[test]
     fn reconnect_resolves_a_submission_against_the_authoritative_trail() {
         let scratch = tempdir().unwrap();
         let catalog = open_catalog(scratch.path());
@@ -3433,11 +3464,19 @@ mod tests {
         let blocks = vec![
             DraftBlock::text("before "),
             DraftBlock::Image(image.clone()),
-            DraftBlock::text(" "),
+            DraftBlock::text(
+                "
+",
+            ),
+            DraftBlock::text(""),
             DraftBlock::text(" after"),
         ];
         let (content, paths) = catalog.transfer_draft_images("sess-2-1", &blocks).unwrap();
-        assert_eq!(content.len(), 3, "blank text segments are omitted");
+        assert_eq!(content.len(), 4, "only empty text segments are omitted");
+        assert!(
+            matches!(&content[2], ContentBlock::Text { text } if text == "
+")
+        );
         let ContentBlock::Image {
             source: ImageSource::Attachment { id, sha256, .. },
         } = &content[1]
