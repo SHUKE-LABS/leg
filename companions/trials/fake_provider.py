@@ -45,6 +45,7 @@ RESPONSIVENESS_DURATION_SECONDS = 30
 RESPONSIVENESS_CHUNK_COUNT = RESPONSIVENESS_CHUNKS_PER_SECOND * RESPONSIVENESS_DURATION_SECONDS
 RESPONSIVENESS_CHUNK_INTERVAL_MS = 1000 // RESPONSIVENESS_CHUNKS_PER_SECOND
 TRIAL_LINES = "Line one: keep this first.\n第二行：保留中文。\nLine three: keep this third."
+BROWSER_IMAGE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 UNTRUSTED_MARKDOWN = (
     "<script>window.__legXss = true</script>\n"
     '<img src="http://leg-web-xss.invalid/pixel" onerror="fetch(\'/api/sessions/invalid/stop\',{method:\'POST\'})">\n'
@@ -168,6 +169,9 @@ class Fixture:
         messages = payload.get("messages", [])
         markers = (
             "TRIAL-CHINESE",
+            "TRIAL-IMAGE-UNSUPPORTED",
+            "TRIAL-IMAGE-RETRY",
+            "TRIAL-IMAGE",
             "TRIAL-SEED-SESSION",
             "TRIAL-NAV-SEED",
             "TRIAL-NAV-CONTINUE",
@@ -675,6 +679,51 @@ class Fixture:
             )
             self.check("emoji_paste", line_checks["pasted_emoji"])
             self.send_stream(handler, [{"type": "text", "text": "Three lines received, including the Chinese second line."}])
+            return
+        if marker == "TRIAL-IMAGE-UNSUPPORTED":
+            self.check("image_input_unsupported_response")
+            self.send_error(
+                handler,
+                400,
+                "invalid_request_error",
+                "image input is not supported by this model",
+            )
+            return
+        if marker == "TRIAL-IMAGE-RETRY" and occurrence == 1:
+            self.check("image_retry_first_attempt_failed")
+            self.send_error(
+                handler,
+                400,
+                "invalid_request_error",
+                "image input is not supported by this model",
+            )
+            return
+        if marker in ("TRIAL-IMAGE", "TRIAL-IMAGE-RETRY"):
+            user_messages = [
+                message
+                for message in payload.get("messages", [])
+                if isinstance(message, dict) and message.get("role") == "user"
+            ]
+            content = user_messages[-1].get("content") if user_messages else None
+            image = content[0] if isinstance(content, list) and content else None
+            prompt = content[-1] if isinstance(content, list) and content else None
+            self.check(
+                "image_content_resolved",
+                isinstance(image, dict)
+                and image.get("type") == "image"
+                and image.get("source", {}).get("type") == "base64"
+                and image.get("source", {}).get("media_type") == "image/png"
+                and image.get("source", {}).get("data") == BROWSER_IMAGE_BASE64,
+            )
+            self.check(
+                "image_content_ordered",
+                isinstance(content, list)
+                and len(content) == 2
+                and isinstance(prompt, dict)
+                and prompt.get("type") == "text"
+                and "TRIAL-IMAGE" in prompt.get("text", ""),
+            )
+            self.send_stream(handler, [{"type": "text", "text": "Image content accepted."}])
             return
         if marker == "text-tool-text" or marker == "TRIAL-TOOL-TEXT":
             if occurrence == 1:

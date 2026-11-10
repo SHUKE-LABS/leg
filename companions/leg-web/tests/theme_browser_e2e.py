@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import signal
@@ -15,6 +16,11 @@ from urllib.parse import urlsplit
 from playwright.async_api import async_playwright
 
 import browser_e2e as common
+
+
+ONE_PIXEL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 async def wait_theme(page, theme_id: str) -> None:
@@ -110,6 +116,31 @@ async def start_session(page, workspace: Path) -> str:
     return await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
 
 
+async def dispatch_file_drop(page, selector: str, name: str, mime_type: str, data: bytes) -> None:
+    await page.locator(selector).evaluate(
+        """(element, value) => {
+          const transfer = new DataTransfer();
+          transfer.items.add(new File([new Uint8Array(value.bytes)], value.name, {type: value.mimeType}));
+          const event = new DragEvent('drop', {bubbles: true, cancelable: true, dataTransfer: transfer});
+          element.dispatchEvent(event);
+        }""",
+        {"name": name, "mimeType": mime_type, "bytes": list(data)},
+    )
+
+
+async def dispatch_image_paste(page, name: str, data: bytes) -> None:
+    await page.locator("#prompt").evaluate(
+        """(element, value) => {
+          const transfer = new DataTransfer();
+          transfer.items.add(new File([new Uint8Array(value.bytes)], value.name, {type: 'image/png'}));
+          const event = new Event('paste', {bubbles: true, cancelable: true});
+          Object.defineProperty(event, 'clipboardData', {value: transfer});
+          element.dispatchEvent(event);
+        }""",
+        {"name": name, "bytes": list(data)},
+    )
+
+
 async def inject_bind_failure(route, theme_id: str) -> None:
     response = await route.fetch()
     source = await response.text()
@@ -153,6 +184,7 @@ async def run(
             [os.fspath(common.FAKE_PROVIDER), "--scenario", "browser", "--workspace", str(workspace)]
         )
         host = None
+        capability_host = None
         browser = None
         context = None
         extra_contexts = []
@@ -190,6 +222,7 @@ async def run(
                 browser, context, persistent_context = await common.launch_test_browser_context(
                     playwright, browser_name, root / "browser-profile"
                 )
+                await common.grant_clipboard_permissions(context, browser_name, f"http://{authority}")
                 page = await context.new_page()
                 requests: list[tuple[str, str, dict[str, object] | None]] = []
                 page_errors: list[str] = []
@@ -529,6 +562,263 @@ async def run(
                 assert await page.locator("#send").is_disabled()
                 assert "read-only" in (await page.locator("#session-guidance").inner_text()).lower()
 
+                # Picker, drop, and image-paste all stage the same opaque attachment contract.
+                await page.locator("#new-conversation").click()
+                await page.locator("#welcome").wait_for(state="visible")
+                session_image = await start_session(page, workspace)
+                await page.wait_for_function("document.querySelector('#connection-state')?.textContent === ''")
+
+                async def assert_attachment(name: str) -> None:
+                    item = page.locator("#attachment-list .attachment-item")
+                    await item.wait_for(state="visible")
+                    preview_src = await item.locator("img.attachment-preview").get_attribute("src")
+                    assert preview_src and preview_src.startswith("blob:")
+                    assert await item.get_by_role("button", name=f"Remove {name}").count() == 1
+                    details = await item.inner_text()
+                    assert name in details and "image/png" in details and "bytes" in details
+
+                async def remove_attachment(name: str) -> None:
+                    await page.get_by_role("button", name=f"Remove {name}").click()
+                    await page.locator("#attachment-list .attachment-item").wait_for(state="detached")
+
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "picker.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await assert_attachment("picker.png")
+                await remove_attachment("picker.png")
+
+                await dispatch_file_drop(page, "#composer", "drop.png", "image/png", ONE_PIXEL_PNG)
+                await assert_attachment("drop.png")
+                await remove_attachment("drop.png")
+
+                await page.locator("#prompt").fill("draft survives image acquisition")
+                await dispatch_image_paste(page, "pasted.png", ONE_PIXEL_PNG)
+                await assert_attachment("pasted.png")
+                assert await page.locator("#prompt").input_value() == "draft survives image acquisition"
+
+                text_clipboard = "ordinary text paste stays in the draft"
+                await page.evaluate("text => navigator.clipboard.writeText(text)", text_clipboard)
+                await page.locator("#prompt").fill("")
+                await page.locator("#prompt").focus()
+                await page.keyboard.press("Control+V")
+                assert await page.locator("#prompt").input_value() == text_clipboard
+
+                # An in-flight upload owns its captured session. Navigation and send stay
+                # disabled until the host has returned the opaque ref.
+                await remove_attachment("pasted.png")
+                attachment_seen = asyncio.Event()
+                attachment_release = asyncio.Event()
+
+                async def hold_attachment_upload(route) -> None:
+                    attachment_seen.set()
+                    await attachment_release.wait()
+                    await route.continue_()
+
+                await page.route("**/attachments", hold_attachment_upload)
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "race.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await attachment_seen.wait()
+                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#new-conversation").is_disabled()
+                assert await page.evaluate("sessionStorage.getItem('leg-web-current-session')") == session_image
+                attachment_release.set()
+                await assert_attachment("race.png")
+                await page.unroute("**/attachments", hold_attachment_upload)
+
+                image_prompt = "TRIAL-IMAGE: preserve ordered image content"
+                await page.locator("#prompt").fill(image_prompt)
+                await dispatch_file_drop(page, "#composer", "notes.txt", "text/plain", b"not an image")
+                await page.locator("#attachment-error").wait_for(state="visible")
+                assert "JPEG" in await page.locator("#attachment-error").inner_text()
+                assert await page.locator("#prompt").input_value() == image_prompt
+                assert await page.locator("#attachment-list .attachment-item").count() == 1
+
+                oversized = root / "over-limit.png"
+                oversized.write_bytes(b"x" * 7_500_001)
+                await page.locator("#attachment-input").set_input_files(oversized)
+                await page.locator("#attachment-error").wait_for(state="visible")
+                assert "10 MB" in await page.locator("#attachment-error").inner_text()
+                assert await page.locator("#prompt").input_value() == image_prompt
+                assert await page.locator("#attachment-list .attachment-item").count() == 1
+
+                await page.get_by_role("button", name="Send").click()
+                image_turn = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 1
+                )
+                await common.wait_status(page, "Succeeded")
+                assert image_turn["last_submission"]["status"] == "succeeded", image_turn
+                image_request = next(
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == image_prompt
+                )
+                assert image_request["request_id"] == 1
+                assert len(image_request["attachments"]) == 1
+                assert isinstance(image_request["attachments"][0], str)
+                serialized_image_request = json.dumps(image_request).encode()
+                assert len(serialized_image_request) < 64 * 1024
+                for forbidden in ("data", "path", "media_type", "byte_len", "sha256"):
+                    assert forbidden not in image_request
+                await page.locator(".message-attachment-marker").wait_for()
+                marker = await page.locator(".message-attachment-marker").inner_text()
+                assert "image/png" in marker and "upload-" not in marker and "sha256" not in marker
+                image_status = common.fixture_status(provider_authority)
+                assert image_status["scenario_requests"].get("TRIAL-IMAGE") == 1
+                assert image_status["input_checks"].get("image_content_resolved") is True, image_status
+                assert image_status["input_checks"].get("image_content_ordered") is True, image_status
+
+                # Provider modality failures stay explicit and keep the turn retryable.
+                unsupported_prompt = "TRIAL-IMAGE-UNSUPPORTED: show the capability error"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "unsupported.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#prompt").fill(unsupported_prompt)
+                unsupported_before = common.fixture_status(provider_authority)
+                await page.get_by_role("button", name="Send").click()
+                unsupported_turn = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 2
+                )
+                assert unsupported_turn["last_submission"]["status"] == "failed", unsupported_turn
+                await page.get_by_text("image_input_unsupported", exact=False).wait_for()
+                unsupported_status = common.fixture_status(provider_authority)
+                assert unsupported_status["scenario_requests"].get("TRIAL-IMAGE-UNSUPPORTED") == 1, unsupported_status
+                assert unsupported_status["requests"] == unsupported_before["requests"] + 1, unsupported_status
+                assert unsupported_status["input_checks"].get("image_input_unsupported_response") is True
+                failed_image_turn = page.locator(".transcript-turn").last
+                await failed_image_turn.locator(".message-attachment-marker").wait_for()
+                assert await failed_image_turn.locator(".message-attachment-marker").count() == 1
+                failed_text = await failed_image_turn.inner_text()
+                assert "Remove the image or switch models explicitly." in failed_text
+                await failed_image_turn.get_by_role("button", name="Retry turn").wait_for()
+
+                # A known text-only model rejects image input locally, before the
+                # provider endpoint is touched, while retaining the recorded image
+                # and an explicit retry/removal action.
+                capability_state_dir = root / "known-capability-state"
+                capability_env = host_env.copy()
+                capability_env.update(
+                    {
+                        "LEG_PROVIDER": "openai-responses",
+                        "OPENAI_BASE_URL": provider_url,
+                        "OPENAI_API_KEY": "theme-e2e-not-a-secret",
+                        "LEG_MODEL": "o3-mini",
+                        "LEG_MAX_RETRIES": "2",
+                    }
+                )
+                capability_host, capability_lines = common.start_process(
+                    [
+                        str(web_bin), "--no-open", "--bind", "127.0.0.1:0",
+                        "--state-dir", str(capability_state_dir), "--leg-bin", str(leg_bin),
+                        "--supervisor-bin", str(supervisor_bin),
+                    ],
+                    cwd=workspace,
+                    env=capability_env,
+                )
+                capability_launch = common.read_until(
+                    capability_host, capability_lines, "Open this one-time launch URL:"
+                ).split(": ", 1)[1]
+                capability_authority = urlsplit(capability_launch).netloc
+                capability_token = urlsplit(capability_launch).fragment
+                capability_context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                capability_page = await capability_context.new_page()
+                await capability_page.goto(capability_launch, wait_until="load")
+                await wait_theme(capability_page, "default")
+                capability_session = await start_session(capability_page, workspace)
+                await capability_page.locator("#attachment-input").set_input_files(
+                    {"name": "known-local.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await capability_page.locator("#prompt").fill("TRIAL-IMAGE-KNOWN-LOCAL")
+                provider_before_local_rejection = common.fixture_status(provider_authority)
+                await capability_page.get_by_role("button", name="Send").click()
+                local_failure = await asyncio.to_thread(
+                    common.wait_completed_submission,
+                    capability_authority,
+                    capability_token,
+                    capability_session,
+                    1,
+                )
+                await common.wait_status(capability_page, "Failed")
+                assert local_failure["last_submission"]["status"] == "failed", local_failure
+                await capability_page.get_by_text("image_input_unsupported", exact=False).wait_for()
+                provider_after_local_rejection = common.fixture_status(provider_authority)
+                assert provider_after_local_rejection["requests"] == provider_before_local_rejection["requests"], (
+                    provider_before_local_rejection,
+                    provider_after_local_rejection,
+                )
+                local_failed_turn = capability_page.locator(".transcript-turn").last
+                await local_failed_turn.locator(".message-attachment-marker").wait_for()
+                assert "Remove the image or switch models explicitly." in await local_failed_turn.inner_text()
+                await local_failed_turn.get_by_role("button", name="Retry turn").wait_for()
+                await capability_context.close()
+                common.stop_process(capability_host, graceful=True)
+                capability_host = None
+
+                # Recorded retry rehydrates the authoritative image bytes while an edited
+                # composer draft remains independent of the retry request.
+                retry_prompt = "TRIAL-IMAGE-RETRY: rehydrate the recorded image"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "retry.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#prompt").fill(retry_prompt)
+                await page.get_by_role("button", name="Send").click()
+                failed_retry = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 3
+                )
+                assert failed_retry["last_submission"]["status"] == "failed", failed_retry
+                await page.get_by_role("button", name="Retry turn").last.wait_for(state="visible")
+                edited_draft = "independently edited composer draft"
+                await page.locator("#prompt").fill(edited_draft)
+                await page.get_by_role("button", name="Retry turn").last.click()
+                retried_image = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 4
+                )
+                assert retried_image["last_submission"]["status"] == "succeeded", retried_image
+                await common.wait_status(page, "Succeeded")
+                assert await page.locator("#prompt").input_value() == edited_draft
+                retry_status = common.fixture_status(provider_authority)
+                assert retry_status["input_checks"].get("image_retry_first_attempt_failed") is True
+                assert retry_status["input_checks"].get("image_content_resolved") is True
+
+                # An image-bearing request that is lost before acceptance survives a
+                # reload; Retry same send reuses the request ID and image digest.
+                lost_prompt = "TRIAL-IMAGE: lost response keeps image identity"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "lost.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#prompt").fill(lost_prompt)
+                lost_request_aborted = False
+
+                async def abort_lost_image_submit(route) -> None:
+                    nonlocal lost_request_aborted
+                    if not lost_request_aborted:
+                        lost_request_aborted = True
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route("**/submit", abort_lost_image_submit)
+                await page.get_by_role("button", name="Send").click()
+                await page.get_by_role("button", name="Retry same send").wait_for(state="visible")
+                await page.reload(wait_until="load")
+                await wait_theme(page, "fixture")
+                await page.get_by_role("button", name="Retry same send").wait_for(state="visible")
+                await page.get_by_role("button", name="Retry same send").click()
+                recovered_image = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 5
+                )
+                assert recovered_image["last_submission"]["status"] == "succeeded", recovered_image
+                lost_requests = [
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == lost_prompt
+                ]
+                assert [body["request_id"] for body in lost_requests] == [5, 5], lost_requests
+                assert lost_requests[0]["attachments"] == lost_requests[1]["attachments"]
+                await page.unroute("**/submit", abort_lost_image_submit)
+
                 # Exercise independent first-send warnings and exact/IME-safe drafts in each theme.
                 await page.locator("#new-conversation").click()
                 await page.locator("#welcome").wait_for(state="visible")
@@ -551,6 +841,7 @@ async def run(
                 )
                 assert fixture_turn["session"]["turns"][0]["prompt"] == exact_prompt, fixture_turn
                 await common.wait_status(page, "Succeeded")
+                await page.locator("#workspace-warning").wait_for(state="hidden")
                 session_fixture = await page.evaluate(
                     "sessionStorage.getItem('leg-web-current-session')"
                 )
@@ -561,9 +852,18 @@ async def run(
                 await wait_theme(page, "default")
                 session_default = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
                 assert session_default == session_fixture
-                assert await page.locator("#workspace-warning").is_hidden()
+                await page.locator("#workspace-warning").wait_for(state="hidden")
 
                 # The host accepts this request, then the browser loses its receipt.
+                # Keep an image in the accepted request so reload/replay also proves
+                # that the active run's staged bytes remain leased.
+                accepted_image_prompt = "TRIAL-WORKING: live image turn across reload"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "working.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#attachment-list .attachment-item").wait_for(state="visible")
+                await page.locator("#prompt").fill(accepted_image_prompt)
+
                 # Hold snapshots so both theme directions preserve an unresolved send.
                 accepted_response_dropped = False
                 snapshot_gate = asyncio.Event()
@@ -586,7 +886,6 @@ async def run(
                     await route.abort()
 
                 await page.route("**/submit", drop_accepted_response)
-                await page.locator("#prompt").fill("TRIAL-WORKING: live turn across theme reload")
                 await common.send_with_keyboard(page)
                 working_bubble = page.locator("#messages .message-assistant .message-content").last
                 await working_bubble.get_by_text("Working…", exact=True).wait_for()
@@ -605,6 +904,14 @@ async def run(
                 )
                 await snapshot_intercepted.wait()
                 assert accepted_response_dropped
+                accepted_image_request = next(
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == accepted_image_prompt
+                )
+                assert accepted_image_request["request_id"] == 2
+                assert len(accepted_image_request["attachments"]) == 1
                 draft = "Draft kept during run\nsecond line Ω"
                 await page.locator("#prompt").fill(draft)
                 assert await page.locator("#send").count() == 0
@@ -634,7 +941,45 @@ async def run(
                 assert await page.evaluate("sessionStorage.getItem('leg-web-current-session')") == session_fixture
                 assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
                 assert len([item for item in requests if item[1].endswith("/stop")]) == before_active_actions["stop"]
+
+                # The accepted response was lost. Reload while reconciliation is
+                # held, then explicitly replay the exact request body. The host
+                # must return the existing running receipt without starting a
+                # second provider/native turn.
+                await page.reload(wait_until="domcontentloaded")
                 snapshot_gate.set()
+                await page.unroute("**/snapshot", hold_snapshot)
+                await page.unroute("**/submit", drop_accepted_response)
+                await wait_theme(page, "default")
+                await common.wait_status(page, "Running")
+                duplicate = await page.evaluate(
+                    """async ({sessionId, body}) => {
+                      const response = await fetch(
+                        `/api/sessions/${encodeURIComponent(sessionId)}/submit`,
+                        {
+                          method: 'POST',
+                          headers: {
+                            'Authorization': `Bearer ${sessionStorage.getItem('leg-web-launch-token')}`,
+                            'Content-Type': 'application/json',
+                          },
+                          body: JSON.stringify(body),
+                        },
+                      );
+                      return {status: response.status, body: await response.json()};
+                    }""",
+                    {"sessionId": session_fixture, "body": accepted_image_request},
+                )
+                assert duplicate["status"] == 200, duplicate
+                assert duplicate["body"]["duplicate"] is True, duplicate
+                assert duplicate["body"]["request_id"] == accepted_image_request["request_id"]
+                replayed_requests = [
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == accepted_image_prompt
+                ]
+                assert [body["request_id"] for body in replayed_requests] == [2, 2], replayed_requests
+                assert replayed_requests[0]["attachments"] == replayed_requests[1]["attachments"]
                 assert await asyncio.to_thread(
                     common.api_status,
                     provider_authority,
@@ -642,10 +987,10 @@ async def run(
                     f"/__trial/release?request={working_request}",
                     {},
                 ) == 200
-                await page.unroute("**/snapshot", hold_snapshot)
-                await page.unroute("**/submit", drop_accepted_response)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await common.wait_status(page, "Running")
+                working_status = common.fixture_status(provider_authority)
+                assert working_status["scenario_requests"].get("TRIAL-WORKING") == 1, working_status
                 assert await page.locator("#stop-turn").is_visible()
                 assert await page.locator("#send").count() == 0
                 assert await page.get_by_text("The first live text is visible", exact=False).count() == 1
@@ -753,6 +1098,7 @@ async def run(
                 if not persistent_context:
                     await browser.close()
         finally:
+            common.stop_process(capability_host, graceful=True)
             common.stop_process(host, graceful=True)
             common.stop_process(provider, graceful=False)
 

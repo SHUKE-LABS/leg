@@ -130,6 +130,7 @@ dependencies = [
  "base64",
  "flate2",
  "httpdate",
+ "leg-image-contract",
  "libc",
  "serde",
  "serde_json",
@@ -138,6 +139,10 @@ dependencies = [
  "ureq",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "leg-image-contract"
+version = "0.1.0"
 
 [[package]]
 name = "libc"

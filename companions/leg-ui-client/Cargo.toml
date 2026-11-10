@@ -15,6 +15,7 @@ path = "src/bin/leg-ui-supervisor.rs"
 
 [dependencies]
 base64 = "0.22"
+leg-image-contract = { path = "../../image-policy" }
 fs2 = "0.4"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }

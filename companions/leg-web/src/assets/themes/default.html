@@ -113,10 +113,16 @@
         <form id="composer" class="composer">
           <div class="composer-field">
             <textarea id="prompt" rows="1" aria-label="Message" placeholder="Enter for a new line · Ctrl+Enter to send" autocomplete="off"></textarea>
+            <div id="attachment-list" class="attachment-list" aria-live="polite" aria-label="Attached images"></div>
+            <div class="composer-attachment-actions">
+              <button id="attach-image" class="quiet-button" type="button">Attach image</button>
+              <input id="attachment-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple hidden />
+            </div>
             <div class="composer-actions">
               <button id="retry-submission" class="quiet-button" type="button" hidden>Retry same send</button>
             </div>
           </div>
+          <p id="attachment-error" class="error-message" role="alert" hidden></p>
           <p id="send-error" class="error-message" role="alert" hidden></p>
         </form>
 

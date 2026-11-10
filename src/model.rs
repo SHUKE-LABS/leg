@@ -137,6 +137,21 @@ pub fn as_single_text(blocks: &[ContentBlock]) -> Option<&str> {
     }
 }
 
+/// Returns provider content that carries the envelope prompt alongside any
+/// explicitly supplied non-text blocks. Companion submit requests keep the
+/// prompt in `body` and use `content` for opaque image refs, so the provider
+/// message needs the prompt text restored without changing the trail shape.
+pub fn content_with_prompt(prompt: &str, blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+    let mut content = blocks.to_vec();
+    if !content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text { text } if text == prompt))
+    {
+        content.push(ContentBlock::text(prompt));
+    }
+    content
+}
+
 /// A single role-tagged turn in a conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -475,6 +490,32 @@ mod tests {
         assert_eq!(as_single_text(&blocks), None);
         assert_eq!(as_single_text(&[ContentBlock::text("a")]), Some("a"));
         assert_eq!(as_single_text(&[tool]), None);
+    }
+
+    #[test]
+    fn content_with_prompt_keeps_image_order_and_avoids_duplicate_text() {
+        let image = ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+        };
+        assert_eq!(
+            content_with_prompt("describe", std::slice::from_ref(&image)),
+            vec![image.clone(), ContentBlock::text("describe")]
+        );
+        assert_eq!(
+            content_with_prompt("describe", &[ContentBlock::text("describe"), image]),
+            vec![
+                ContentBlock::text("describe"),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    },
+                }
+            ]
+        );
     }
 
     #[test]

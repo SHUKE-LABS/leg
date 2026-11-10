@@ -5,6 +5,11 @@ export function startController(view) {
   const workspaceKey = "leg-web-last-workspace";
   const draftPrefix = "leg-web-draft:";
   const pendingPrefix = "leg-web-pending:";
+  const attachmentPrefix = "leg-web-attachments:";
+  const MAX_BASE64_IMAGE_BYTES = 10_000_000;
+  const MAX_RAW_IMAGE_BYTES = Math.floor(MAX_BASE64_IMAGE_BYTES / 4 * 3);
+  const MAX_IMAGE_REQUEST_BYTES = 32_000_000;
+  const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
   const workspacePathHelp = "Enter an absolute path or use ~, ~/path, or ~\\path to choose a folder on the host computer.";
   const bootstrap = window.location.hash.slice(1);
   if (/^[0-9a-f]{64}$/i.test(bootstrap)) {
@@ -32,6 +37,10 @@ export function startController(view) {
     switchGeneration: 0,
     reconnecting: false,
     pending: null,
+    attachments: [],
+    attachmentBusy: false,
+    attachmentError: "",
+    activeContent: null,
     connectionText: "",
     submitting: false,
     startBusy: false,
@@ -109,6 +118,7 @@ export function startController(view) {
     if (!state.sessionId) return;
     saveDraft();
     savePending();
+    saveAttachments();
     view.save();
   }
 
@@ -128,6 +138,13 @@ export function startController(view) {
       submission_id_conflict: "This send ID is already associated with different text. Your draft is preserved; reload the conversation before sending again.",
       submission_id_stale: "This send ID has expired. Your draft is preserved; reload the conversation before sending again.",
       submission_id_unexpected: "Another tab advanced this conversation. Your draft is preserved; reload before sending again.",
+      attachment_missing: "Choose an image before uploading it.",
+      attachment_expired: "This staged image expired. Attach it again before sending.",
+      attachment_mime_invalid: "The image MIME type does not match its bytes. Choose a JPEG, PNG, GIF, or WebP image.",
+      attachment_invalid: "The image could not be validated. Choose a JPEG, PNG, GIF, or WebP image.",
+      attachment_too_large: "That image is over the fixed 10 MB encoded limit.",
+      attachment_unavailable: "The local host could not stage that image. Your text draft is preserved.",
+      image_input_unsupported: "The selected provider/model does not accept image input. Remove the image or switch models explicitly.",
       catalog_unavailable: "The host could not start a Leg turn. Check that leg and leg-ui-supervisor are installed, then restart leg-web with --leg-bin and --supervisor-bin if needed. Provider settings come from the environment that starts leg-web.",
       invalid_request: "The host rejected this request. Check the entered value and try again.",
     };
@@ -151,6 +168,43 @@ export function startController(view) {
     }
     if (!response.ok) throw new HostError(payload?.error || "host_error", response.status);
     return payload;
+  }
+
+  async function uploadAttachment(file, sessionId) {
+    if (!token) throw new HostError("unauthorized", 401);
+    const form = new FormData();
+    form.append("file", file, file.name || "pasted-image");
+    const response = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/attachments`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+        cache: "no-store",
+        credentials: "same-origin",
+      },
+    );
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    if (!response.ok) throw new HostError(payload?.error || "attachment_unavailable", response.status);
+    return payload;
+  }
+
+  async function deleteStagedAttachment(sessionId, id) {
+    if (!token || typeof id !== "string") return;
+    await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(id)}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+        cache: "no-store",
+        credentials: "same-origin",
+      },
+    ).catch(() => {});
   }
 
   function setConnection(text, reconnecting = false) {
@@ -185,6 +239,99 @@ export function startController(view) {
       window.sessionStorage.setItem(storageKey(pendingPrefix, state.sessionId), JSON.stringify(state.pending));
     } else {
       window.sessionStorage.removeItem(storageKey(pendingPrefix, state.sessionId));
+    }
+  }
+
+  function attachmentContent(attachment) {
+    return {
+      type: "image",
+      source: {
+        type: "attachment",
+        id: attachment.id,
+        media_type: attachment.media_type,
+        byte_len: attachment.byte_len,
+        sha256: attachment.sha256,
+      },
+    };
+  }
+
+  function attachmentFromContent(block) {
+    const source = block?.type === "image" && block.source?.type === "attachment"
+      ? block.source
+      : null;
+    if (!source || typeof source.id !== "string" || typeof source.media_type !== "string" ||
+      !Number.isSafeInteger(source.byte_len) || typeof source.sha256 !== "string") return null;
+    return {
+      id: source.id,
+      media_type: source.media_type,
+      byte_len: source.byte_len,
+      sha256: source.sha256,
+      name: "Attached image",
+      preview_url: null,
+    };
+  }
+
+  function readAttachments(sessionId) {
+    try {
+      const raw = window.sessionStorage.getItem(storageKey(attachmentPrefix, sessionId));
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((value) => {
+        const attachment = attachmentFromContent({
+          type: "image",
+          source: {
+            type: "attachment",
+            id: value?.id,
+            media_type: value?.media_type,
+            byte_len: value?.byte_len,
+            sha256: value?.sha256,
+          },
+        });
+        return attachment && {
+          ...attachment,
+          name: typeof value?.name === "string" && value.name ? value.name.slice(0, 200) : "Attached image",
+        };
+      }).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  function saveAttachments() {
+    if (!state.sessionId) return;
+    try {
+      const persisted = state.attachments.map(({ id, media_type, byte_len, sha256, name }) => ({
+        id, media_type, byte_len, sha256, name,
+      }));
+      window.sessionStorage.setItem(storageKey(attachmentPrefix, state.sessionId), JSON.stringify(persisted));
+    } catch {
+      // The browser may reject session storage; the host remains authoritative.
+    }
+  }
+
+  function revokeAttachmentPreview(attachment) {
+    if (attachment?.preview_url) URL.revokeObjectURL(attachment.preview_url);
+  }
+
+  function clearAttachments() {
+    for (const attachment of state.attachments) revokeAttachmentPreview(attachment);
+    state.attachments = [];
+    saveAttachments();
+  }
+
+  function hydratePendingAttachments() {
+    const saved = readAttachments(state.sessionId);
+    if (saved.length) {
+      state.attachments = saved;
+      return;
+    }
+    const content = state.pending?.content;
+    if (Array.isArray(content)) {
+      state.attachments = content.map(attachmentFromContent).filter(Boolean);
+      saveAttachments();
+    } else {
+      state.attachments = [];
     }
   }
 
@@ -274,7 +421,7 @@ export function startController(view) {
   }
 
   async function startConversation(workspace) {
-    if (state.startBusy) return;
+    if (state.startBusy || state.attachmentBusy) return;
     const switchGeneration = state.switchGeneration;
     const cwd = String(workspace ?? state.workspaceDraft).trim();
     state.workspaceDraft = cwd;
@@ -300,7 +447,11 @@ export function startController(view) {
   }
 
   async function activateSession(sessionId) {
+    if (state.attachmentBusy && state.sessionId !== sessionId) return;
     if (state.sessionId && state.sessionId !== sessionId) saveCurrentSessionView();
+    if (state.sessionId !== sessionId) {
+      for (const attachment of state.attachments) revokeAttachmentPreview(attachment);
+    }
     const switchGeneration = ++state.switchGeneration;
     state.streamGeneration += 1;
     state.streamAbort?.abort();
@@ -309,6 +460,9 @@ export function startController(view) {
     state.active = null;
     state.cursor = 0;
     state.pending = readPending(sessionId);
+    state.activeContent = null;
+    hydratePendingAttachments();
+    state.attachmentError = "";
     state.transcriptItems = [];
     state.loadingSession = true;
     state.renamingSessionId = null;
@@ -389,7 +543,7 @@ export function startController(view) {
 
   function bindSessionId(oldId, actualId) {
     if (!actualId || oldId === actualId) return;
-    for (const prefix of [draftPrefix, pendingPrefix]) {
+    for (const prefix of [draftPrefix, pendingPrefix, attachmentPrefix]) {
       const oldKey = storageKey(prefix, oldId);
       const value = window.sessionStorage.getItem(oldKey);
       if (value !== null && window.sessionStorage.getItem(storageKey(prefix, actualId)) === null) {
@@ -754,6 +908,8 @@ export function startController(view) {
       transcript: state.transcriptItems,
       active: state.active,
       pending: state.pending,
+      attachments: state.attachments,
+      attachmentBusy: state.attachmentBusy,
       draft: state.draft,
       workspaceDraft: state.workspaceDraft,
       recoveryWorkspaceDraft: state.recoveryWorkspaceDraft,
@@ -768,16 +924,19 @@ export function startController(view) {
         sessionList: state.sessionListError,
         setup: state.setupError,
         send: state.sendError,
+        attachments: state.attachmentError,
         rename: state.renameError,
         recovery: state.recoveryError,
       },
       status,
       availability: {
-        send: !status.busy && !state.reconnecting && !state.submitting && !state.pending &&
+        send: !status.busy && !state.reconnecting && !state.submitting && !state.pending && !state.attachmentBusy &&
           !sessionWorkspaceMissing(session) && !session?.read_only,
+        attach: Boolean(state.sessionId && !status.busy && !state.reconnecting && !state.submitting &&
+          !state.pending && !session?.read_only && !state.attachmentBusy),
         stop: Boolean(state.active && state.active.status !== "stopping" && !state.reconnecting),
-        retrySameSend: Boolean(state.pending?.retryAllowed && !status.busy && !state.submitting),
-        createSession: !status.busy && !state.reconnecting && !state.submitting && !state.pending,
+        retrySameSend: Boolean(state.pending?.retryAllowed && !status.busy && !state.submitting && !state.attachmentBusy),
+        createSession: !status.busy && !state.reconnecting && !state.submitting && !state.pending && !state.attachmentBusy,
       },
       connection: { text: state.connectionText, reconnecting: state.reconnecting },
       retryableTurnIndices,
@@ -796,6 +955,14 @@ export function startController(view) {
     publishThemeModel(options);
   }
 
+  function actionableFailureMessage(turn) {
+    const message = typeof turn.failure_message === "string" ? turn.failure_message : "";
+    return message.includes("image_input_unsupported") &&
+      !message.includes("Remove the image or switch models explicitly.")
+      ? `${message} Remove the image or switch models explicitly.`
+      : message;
+  }
+
   function renderSessionList() {
     publishThemeModel();
   }
@@ -808,6 +975,7 @@ export function startController(view) {
       state.snapshot && !state.snapshot.recovery_required && Number.isSafeInteger(state.snapshot.next_request_id) &&
       !["running", "accepted"].includes(lastStatus) &&
       !currentStatus().busy && !state.active && !state.reconnecting && !state.submitting && !state.pending &&
+      !state.attachmentBusy &&
       !session?.read_only && !sessionWorkspaceMissing(session) &&
       session?.run_state !== "active" && !session?.pending_new_turn
     );
@@ -845,8 +1013,11 @@ export function startController(view) {
         assistantKey: `turn-${turn.turn_index}-assistant`,
         turnIndex,
         prompt: turn.prompt || "",
+        content: turn.content || (state.pending && state.pending.request_id === state.snapshot?.last_submission?.request_id
+          ? state.pending.content
+          : null),
         reply: (live ? liveReplyText(live, toolRounds) : "") || turn.reply || "",
-        failureMessage: turn.failure_message || "",
+        failureMessage: actionableFailureMessage(turn),
         outcome: turn.outcome || "incomplete",
         active: live,
         provider: live?.provider || metadata.provider,
@@ -878,6 +1049,7 @@ export function startController(view) {
           : `turn-${turnIndex}-assistant`,
         turnIndex,
         prompt: state.active.prompt || "",
+        content: state.active?.content || state.activeContent || state.pending?.content || null,
         reply: liveReplyText(state.active, toolRounds),
         failureMessage: "",
         outcome: "incomplete",
@@ -1041,7 +1213,7 @@ export function startController(view) {
   }
 
   async function submitPrompt({ retry = false, recordedPrompt = null, recordedContent = null, recordedTurnIndex = null, preserveDraft = false } = {}) {
-    if (!state.sessionId || state.submitting || state.active || state.reconnecting) return;
+    if (!state.sessionId || state.submitting || state.active || state.reconnecting || state.attachmentBusy) return;
     const sessionId = state.sessionId;
     const switchGeneration = state.switchGeneration;
     if (retry) {
@@ -1064,7 +1236,11 @@ export function startController(view) {
       state.pending = {
         request_id: requestId,
         prompt,
-        content: Array.isArray(recordedContent) ? recordedContent : null,
+        content: Number.isSafeInteger(recordedTurnIndex)
+          ? null
+          : Array.isArray(recordedContent)
+            ? recordedContent
+            : state.attachments.length ? state.attachments.map(attachmentContent) : null,
         retry_turn_index: Number.isSafeInteger(recordedTurnIndex) ? recordedTurnIndex : null,
         phase: "sending",
         retryAllowed: false,
@@ -1077,13 +1253,21 @@ export function startController(view) {
     if (!pending) return;
     state.submitting = true;
     showSendError("");
+    state.attachmentError = "";
     renderStatus();
     try {
+      const attachmentIds = Array.isArray(pending.content)
+        ? pending.content
+          .map((block) => block?.type === "image" && block.source?.type === "attachment"
+            ? block.source.id
+            : null)
+          .filter((id) => typeof id === "string")
+        : null;
       const receipt = await api(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
         method: "POST",
         body: Object.assign(
           { request_id: pending.request_id, prompt: pending.prompt },
-          pending.content === null || pending.content === undefined ? {} : { content: pending.content },
+          attachmentIds === null ? {} : { attachments: attachmentIds },
           Number.isSafeInteger(pending.retry_turn_index)
             ? { retry_turn_index: pending.retry_turn_index }
             : {},
@@ -1097,6 +1281,7 @@ export function startController(view) {
         if (error.code === "session_busy") {
           state.pending = null;
           savePending();
+          clearAttachments();
           saveDraft();
           showSendError(apiErrorText(error.code));
           await refreshSnapshot({ sessionId, switchGeneration }).catch(() => {});
@@ -1105,10 +1290,12 @@ export function startController(view) {
           state.pending.phase = "conflict";
           state.pending.retryAllowed = false;
           savePending();
+          clearAttachments();
           showSendError(apiErrorText(error.code));
         } else {
           state.pending = null;
           savePending();
+          if (error.code.startsWith("attachment_") || error.code === "invalid_content") clearAttachments();
           showSendError(apiErrorText(error.code));
         }
       } else {
@@ -1135,8 +1322,11 @@ export function startController(view) {
       bindSessionId(oldId, actualId);
     }
     const currentPending = state.pending;
+    if (state.active && pending.content) state.active.content = pending.content;
+    state.activeContent = pending.content || null;
     state.pending = null;
     savePending();
+    if (!pending.preserveDraft) clearAttachments();
     if (!pending.preserveDraft && state.draft === pending.prompt) state.draft = "";
     saveDraft();
     await api("/api/sessions/select", {
@@ -1186,6 +1376,7 @@ export function startController(view) {
           pending.phase = "conflict";
           pending.retryAllowed = false;
           savePending();
+          clearAttachments();
           showSendError("This send ID was accepted with different text in another tab. Your draft is preserved; inspect the current conversation before sending again.");
           return;
         }
@@ -1196,6 +1387,7 @@ export function startController(view) {
         const completedWithError = ["failed", "incomplete", "stopped"].includes(receipt.status);
         state.pending = null;
         savePending();
+        if (!pending.preserveDraft) clearAttachments();
         if (!pending.preserveDraft && !completedWithError && state.draft === pending.prompt) state.draft = "";
         if (!pending.preserveDraft && completedWithError && !state.draft.trim()) state.draft = pending.prompt;
         saveDraft();
@@ -1269,8 +1461,12 @@ export function startController(view) {
   }
 
   function openNewConversation() {
-    if (state.active || state.pending || state.submitting) return;
+    if (state.active || state.pending || state.submitting || state.attachmentBusy) return;
     saveCurrentSessionView();
+    for (const attachment of state.attachments) revokeAttachmentPreview(attachment);
+    state.attachments = [];
+    state.attachmentError = "";
+    state.attachmentBusy = false;
     state.switchGeneration += 1;
     state.streamGeneration += 1;
     state.streamAbort?.abort();
@@ -1351,6 +1547,96 @@ export function startController(view) {
     renderStatus();
   }
 
+  function normalizedImageType(value) {
+    return String(value || "").split(";", 1)[0].trim().toLowerCase();
+  }
+
+  function encodedImageBytes(rawBytes) {
+    return Math.ceil(rawBytes / 3) * 4;
+  }
+
+  async function selectAttachmentFiles(files) {
+    if (!state.sessionId || state.attachmentBusy || state.active || state.pending || state.submitting) return;
+    const sessionId = state.sessionId;
+    const switchGeneration = state.switchGeneration;
+    const selected = Array.from(files || []);
+    if (!selected.length) return;
+    const normalized = selected.map((file) => ({ file, mediaType: normalizedImageType(file.type) }));
+    const invalid = normalized.find(({ file, mediaType }) => {
+      return !SUPPORTED_IMAGE_TYPES.has(mediaType) || file.size > MAX_RAW_IMAGE_BYTES;
+    });
+    const currentEncoded = state.attachments.reduce(
+      (total, attachment) => total + encodedImageBytes(Number(attachment.byte_len) || 0),
+      0,
+    );
+    const selectedEncoded = normalized.reduce((total, { file }) => total + encodedImageBytes(file.size), 0);
+    if (invalid || currentEncoded + selectedEncoded > MAX_IMAGE_REQUEST_BYTES) {
+      state.attachmentError = invalid && !SUPPORTED_IMAGE_TYPES.has(invalid.mediaType)
+        ? "Only JPEG, PNG, GIF, and WebP images can be attached."
+        : invalid
+          ? "That image is over the fixed 10 MB encoded limit."
+          : "These images exceed the fixed 32 MB encoded request limit.";
+      publishThemeModel();
+      return;
+    }
+    state.attachmentBusy = true;
+    state.attachmentError = "";
+    publishThemeModel();
+    try {
+      for (const { file, mediaType } of normalized) {
+        const reference = await uploadAttachment(file, sessionId);
+        if (!reference || typeof reference.id !== "string" || reference.media_type !== mediaType ||
+          !Number.isSafeInteger(reference.byte_len) || typeof reference.sha256 !== "string") {
+          throw new HostError("attachment_invalid", 400);
+        }
+        if (!isCurrentSession(sessionId, switchGeneration)) {
+          await deleteStagedAttachment(sessionId, reference.id);
+          return;
+        }
+        state.attachments.push({
+          id: reference.id,
+          media_type: reference.media_type,
+          byte_len: reference.byte_len,
+          sha256: reference.sha256,
+          name: file.name && file.name !== "blob" ? file.name.slice(0, 200) : "Pasted image",
+          preview_url: URL.createObjectURL(file),
+        });
+        saveAttachments();
+        publishThemeModel();
+      }
+    } catch (error) {
+      if (isCurrentSession(sessionId, switchGeneration)) {
+        state.attachmentError = apiErrorText(error.code || "attachment_unavailable");
+      }
+    } finally {
+      state.attachmentBusy = false;
+      if (isCurrentSession(sessionId, switchGeneration)) publishThemeModel();
+    }
+  }
+
+  async function removeAttachment(index) {
+    if (state.attachmentBusy || state.active || state.pending || state.submitting) return;
+    const attachment = state.attachments[index];
+    if (!attachment || !state.sessionId) return;
+    state.attachmentBusy = true;
+    state.attachmentError = "";
+    publishThemeModel();
+    try {
+      await api(
+        `/api/sessions/${encodeURIComponent(state.sessionId)}/attachments/${encodeURIComponent(attachment.id)}`,
+        { method: "DELETE" },
+      );
+      revokeAttachmentPreview(attachment);
+      state.attachments.splice(index, 1);
+      saveAttachments();
+    } catch (error) {
+      state.attachmentError = apiErrorText(error.code || "attachment_unavailable");
+    } finally {
+      state.attachmentBusy = false;
+      publishThemeModel();
+    }
+  }
+
   const viewActions = Object.freeze({
     startConversation: (cwd) => void startConversation(cwd),
     openWorkspaceBrowser,
@@ -1393,6 +1679,8 @@ export function startController(view) {
     },
     submitPrompt: () => void submitPrompt(),
     updateDraft,
+    selectAttachmentFiles: (files) => void selectAttachmentFiles(files),
+    removeAttachment: (index) => void removeAttachment(index),
     retrySubmission: () => void submitPrompt({ retry: true }),
     stopTurn: () => void stopTurn(),
     retryRecordedTurn(turnIndex) {

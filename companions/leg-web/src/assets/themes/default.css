@@ -373,6 +373,70 @@ textarea:focus-visible,
   background: #fff;
 }
 
+.composer-attachment-actions,
+.fixture-attachment-actions {
+  display: flex;
+  gap: .5rem;
+  align-items: center;
+}
+
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .65rem;
+  margin-top: .55rem;
+}
+
+.attachment-item {
+  display: grid;
+  grid-template-columns: 3.25rem minmax(0, 1fr);
+  gap: .55rem;
+  align-items: center;
+  max-width: 20rem;
+  margin: 0;
+  padding: .4rem;
+  border: 1px solid #d8d2c8;
+  border-radius: .55rem;
+  background: #fbfaf7;
+}
+
+.attachment-preview {
+  width: 3.25rem;
+  height: 3.25rem;
+  object-fit: cover;
+  border-radius: .35rem;
+  background: #eee9df;
+}
+
+.attachment-item figcaption {
+  display: grid;
+  min-width: 0;
+  gap: .15rem;
+}
+
+.attachment-name,
+.attachment-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-name { font-weight: 600; }
+.attachment-detail { color: #655f58; font-size: .8rem; }
+.attachment-remove { justify-self: start; padding: .15rem .35rem; font-size: .8rem; }
+.attachment-upload-status { color: #655f58; font-size: .85rem; }
+.message-attachments { display: grid; gap: .35rem; margin-top: .55rem; }
+.message-attachment-marker {
+  display: inline-block;
+  width: fit-content;
+  padding: .3rem .5rem;
+  border: 1px solid #d8d2c8;
+  border-radius: .45rem;
+  color: #514b45;
+  background: #f4f1eb;
+  font-size: .85rem;
+}
+
 .start-form input {
   min-height: 2.9rem;
 }
