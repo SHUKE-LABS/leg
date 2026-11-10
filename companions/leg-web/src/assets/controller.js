@@ -170,12 +170,12 @@ export function startController(view) {
     return payload;
   }
 
-  async function uploadAttachment(file) {
+  async function uploadAttachment(file, sessionId) {
     if (!token) throw new HostError("unauthorized", 401);
     const form = new FormData();
     form.append("file", file, file.name || "pasted-image");
     const response = await fetch(
-      `/api/sessions/${encodeURIComponent(state.sessionId)}/attachments`,
+      `/api/sessions/${encodeURIComponent(sessionId)}/attachments`,
       {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
@@ -192,6 +192,19 @@ export function startController(view) {
     }
     if (!response.ok) throw new HostError(payload?.error || "attachment_unavailable", response.status);
     return payload;
+  }
+
+  async function deleteStagedAttachment(sessionId, id) {
+    if (!token || typeof id !== "string") return;
+    await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(id)}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+        cache: "no-store",
+        credentials: "same-origin",
+      },
+    ).catch(() => {});
   }
 
   function setConnection(text, reconnecting = false) {
@@ -408,7 +421,7 @@ export function startController(view) {
   }
 
   async function startConversation(workspace) {
-    if (state.startBusy) return;
+    if (state.startBusy || state.attachmentBusy) return;
     const switchGeneration = state.switchGeneration;
     const cwd = String(workspace ?? state.workspaceDraft).trim();
     state.workspaceDraft = cwd;
@@ -434,6 +447,7 @@ export function startController(view) {
   }
 
   async function activateSession(sessionId) {
+    if (state.attachmentBusy && state.sessionId !== sessionId) return;
     if (state.sessionId && state.sessionId !== sessionId) saveCurrentSessionView();
     if (state.sessionId !== sessionId) {
       for (const attachment of state.attachments) revokeAttachmentPreview(attachment);
@@ -916,13 +930,13 @@ export function startController(view) {
       },
       status,
       availability: {
-        send: !status.busy && !state.reconnecting && !state.submitting && !state.pending &&
+        send: !status.busy && !state.reconnecting && !state.submitting && !state.pending && !state.attachmentBusy &&
           !sessionWorkspaceMissing(session) && !session?.read_only,
         attach: Boolean(state.sessionId && !status.busy && !state.reconnecting && !state.submitting &&
           !state.pending && !session?.read_only && !state.attachmentBusy),
         stop: Boolean(state.active && state.active.status !== "stopping" && !state.reconnecting),
-        retrySameSend: Boolean(state.pending?.retryAllowed && !status.busy && !state.submitting),
-        createSession: !status.busy && !state.reconnecting && !state.submitting && !state.pending,
+        retrySameSend: Boolean(state.pending?.retryAllowed && !status.busy && !state.submitting && !state.attachmentBusy),
+        createSession: !status.busy && !state.reconnecting && !state.submitting && !state.pending && !state.attachmentBusy,
       },
       connection: { text: state.connectionText, reconnecting: state.reconnecting },
       retryableTurnIndices,
@@ -953,6 +967,7 @@ export function startController(view) {
       state.snapshot && !state.snapshot.recovery_required && Number.isSafeInteger(state.snapshot.next_request_id) &&
       !["running", "accepted"].includes(lastStatus) &&
       !currentStatus().busy && !state.active && !state.reconnecting && !state.submitting && !state.pending &&
+      !state.attachmentBusy &&
       !session?.read_only && !sessionWorkspaceMissing(session) &&
       session?.run_state !== "active" && !session?.pending_new_turn
     );
@@ -1190,7 +1205,7 @@ export function startController(view) {
   }
 
   async function submitPrompt({ retry = false, recordedPrompt = null, recordedContent = null, recordedTurnIndex = null, preserveDraft = false } = {}) {
-    if (!state.sessionId || state.submitting || state.active || state.reconnecting) return;
+    if (!state.sessionId || state.submitting || state.active || state.reconnecting || state.attachmentBusy) return;
     const sessionId = state.sessionId;
     const switchGeneration = state.switchGeneration;
     if (retry) {
@@ -1431,7 +1446,7 @@ export function startController(view) {
   }
 
   function openNewConversation() {
-    if (state.active || state.pending || state.submitting) return;
+    if (state.active || state.pending || state.submitting || state.attachmentBusy) return;
     saveCurrentSessionView();
     for (const attachment of state.attachments) revokeAttachmentPreview(attachment);
     state.attachments = [];
@@ -1527,6 +1542,8 @@ export function startController(view) {
 
   async function selectAttachmentFiles(files) {
     if (!state.sessionId || state.attachmentBusy || state.active || state.pending || state.submitting) return;
+    const sessionId = state.sessionId;
+    const switchGeneration = state.switchGeneration;
     const selected = Array.from(files || []);
     if (!selected.length) return;
     const normalized = selected.map((file) => ({ file, mediaType: normalizedImageType(file.type) }));
@@ -1552,10 +1569,14 @@ export function startController(view) {
     publishThemeModel();
     try {
       for (const { file, mediaType } of normalized) {
-        const reference = await uploadAttachment(file);
+        const reference = await uploadAttachment(file, sessionId);
         if (!reference || typeof reference.id !== "string" || reference.media_type !== mediaType ||
           !Number.isSafeInteger(reference.byte_len) || typeof reference.sha256 !== "string") {
           throw new HostError("attachment_invalid", 400);
+        }
+        if (!isCurrentSession(sessionId, switchGeneration)) {
+          await deleteStagedAttachment(sessionId, reference.id);
+          return;
         }
         state.attachments.push({
           id: reference.id,
@@ -1569,10 +1590,12 @@ export function startController(view) {
         publishThemeModel();
       }
     } catch (error) {
-      state.attachmentError = apiErrorText(error.code || "attachment_unavailable");
+      if (isCurrentSession(sessionId, switchGeneration)) {
+        state.attachmentError = apiErrorText(error.code || "attachment_unavailable");
+      }
     } finally {
       state.attachmentBusy = false;
-      publishThemeModel();
+      if (isCurrentSession(sessionId, switchGeneration)) publishThemeModel();
     }
   }
 

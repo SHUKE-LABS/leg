@@ -20,6 +20,7 @@ path = "src/bin/leg-bridge.rs"
 [dependencies]
 base64 = "0.23.1"
 flate2 = "1.1"
+leg-image-policy = { path = "companions/leg-image-policy" }
 httpdate = "1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

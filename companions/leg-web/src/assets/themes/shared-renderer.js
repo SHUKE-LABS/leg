@@ -435,7 +435,7 @@ export function createSharedRenderer(ui, features) {
     ui["connection-message"].textContent = state.reconnecting
       ? "Reconnecting to the local host. The draft is kept, and no message will be resent."
       : "";
-    ui["start-form"].querySelector("button[type=submit]").disabled = state.startBusy;
+    ui["start-form"].querySelector("button[type=submit]").disabled = state.startBusy || state.attachmentBusy;
     renderAttachmentList();
     renderSessionList();
     if (!hasSession) {

@@ -11,20 +11,19 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use leg_image_policy::{
+    detect_media_type, encoded_len, is_supported_media_type, normalize_media_type,
+};
 use leg_ui_client::{AttachmentRef, ContentBlock, ImageSource};
 use sha2::{Digest, Sha256};
 
-pub const MAX_BASE64_IMAGE_BYTES: usize = 10_000_000;
-pub const MAX_IMAGE_REQUEST_BYTES: usize = 32_000_000;
-pub const MAX_RAW_IMAGE_BYTES: usize = MAX_BASE64_IMAGE_BYTES / 4 * 3;
+pub use leg_image_policy::{MAX_BASE64_IMAGE_BYTES, MAX_IMAGE_REQUEST_BYTES, MAX_RAW_IMAGE_BYTES};
 /// Leaves bounded room for multipart headers while keeping the upload route
 /// stricter than the JSON submit route's 64 KiB limit.
 pub const MAX_UPLOAD_BODY_BYTES: usize = MAX_RAW_IMAGE_BYTES + 64 * 1024;
 pub const ATTACHMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 const ATTACHMENTS_DIR: &str = "attachments";
-const SUPPORTED_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
-
 #[derive(Clone)]
 pub struct AttachmentStore {
     root: PathBuf,
@@ -94,9 +93,15 @@ impl AttachmentStore {
         set_private_directory(&directory).map_err(|_| AttachmentError::Io)?;
         let sha256 = sha256_hex(bytes);
         for _ in 0..16 {
-            let id = format!("upload-{}", random_hex(16)?);
+            let id = format!(
+                "upload-{}",
+                super::random_hex(16).map_err(|_| AttachmentError::Io)?
+            );
             let path = directory.join(&id);
-            let temporary = directory.join(format!(".upload-tmp-{}", random_hex(8)?));
+            let temporary = directory.join(format!(
+                ".upload-tmp-{}",
+                super::random_hex(8).map_err(|_| AttachmentError::Io)?
+            ));
             let result = (|| {
                 let mut file = private_create_new(&temporary).map_err(|_| AttachmentError::Io)?;
                 file.write_all(bytes).map_err(|_| AttachmentError::Io)?;
@@ -268,7 +273,10 @@ impl AttachmentStore {
         let Ok(namespaces) = fs::read_dir(&self.root) else {
             return;
         };
-        let now = SystemTime::now();
+        self.cleanup_expired_at(SystemTime::now(), namespaces);
+    }
+
+    fn cleanup_expired_at(&self, now: SystemTime, namespaces: fs::ReadDir) {
         for namespace in namespaces.flatten() {
             let path = namespace.path();
             if !namespace
@@ -392,32 +400,6 @@ fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
     }
 }
 
-fn encoded_len(raw_len: usize) -> usize {
-    raw_len.div_ceil(3) * 4
-}
-
-fn normalize_media_type(value: &str) -> &str {
-    value.split(';').next().unwrap_or(value).trim()
-}
-
-fn is_supported_media_type(value: &str) -> bool {
-    SUPPORTED_MEDIA_TYPES.contains(&value)
-}
-
-fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
 fn validate_component(value: &str) -> Result<(), AttachmentError> {
     if valid_component(value) {
         Ok(())
@@ -434,12 +416,6 @@ fn valid_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn random_hex(bytes: usize) -> Result<String, AttachmentError> {
-    let mut value = vec![0u8; bytes];
-    getrandom::fill(&mut value).map_err(|_| AttachmentError::Io)?;
-    Ok(sha256_hex(&value)[..bytes * 2].to_string())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -537,5 +513,38 @@ mod tests {
         );
         store.validate_content("sess-1", &content).unwrap();
         assert!(store.validate_content("draft-1", &content).is_err());
+    }
+
+    #[test]
+    fn cleanup_removes_terminal_content_and_orphan_namespaces() {
+        let (store, _temp) = store();
+        let terminal = store
+            .stage("sess-terminal", "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        let content = [ContentBlock::image(terminal)];
+        let path = store.root.join("sess-terminal").join(match &content[0] {
+            ContentBlock::Image {
+                source: ImageSource::Attachment { id, .. },
+            } => id,
+            _ => unreachable!(),
+        });
+        assert!(path.is_file());
+        store.remove_content("sess-terminal", Some(&content));
+        assert!(!path.exists());
+
+        store
+            .stage("sess-orphan", "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        store.cleanup_orphans(&std::collections::HashSet::new());
+        assert!(!store.root.join("sess-orphan").exists());
+
+        store
+            .stage("sess-expired", "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        store.cleanup_expired_at(
+            SystemTime::now() + ATTACHMENT_TTL,
+            fs::read_dir(&store.root).unwrap(),
+        );
+        assert!(!store.root.join("sess-expired").exists());
     }
 }

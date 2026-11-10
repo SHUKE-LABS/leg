@@ -1,5 +1,5 @@
 [workspace]
-members = ["leg-ui-client", "leg-tui", "leg-web", "crossterm"]
+members = ["leg-image-policy", "leg-ui-client", "leg-tui", "leg-web", "crossterm"]
 resolver = "3"
 
 [patch.crates-io]

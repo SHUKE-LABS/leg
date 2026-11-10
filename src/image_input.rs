@@ -4,13 +4,12 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use leg_image_policy::{MAX_RAW_IMAGE_BYTES, detect_media_type};
 
 use crate::error::{LegError, Result};
 use crate::model::{ContentBlock, ImageSource, Message};
 
-pub(crate) const MAX_BASE64_IMAGE_BYTES: usize = 10_000_000;
-pub(crate) const MAX_IMAGE_REQUEST_BYTES: usize = 32_000_000;
-const MAX_RAW_IMAGE_BYTES: usize = MAX_BASE64_IMAGE_BYTES / 4 * 3;
+pub(crate) use leg_image_policy::{MAX_BASE64_IMAGE_BYTES, MAX_IMAGE_REQUEST_BYTES};
 const ATTACHMENTS_DIR: &str = "attachments";
 
 /// Resolves companion attachment references into provider-ready image blocks.
@@ -413,20 +412,6 @@ fn image_too_large(path: &str) -> LegError {
     LegError::Usage(format!(
         "--image file {path:?} exceeds the 10 MB base64-encoded size limit"
     ))
-}
-
-fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some("image/webp")
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

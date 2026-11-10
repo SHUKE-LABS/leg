@@ -602,6 +602,29 @@ async def run(
                 await page.keyboard.press("Control+V")
                 assert await page.locator("#prompt").input_value() == text_clipboard
 
+                # An in-flight upload owns its captured session. Navigation and send stay
+                # disabled until the host has returned the opaque ref.
+                await remove_attachment("pasted.png")
+                attachment_seen = asyncio.Event()
+                attachment_release = asyncio.Event()
+
+                async def hold_attachment_upload(route) -> None:
+                    attachment_seen.set()
+                    await attachment_release.wait()
+                    await route.continue_()
+
+                await page.route("**/attachments", hold_attachment_upload)
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "race.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await attachment_seen.wait()
+                assert await page.get_by_role("button", name="Send").is_disabled()
+                assert await page.locator("#new-conversation").is_disabled()
+                assert await page.evaluate("sessionStorage.getItem('leg-web-current-session')") == session_image
+                attachment_release.set()
+                await assert_attachment("race.png")
+                await page.unroute("**/attachments", hold_attachment_upload)
+
                 image_prompt = "TRIAL-IMAGE: preserve ordered image content"
                 await page.locator("#prompt").fill(image_prompt)
                 await dispatch_file_drop(page, "#composer", "notes.txt", "text/plain", b"not an image")
@@ -642,7 +665,89 @@ async def run(
                 await page.locator(".message-attachment-marker").wait_for()
                 marker = await page.locator(".message-attachment-marker").inner_text()
                 assert "image/png" in marker and "upload-" not in marker and "sha256" not in marker
-                assert common.fixture_status(provider_authority)["scenario_requests"].get("TRIAL-IMAGE") == 1
+                image_status = common.fixture_status(provider_authority)
+                assert image_status["scenario_requests"].get("TRIAL-IMAGE") == 1
+                assert image_status["input_checks"].get("image_content_resolved") is True, image_status
+                assert image_status["input_checks"].get("image_content_ordered") is True, image_status
+
+                # Provider modality failures stay explicit and keep the turn retryable.
+                unsupported_prompt = "TRIAL-IMAGE-UNSUPPORTED: show the capability error"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "unsupported.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#prompt").fill(unsupported_prompt)
+                await page.get_by_role("button", name="Send").click()
+                unsupported_turn = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 2
+                )
+                assert unsupported_turn["last_submission"]["status"] == "failed", unsupported_turn
+                await page.get_by_text("image_input_unsupported", exact=False).wait_for()
+                unsupported_status = common.fixture_status(provider_authority)
+                assert unsupported_status["input_checks"].get("image_input_unsupported_response") is True
+
+                # Recorded retry rehydrates the authoritative image bytes while an edited
+                # composer draft remains independent of the retry request.
+                retry_prompt = "TRIAL-IMAGE-RETRY: rehydrate the recorded image"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "retry.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#prompt").fill(retry_prompt)
+                await page.get_by_role("button", name="Send").click()
+                failed_retry = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 3
+                )
+                assert failed_retry["last_submission"]["status"] == "failed", failed_retry
+                await page.get_by_role("button", name="Retry turn").last.wait_for(state="visible")
+                edited_draft = "independently edited composer draft"
+                await page.locator("#prompt").fill(edited_draft)
+                await page.get_by_role("button", name="Retry turn").last.click()
+                retried_image = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 4
+                )
+                assert retried_image["last_submission"]["status"] == "succeeded", retried_image
+                await common.wait_status(page, "Succeeded")
+                assert await page.locator("#prompt").input_value() == edited_draft
+                retry_status = common.fixture_status(provider_authority)
+                assert retry_status["input_checks"].get("image_retry_first_attempt_failed") is True
+                assert retry_status["input_checks"].get("image_content_resolved") is True
+
+                # An image-bearing request that is lost before acceptance survives a
+                # reload; Retry same send reuses the request ID and image digest.
+                lost_prompt = "TRIAL-IMAGE: lost response keeps image identity"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "lost.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#prompt").fill(lost_prompt)
+                lost_request_aborted = False
+
+                async def abort_lost_image_submit(route) -> None:
+                    nonlocal lost_request_aborted
+                    if not lost_request_aborted:
+                        lost_request_aborted = True
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route("**/submit", abort_lost_image_submit)
+                await page.get_by_role("button", name="Send").click()
+                await page.get_by_role("button", name="Retry same send").wait_for(state="visible")
+                await page.reload(wait_until="load")
+                await wait_theme(page, "fixture")
+                await page.get_by_role("button", name="Retry same send").wait_for(state="visible")
+                await page.get_by_role("button", name="Retry same send").click()
+                recovered_image = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 5
+                )
+                assert recovered_image["last_submission"]["status"] == "succeeded", recovered_image
+                lost_requests = [
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == lost_prompt
+                ]
+                assert [body["request_id"] for body in lost_requests] == [5, 5], lost_requests
+                assert lost_requests[0]["content"][0]["source"]["sha256"] == lost_requests[1]["content"][0]["source"]["sha256"]
+                await page.unroute("**/submit", abort_lost_image_submit)
 
                 # Exercise independent first-send warnings and exact/IME-safe drafts in each theme.
                 await page.locator("#new-conversation").click()
@@ -666,6 +771,7 @@ async def run(
                 )
                 assert fixture_turn["session"]["turns"][0]["prompt"] == exact_prompt, fixture_turn
                 await common.wait_status(page, "Succeeded")
+                await page.locator("#workspace-warning").wait_for(state="hidden")
                 session_fixture = await page.evaluate(
                     "sessionStorage.getItem('leg-web-current-session')"
                 )
@@ -676,7 +782,7 @@ async def run(
                 await wait_theme(page, "default")
                 session_default = await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
                 assert session_default == session_fixture
-                assert await page.locator("#workspace-warning").is_hidden()
+                await page.locator("#workspace-warning").wait_for(state="hidden")
 
                 # The host accepts this request, then the browser loses its receipt.
                 # Hold snapshots so both theme directions preserve an unresolved send.
