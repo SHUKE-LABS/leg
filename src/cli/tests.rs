@@ -2785,6 +2785,34 @@ fn invalid_inline_image_is_rejected_before_provider_invocation() {
 }
 
 #[test]
+fn supported_mime_mismatch_is_rejected_before_provider_invocation() {
+    let participant = LocalParticipant::new(PanicTransport, meta());
+    let mut envelope = MessageEnvelope::new(
+        "m-image-mismatch",
+        "c-image-mismatch",
+        "user",
+        "assistant",
+        MessageKind::Request,
+        "describe",
+        1_700_000_000_000,
+    );
+    envelope.content = Some(vec![ContentBlock::Image {
+        source: crate::model::ImageSource::Base64 {
+            media_type: "image/jpeg".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        },
+    }]);
+    let raw = serde_json::to_string(&envelope).unwrap();
+    let mut output = Vec::new();
+
+    let error = execute_exchange_core(&participant, &meta(), &raw, &mut output, &mut NoopSink)
+        .expect_err("declared MIME mismatch must fail at the envelope boundary");
+
+    assert!(error.to_string().contains("MIME type does not match"));
+    assert!(output.is_empty());
+}
+
+#[test]
 fn parse_exchange_request_plain_text_synthesizes_a_request() {
     let (request, mode) = parse_exchange_request("hello there\n").unwrap();
     assert_eq!(mode, ExchangeMode::PlainText);

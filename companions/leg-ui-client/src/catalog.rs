@@ -867,6 +867,33 @@ impl SessionCatalog {
         })
     }
 
+    /// Returns the durable identity for a recorded retry without requiring
+    /// the session to be idle. The Web host uses this to resolve duplicate
+    /// request IDs before the active-session retry gate is checked.
+    pub fn retry_fingerprint_for_turn(
+        &self,
+        id: &str,
+        turn_index: u64,
+        prompt: &str,
+    ) -> Result<String, CatalogError> {
+        let session = self.get(id)?;
+        if session.read_only {
+            return Err(CatalogError::ReadOnly(id.into()));
+        }
+        let turn = session
+            .turns
+            .iter()
+            .find(|turn| turn.turn_index == turn_index)
+            .filter(|turn| {
+                matches!(
+                    turn.outcome,
+                    TrailOutcome::Failed | TrailOutcome::Interrupted | TrailOutcome::Incomplete
+                )
+            })
+            .ok_or_else(|| CatalogError::NoRetry(id.into()))?;
+        Ok(turn_fingerprint(prompt, turn.content.as_deref()))
+    }
+
     pub fn confirm_retry(
         &self,
         intent: &RetryIntent,
@@ -2468,7 +2495,10 @@ mod tests {
         );
         let serialized = serde_json::to_string(&snapshot.turns).unwrap();
         assert!(!serialized.contains("upload-1"));
-        assert!(!serialized.contains("0000000000000000000000000000000000000000000000000000000000000000"));
+        assert!(
+            !serialized
+                .contains("0000000000000000000000000000000000000000000000000000000000000000")
+        );
         assert_ne!(attachment, resolved);
     }
 

@@ -986,10 +986,7 @@ fn redact_value_inner(value: &mut Value, strip_attachment_identity: bool) {
                 {
                     *data = Value::String("[REDACTED_IMAGE]".to_string());
                 }
-            } else if is_image
-                && strip_attachment_identity
-                && source_type == Some("attachment")
-            {
+            } else if is_image && strip_attachment_identity && source_type == Some("attachment") {
                 let source = object
                     .get("source")
                     .and_then(Value::as_object)

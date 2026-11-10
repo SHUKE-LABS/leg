@@ -1385,22 +1385,6 @@ impl HostState {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
-        let retry_intent = if let Some(turn_index) = body.retry_turn_index {
-            if body.content.is_some() {
-                return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
-            }
-            let intent = self
-                .inner
-                .catalog
-                .prepare_retry(id)
-                .map_err(map_catalog_error)?;
-            if intent.turn_index() != turn_index || intent.prompt() != body.prompt {
-                return Err(api_error(StatusCode::CONFLICT, "retry_unavailable"));
-            }
-            Some(intent)
-        } else {
-            None
-        };
         if body
             .content
             .as_deref()
@@ -1408,11 +1392,19 @@ impl HostState {
         {
             return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
         }
+        if body.retry_turn_index.is_some() && body.content.is_some() {
+            return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
+        }
         let ledger_id = self.ledger_id(id);
-        let prompt_hash = retry_intent.as_ref().map_or_else(
-            || turn_fingerprint(&body.prompt, body.content.as_deref()),
-            |intent| intent.fingerprint().to_string(),
-        );
+        let retry_fingerprint = body.retry_turn_index.map(|turn_index| {
+            self.inner
+                .catalog
+                .retry_fingerprint_for_turn(id, turn_index, &body.prompt)
+                .map_err(map_catalog_error)
+        });
+        let retry_fingerprint = retry_fingerprint.transpose()?;
+        let prompt_hash = retry_fingerprint
+            .unwrap_or_else(|| turn_fingerprint(&body.prompt, body.content.as_deref()));
         let decision = self.inner.durable.read(|data| {
             submission_decision(data.sessions.get(&ledger_id), body.request_id, &prompt_hash)
         });
@@ -1440,6 +1432,16 @@ impl HostState {
             }
             Err(SubmissionReject::Exhausted) => {
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_exhausted"));
+            }
+        }
+        if let Some(turn_index) = body.retry_turn_index {
+            let intent = self
+                .inner
+                .catalog
+                .prepare_retry(id)
+                .map_err(map_catalog_error)?;
+            if intent.turn_index() != turn_index || intent.prompt() != body.prompt {
+                return Err(api_error(StatusCode::CONFLICT, "retry_unavailable"));
             }
         }
         if self.runtime_is_busy(&ledger_id) {
@@ -3647,6 +3649,179 @@ mod tests {
             snapshot.session.display["web.turn_metadata"]["0"]["capped"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn retry_submission_replays_durable_receipt_before_active_catalog_gate() {
+        let (host, temp) = test_host();
+        let draft = host
+            .state
+            .inner
+            .catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("retry identity".into()),
+                Some(temp.path()),
+            )
+            .unwrap();
+        let id = "sess-retry-288";
+        let catalog_path = temp.path().join("catalog.json");
+        let mut catalog: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        let sessions = catalog["sessions"].as_object_mut().unwrap();
+        let record = sessions.remove(&draft.id).unwrap();
+        sessions.insert(id.to_string(), record);
+        fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+
+        let content = vec![ContentBlock::Image {
+            source: leg_ui_client::ImageSource::Attachment {
+                id: "private-ref".into(),
+                media_type: "image/png".into(),
+                byte_len: 8,
+                sha256: "11".repeat(32),
+            },
+        }];
+        let trail = [
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "session_start",
+                "session_id": id,
+                "ts_ms": 1
+            }),
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "request",
+                "session_id": id,
+                "turn_index": 0,
+                "prompt": "retry me",
+                "content": serde_json::to_value(&content).unwrap()
+            }),
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "response_error",
+                "session_id": id,
+                "turn_index": 0,
+                "kind": "provider_error",
+                "message": "failed"
+            }),
+        ]
+        .into_iter()
+        .map(|event| serde_json::to_string(&event).unwrap() + "\n")
+        .collect::<String>();
+        fs::write(
+            host.state
+                .inner
+                .catalog
+                .sessions_dir()
+                .join(format!("{id}.jsonl")),
+            trail,
+        )
+        .unwrap();
+
+        let prompt_hash = turn_fingerprint("retry me", Some(&content));
+        host.state
+            .inner
+            .durable
+            .transact(|data| {
+                let ledger = data.sessions.entry(id.to_string()).or_default();
+                ledger.high_water = 1;
+                ledger.receipts.push_back(Receipt {
+                    request_id: 1,
+                    prompt_sha256: prompt_hash.clone(),
+                    turn_id: "turn-retry".into(),
+                    status: ReceiptStatus::Running,
+                    session_id: Some(id.into()),
+                    outcome: Some(json!({"status": "running"})),
+                    recovery_evidence: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let lock_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join(format!(".leg-ui-session-{id}.lock"));
+        let session_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        session_lock.lock_exclusive().unwrap();
+
+        let router = build_router(host.state.clone());
+        let retry_body = || {
+            json!({
+                "request_id": 1,
+                "prompt": "retry me",
+                "retry_turn_index": 0
+            })
+            .to_string()
+        };
+        let (status, active_duplicate) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{id}/submit"),
+                &retry_body(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{active_duplicate}");
+        assert_eq!(active_duplicate["duplicate"], true);
+        assert_eq!(active_duplicate["turn_id"], "turn-retry");
+        assert_eq!(active_duplicate["status"], "running");
+
+        drop(session_lock);
+        host.state
+            .finish_receipt(
+                id,
+                1,
+                ReceiptStatus::Succeeded,
+                Some(id.into()),
+                json!({"status": "succeeded"}),
+            )
+            .unwrap();
+        let (status, completed_duplicate) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{id}/submit"),
+                &retry_body(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{completed_duplicate}");
+        assert_eq!(completed_duplicate["duplicate"], true);
+        assert_eq!(completed_duplicate["turn_id"], "turn-retry");
+        assert_eq!(completed_duplicate["status"], "succeeded");
+
+        let conflict_body = json!({
+            "request_id": 1,
+            "prompt": "changed retry",
+            "retry_turn_index": 0
+        })
+        .to_string();
+        let (status, conflict) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{id}/submit"),
+                &conflict_body,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(conflict["error"], "submission_id_conflict");
     }
 
     #[tokio::test]
