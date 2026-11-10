@@ -632,6 +632,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "leg-image-contract"
+version = "0.1.0"
+
+[[package]]
 name = "leg-tui"
 version = "0.1.0"
 dependencies = [
@@ -650,6 +654,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "fs2",
+ "leg-image-contract",
  "libc",
  "serde",
  "serde_json",

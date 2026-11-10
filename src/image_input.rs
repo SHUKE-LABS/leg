@@ -4,7 +4,7 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use leg_ui_client::{
+use leg_image_contract::{
     MAX_IMAGE_ENCODED_BYTES, MAX_TURN_IMAGE_ENCODED_BYTES, base64_encoded_len,
     detect_image_media_type,
 };
