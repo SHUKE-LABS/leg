@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::config::Provider;
 use crate::error::{LegError, Result};
+use crate::model::{ContentBlock, Message};
 
 /// The minimum answer room retained when a provider shares its output ceiling
 /// between thinking and the visible answer.
@@ -78,6 +79,15 @@ impl ThinkingLevel {
 pub(crate) enum ThinkingEncoding {
     Effort,
     Budget,
+}
+
+/// Whether a known provider/model accepts image input. Unknown models are
+/// intentionally represented by `None` from [`image_input_capability`] so a
+/// compatible endpoint gets one normal chance to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageInputCapability {
+    Supported,
+    Unsupported,
 }
 
 /// The resolved thinking request to add to a provider body.
@@ -212,6 +222,7 @@ struct ModelCapability {
     prefix: &'static str,
     encoding: ThinkingEncoding,
     supported: &'static [ThinkingLevel],
+    image_input: ImageInputCapability,
 }
 
 const CLAUDE_EFFORT_LEVELS: &[ThinkingLevel] = &[
@@ -250,30 +261,35 @@ const MODEL_CAPABILITIES: &[ModelCapability] = &[
         prefix: "claude-opus-5",
         encoding: ThinkingEncoding::Effort,
         supported: CLAUDE_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-sonnet-5",
         encoding: ThinkingEncoding::Effort,
         supported: CLAUDE_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-haiku-5",
         encoding: ThinkingEncoding::Effort,
         supported: CLAUDE_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-opus-4-6",
         encoding: ThinkingEncoding::Effort,
         supported: CLAUDE_4_6_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-sonnet-4-6",
         encoding: ThinkingEncoding::Effort,
         supported: CLAUDE_4_6_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     // Older Claude models use the extended-thinking budget shape.
     ModelCapability {
@@ -281,90 +297,142 @@ const MODEL_CAPABILITIES: &[ModelCapability] = &[
         prefix: "claude-3-7-sonnet",
         encoding: ThinkingEncoding::Budget,
         supported: BUDGET_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-opus-4-5",
         encoding: ThinkingEncoding::Budget,
         supported: BUDGET_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-sonnet-4-5",
         encoding: ThinkingEncoding::Budget,
         supported: BUDGET_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-opus-4",
         encoding: ThinkingEncoding::Budget,
         supported: BUDGET_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-sonnet-4",
         encoding: ThinkingEncoding::Budget,
         supported: BUDGET_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::Anthropic,
         prefix: "claude-haiku-4",
         encoding: ThinkingEncoding::Budget,
         supported: BUDGET_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     // OpenAI reasoning models expose the effort string directly.
+    // These reasoning variants are known text-only models. Keep their
+    // entries ahead of the broader `o1`/`o3` prefixes below.
+    ModelCapability {
+        provider: Provider::OpenAiResponses,
+        prefix: "o1-mini",
+        encoding: ThinkingEncoding::Effort,
+        supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Unsupported,
+    },
+    ModelCapability {
+        provider: Provider::OpenAiResponses,
+        prefix: "o3-mini",
+        encoding: ThinkingEncoding::Effort,
+        supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Unsupported,
+    },
+    ModelCapability {
+        provider: Provider::OpenAiChatCompletions,
+        prefix: "o1-mini",
+        encoding: ThinkingEncoding::Effort,
+        supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Unsupported,
+    },
+    ModelCapability {
+        provider: Provider::OpenAiChatCompletions,
+        prefix: "o3-mini",
+        encoding: ThinkingEncoding::Effort,
+        supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Unsupported,
+    },
     ModelCapability {
         provider: Provider::OpenAiResponses,
         prefix: "o1",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::OpenAiResponses,
         prefix: "o3",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::OpenAiResponses,
         prefix: "o4",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::OpenAiResponses,
         prefix: "gpt-5",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::OpenAiChatCompletions,
         prefix: "o1",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::OpenAiChatCompletions,
         prefix: "o3",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::OpenAiChatCompletions,
         prefix: "o4",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
     ModelCapability {
         provider: Provider::OpenAiChatCompletions,
         prefix: "gpt-5",
         encoding: ThinkingEncoding::Effort,
         supported: OPENAI_EFFORT_LEVELS,
+        image_input: ImageInputCapability::Supported,
     },
 ];
 
 fn capability_for(provider: Provider, model: &str) -> Option<&'static ModelCapability> {
-    let model = if provider == Provider::Anthropic {
+    let model = normalized_model(provider, model);
+
+    MODEL_CAPABILITIES
+        .iter()
+        .find(|capability| capability.provider == provider && model.starts_with(capability.prefix))
+}
+
+fn normalized_model(provider: Provider, model: &str) -> &str {
+    if provider == Provider::Anthropic {
         let model = model.strip_suffix("[1m]").unwrap_or(model);
         match model {
             "opus" => "claude-opus-5",
@@ -374,11 +442,50 @@ fn capability_for(provider: Provider, model: &str) -> Option<&'static ModelCapab
         }
     } else {
         model
-    };
+    }
+}
 
-    MODEL_CAPABILITIES
-        .iter()
-        .find(|capability| capability.provider == provider && model.starts_with(capability.prefix))
+/// Returns the known image-input capability for a provider/model pair.
+/// `None` means the model is unknown and should be tried once normally.
+pub(crate) fn image_input_capability(
+    provider: Provider,
+    model: &str,
+) -> Option<ImageInputCapability> {
+    capability_for(provider, model).map(|capability| capability.image_input)
+}
+
+/// Applies the image capability check to a provider conversation without
+/// materializing a second copy of its ordered content blocks.
+pub(crate) fn ensure_message_image_input_supported(
+    provider: Provider,
+    model: &str,
+    messages: &[Message],
+) -> Result<()> {
+    if messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }) {
+        return reject_known_unsupported_image_input(provider, model, true);
+    }
+    Ok(())
+}
+
+fn reject_known_unsupported_image_input(
+    provider: Provider,
+    model: &str,
+    has_image: bool,
+) -> Result<()> {
+    if has_image
+        && image_input_capability(provider, model) == Some(ImageInputCapability::Unsupported)
+    {
+        return Err(LegError::ImageInputUnsupported {
+            provider: provider.as_str().to_string(),
+            model: model.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_budget_overrides(overrides: &BTreeMap<ThinkingLevel, Option<String>>) -> Result<()> {
@@ -579,6 +686,39 @@ mod tests {
         assert_eq!(
             config.request(32_000),
             Some(ThinkingRequest::Effort("medium".to_string()))
+        );
+    }
+
+    #[test]
+    fn known_text_only_reasoning_models_reject_images_but_unknown_models_remain_open() {
+        assert_eq!(
+            image_input_capability(Provider::OpenAiResponses, "o3-mini"),
+            Some(ImageInputCapability::Unsupported)
+        );
+        assert_eq!(
+            image_input_capability(Provider::OpenAiResponses, "vendor-vision-model"),
+            None
+        );
+        let content = [ContentBlock::Image {
+            source: crate::model::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "a".to_string(),
+            },
+        }];
+        let error = ensure_message_image_input_supported(
+            Provider::OpenAiResponses,
+            "o3-mini",
+            &[Message::new(crate::model::Role::User, content.to_vec())],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), "image_input_unsupported");
+        assert!(
+            ensure_message_image_input_supported(
+                Provider::OpenAiResponses,
+                "vendor-vision-model",
+                &[Message::new(crate::model::Role::User, content.to_vec())]
+            )
+            .is_ok()
         );
     }
 }

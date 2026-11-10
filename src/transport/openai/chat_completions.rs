@@ -98,8 +98,27 @@ impl<H: HttpClient> OpenAiChatCompletionsClient<H> {
                 };
                 result.and_then(|()| assembler.finish())
             }
-            Ok(response) => Err(common::api_error(response.status, &response.body)),
+            Ok(response) => {
+                let status = response.status;
+                let body = response.body;
+                Err(
+                    common::api_error(status, &body).classify_image_input_response(
+                        self.config.provider.as_str(),
+                        &self.config.model,
+                        common::has_image_input(messages),
+                        status,
+                        &body,
+                    ),
+                )
+            }
         };
+        let result = result.map_err(|error| {
+            error.classify_image_input_rejection(
+                self.config.provider.as_str(),
+                &self.config.model,
+                common::has_image_input(messages),
+            )
+        });
         TransportCall::new(result, attempts)
     }
 }
@@ -217,6 +236,11 @@ fn build_request_body_with_max_tokens(
     system_prompt: Option<&str>,
     max_tokens: u32,
 ) -> Result<String> {
+    crate::thinking::ensure_message_image_input_supported(
+        config.provider,
+        &config.model,
+        messages,
+    )?;
     let mut api_messages = Vec::new();
     if let Some(system_prompt) = system_prompt {
         api_messages.push(json!({"role": "system", "content": system_prompt}));
@@ -279,6 +303,12 @@ fn chat_messages(messages: &[Message]) -> Result<Vec<Value>> {
                                 "type": "image_url",
                                 "image_url": {"url": common::image_data_url(source)}
                             }));
+                        }
+                        ContentBlock::Image { .. } => {
+                            return Err(LegError::Usage(
+                                "image attachment was not resolved before provider serialization"
+                                    .to_string(),
+                            ));
                         }
                         ContentBlock::ToolResult {
                             tool_use_id,
@@ -708,7 +738,9 @@ mod tests {
     use crate::config::{Credential, DEFAULT_MAX_TOKENS, Provider};
     use crate::error::Result as HttpResult;
     use crate::transport::http::HttpResponse;
-    use std::cell::RefCell;
+    use crate::transport::{RetryPolicy, RetryingHttpClient};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
     use std::time::Duration;
 
     type CapturedRequest = (String, Vec<(String, String)>, String);
@@ -716,6 +748,28 @@ mod tests {
     struct FakeHttp {
         body: String,
         request: RefCell<Option<CapturedRequest>>,
+    }
+
+    struct StatusHttp {
+        status: u16,
+        body: String,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl HttpClient for StatusHttp {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &str,
+        ) -> HttpResult<HttpResponse> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(HttpResponse {
+                status: self.status,
+                body: self.body.clone(),
+                retry_after: None,
+            })
+        }
     }
 
     impl HttpClient for FakeHttp {
@@ -768,6 +822,72 @@ mod tests {
             .map(|chunk| format!("data: {chunk}\n\n"))
             .collect::<String>()
             + "data: [DONE]\n\n"
+    }
+
+    fn image_message() -> Message {
+        Message::new(
+            Role::User,
+            vec![
+                ContentBlock::text("describe"),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    },
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn known_text_only_model_rejects_image_before_http_call() {
+        let calls = Rc::new(Cell::new(0));
+        let mut config = config();
+        config.model = "o3-mini".to_string();
+        let client = OpenAiChatCompletionsClient::with_http(
+            config,
+            StatusHttp {
+                status: 200,
+                body: String::new(),
+                calls: Rc::clone(&calls),
+            },
+        );
+
+        let call = client.send_conversation_with_attempts(&[image_message()]);
+
+        assert_eq!(call.attempts, 0);
+        assert_eq!(calls.get(), 0);
+        assert!(matches!(
+            call.result,
+            Err(LegError::ImageInputUnsupported { provider, model })
+                if provider == "openai-chat-completions" && model == "o3-mini"
+        ));
+    }
+
+    #[test]
+    fn unknown_model_image_rejection_is_classified_without_retry() {
+        let calls = Rc::new(Cell::new(0));
+        let http = RetryingHttpClient::new(
+            StatusHttp {
+                status: 400,
+                body: r#"{"error":{"type":"invalid_request_error","message":"model does not support image input"}}"#.to_string(),
+                calls: Rc::clone(&calls),
+            },
+            RetryPolicy::new(2, Duration::ZERO),
+        );
+        let mut config = config();
+        config.model = "vendor-vision-model".to_string();
+        let client = OpenAiChatCompletionsClient::with_http(config, http);
+
+        let call = client.send_conversation_with_attempts(&[image_message()]);
+
+        assert_eq!(call.attempts, 1);
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            call.result,
+            Err(LegError::ImageInputUnsupported { provider, model })
+                if provider == "openai-chat-completions" && model == "vendor-vision-model"
+        ));
     }
 
     #[test]

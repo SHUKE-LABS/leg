@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::config::{Credential, LegConfig};
+use crate::config::{Credential, LegConfig, Provider};
 use crate::error::{LegError, Result};
 use crate::image_input::{MAX_IMAGE_REQUEST_BYTES, validate_message_image_limits};
 use crate::model::{
@@ -117,10 +117,28 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
             ("content-type", "application/json"),
         ];
 
+        let has_images = has_image_input(messages);
         let call = self.http.post_json_with_attempts(&url, &headers, &body);
         let attempts = call.attempts;
         let result = call.result.and_then(|response| {
-            parse_response(response.status, &response.body, self.config.max_tokens)
+            let status = response.status;
+            let body = response.body;
+            parse_response(status, &body, self.config.max_tokens).map_err(|error| {
+                error.classify_image_input_response(
+                    Provider::Anthropic.as_str(),
+                    &self.config.model,
+                    has_images,
+                    status,
+                    &body,
+                )
+            })
+        });
+        let result = result.map_err(|error| {
+            error.classify_image_input_rejection(
+                Provider::Anthropic.as_str(),
+                &self.config.model,
+                has_images,
+            )
         });
         TransportCall::new(result, attempts)
     }
@@ -185,8 +203,28 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
                 };
                 result.and_then(|()| assembler.finish())
             }
-            Ok(response) => parse_response(response.status, &response.body, self.config.max_tokens),
+            Ok(response) => {
+                let status = response.status;
+                let body = response.body;
+                parse_response(status, &body, self.config.max_tokens).map_err(|error| {
+                    error.classify_image_input_response(
+                        Provider::Anthropic.as_str(),
+                        &self.config.model,
+                        has_image_input(messages),
+                        status,
+                        &body,
+                    )
+                })
+            }
         };
+        let has_images = has_image_input(messages);
+        let result = result.map_err(|error| {
+            error.classify_image_input_rejection(
+                Provider::Anthropic.as_str(),
+                &self.config.model,
+                has_images,
+            )
+        });
         TransportCall::new(result, attempts)
     }
 
@@ -250,12 +288,30 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
             ("anthropic-version", ANTHROPIC_VERSION),
             ("content-type", "application/json"),
         ];
+        let has_images = has_image_input(messages);
         let call = self
             .http
             .post_json_with_attempts(&self.endpoint(), &headers, &body);
         let attempts = call.attempts;
         let result = call.result.and_then(|response| {
-            parse_response(response.status, &response.body, max_output_tokens)
+            let status = response.status;
+            let body = response.body;
+            parse_response(status, &body, max_output_tokens).map_err(|error| {
+                error.classify_image_input_response(
+                    Provider::Anthropic.as_str(),
+                    &self.config.model,
+                    has_images,
+                    status,
+                    &body,
+                )
+            })
+        });
+        let result = result.map_err(|error| {
+            error.classify_image_input_rejection(
+                Provider::Anthropic.as_str(),
+                &self.config.model,
+                has_images,
+            )
         });
         TransportCall::new(result, attempts)
     }
@@ -320,6 +376,7 @@ fn build_request_body_with_stream_and_thinking(
     thinking_config: Option<&ThinkingConfig>,
     stream: bool,
 ) -> Result<String> {
+    crate::thinking::ensure_message_image_input_supported(Provider::Anthropic, model, messages)?;
     validate_message_image_limits(messages)?;
     let has_images = messages.iter().any(|message| {
         message
@@ -372,6 +429,15 @@ fn build_request_body_with_stream_and_thinking(
         ));
     }
     Ok(body)
+}
+
+fn has_image_input(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    })
 }
 
 /// Maps an HTTP status and body onto an [`AssistantReply`] or [`LegError`].
@@ -2314,6 +2380,39 @@ mod tests {
         ));
         assert_eq!(call.attempts, 1);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unknown_model_image_rejection_is_classified_without_retry() {
+        const ERROR_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"model does not support image input"}}"#;
+        let calls = Rc::new(Cell::new(0));
+        let http = RetryingHttpClient::new(
+            ScriptedHttp::new(vec![(400, ERROR_BODY.to_string())], calls.clone()),
+            RetryPolicy::new(2, Duration::ZERO),
+        );
+        let client = ClaudeClient::with_http(
+            config_with("https://proxy.example", "vendor-vision-model"),
+            http,
+        );
+        let image = ContentBlock::Image {
+            source: crate::model::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+        };
+
+        let call = client.send_conversation_with_attempts(&[Message::new(
+            Role::User,
+            vec![ContentBlock::text("describe"), image],
+        )]);
+
+        assert_eq!(call.attempts, 1);
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            call.result,
+            Err(LegError::ImageInputUnsupported { provider, model })
+                if provider == "anthropic" && model == "vendor-vision-model"
+        ));
     }
 
     #[test]

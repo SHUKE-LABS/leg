@@ -10,9 +10,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::content::ContentBlock;
 use crate::protocol::{StreamDecoder, StreamEvent, StreamFailure};
 use crate::resolve::{ResolveError, resolve_leg};
 
@@ -44,6 +45,9 @@ pub struct TurnRequest {
     pub prompt: String,
     pub cwd: PathBuf,
     pub session: LegSession,
+    /// Optional ordered content. Image blocks contain attachment identities,
+    /// never paths or bytes.
+    pub content: Option<Vec<ContentBlock>>,
 }
 
 impl TurnRequest {
@@ -52,7 +56,27 @@ impl TurnRequest {
             prompt: prompt.into(),
             cwd: cwd.into(),
             session,
+            content: None,
         }
+    }
+
+    pub fn new_with_content(
+        prompt: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+        session: LegSession,
+        content: Vec<ContentBlock>,
+    ) -> Self {
+        Self {
+            prompt: prompt.into(),
+            cwd: cwd.into(),
+            session,
+            content: Some(content),
+        }
+    }
+
+    pub fn with_content(mut self, content: Vec<ContentBlock>) -> Self {
+        self.content = Some(content);
+        self
     }
 }
 
@@ -74,6 +98,8 @@ pub enum StartError {
     Busy,
     #[error("could not start the companion supervisor: {0}")]
     Supervisor(String),
+    #[error("turn content contains an inline image payload; use a managed attachment ref")]
+    InvalidContent,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -114,6 +140,8 @@ struct StartRequestWire<'a> {
     cwd: String,
     store_dir: String,
     prompt: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<&'a [ContentBlock]>,
     session: SessionWire<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt: Option<StartAttemptWire<'a>>,
@@ -165,6 +193,13 @@ impl Client {
         request: TurnRequest,
         attempt: Option<(&str, &str)>,
     ) -> Result<TurnHandle, StartError> {
+        if request
+            .content
+            .as_deref()
+            .is_some_and(|content| content.iter().any(|block| !block.is_wire_safe()))
+        {
+            return Err(StartError::InvalidContent);
+        }
         if attempt.is_some() && !matches!(&request.session, LegSession::NewWithId(_)) {
             return Err(StartError::InvalidSessionId);
         }
@@ -225,6 +260,7 @@ impl Client {
             cwd: cwd.to_string_lossy().into_owned(),
             store_dir: store_dir.to_string_lossy().into_owned(),
             prompt: &request.prompt,
+            content: request.content.as_deref(),
             session,
             attempt: attempt.map(|(draft_id, token)| StartAttemptWire { draft_id, token }),
         };
@@ -920,10 +956,54 @@ fn redact_stream_event(event: &mut StreamEvent) {
 }
 
 pub(crate) fn redact_value(value: &mut Value) {
+    redact_value_inner(value, true);
+}
+
+/// Redacts provider image bytes from private trail records while retaining
+/// attachment refs long enough for the catalog to derive its retry copy.
+pub(crate) fn redact_trail_value(value: &mut Value) {
+    redact_value_inner(value, false);
+}
+
+fn redact_value_inner(value: &mut Value, strip_attachment_identity: bool) {
     match value {
         Value::String(text) => *text = redact_credentials(std::mem::take(text)),
-        Value::Array(items) => items.iter_mut().for_each(redact_value),
-        Value::Object(object) => object.values_mut().for_each(redact_value),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_value_inner(item, strip_attachment_identity)),
+        Value::Object(object) => {
+            let is_image = object.get("type").and_then(Value::as_str) == Some("image");
+            let source_type = object
+                .get("source")
+                .and_then(Value::as_object)
+                .and_then(|source| source.get("type"))
+                .and_then(Value::as_str);
+            if is_image && source_type == Some("base64") {
+                if let Some(data) = object
+                    .get_mut("source")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|source| source.get_mut("data"))
+                {
+                    *data = Value::String("[REDACTED_IMAGE]".to_string());
+                }
+            } else if is_image && strip_attachment_identity && source_type == Some("attachment") {
+                let source = object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .expect("image attachment source is an object");
+                let mut safe_source = Map::new();
+                safe_source.insert("type".to_string(), Value::String("attachment".into()));
+                for field in ["media_type", "byte_len"] {
+                    if let Some(value) = source.get(field) {
+                        safe_source.insert(field.to_string(), value.clone());
+                    }
+                }
+                object.insert("source".to_string(), Value::Object(safe_source));
+            }
+            object
+                .values_mut()
+                .for_each(|item| redact_value_inner(item, strip_attachment_identity));
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
@@ -932,6 +1012,33 @@ pub(crate) fn redact_value(value: &mut Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn redaction_removes_attachment_identity_from_client_values() {
+        let mut value = json!({
+            "request": {
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "attachment",
+                        "id": "upload-secret",
+                        "media_type": "image/png",
+                        "byte_len": 13,
+                        "sha256": "deadbeef"
+                    }
+                }]
+            }
+        });
+
+        redact_value(&mut value);
+
+        let source = &value["request"]["content"][0]["source"];
+        assert_eq!(source["type"], "attachment");
+        assert_eq!(source["media_type"], "image/png");
+        assert_eq!(source["byte_len"], 13);
+        assert!(source.get("id").is_none());
+        assert!(source.get("sha256").is_none());
+    }
 
     fn response(kind: &str) -> Value {
         json!({

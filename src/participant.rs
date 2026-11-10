@@ -24,6 +24,19 @@ use crate::transport::Transport;
 pub trait Participant {
     /// Consumes a `request` envelope and returns the correlated response.
     fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope;
+
+    /// Answers a request with provider-ready content while retaining the
+    /// original envelope for the nested exchange record and response
+    /// correlation. Implementations that do not have a separate resolver keep
+    /// the legacy behavior.
+    fn respond_with_content(
+        &self,
+        request: &MessageEnvelope,
+        content: &[ContentBlock],
+    ) -> MessageEnvelope {
+        let _ = content;
+        self.respond(request)
+    }
 }
 
 /// An in-process, LLM-backed participant: a [`Transport`] plus exchange
@@ -46,7 +59,7 @@ impl<T: Transport> LocalParticipant<T> {
         Self { transport, meta }
     }
 
-    pub(crate) fn respond_with_content(
+    fn respond_with_resolved_content(
         &self,
         request: &MessageEnvelope,
         content: &[ContentBlock],
@@ -65,7 +78,7 @@ impl<T: Transport> LocalParticipant<T> {
             model: self.meta.model.clone(),
             base_url: self.meta.base_url.clone(),
             prompt: request.body.clone(),
-            content: trail_content(content),
+            content: trail_content(&request.content_blocks()),
             session_id: None,
             turn_index: None,
         };
@@ -107,8 +120,16 @@ impl<T: Transport> LocalParticipant<T> {
 
 impl<T: Transport> Participant for LocalParticipant<T> {
     fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
-        let content = [ContentBlock::text(request.body.clone())];
-        self.respond_with_content(request, &content)
+        let content = request.content_blocks();
+        self.respond_with_resolved_content(request, &content)
+    }
+
+    fn respond_with_content(
+        &self,
+        request: &MessageEnvelope,
+        content: &[ContentBlock],
+    ) -> MessageEnvelope {
+        self.respond_with_resolved_content(request, content)
     }
 }
 

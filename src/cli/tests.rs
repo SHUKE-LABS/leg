@@ -2747,14 +2747,74 @@ fn parse_exchange_request_valid_envelope_passes_through_unchanged() {
         1_700_000_000_000,
     );
     let raw = serde_json::to_string(&envelope).unwrap();
-    let (request, mode) = parse_exchange_request(&raw);
+    let (request, mode) = parse_exchange_request(&raw).unwrap();
     assert_eq!(mode, ExchangeMode::Envelope);
     assert_eq!(request, envelope);
 }
 
 #[test]
+fn invalid_inline_image_is_rejected_before_provider_invocation() {
+    let participant = LocalParticipant::new(PanicTransport, meta());
+    let mut envelope = MessageEnvelope::new(
+        "m-image-invalid",
+        "c-image-invalid",
+        "user",
+        "assistant",
+        MessageKind::Request,
+        "describe",
+        1_700_000_000_000,
+    );
+    envelope.content = Some(vec![ContentBlock::Image {
+        source: crate::model::ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        },
+    }]);
+    let raw = serde_json::to_string(&envelope).unwrap();
+    let mut output = Vec::new();
+
+    let error = execute_exchange_core(&participant, &meta(), &raw, &mut output, &mut NoopSink)
+        .expect_err("invalid inline image must fail at the envelope boundary");
+
+    assert!(
+        error
+            .to_string()
+            .contains("supported JPEG, PNG, GIF, or WebP")
+    );
+    assert!(output.is_empty());
+}
+
+#[test]
+fn supported_mime_mismatch_is_rejected_before_provider_invocation() {
+    let participant = LocalParticipant::new(PanicTransport, meta());
+    let mut envelope = MessageEnvelope::new(
+        "m-image-mismatch",
+        "c-image-mismatch",
+        "user",
+        "assistant",
+        MessageKind::Request,
+        "describe",
+        1_700_000_000_000,
+    );
+    envelope.content = Some(vec![ContentBlock::Image {
+        source: crate::model::ImageSource::Base64 {
+            media_type: "image/jpeg".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        },
+    }]);
+    let raw = serde_json::to_string(&envelope).unwrap();
+    let mut output = Vec::new();
+
+    let error = execute_exchange_core(&participant, &meta(), &raw, &mut output, &mut NoopSink)
+        .expect_err("declared MIME mismatch must fail at the envelope boundary");
+
+    assert!(error.to_string().contains("MIME type does not match"));
+    assert!(output.is_empty());
+}
+
+#[test]
 fn parse_exchange_request_plain_text_synthesizes_a_request() {
-    let (request, mode) = parse_exchange_request("hello there\n");
+    let (request, mode) = parse_exchange_request("hello there\n").unwrap();
     assert_eq!(mode, ExchangeMode::PlainText);
     assert_eq!(request.body, "hello there");
     assert_eq!(request.kind, MessageKind::Request);
@@ -2762,7 +2822,7 @@ fn parse_exchange_request_plain_text_synthesizes_a_request() {
 
 #[test]
 fn parse_exchange_request_trims_trailing_newline_only_preserves_trailing_spaces() {
-    let (request, _) = parse_exchange_request("hello   \r\n");
+    let (request, _) = parse_exchange_request("hello   \r\n").unwrap();
     assert_eq!(request.body, "hello   ");
 }
 

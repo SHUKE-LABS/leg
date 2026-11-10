@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use super::*;
 use crate::config::Provider;
 use crate::events::{RequestRecord, trail_content};
+use crate::image_input::{cleanup_staged_content, resolve_content, resolve_messages};
 use crate::tools::{ContextTurn, OwnedToolEvent};
 use crate::transport::Transport;
 
@@ -33,7 +34,7 @@ fn execute_cold_exchange(in_path: Option<&str>) -> Result<()> {
     let provider = config.provider;
     let meta = exchange_meta(&config);
     let raw = read_exchange_input(in_path)?;
-    let (request, _) = parse_exchange_request(&raw);
+    let (request, _) = parse_exchange_request(&raw)?;
     let transport = build_transport(config);
     let mut sink = open_event_sink();
     let stdout = std::io::stdout();
@@ -106,7 +107,7 @@ fn execute_session_exchange(
     let provider = config.provider;
     let meta = exchange_meta(&config);
     let raw = read_exchange_input(in_path)?;
-    let (request, _) = parse_exchange_request(&raw);
+    let (request, _) = parse_exchange_request(&raw)?;
 
     if create_new {
         std::fs::create_dir_all(&store_dir).map_err(|err| {
@@ -164,18 +165,21 @@ fn execute_cold_exchange_core<T: Transport, W: Write>(
     let request_ts_ms = now_ms();
     emit(
         sink,
-        &ExchangeEvent::request(request_ts_ms, meta, &request.body),
+        &ExchangeEvent::request(request_ts_ms, meta, &request.body)
+            .with_content(&request.content_blocks()),
     );
 
-    let content = [ContentBlock::text(request.body.clone())];
     let start = Instant::now();
-    let call = run_streaming_turn(
-        transport,
-        &[Message::new(Role::User, content.to_vec())],
-        sink,
-        None,
-        writer,
-    );
+    let call = match resolve_content(&request.content_blocks(), None) {
+        Ok(content) => run_streaming_turn(
+            transport,
+            &[Message::new(Role::User, content)],
+            sink,
+            None,
+            writer,
+        ),
+        Err(error) => TransportCall::completed(Err(error), 0),
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
     let result = match interrupt::error() {
         Some(error) => Err(error),
@@ -235,7 +239,7 @@ fn execute_cold_exchange_core<T: Transport, W: Write>(
         model: meta.model.clone(),
         base_url: meta.base_url.clone(),
         prompt: request.body.clone(),
-        content: None,
+        content: trail_content(&request.content_blocks()),
         session_id: None,
         turn_index: None,
     };
@@ -276,6 +280,17 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
     let session_id = resumed.session_id.clone();
     let turn_index = resumed.next_turn_index;
     let system_prompt = system_prompt_for_turn(base_system_prompt)?;
+    let request_content = request.content_blocks();
+    let resolved_content = resolve_content(&request_content, Some(&session_id));
+    let provider_request_content = match &resolved_content {
+        Ok(content) => content.clone(),
+        Err(_) => request_content.clone(),
+    };
+    let trail_request_content = match &resolved_content {
+        Ok(content) => content.as_slice(),
+        Err(_) => request_content.as_slice(),
+    };
+    let user_message = Message::new(Role::User, provider_request_content.clone());
     write_turn_start(
         writer,
         request,
@@ -285,7 +300,7 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
     )?;
 
     let request_ts_ms = now_ms();
-    resumed.conversation.push_user(request.body.as_str());
+    resumed.conversation.push(user_message);
     let start = Instant::now();
     let stderr = std::io::stderr();
     let mut warning = stderr.lock();
@@ -295,6 +310,7 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
         TimedSessionExchangeContext {
             meta,
             prompt: &request.body,
+            trail_content: trail_request_content,
             session_id: &session_id,
             turn_index,
             max_tool_rounds: transport.max_tool_rounds(),
@@ -332,14 +348,23 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
             let counters_for_text = &counters;
             let mut observe_stream =
                 |event| write_stream_event(&writer_for_text, counters_for_text, event);
-            transport.run_streaming_observed_fallible_with_system_prompt_and_context_with_attempts(
-                resumed.conversation.messages(),
-                system_prompt.as_deref(),
-                ContextTurn::new(&session_id, turn_index),
-                &mut observe_tool,
-                &mut observe_compaction,
-                &mut observe_stream,
-            )
+            match resolve_messages(resumed.conversation.messages(), Some(&session_id)) {
+                Ok(provider_messages) => {
+                    resumed
+                        .conversation
+                        .replace_messages(provider_messages.clone());
+                    transport
+                        .run_streaming_observed_fallible_with_system_prompt_and_context_with_attempts(
+                        &provider_messages,
+                        system_prompt.as_deref(),
+                        ContextTurn::new(&session_id, turn_index),
+                        &mut observe_tool,
+                        &mut observe_compaction,
+                        &mut observe_stream,
+                    )
+                }
+                Err(error) => TransportCall::completed(Err(error), 0),
+            }
         },
     );
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -413,7 +438,9 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
         model: meta.model.clone(),
         base_url: meta.base_url.clone(),
         prompt: request.body.clone(),
-        content: None,
+        // The private session trail carries resolved provider content; the
+        // client-facing terminal envelope stays on the opaque-ref boundary.
+        content: trail_content(&request_content),
         session_id: Some(session_id.clone()),
         turn_index: Some(turn_index),
     };
@@ -432,6 +459,8 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
         Some((&session_id, turn_index)),
         is_interrupted,
     );
+
+    cleanup_staged_content(&request_content, &session_id);
 
     if is_interrupted {
         let _ = terminal;
@@ -948,7 +977,7 @@ mod tests {
     use super::*;
     use std::io;
 
-    use crate::model::AssistantReply;
+    use crate::model::{AssistantReply, ImageSource};
     use crate::transport::Transport;
 
     struct BufferedTransport {
@@ -1191,7 +1220,7 @@ mod tests {
         let mut bytes = Vec::new();
         let writer = Rc::new(RefCell::new(StreamJsonWriter::new(&mut bytes)));
         let mut sink = NoopSink;
-        let (request, _) = parse_exchange_request("line one\nline two\n");
+        let (request, _) = parse_exchange_request("line one\nline two\n").unwrap();
         execute_cold_exchange_core(
             &transport,
             &ExchangeMeta {
@@ -1270,6 +1299,58 @@ mod tests {
             "response_error"
         );
         assert_eq!(error.kind(), "turn_failure");
+    }
+
+    #[test]
+    fn attachment_resolution_failure_emits_terminal_error_without_provider_call() {
+        let calls = Rc::new(Cell::new(0));
+        let transport = ToolLoop::new(
+            BufferedTransport {
+                reply: Ok(AssistantReply::new("should not be used")),
+                calls: Rc::clone(&calls),
+                histories: Rc::new(RefCell::new(Vec::new())),
+            },
+            ToolRegistry::new(),
+            None,
+        );
+        let mut request = request("describe");
+        request.content = Some(vec![ContentBlock::Image {
+            source: ImageSource::Attachment {
+                id: "upload-1".to_string(),
+                media_type: "image/png".to_string(),
+                byte_len: 8,
+                sha256: "0".repeat(64),
+            },
+        }]);
+        let mut bytes = Vec::new();
+        let writer = Rc::new(RefCell::new(StreamJsonWriter::new(&mut bytes)));
+        let mut sink = NoopSink;
+        let error = execute_cold_exchange_core(
+            &transport,
+            &ExchangeMeta {
+                model: "test-model".to_string(),
+                base_url: "https://provider.test".to_string(),
+            },
+            Provider::Anthropic,
+            &request,
+            &mut sink,
+            &mut Vec::new(),
+            &writer,
+        )
+        .unwrap_err();
+        drop(writer);
+
+        let records = parse_records(&bytes);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "turn_start");
+        assert_eq!(records[1]["event"], "turn_end");
+        assert_eq!(records[1]["response"]["kind"], "error");
+        assert_eq!(
+            records[1]["response"]["exchange"]["exchange"]["outcome"]["kind"],
+            "usage"
+        );
+        assert!(error.to_string().contains("managed exchange session"));
     }
 
     #[test]

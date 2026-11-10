@@ -21,12 +21,12 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use fs2::FileExt;
 use leg_ui_client::{
-    CatalogError, CatalogRunState, CatalogSession, CatalogTurn, SessionCatalog,
+    CatalogError, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock, SessionCatalog,
     SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome, TurnStopHandle,
+    turn_fingerprint,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
@@ -402,6 +402,8 @@ struct NewSubmission {
     request_id: u64,
     turn_id: String,
     prompt: String,
+    content: Option<Vec<ContentBlock>>,
+    retry_turn_index: Option<u64>,
     stop: PendingStop,
 }
 
@@ -577,6 +579,10 @@ struct SelectSession {
 struct SubmitTurn {
     request_id: u64,
     prompt: String,
+    #[serde(default)]
+    content: Option<Vec<ContentBlock>>,
+    #[serde(default)]
+    retry_turn_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1379,13 +1385,39 @@ impl HostState {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
+        if body
+            .content
+            .as_deref()
+            .is_some_and(|content| content.iter().any(|block| !block.is_wire_safe()))
+        {
+            return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
+        }
+        if body.retry_turn_index.is_some() && body.content.is_some() {
+            return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
+        }
         let ledger_id = self.ledger_id(id);
-        let prompt_hash = hex(&Sha256::digest(body.prompt.as_bytes()));
+        let retry_intent = body.retry_turn_index.map(|turn_index| {
+            self.inner
+                .catalog
+                .retry_intent_for_turn(id, turn_index)
+                .map_err(map_catalog_error)
+        });
+        let retry_intent = retry_intent.transpose()?;
+        let prompt_hash = retry_intent.as_ref().map_or_else(
+            || turn_fingerprint(&body.prompt, body.content.as_deref()),
+            |intent| intent.fingerprint().to_string(),
+        );
         let decision = self.inner.durable.read(|data| {
             submission_decision(data.sessions.get(&ledger_id), body.request_id, &prompt_hash)
         });
         match decision {
             Ok(SubmissionDecision::Replay(previous)) => {
+                if retry_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.visible_prompt() != body.prompt)
+                {
+                    return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
+                }
                 return Ok(SubmissionAcceptance {
                     receipt: SubmissionReceipt {
                         request_id: previous.request_id,
@@ -1408,6 +1440,21 @@ impl HostState {
             }
             Err(SubmissionReject::Exhausted) => {
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_exhausted"));
+            }
+        }
+        if let (Some(turn_index), Some(submitted_intent)) =
+            (body.retry_turn_index, retry_intent.as_ref())
+        {
+            let current_intent = self
+                .inner
+                .catalog
+                .prepare_retry(id)
+                .map_err(map_catalog_error)?;
+            if current_intent.turn_index() != turn_index
+                || current_intent.visible_prompt() != body.prompt
+                || current_intent.fingerprint() != submitted_intent.fingerprint()
+            {
+                return Err(api_error(StatusCode::CONFLICT, "retry_unavailable"));
             }
         }
         if self.runtime_is_busy(&ledger_id) {
@@ -1538,6 +1585,8 @@ impl HostState {
             request_id: body.request_id,
             turn_id: turn_id.clone(),
             prompt: body.prompt,
+            content: body.content,
+            retry_turn_index: body.retry_turn_index,
             stop: pending_stop,
         };
         let owner_submission = submission.clone();
@@ -1597,6 +1646,8 @@ impl HostState {
         let mut turn = match self.start_turn(
             &submission.requested_id,
             &submission.prompt,
+            submission.content.as_deref(),
+            submission.retry_turn_index,
             submission.bound_session_id.as_deref(),
         ) {
             Ok(turn) => turn,
@@ -1741,30 +1792,47 @@ impl HostState {
         &self,
         id: &str,
         prompt: &str,
+        content: Option<&[ContentBlock]>,
+        retry_turn_index: Option<u64>,
         bound_session_id: Option<&str>,
     ) -> Result<CatalogTurn, CatalogError> {
+        if let Some(turn_index) = retry_turn_index {
+            let intent = self.inner.catalog.prepare_retry(id)?;
+            if intent.turn_index() != turn_index {
+                return Err(CatalogError::StaleRetry);
+            }
+            return self
+                .inner
+                .catalog
+                .confirm_retry(&intent, SessionInterface::Web);
+        }
         if id.starts_with("draft-") {
             let bound_session_id = bound_session_id.ok_or_else(|| {
                 CatalogError::Catalog("draft submission has no reserved native id".into())
             })?;
-            return self.inner.catalog.start_new_with_id(
+            return self.inner.catalog.start_new_with_id_content(
                 id,
                 bound_session_id.to_string(),
                 SessionInterface::Web,
                 prompt.to_string(),
+                content.map(ToOwned::to_owned),
             );
         }
         if let Ok(intent) = self.inner.catalog.prepare_retry(id)
             && intent.prompt() == prompt
+            && intent.fingerprint() == turn_fingerprint(prompt, content)
         {
             return self
                 .inner
                 .catalog
                 .confirm_retry(&intent, SessionInterface::Web);
         }
-        self.inner
-            .catalog
-            .start_existing(id, SessionInterface::Web, prompt.to_string())
+        self.inner.catalog.start_existing_with_content(
+            id,
+            SessionInterface::Web,
+            prompt.to_string(),
+            content.map(ToOwned::to_owned),
+        )
     }
 
     fn reap_finished_workers(&self) {
@@ -3597,6 +3665,370 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_submission_replays_durable_receipt_before_active_catalog_gate() {
+        let (host, temp) = test_host();
+        let draft = host
+            .state
+            .inner
+            .catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("retry identity".into()),
+                Some(temp.path()),
+            )
+            .unwrap();
+        let id = "sess-retry-288";
+        let catalog_path = temp.path().join("catalog.json");
+        let mut catalog: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        let sessions = catalog["sessions"].as_object_mut().unwrap();
+        let record = sessions.remove(&draft.id).unwrap();
+        sessions.insert(id.to_string(), record);
+        fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+
+        let content = vec![ContentBlock::Image {
+            source: leg_ui_client::ImageSource::Attachment {
+                id: "private-ref".into(),
+                media_type: "image/png".into(),
+                byte_len: 8,
+                sha256: "11".repeat(32),
+            },
+        }];
+        let trail = [
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "session_start",
+                "session_id": id,
+                "ts_ms": 1
+            }),
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "request",
+                "session_id": id,
+                "turn_index": 0,
+                "prompt": "retry me",
+                "content": serde_json::to_value(&content).unwrap()
+            }),
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "response_error",
+                "session_id": id,
+                "turn_index": 0,
+                "kind": "provider_error",
+                "message": "failed"
+            }),
+        ]
+        .into_iter()
+        .map(|event| serde_json::to_string(&event).unwrap() + "\n")
+        .collect::<String>();
+        fs::write(
+            host.state
+                .inner
+                .catalog
+                .sessions_dir()
+                .join(format!("{id}.jsonl")),
+            trail,
+        )
+        .unwrap();
+
+        let prompt_hash = turn_fingerprint("retry me", Some(&content));
+        host.state
+            .inner
+            .durable
+            .transact(|data| {
+                let ledger = data.sessions.entry(id.to_string()).or_default();
+                ledger.high_water = 1;
+                ledger.receipts.push_back(Receipt {
+                    request_id: 1,
+                    prompt_sha256: prompt_hash.clone(),
+                    turn_id: "turn-retry".into(),
+                    status: ReceiptStatus::Running,
+                    session_id: Some(id.into()),
+                    outcome: Some(json!({"status": "running"})),
+                    recovery_evidence: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let lock_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join(format!(".leg-ui-session-{id}.lock"));
+        let session_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        session_lock.lock_exclusive().unwrap();
+
+        let router = build_router(host.state.clone());
+        let retry_body = || {
+            json!({
+                "request_id": 1,
+                "prompt": "retry me",
+                "retry_turn_index": 0
+            })
+            .to_string()
+        };
+        let (status, active_duplicate) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{id}/submit"),
+                &retry_body(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{active_duplicate}");
+        assert_eq!(active_duplicate["duplicate"], true);
+        assert_eq!(active_duplicate["turn_id"], "turn-retry");
+        assert_eq!(active_duplicate["status"], "running");
+
+        drop(session_lock);
+        host.state
+            .finish_receipt(
+                id,
+                1,
+                ReceiptStatus::Succeeded,
+                Some(id.into()),
+                json!({"status": "succeeded"}),
+            )
+            .unwrap();
+        let (status, completed_duplicate) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{id}/submit"),
+                &retry_body(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{completed_duplicate}");
+        assert_eq!(completed_duplicate["duplicate"], true);
+        assert_eq!(completed_duplicate["turn_id"], "turn-retry");
+        assert_eq!(completed_duplicate["status"], "succeeded");
+
+        let conflict_body = json!({
+            "request_id": 1,
+            "prompt": "changed retry",
+            "retry_turn_index": 0
+        })
+        .to_string();
+        let (status, conflict) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{id}/submit"),
+                &conflict_body,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(conflict["error"], "submission_id_conflict");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_retry_uses_private_prompt_after_public_redaction() {
+        use std::process::Command;
+
+        const CHILD_MARKER: &str = "LEG_WEB_RETRY_FIXTURE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::fresh_retry_uses_private_prompt_after_public_redaction",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env("LEG_WEB_RETRY_SECRET", "web-retry-secret-288")
+                .status()
+                .expect("start isolated redaction fixture test");
+            assert!(
+                status.success(),
+                "isolated redaction fixture failed: {status}"
+            );
+            return;
+        }
+        let secret = std::env::var("LEG_WEB_RETRY_SECRET").expect("fixture secret is set");
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let fixture_dir = workspace.join("fixture");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        let log_path = fixture_dir.join("retry-input.json");
+        let leg = fixture_dir.join("fake-leg");
+        let source = fixture_dir.join("fake_leg.rs");
+        let log_literal = format!("{:?}", log_path.to_string_lossy().to_string());
+        let source_text = format!(
+            r#"
+use std::env;
+use std::fs;
+use std::io::Read;
+use std::path::PathBuf;
+
+fn main() {{
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {{
+        println!("leg 0.14.0");
+        return;
+    }}
+    if args == ["--help"] {{
+        println!("usage: leg exchange --stream-json --session --new-session-id");
+        return;
+    }}
+    if args.first().map(String::as_str) != Some("exchange") {{
+        std::process::exit(2);
+    }}
+    let session_id = args
+        .windows(2)
+        .find(|pair| pair[0] == "--new-session-id" || pair[0] == "--session")
+        .map(|pair| pair[1].clone())
+        .expect("session argument");
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap();
+    fs::write(PathBuf::from({log_literal}), &input).unwrap();
+    let start = format!(
+        "{{{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_start\",\"seq\":0,\"provider\":\"fixture\",\"model\":\"fixture\",\"session_id\":\"{{session_id}}\",\"turn_index\":1,\"request\":{{{{\"schema\":\"baton.message/v1\",\"message_id\":\"request-1\",\"conversation_id\":\"{{session_id}}\",\"kind\":\"request\",\"body\":\"[REDACTED]\"}}}}}}}}"
+    );
+    let end = format!(
+        "{{{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_end\",\"seq\":1,\"capped\":false,\"session_id\":\"{{session_id}}\",\"turn_index\":1,\"response\":{{{{\"schema\":\"baton.message/v1\",\"message_id\":\"response-1\",\"conversation_id\":\"{{session_id}}\",\"in_reply_to\":\"request-1\",\"kind\":\"response\",\"body\":\"ok\"}}}}}}}}"
+    );
+    println!("{{start}}");
+    println!("{{end}}");
+}}
+"#
+        );
+        fs::write(&source, source_text).unwrap();
+        let compiled = Command::new("rustc")
+            .args(["--edition=2021"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&leg)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "failed to compile retry fixture: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+
+        let supervisor = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("leg-ui-supervisor");
+        assert!(supervisor.is_file(), "missing supervisor at {supervisor:?}");
+        let host = test_host_with_driver(&temp, &leg, &supervisor);
+        let router = build_router(host.state.clone());
+        let draft = host
+            .state
+            .inner
+            .catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("redacted retry".into()),
+                Some(&workspace),
+            )
+            .unwrap();
+        let id = "sess-web-retry-secret";
+        let catalog_path = temp.path().join("catalog.json");
+        let mut catalog: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        let sessions = catalog["sessions"].as_object_mut().unwrap();
+        let record = sessions.remove(&draft.id).unwrap();
+        sessions.insert(id.to_string(), record);
+        fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+
+        let private_prompt = format!("retry with {secret}");
+        let raw_content = json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgo="
+            }
+        }]);
+        let trail = [
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "session_start",
+                "session_id": id,
+                "ts_ms": 1
+            }),
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "request",
+                "session_id": id,
+                "turn_index": 0,
+                "prompt": private_prompt,
+                "content": raw_content
+            }),
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "response_error",
+                "session_id": id,
+                "turn_index": 0,
+                "kind": "provider_error",
+                "message": "failed"
+            }),
+        ]
+        .into_iter()
+        .map(|event| serde_json::to_string(&event).unwrap() + "\n")
+        .collect::<String>();
+        fs::write(
+            host.state
+                .inner
+                .catalog
+                .sessions_dir()
+                .join(format!("{id}.jsonl")),
+            trail,
+        )
+        .unwrap();
+
+        let visible_prompt = "retry with [REDACTED]".to_string();
+        let (status, accepted) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{id}/submit"),
+                &json!({
+                    "request_id": 1,
+                    "prompt": visible_prompt,
+                    "retry_turn_index": 0
+                })
+                .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        assert_eq!(accepted["duplicate"], false);
+        let snapshot = wait_for_receipt(&host, &router, id, 1).await;
+        assert_eq!(snapshot["session"]["turns"][0]["prompt"], visible_prompt);
+        let serialized = snapshot.to_string();
+        assert!(!serialized.contains(&secret));
+
+        let input = fs::read_to_string(log_path).unwrap();
+        assert!(
+            input.contains(&private_prompt),
+            "private prompt was not sent"
+        );
+        assert!(input.contains("\"type\":\"attachment\""));
+        assert!(!input.contains("iVBORw0KGgo="));
+    }
+
+    #[tokio::test]
     async fn malformed_json_unknown_ids_and_traversal_have_no_effect() {
         let (host, _temp) = test_host();
         let router = build_router(host.state.clone());
@@ -4379,6 +4811,8 @@ fn main() {
             .start_turn(
                 pending_stop_draft,
                 "HOLD-PENDING-STOP",
+                None,
+                None,
                 Some(&pending_stop_session),
             )
             .unwrap();

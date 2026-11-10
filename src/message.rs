@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::events::Exchange;
+use crate::model::ContentBlock;
 
 /// Schema discriminator stamped on every envelope.
 ///
@@ -103,6 +104,10 @@ pub struct MessageEnvelope {
     pub kind: MessageKind,
     /// The message body.
     pub body: String,
+    /// Optional ordered content blocks. When absent, `body` is the one text
+    /// block, preserving the legacy envelope shape and behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentBlock>>,
     /// Wall-clock emission time, Unix epoch milliseconds.
     pub ts_ms: u64,
     /// The provider call this message wrapped, if any (zero-or-one).
@@ -131,9 +136,17 @@ impl MessageEnvelope {
             in_reply_to: None,
             kind,
             body: body.into(),
+            content: None,
             ts_ms,
             exchange: None,
         }
+    }
+
+    /// Returns the ordered provider input represented by this envelope.
+    pub fn content_blocks(&self) -> Vec<ContentBlock> {
+        self.content
+            .clone()
+            .unwrap_or_else(|| vec![ContentBlock::text(self.body.clone())])
     }
 }
 
