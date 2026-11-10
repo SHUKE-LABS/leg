@@ -1131,7 +1131,7 @@ test_third_party_notices_cover_release_graph() (
             cargo tree --locked --manifest-path "${ROOT}/${manifest}" -e normal,build \
                 --target "${target}" --prefix none --format '{p}'
         done
-    done < <(release_npm_platform_rows) | awk '$1 !~ /^(leg|leg-ui-client|leg-tui|leg-web)$/ { sub(/^v/, "", $2); print $1, $2 }' | \
+    done < <(release_npm_platform_rows) | awk '$1 !~ /^(leg|leg-image-contract|leg-ui-client|leg-tui|leg-web)$/ { sub(/^v/, "", $2); print $1, $2 }' | \
         sort -u >"${dir}/expected"
     grep '^Crate: ' "${ROOT}/THIRD_PARTY_NOTICES.txt" | sed 's/^Crate: //' | sort -u >"${dir}/actual"
     [[ -s "${dir}/expected" ]] || fail "cargo tree reported release dependencies"
@@ -1212,7 +1212,7 @@ test_web_trial_notices_cover_companion_graph() (
     for manifest in Cargo.toml companions/leg-ui-client/Cargo.toml companions/leg-web/Cargo.toml; do
         cargo tree --locked --manifest-path "${ROOT}/${manifest}" -e normal,build \
             --target "${target}" --prefix none --format '{p}'
-    done | awk '$1 !~ /^(leg|leg-web|leg-ui-client)$/ { sub(/^v/, "", $2); print $1, $2 }' \
+    done | awk '$1 !~ /^(leg|leg-image-contract|leg-web|leg-ui-client)$/ { sub(/^v/, "", $2); print $1, $2 }' \
         | sort -u >"${dir}/expected"
     grep '^Crate: ' "${dir}/first.txt" | sed 's/^Crate: //' | sort -u >"${dir}/actual"
     assert_eq "" "$(comm -23 "${dir}/expected" "${dir}/actual")" \
