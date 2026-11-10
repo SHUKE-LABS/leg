@@ -23,8 +23,7 @@ pub const MAX_UPLOAD_BODY_BYTES: usize = MAX_RAW_IMAGE_BYTES + 64 * 1024;
 pub const ATTACHMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 const ATTACHMENTS_DIR: &str = "attachments";
-const SUPPORTED_MEDIA_TYPES: &[&str] =
-    &["image/jpeg", "image/png", "image/gif", "image/webp"];
+const SUPPORTED_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 #[derive(Clone)]
 pub struct AttachmentStore {
@@ -115,12 +114,7 @@ impl AttachmentStore {
             match result {
                 Ok(()) => {
                     sync_directory(&directory);
-                    return Ok(AttachmentRef::new(
-                        id,
-                        detected,
-                        bytes.len() as u64,
-                        sha256,
-                    ));
+                    return Ok(AttachmentRef::new(id, detected, bytes.len() as u64, sha256));
                 }
                 Err(AttachmentError::Missing) => continue,
                 Err(error) => return Err(error),
@@ -224,7 +218,9 @@ impl AttachmentStore {
         to_namespace: &str,
         content: Option<&[ContentBlock]>,
     ) -> Result<(), AttachmentError> {
-        let Some(content) = content else { return Ok(()) };
+        let Some(content) = content else {
+            return Ok(());
+        };
         validate_component(from_namespace)?;
         validate_component(to_namespace)?;
         if from_namespace == to_namespace {
@@ -269,16 +265,26 @@ impl AttachmentStore {
     }
 
     pub fn cleanup_expired(&self) {
-        let Ok(namespaces) = fs::read_dir(&self.root) else { return };
+        let Ok(namespaces) = fs::read_dir(&self.root) else {
+            return;
+        };
         let now = SystemTime::now();
         for namespace in namespaces.flatten() {
             let path = namespace.path();
-            if !namespace.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            if !namespace
+                .file_type()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let Ok(files) = fs::read_dir(&path) else { continue };
+            let Ok(files) = fs::read_dir(&path) else {
+                continue;
+            };
             for file in files.flatten() {
-                let Ok(metadata) = file.metadata() else { continue };
+                let Ok(metadata) = file.metadata() else {
+                    continue;
+                };
                 let expired = metadata
                     .modified()
                     .ok()
@@ -293,10 +299,15 @@ impl AttachmentStore {
     }
 
     pub fn cleanup_orphans(&self, live_namespaces: &std::collections::HashSet<String>) {
-        let Ok(namespaces) = fs::read_dir(&self.root) else { return };
+        let Ok(namespaces) = fs::read_dir(&self.root) else {
+            return;
+        };
         for namespace in namespaces.flatten() {
             let name = namespace.file_name().to_string_lossy().into_owned();
-            if namespace.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+            if namespace
+                .file_type()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
                 && !live_namespaces.contains(&name)
             {
                 let _ = fs::remove_dir_all(namespace.path());
@@ -509,10 +520,21 @@ mod tests {
             .unwrap();
         let content = [ContentBlock::image(reference.clone())];
         store.rehome("draft-1", "sess-1", Some(&content)).unwrap();
-        assert_eq!(reference, match &content[0] {
-            ContentBlock::Image { source: ImageSource::Attachment { id, media_type, byte_len, sha256 } } => AttachmentRef::new(id.clone(), media_type.clone(), *byte_len, sha256.clone()),
-            _ => unreachable!(),
-        });
+        assert_eq!(
+            reference,
+            match &content[0] {
+                ContentBlock::Image {
+                    source:
+                        ImageSource::Attachment {
+                            id,
+                            media_type,
+                            byte_len,
+                            sha256,
+                        },
+                } => AttachmentRef::new(id.clone(), media_type.clone(), *byte_len, sha256.clone()),
+                _ => unreachable!(),
+            }
+        );
         store.validate_content("sess-1", &content).unwrap();
         assert!(store.validate_content("draft-1", &content).is_err());
     }

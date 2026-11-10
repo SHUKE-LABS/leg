@@ -763,10 +763,7 @@ fn directory_entries(
 
 fn build_router(state: HostState) -> Router {
     let attachment_routes = Router::new()
-        .route(
-            "/api/sessions/{id}/attachments",
-            post(upload_attachment),
-        )
+        .route("/api/sessions/{id}/attachments", post(upload_attachment))
         .route(
             "/api/sessions/{id}/attachments/{attachment_id}",
             delete(delete_attachment),
@@ -1524,15 +1521,11 @@ impl HostState {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
         let source_attachment_namespace = self.attachment_namespace(id)?;
-        if body
-            .content
-            .as_deref()
-            .is_some_and(|content| {
-                content
-                    .iter()
-                    .any(|block| !block.is_managed_attachment() || !block.is_wire_safe())
-            })
-        {
+        if body.content.as_deref().is_some_and(|content| {
+            content
+                .iter()
+                .any(|block| !block.is_managed_attachment() || !block.is_wire_safe())
+        }) {
             self.inner
                 .attachments
                 .remove_content(&source_attachment_namespace, body.content.as_deref());
@@ -1585,10 +1578,9 @@ impl HostState {
                     .as_ref()
                     .is_some_and(|intent| intent.visible_prompt() != body.prompt)
                 {
-                    self.inner.attachments.remove_content(
-                        &source_attachment_namespace,
-                        body.content.as_deref(),
-                    );
+                    self.inner
+                        .attachments
+                        .remove_content(&source_attachment_namespace, body.content.as_deref());
                     return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
                 }
                 return Ok(SubmissionAcceptance {
@@ -1603,31 +1595,27 @@ impl HostState {
             }
             Ok(SubmissionDecision::New) => {}
             Err(SubmissionReject::Stale) => {
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_stale"));
             }
             Err(SubmissionReject::Conflict) => {
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
             }
             Err(SubmissionReject::Unexpected) => {
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_unexpected"));
             }
             Err(SubmissionReject::Exhausted) => {
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_exhausted"));
             }
         }
@@ -1643,35 +1631,31 @@ impl HostState {
                 || current_intent.visible_prompt() != body.prompt
                 || current_intent.fingerprint() != submitted_intent.fingerprint()
             {
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 return Err(api_error(StatusCode::CONFLICT, "retry_unavailable"));
             }
         }
         if self.runtime_is_busy(&ledger_id) {
-            self.inner.attachments.remove_content(
-                &source_attachment_namespace,
-                body.content.as_deref(),
-            );
+            self.inner
+                .attachments
+                .remove_content(&source_attachment_namespace, body.content.as_deref());
             return Err(api_error(StatusCode::CONFLICT, "session_busy"));
         }
         let current = match self.catalog_session(id) {
             Ok(current) => current,
             Err(error) => {
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 return Err(error);
             }
         };
         if current.run_state != CatalogRunState::Idle {
-            self.inner.attachments.remove_content(
-                &source_attachment_namespace,
-                body.content.as_deref(),
-            );
+            self.inner
+                .attachments
+                .remove_content(&source_attachment_namespace, body.content.as_deref());
             return Err(api_error(StatusCode::CONFLICT, "session_busy"));
         }
         let bound_session_id = if id.starts_with("draft-") {
@@ -1680,10 +1664,9 @@ impl HostState {
                 let candidate = match self.inner.catalog.allocate_new_session_id() {
                     Ok(candidate) => candidate,
                     Err(error) => {
-                        self.inner.attachments.remove_content(
-                            &source_attachment_namespace,
-                            body.content.as_deref(),
-                        );
+                        self.inner
+                            .attachments
+                            .remove_content(&source_attachment_namespace, body.content.as_deref());
                         return Err(map_catalog_error(error));
                     }
                 };
@@ -1696,10 +1679,9 @@ impl HostState {
                 }
             }
             let Some(candidate) = available else {
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 return Err(api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "session_id_unavailable",
@@ -1728,10 +1710,9 @@ impl HostState {
                 body.content.as_deref(),
             ) {
                 self.release_attachment_namespace(bound_id);
-                self.inner.attachments.remove_content(
-                    &source_attachment_namespace,
-                    body.content.as_deref(),
-                );
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
                 self.inner
                     .attachments
                     .remove_content(bound_id, body.content.as_deref());
@@ -1739,16 +1720,15 @@ impl HostState {
             }
             attachment_namespace = bound_id.clone();
         }
-        let turn_id = random_hex(16)
-            .map_err(|_| {
-                if let Some(namespace) = reserved_attachment_namespace.as_deref() {
-                    self.release_attachment_namespace(namespace);
-                }
-                self.inner
-                    .attachments
-                    .remove_content(&attachment_namespace, body.content.as_deref());
-                api_error(StatusCode::INTERNAL_SERVER_ERROR, "random_unavailable")
-            })?;
+        let turn_id = random_hex(16).map_err(|_| {
+            if let Some(namespace) = reserved_attachment_namespace.as_deref() {
+                self.release_attachment_namespace(namespace);
+            }
+            self.inner
+                .attachments
+                .remove_content(&attachment_namespace, body.content.as_deref());
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "random_unavailable")
+        })?;
         let accepted = Receipt {
             request_id: body.request_id,
             prompt_sha256: prompt_hash.clone(),
@@ -1798,7 +1778,10 @@ impl HostState {
             self.inner
                 .attachments
                 .remove_content(&attachment_namespace, body.content.as_deref());
-            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"));
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "state_unavailable",
+            ));
         }
         #[cfg(test)]
         self.pause_after_durable_receipt();
@@ -2866,10 +2849,9 @@ fn map_attachment_error(error: attachments::AttachmentError) -> ApiError {
         AttachmentError::DigestMismatch | AttachmentError::Invalid => {
             api_error(StatusCode::BAD_REQUEST, "attachment_invalid")
         }
-        AttachmentError::Io => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "attachment_unavailable",
-        ),
+        AttachmentError::Io => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "attachment_unavailable")
+        }
     }
 }
 
@@ -4493,18 +4475,15 @@ fn main() {{
         assert!(value["id"].as_str().unwrap().starts_with("upload-"));
 
         let mut delete_request = api_request(
-                &host,
-                &format!(
-                    "/api/sessions/{}/attachments/{}",
-                    session.id,
-                    value["id"].as_str().unwrap()
-                ),
-            );
+            &host,
+            &format!(
+                "/api/sessions/{}/attachments/{}",
+                session.id,
+                value["id"].as_str().unwrap()
+            ),
+        );
         *delete_request.method_mut() = Method::DELETE;
-        let delete = router
-            .oneshot(delete_request)
-            .await
-            .unwrap();
+        let delete = router.oneshot(delete_request).await.unwrap();
         assert_eq!(delete.status(), StatusCode::NO_CONTENT);
         host.state.shutdown();
     }
