@@ -124,9 +124,11 @@ or resent as text.
 
 Submit JSON carries only prompt text, request ID, and ordered opaque
 attachment IDs. The host resolves the staged bytes; its content fingerprint
-includes ordered image MIME, byte length, and SHA-256 digest, while replay
-identity also binds the ordered IDs. Thus a reused request ID with changed
-text or image conflicts. Lost-response
+includes ordered image MIME, byte length, and SHA-256 digest while ignoring
+ephemeral attachment IDs. A reused request ID with the same text and image
+content replays even when the image was re-staged under a fresh ID; changed
+text or image content conflicts. When staged bytes have already been cleaned,
+an exact-ID terminal replay still returns the recorded receipt. Lost-response
 reconciliation and **Retry same send** preserve the exact request ID and image
 identity. Recorded **Retry turn** uses the catalog's private authoritative
 trail to re-stage the same image bytes after ordinary staged files have been

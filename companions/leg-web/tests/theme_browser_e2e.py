@@ -855,6 +855,15 @@ async def run(
                 await page.locator("#workspace-warning").wait_for(state="hidden")
 
                 # The host accepts this request, then the browser loses its receipt.
+                # Keep an image in the accepted request so reload/replay also proves
+                # that the active run's staged bytes remain leased.
+                accepted_image_prompt = "TRIAL-WORKING: live image turn across reload"
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "working.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await page.locator("#attachment-list .attachment-item").wait_for(state="visible")
+                await page.locator("#prompt").fill(accepted_image_prompt)
+
                 # Hold snapshots so both theme directions preserve an unresolved send.
                 accepted_response_dropped = False
                 snapshot_gate = asyncio.Event()
@@ -877,7 +886,6 @@ async def run(
                     await route.abort()
 
                 await page.route("**/submit", drop_accepted_response)
-                await page.locator("#prompt").fill("TRIAL-WORKING: live turn across theme reload")
                 await common.send_with_keyboard(page)
                 working_bubble = page.locator("#messages .message-assistant .message-content").last
                 await working_bubble.get_by_text("Working…", exact=True).wait_for()
@@ -896,6 +904,14 @@ async def run(
                 )
                 await snapshot_intercepted.wait()
                 assert accepted_response_dropped
+                accepted_image_request = next(
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == accepted_image_prompt
+                )
+                assert accepted_image_request["request_id"] == 2
+                assert len(accepted_image_request["attachments"]) == 1
                 draft = "Draft kept during run\nsecond line Ω"
                 await page.locator("#prompt").fill(draft)
                 assert await page.locator("#send").count() == 0
@@ -925,7 +941,45 @@ async def run(
                 assert await page.evaluate("sessionStorage.getItem('leg-web-current-session')") == session_fixture
                 assert len([item for item in requests if item[1].endswith("/submit")]) == before_active_actions["submit"]
                 assert len([item for item in requests if item[1].endswith("/stop")]) == before_active_actions["stop"]
+
+                # The accepted response was lost. Reload while reconciliation is
+                # held, then explicitly replay the exact request body. The host
+                # must return the existing running receipt without starting a
+                # second provider/native turn.
+                await page.reload(wait_until="domcontentloaded")
                 snapshot_gate.set()
+                await page.unroute("**/snapshot", hold_snapshot)
+                await page.unroute("**/submit", drop_accepted_response)
+                await wait_theme(page, "default")
+                await common.wait_status(page, "Running")
+                duplicate = await page.evaluate(
+                    """async ({sessionId, body}) => {
+                      const response = await fetch(
+                        `/api/sessions/${encodeURIComponent(sessionId)}/submit`,
+                        {
+                          method: 'POST',
+                          headers: {
+                            'Authorization': `Bearer ${sessionStorage.getItem('leg-web-launch-token')}`,
+                            'Content-Type': 'application/json',
+                          },
+                          body: JSON.stringify(body),
+                        },
+                      );
+                      return {status: response.status, body: await response.json()};
+                    }""",
+                    {"sessionId": session_fixture, "body": accepted_image_request},
+                )
+                assert duplicate["status"] == 200, duplicate
+                assert duplicate["body"]["duplicate"] is True, duplicate
+                assert duplicate["body"]["request_id"] == accepted_image_request["request_id"]
+                replayed_requests = [
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == accepted_image_prompt
+                ]
+                assert [body["request_id"] for body in replayed_requests] == [2, 2], replayed_requests
+                assert replayed_requests[0]["attachments"] == replayed_requests[1]["attachments"]
                 assert await asyncio.to_thread(
                     common.api_status,
                     provider_authority,
@@ -933,10 +987,10 @@ async def run(
                     f"/__trial/release?request={working_request}",
                     {},
                 ) == 200
-                await page.unroute("**/snapshot", hold_snapshot)
-                await page.unroute("**/submit", drop_accepted_response)
                 await page.get_by_text("The first live text is visible", exact=False).wait_for()
                 await common.wait_status(page, "Running")
+                working_status = common.fixture_status(provider_authority)
+                assert working_status["scenario_requests"].get("TRIAL-WORKING") == 1, working_status
                 assert await page.locator("#stop-turn").is_visible()
                 assert await page.locator("#send").count() == 0
                 assert await page.get_by_text("The first live text is visible", exact=False).count() == 1

@@ -1600,15 +1600,15 @@ impl HostState {
                     .cloned()
             })
         });
+        // Attachment IDs are ephemeral. Resolve fresh IDs and compare their
+        // content fingerprint below; only the prompt-only identity can reject
+        // before resolution. The exact ID hash remains part of the terminal
+        // replay fast path for receipts whose staged bytes were cleaned up.
         if prior_receipt.as_ref().is_some_and(|receipt| {
             receipt
                 .prompt_only_sha256
                 .as_deref()
                 .is_some_and(|expected| expected != prompt_only_hash)
-                || receipt
-                    .attachment_ids_sha256
-                    .as_deref()
-                    .is_some_and(|expected| expected != attachment_ids_hash)
         }) {
             self.cleanup_request_attachments(id, &attachment_ids);
             return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
@@ -5028,6 +5028,81 @@ fn main() {{
         assert_eq!(replay["duplicate"], true);
         assert_eq!(replay["turn_id"], "turn-replay-image");
         assert_eq!(replay["status"], "succeeded");
+
+        let fresh_reference = host
+            .state
+            .inner
+            .attachments
+            .stage(&session.id, "image/png", bytes)
+            .unwrap();
+        let fresh_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(&session.id)
+            .join(&fresh_reference.id);
+        let (status, fresh_replay) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", session.id),
+                &json!({
+                    "request_id": 1,
+                    "prompt": prompt,
+                    "attachments": [fresh_reference.id]
+                })
+                .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{fresh_replay}");
+        assert_eq!(fresh_replay["duplicate"], true);
+        assert_eq!(fresh_replay["turn_id"], "turn-replay-image");
+        assert!(
+            !fresh_path.exists(),
+            "duplicate replay left fresh staged bytes"
+        );
+
+        let changed_reference = host
+            .state
+            .inner
+            .attachments
+            .stage(&session.id, "image/png", b"\x89PNG\r\n\x1a\nchanged")
+            .unwrap();
+        let changed_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(&session.id)
+            .join(&changed_reference.id);
+        let (status, changed_replay) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", session.id),
+                &json!({
+                    "request_id": 1,
+                    "prompt": prompt,
+                    "attachments": [changed_reference.id]
+                })
+                .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{changed_replay}");
+        assert_eq!(changed_replay["error"], "submission_id_conflict");
+        assert!(
+            !changed_path.exists(),
+            "conflicting replay left staged bytes"
+        );
         host.state.shutdown();
     }
 
@@ -5248,7 +5323,7 @@ fn main() {{
             .state
             .inner
             .attachments
-            .stage(&bound_id, "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .stage(&bound_id, "image/png", b"\x89PNG\r\n\x1a\nchanged")
             .unwrap();
         let replacement_path = host
             .state
