@@ -955,6 +955,14 @@ export function startController(view) {
     publishThemeModel(options);
   }
 
+  function actionableFailureMessage(turn) {
+    const message = typeof turn.failure_message === "string" ? turn.failure_message : "";
+    return message.includes("image_input_unsupported") &&
+      !message.includes("Remove the image or switch models explicitly.")
+      ? `${message} Remove the image or switch models explicitly.`
+      : message;
+  }
+
   function renderSessionList() {
     publishThemeModel();
   }
@@ -1009,7 +1017,7 @@ export function startController(view) {
           ? state.pending.content
           : null),
         reply: (live ? liveReplyText(live, toolRounds) : "") || turn.reply || "",
-        failureMessage: turn.failure_message || "",
+        failureMessage: actionableFailureMessage(turn),
         outcome: turn.outcome || "incomplete",
         active: live,
         provider: live?.provider || metadata.provider,
@@ -1248,11 +1256,18 @@ export function startController(view) {
     state.attachmentError = "";
     renderStatus();
     try {
+      const attachmentIds = Array.isArray(pending.content)
+        ? pending.content
+          .map((block) => block?.type === "image" && block.source?.type === "attachment"
+            ? block.source.id
+            : null)
+          .filter((id) => typeof id === "string")
+        : null;
       const receipt = await api(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
         method: "POST",
         body: Object.assign(
           { request_id: pending.request_id, prompt: pending.prompt },
-          pending.content === null || pending.content === undefined ? {} : { content: pending.content },
+          attachmentIds === null ? {} : { attachments: attachmentIds },
           Number.isSafeInteger(pending.retry_turn_index)
             ? { retry_turn_index: pending.retry_turn_index }
             : {},

@@ -90,7 +90,7 @@ echo credentials, paths, request bodies, or tokens.
 | `GET /api/sessions/{id}/snapshot` | Read the authoritative session, host turn ID, cursor, next request ID, active provisional state, and last receipt. |
 | `POST /api/sessions/{id}/attachments` | Upload one multipart `file` image and return only `{ id, media_type, byte_len, sha256 }`. |
 | `DELETE /api/sessions/{id}/attachments/{attachment_id}` | Remove one staged image owned by the session. |
-| `POST /api/sessions/{id}/submit` | Submit `{ "request_id": N, "prompt": "...", "content": [{ "type": "image", "source": { "type": "attachment", "id": "...", "media_type": "...", "byte_len": N, "sha256": "..." } }] }`; `content` remains optional for text-only clients. |
+| `POST /api/sessions/{id}/submit` | Submit `{ "request_id": N, "prompt": "...", "attachments": ["upload-..."] }`; `attachments` is an optional ordered list of opaque IDs. The host resolves and validates their MIME, length, and digest from staged bytes. |
 | `POST /api/sessions/{id}/stop` | Idempotently stop the host-owned run through the shared driver. |
 | `GET /api/sessions/{id}/events?after=N` | Reconnect to authenticated server-sent events using `fetch`. |
 
@@ -123,9 +123,10 @@ invalid or expired image is shown to the user and is never silently stripped
 or resent as text.
 
 Submit JSON carries only prompt text, request ID, and ordered opaque
-attachment metadata. The durable fingerprint includes ordered image MIME,
-byte length, and SHA-256 digest while ignoring ephemeral staged IDs, so a
-reused request ID with changed text or image conflicts. Lost-response
+attachment IDs. The host resolves the staged bytes; its content fingerprint
+includes ordered image MIME, byte length, and SHA-256 digest, while replay
+identity also binds the ordered IDs. Thus a reused request ID with changed
+text or image conflicts. Lost-response
 reconciliation and **Retry same send** preserve the exact request ID and image
 identity. Recorded **Retry turn** uses the catalog's private authoritative
 trail to re-stage the same image bytes after ordinary staged files have been

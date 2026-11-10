@@ -184,6 +184,7 @@ async def run(
             [os.fspath(common.FAKE_PROVIDER), "--scenario", "browser", "--workspace", str(workspace)]
         )
         host = None
+        capability_host = None
         browser = None
         context = None
         extra_contexts = []
@@ -654,14 +655,12 @@ async def run(
                     and body and body.get("prompt") == image_prompt
                 )
                 assert image_request["request_id"] == 1
-                assert len(image_request["content"]) == 1
-                assert image_request["content"][0]["type"] == "image"
-                image_source = image_request["content"][0]["source"]
-                assert image_source["type"] == "attachment"
-                assert image_source["media_type"] == "image/png"
-                assert isinstance(image_source["byte_len"], int)
-                assert len(image_source["sha256"]) == 64
-                assert "data" not in json.dumps(image_request)
+                assert len(image_request["attachments"]) == 1
+                assert isinstance(image_request["attachments"][0], str)
+                serialized_image_request = json.dumps(image_request).encode()
+                assert len(serialized_image_request) < 64 * 1024
+                for forbidden in ("data", "path", "media_type", "byte_len", "sha256"):
+                    assert forbidden not in image_request
                 await page.locator(".message-attachment-marker").wait_for()
                 marker = await page.locator(".message-attachment-marker").inner_text()
                 assert "image/png" in marker and "upload-" not in marker and "sha256" not in marker
@@ -676,6 +675,7 @@ async def run(
                     {"name": "unsupported.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
                 )
                 await page.locator("#prompt").fill(unsupported_prompt)
+                unsupported_before = common.fixture_status(provider_authority)
                 await page.get_by_role("button", name="Send").click()
                 unsupported_turn = await asyncio.to_thread(
                     common.wait_completed_submission, authority, token, session_image, 2
@@ -683,7 +683,77 @@ async def run(
                 assert unsupported_turn["last_submission"]["status"] == "failed", unsupported_turn
                 await page.get_by_text("image_input_unsupported", exact=False).wait_for()
                 unsupported_status = common.fixture_status(provider_authority)
+                assert unsupported_status["scenario_requests"].get("TRIAL-IMAGE-UNSUPPORTED") == 1, unsupported_status
+                assert unsupported_status["requests"] == unsupported_before["requests"] + 1, unsupported_status
                 assert unsupported_status["input_checks"].get("image_input_unsupported_response") is True
+                failed_image_turn = page.locator(".transcript-turn").last
+                await failed_image_turn.locator(".message-attachment-marker").wait_for()
+                assert await failed_image_turn.locator(".message-attachment-marker").count() == 1
+                failed_text = await failed_image_turn.inner_text()
+                assert "Remove the image or switch models explicitly." in failed_text
+                await failed_image_turn.get_by_role("button", name="Retry turn").wait_for()
+
+                # A known text-only model rejects image input locally, before the
+                # provider endpoint is touched, while retaining the recorded image
+                # and an explicit retry/removal action.
+                capability_state_dir = root / "known-capability-state"
+                capability_env = host_env.copy()
+                capability_env.update(
+                    {
+                        "LEG_PROVIDER": "openai-responses",
+                        "OPENAI_BASE_URL": provider_url,
+                        "OPENAI_API_KEY": "theme-e2e-not-a-secret",
+                        "LEG_MODEL": "o3-mini",
+                        "LEG_MAX_RETRIES": "2",
+                    }
+                )
+                capability_host, capability_lines = common.start_process(
+                    [
+                        str(web_bin), "--no-open", "--bind", "127.0.0.1:0",
+                        "--state-dir", str(capability_state_dir), "--leg-bin", str(leg_bin),
+                        "--supervisor-bin", str(supervisor_bin),
+                    ],
+                    cwd=workspace,
+                    env=capability_env,
+                )
+                capability_launch = common.read_until(
+                    capability_host, capability_lines, "Open this one-time launch URL:"
+                ).split(": ", 1)[1]
+                capability_authority = urlsplit(capability_launch).netloc
+                capability_token = urlsplit(capability_launch).fragment
+                capability_context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                capability_page = await capability_context.new_page()
+                await capability_page.goto(capability_launch, wait_until="load")
+                await wait_theme(capability_page, "default")
+                capability_session = await start_session(capability_page, workspace)
+                await capability_page.locator("#attachment-input").set_input_files(
+                    {"name": "known-local.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await capability_page.locator("#prompt").fill("TRIAL-IMAGE-KNOWN-LOCAL")
+                provider_before_local_rejection = common.fixture_status(provider_authority)
+                await capability_page.get_by_role("button", name="Send").click()
+                local_failure = await asyncio.to_thread(
+                    common.wait_completed_submission,
+                    capability_authority,
+                    capability_token,
+                    capability_session,
+                    1,
+                )
+                await common.wait_status(capability_page, "Failed")
+                assert local_failure["last_submission"]["status"] == "failed", local_failure
+                await capability_page.get_by_text("image_input_unsupported", exact=False).wait_for()
+                provider_after_local_rejection = common.fixture_status(provider_authority)
+                assert provider_after_local_rejection["requests"] == provider_before_local_rejection["requests"], (
+                    provider_before_local_rejection,
+                    provider_after_local_rejection,
+                )
+                local_failed_turn = capability_page.locator(".transcript-turn").last
+                await local_failed_turn.locator(".message-attachment-marker").wait_for()
+                assert "Remove the image or switch models explicitly." in await local_failed_turn.inner_text()
+                await local_failed_turn.get_by_role("button", name="Retry turn").wait_for()
+                await capability_context.close()
+                common.stop_process(capability_host, graceful=True)
+                capability_host = None
 
                 # Recorded retry rehydrates the authoritative image bytes while an edited
                 # composer draft remains independent of the retry request.
@@ -746,7 +816,7 @@ async def run(
                     and body and body.get("prompt") == lost_prompt
                 ]
                 assert [body["request_id"] for body in lost_requests] == [5, 5], lost_requests
-                assert lost_requests[0]["content"][0]["source"]["sha256"] == lost_requests[1]["content"][0]["source"]["sha256"]
+                assert lost_requests[0]["attachments"] == lost_requests[1]["attachments"]
                 await page.unroute("**/submit", abort_lost_image_submit)
 
                 # Exercise independent first-send warnings and exact/IME-safe drafts in each theme.
@@ -974,6 +1044,7 @@ async def run(
                 if not persistent_context:
                     await browser.close()
         finally:
+            common.stop_process(capability_host, graceful=True)
             common.stop_process(host, graceful=True)
             common.stop_process(provider, graceful=False)
 

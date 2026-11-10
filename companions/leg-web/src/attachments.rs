@@ -157,6 +157,29 @@ impl AttachmentStore {
         Ok(())
     }
 
+    /// Resolve the browser's ordered opaque IDs into authoritative managed
+    /// refs. Metadata is read from the staged bytes, never supplied by the
+    /// browser's submit body.
+    pub fn resolve_ids(
+        &self,
+        namespace: &str,
+        ids: &[String],
+    ) -> Result<Vec<ContentBlock>, AttachmentError> {
+        validate_component(namespace)?;
+        let mut encoded_total = 0usize;
+        let mut content = Vec::with_capacity(ids.len());
+        for id in ids {
+            let reference = self.read_reference(namespace, id)?;
+            encoded_total = encoded_total.saturating_add(encoded_len(reference.byte_len as usize));
+            if encoded_total > MAX_IMAGE_REQUEST_BYTES {
+                return Err(AttachmentError::TooLarge);
+            }
+            content.push(ContentBlock::image(reference));
+        }
+        Ok(content)
+    }
+
+    #[cfg(test)]
     pub fn remove_content(&self, namespace: &str, content: Option<&[ContentBlock]>) {
         let Some(content) = content else { return };
         if !valid_component(namespace) {
@@ -169,6 +192,16 @@ impl AttachmentStore {
             else {
                 continue;
             };
+            let _ = self.remove_id(namespace, id);
+        }
+        self.remove_empty_namespace(namespace);
+    }
+
+    pub fn remove_ids(&self, namespace: &str, ids: &[String]) {
+        if !valid_component(namespace) {
+            return;
+        }
+        for id in ids {
             let _ = self.remove_id(namespace, id);
         }
         self.remove_empty_namespace(namespace);
@@ -323,6 +356,22 @@ impl AttachmentStore {
         }
     }
 
+    #[cfg(test)]
+    pub fn expire_for_test(&self, namespace: &str, id: &str) -> Result<(), AttachmentError> {
+        validate_component(namespace)?;
+        validate_component(id)?;
+        let path = self.namespace_dir(namespace)?.join(id);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|_| AttachmentError::Missing)?;
+        let modified = SystemTime::now()
+            .checked_sub(ATTACHMENT_TTL + Duration::from_secs(1))
+            .ok_or(AttachmentError::Io)?;
+        file.set_times(fs::FileTimes::new().set_modified(modified))
+            .map_err(|_| AttachmentError::Io)
+    }
+
     fn read_ref(
         &self,
         namespace: &str,
@@ -331,14 +380,29 @@ impl AttachmentStore {
         byte_len: u64,
         sha256: &str,
     ) -> Result<Vec<u8>, AttachmentError> {
+        let reference = self.read_reference(namespace, id)?;
+        if reference.byte_len != byte_len {
+            return Err(AttachmentError::TooLarge);
+        }
+        if reference.media_type != normalize_media_type(media_type) {
+            return Err(AttachmentError::MimeMismatch);
+        }
+        if !sha256.eq_ignore_ascii_case(&reference.sha256) {
+            return Err(AttachmentError::DigestMismatch);
+        }
+        let directory = self.namespace_dir(namespace)?;
+        fs::read(directory.join(id)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AttachmentError::Missing
+            } else {
+                AttachmentError::Io
+            }
+        })
+    }
+
+    fn read_reference(&self, namespace: &str, id: &str) -> Result<AttachmentRef, AttachmentError> {
+        validate_component(namespace)?;
         validate_component(id)?;
-        let media_type = normalize_media_type(media_type);
-        if !is_supported_media_type(media_type) {
-            return Err(AttachmentError::Invalid);
-        }
-        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(AttachmentError::Invalid);
-        }
         let directory = self.namespace_dir(namespace)?;
         let path = directory.join(id);
         let metadata = fs::symlink_metadata(&path).map_err(|error| {
@@ -366,19 +430,19 @@ impl AttachmentStore {
             return Err(AttachmentError::Invalid);
         }
         let bytes = fs::read(&canonical).map_err(|_| AttachmentError::Io)?;
-        if bytes.len() as u64 != byte_len || bytes.len() > MAX_RAW_IMAGE_BYTES {
+        if bytes.len() > MAX_RAW_IMAGE_BYTES {
             return Err(AttachmentError::TooLarge);
         }
         if encoded_len(bytes.len()) > MAX_BASE64_IMAGE_BYTES {
             return Err(AttachmentError::TooLarge);
         }
-        if detect_media_type(&bytes) != Some(media_type) {
-            return Err(AttachmentError::MimeMismatch);
-        }
-        if !sha256.eq_ignore_ascii_case(&sha256_hex(&bytes)) {
-            return Err(AttachmentError::DigestMismatch);
-        }
-        Ok(bytes)
+        let media_type = detect_media_type(&bytes).ok_or(AttachmentError::Invalid)?;
+        Ok(AttachmentRef::new(
+            id,
+            media_type,
+            bytes.len() as u64,
+            sha256_hex(&bytes),
+        ))
     }
 
     fn namespace_dir(&self, namespace: &str) -> Result<PathBuf, AttachmentError> {

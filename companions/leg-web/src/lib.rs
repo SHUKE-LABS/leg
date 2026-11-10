@@ -29,6 +29,7 @@ use leg_ui_client::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
@@ -301,6 +302,7 @@ struct ActiveRun {
     turn_id: String,
     stop: PendingStop,
     stop_requested: bool,
+    attachment_ids: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -382,6 +384,10 @@ enum ReceiptStatus {
 struct Receipt {
     request_id: u64,
     prompt_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_only_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachment_ids_sha256: Option<String>,
     turn_id: String,
     status: ReceiptStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,6 +430,7 @@ struct NewSubmission {
     turn_id: String,
     prompt: String,
     content: Option<Vec<ContentBlock>>,
+    attachment_ids: Vec<String>,
     attachment_namespace: String,
     retry_turn_index: Option<u64>,
     stop: PendingStop,
@@ -460,6 +467,25 @@ fn submission_decision(
         return Err(SubmissionReject::Unexpected);
     }
     Ok(SubmissionDecision::New)
+}
+
+fn prompt_only_fingerprint(prompt: &str) -> String {
+    turn_fingerprint(prompt, None)
+}
+
+fn attachment_ids_fingerprint(ids: &[String]) -> String {
+    let bytes = serde_json::to_vec(ids).expect("attachment IDs are serializable");
+    hex(&Sha256::digest(bytes))
+}
+
+fn is_terminal_receipt(status: ReceiptStatus) -> bool {
+    matches!(
+        status,
+        ReceiptStatus::Succeeded
+            | ReceiptStatus::Failed
+            | ReceiptStatus::Stopped
+            | ReceiptStatus::Incomplete
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -602,7 +628,7 @@ struct SubmitTurn {
     request_id: u64,
     prompt: String,
     #[serde(default)]
-    content: Option<Vec<ContentBlock>>,
+    attachments: Option<Vec<String>>,
     #[serde(default)]
     retry_turn_index: Option<u64>,
 }
@@ -1188,14 +1214,14 @@ async fn submit_turn(
     Json(body): Json<SubmitTurn>,
 ) -> Result<(StatusCode, Json<SubmissionReceipt>), ApiError> {
     if body.prompt.trim().is_empty() {
-        state.cleanup_attachment_content(&id, body.content.as_deref());
+        state.cleanup_request_attachments(&id, body.attachments.as_deref().unwrap_or_default());
         return Err(api_error(StatusCode::BAD_REQUEST, "prompt_is_blank"));
     }
     if !valid_session_id(&id) {
         return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
     }
     if state.inner.shutting_down.load(Ordering::Acquire) {
-        state.cleanup_attachment_content(&id, body.content.as_deref());
+        state.cleanup_request_attachments(&id, body.attachments.as_deref().unwrap_or_default());
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "host_shutting_down",
@@ -1207,7 +1233,7 @@ async fn submit_turn(
     let gate = state.acceptance_gate(&ledger_id);
     let gate_guard = gate.lock_owned().await;
     if state.inner.shutting_down.load(Ordering::Acquire) {
-        state.cleanup_attachment_content(&id, body.content.as_deref());
+        state.cleanup_request_attachments(&id, body.attachments.as_deref().unwrap_or_default());
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "host_shutting_down",
@@ -1429,23 +1455,45 @@ impl HostState {
 
     fn attachment_namespace(&self, id: &str) -> Result<String, ApiError> {
         self.catalog_session_or_bound_alias(id)?;
-        if id.starts_with("draft-") && self.inner.catalog.get(id).is_err() {
-            if let Some(bound_id) = self.inner.durable.read(|data| {
+        if id.starts_with("draft-")
+            && let Some(bound_id) = self.inner.durable.read(|data| {
                 data.aliases.iter().find_map(|(actual, ledger_id)| {
                     (ledger_id == id && actual != id).then(|| actual.clone())
                 })
-            }) {
-                return Ok(bound_id);
-            }
+            })
+        {
+            return Ok(bound_id);
         }
         Ok(id.to_string())
     }
 
-    fn cleanup_attachment_content(&self, id: &str, content: Option<&[ContentBlock]>) {
+    fn active_attachment_ids(&self, ledger_id: &str) -> HashSet<String> {
+        let runtime = lock(&self.inner.runtime);
+        let key = runtime_id(&runtime, ledger_id);
+        runtime
+            .sessions
+            .get(&key)
+            .and_then(|entry| entry.active.as_ref())
+            .map(|active| active.attachment_ids.clone())
+            .unwrap_or_default()
+    }
+
+    fn cleanup_attachment_ids(&self, ledger_id: &str, namespace: &str, ids: &[String]) {
+        let active = self.active_attachment_ids(ledger_id);
+        let removable = ids
+            .iter()
+            .filter(|id| !active.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.inner.attachments.remove_ids(namespace, &removable);
+    }
+
+    fn cleanup_request_attachments(&self, id: &str, ids: &[String]) {
         let namespace = self
             .attachment_namespace(id)
             .unwrap_or_else(|_| id.to_string());
-        self.inner.attachments.remove_content(&namespace, content);
+        let ledger_id = self.ledger_id(id);
+        self.cleanup_attachment_ids(&ledger_id, &namespace, ids);
     }
 
     fn latest_receipt(&self, id: &str) -> Option<Receipt> {
@@ -1521,20 +1569,9 @@ impl HostState {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
         let source_attachment_namespace = self.attachment_namespace(id)?;
-        if body.content.as_deref().is_some_and(|content| {
-            content
-                .iter()
-                .any(|block| !block.is_managed_attachment() || !block.is_wire_safe())
-        }) {
-            self.inner
-                .attachments
-                .remove_content(&source_attachment_namespace, body.content.as_deref());
-            return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
-        }
-        if body.retry_turn_index.is_some() && body.content.is_some() {
-            self.inner
-                .attachments
-                .remove_content(&source_attachment_namespace, body.content.as_deref());
+        let attachment_ids = body.attachments.clone().unwrap_or_default();
+        if body.retry_turn_index.is_some() && body.attachments.is_some() {
+            self.cleanup_request_attachments(id, &attachment_ids);
             return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
         }
         let ledger_id = self.ledger_id(id);
@@ -1547,14 +1584,82 @@ impl HostState {
         let retry_intent = match retry_intent.transpose() {
             Ok(intent) => intent,
             Err(error) => {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(error);
             }
         };
+
+        let prompt_only_hash = prompt_only_fingerprint(&body.prompt);
+        let attachment_ids_hash = attachment_ids_fingerprint(&attachment_ids);
+        let prior_receipt = self.inner.durable.read(|data| {
+            data.sessions.get(&ledger_id).and_then(|ledger| {
+                ledger
+                    .receipts
+                    .iter()
+                    .find(|receipt| receipt.request_id == body.request_id)
+                    .cloned()
+            })
+        });
+        if prior_receipt.as_ref().is_some_and(|receipt| {
+            receipt
+                .prompt_only_sha256
+                .as_deref()
+                .is_some_and(|expected| expected != prompt_only_hash)
+                || receipt
+                    .attachment_ids_sha256
+                    .as_deref()
+                    .is_some_and(|expected| expected != attachment_ids_hash)
+        }) {
+            self.cleanup_request_attachments(id, &attachment_ids);
+            return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
+        }
+        let terminal_identity_match = prior_receipt.as_ref().is_some_and(|receipt| {
+            is_terminal_receipt(receipt.status)
+                && receipt.prompt_only_sha256.as_deref() == Some(prompt_only_hash.as_str())
+                && receipt.attachment_ids_sha256.as_deref() == Some(attachment_ids_hash.as_str())
+        });
+        let mut terminal_replay = false;
+        let resolved_content = if retry_intent.is_some() || attachment_ids.is_empty() {
+            None
+        } else {
+            match self
+                .inner
+                .attachments
+                .resolve_ids(&source_attachment_namespace, &attachment_ids)
+            {
+                Ok(content) => Some(content),
+                Err(error)
+                    if terminal_identity_match
+                        && matches!(
+                            error,
+                            attachments::AttachmentError::Missing
+                                | attachments::AttachmentError::Expired
+                        ) =>
+                {
+                    terminal_replay = true;
+                    None
+                }
+                Err(error) => {
+                    self.cleanup_request_attachments(id, &attachment_ids);
+                    return Err(map_attachment_error(error));
+                }
+            }
+        };
+        if terminal_replay {
+            let previous = prior_receipt.expect("terminal replay has a receipt");
+            self.cleanup_request_attachments(id, &attachment_ids);
+            return Ok(SubmissionAcceptance {
+                receipt: SubmissionReceipt {
+                    request_id: previous.request_id,
+                    turn_id: previous.turn_id,
+                    session_id: previous.session_id.unwrap_or_else(|| id.to_string()),
+                    status: previous.status,
+                    duplicate: true,
+                },
+            });
+        }
         let prompt_hash = retry_intent.as_ref().map_or_else(
-            || turn_fingerprint(&body.prompt, body.content.as_deref()),
+            || turn_fingerprint(&body.prompt, resolved_content.as_deref()),
             |intent| intent.fingerprint().to_string(),
         );
         let decision = self.inner.durable.read(|data| {
@@ -1566,14 +1671,10 @@ impl HostState {
                     .as_ref()
                     .is_some_and(|intent| intent.visible_prompt() != body.prompt)
                 {
-                    self.inner
-                        .attachments
-                        .remove_content(&source_attachment_namespace, body.content.as_deref());
+                    self.cleanup_request_attachments(id, &attachment_ids);
                     return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
                 }
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Ok(SubmissionAcceptance {
                     receipt: SubmissionReceipt {
                         request_id: previous.request_id,
@@ -1585,41 +1686,23 @@ impl HostState {
                 });
             }
             Ok(SubmissionDecision::New) => {
-                if let Some(content) = body.content.as_deref() {
-                    if let Err(error) = self
-                        .inner
-                        .attachments
-                        .validate_content(&source_attachment_namespace, content)
-                    {
-                        self.inner
-                            .attachments
-                            .remove_content(&source_attachment_namespace, Some(content));
-                        return Err(map_attachment_error(error));
-                    }
-                }
+                // `resolve_ids` has already validated every staged byte and
+                // constructed the authoritative content blocks.
             }
             Err(SubmissionReject::Stale) => {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_stale"));
             }
             Err(SubmissionReject::Conflict) => {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
             }
             Err(SubmissionReject::Unexpected) => {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_unexpected"));
             }
             Err(SubmissionReject::Exhausted) => {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_exhausted"));
             }
         }
@@ -1635,31 +1718,23 @@ impl HostState {
                 || current_intent.visible_prompt() != body.prompt
                 || current_intent.fingerprint() != submitted_intent.fingerprint()
             {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(api_error(StatusCode::CONFLICT, "retry_unavailable"));
             }
         }
         if self.runtime_is_busy(&ledger_id) {
-            self.inner
-                .attachments
-                .remove_content(&source_attachment_namespace, body.content.as_deref());
+            self.cleanup_request_attachments(id, &attachment_ids);
             return Err(api_error(StatusCode::CONFLICT, "session_busy"));
         }
         let current = match self.catalog_session(id) {
             Ok(current) => current,
             Err(error) => {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(error);
             }
         };
         if current.run_state != CatalogRunState::Idle {
-            self.inner
-                .attachments
-                .remove_content(&source_attachment_namespace, body.content.as_deref());
+            self.cleanup_request_attachments(id, &attachment_ids);
             return Err(api_error(StatusCode::CONFLICT, "session_busy"));
         }
         let bound_session_id = if id.starts_with("draft-") {
@@ -1668,9 +1743,7 @@ impl HostState {
                 let candidate = match self.inner.catalog.allocate_new_session_id() {
                     Ok(candidate) => candidate,
                     Err(error) => {
-                        self.inner
-                            .attachments
-                            .remove_content(&source_attachment_namespace, body.content.as_deref());
+                        self.cleanup_request_attachments(id, &attachment_ids);
                         return Err(map_catalog_error(error));
                     }
                 };
@@ -1683,9 +1756,7 @@ impl HostState {
                 }
             }
             let Some(candidate) = available else {
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                self.cleanup_request_attachments(id, &attachment_ids);
                 return Err(api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "session_id_unavailable",
@@ -1698,10 +1769,7 @@ impl HostState {
         let mut attachment_namespace = source_attachment_namespace.clone();
         let mut reserved_attachment_namespace = None;
         if let Some(bound_id) = &bound_session_id
-            && body
-                .content
-                .as_deref()
-                .is_some_and(|content| content.iter().any(ContentBlock::is_managed_attachment))
+            && !attachment_ids.is_empty()
         {
             // The native catalog does not publish the preallocated session
             // until its first turn_start. Keep its staged bytes live while a
@@ -1711,15 +1779,15 @@ impl HostState {
             if let Err(error) = self.inner.attachments.rehome(
                 &source_attachment_namespace,
                 bound_id,
-                body.content.as_deref(),
+                resolved_content.as_deref(),
             ) {
                 self.release_attachment_namespace(bound_id);
-                self.inner
-                    .attachments
-                    .remove_content(&source_attachment_namespace, body.content.as_deref());
-                self.inner
-                    .attachments
-                    .remove_content(bound_id, body.content.as_deref());
+                self.cleanup_attachment_ids(
+                    &ledger_id,
+                    &source_attachment_namespace,
+                    &attachment_ids,
+                );
+                self.cleanup_attachment_ids(&ledger_id, bound_id, &attachment_ids);
                 return Err(map_attachment_error(error));
             }
             attachment_namespace = bound_id.clone();
@@ -1730,12 +1798,14 @@ impl HostState {
             }
             self.inner
                 .attachments
-                .remove_content(&attachment_namespace, body.content.as_deref());
+                .remove_ids(&attachment_namespace, &attachment_ids);
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "random_unavailable")
         })?;
         let accepted = Receipt {
             request_id: body.request_id,
             prompt_sha256: prompt_hash.clone(),
+            prompt_only_sha256: Some(prompt_only_hash.clone()),
+            attachment_ids_sha256: Some(attachment_ids_hash.clone()),
             turn_id: turn_id.clone(),
             status: ReceiptStatus::Accepted,
             session_id: Some(id.to_string()),
@@ -1779,9 +1849,7 @@ impl HostState {
             if let Some(namespace) = reserved_attachment_namespace.as_deref() {
                 self.release_attachment_namespace(namespace);
             }
-            self.inner
-                .attachments
-                .remove_content(&attachment_namespace, body.content.as_deref());
+            self.cleanup_attachment_ids(&ledger_id, &attachment_namespace, &attachment_ids);
             return Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "state_unavailable",
@@ -1807,6 +1875,7 @@ impl HostState {
                 turn_id: turn_id.clone(),
                 stop: pending_stop.clone(),
                 stop_requested: false,
+                attachment_ids: attachment_ids.iter().cloned().collect(),
             });
             entry.live = Some(LiveSnapshot {
                 turn_id: turn_id.clone(),
@@ -1842,7 +1911,8 @@ impl HostState {
             request_id: body.request_id,
             turn_id: turn_id.clone(),
             prompt: body.prompt,
-            content: body.content,
+            content: resolved_content,
+            attachment_ids,
             attachment_namespace,
             retry_turn_index: body.retry_turn_index,
             stop: pending_stop,
@@ -2001,10 +2071,9 @@ impl HostState {
         status: ReceiptStatus,
         outcome: Value,
     ) {
-        self.inner.attachments.remove_content(
-            &submission.attachment_namespace,
-            submission.content.as_deref(),
-        );
+        self.inner
+            .attachments
+            .remove_ids(&submission.attachment_namespace, &submission.attachment_ids);
         self.release_attachment_namespace(&submission.attachment_namespace);
         let _ = self.finish_receipt(
             &submission.ledger_id,
@@ -2986,6 +3055,36 @@ mod tests {
             )
             .unwrap();
         let bound_id = "sess-pending-bound";
+        let draft_attachment = host
+            .state
+            .inner
+            .attachments
+            .stage(&draft.id, "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        let bound_attachment = host
+            .state
+            .inner
+            .attachments
+            .stage(bound_id, "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        let draft_attachment_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(&draft.id)
+            .join(&draft_attachment.id);
+        let bound_attachment_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(bound_id)
+            .join(&bound_attachment.id);
+        assert!(draft_attachment_path.is_file());
+        assert!(bound_attachment_path.is_file());
         let catalog_path = temp.path().join("catalog.json");
         let mut catalog: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
         catalog["sessions"][&draft.id]["pending_new_turn"] = json!(true);
@@ -3002,6 +3101,8 @@ mod tests {
                 ledger.receipts.push_back(Receipt {
                     request_id: 1,
                     prompt_sha256: "00".into(),
+                    prompt_only_sha256: None,
+                    attachment_ids_sha256: None,
                     turn_id: "turn-pending".into(),
                     status: ReceiptStatus::Running,
                     session_id: Some(draft.id.clone()),
@@ -3013,6 +3114,8 @@ mod tests {
                 bound_ledger.receipts.push_back(Receipt {
                     request_id: 1,
                     prompt_sha256: "11".into(),
+                    prompt_only_sha256: None,
+                    attachment_ids_sha256: None,
                     turn_id: "turn-bound-pending".into(),
                     status: ReceiptStatus::Running,
                     session_id: Some(bound_id.into()),
@@ -3079,6 +3182,8 @@ mod tests {
                 .read(|data| data.aliases.clone()),
             HashMap::from([(bound_id.to_string(), bound_draft.id.clone())])
         );
+        assert!(!draft_attachment_path.exists());
+        assert!(!bound_attachment_path.exists());
         let receipt = recovered.state.latest_receipt(&draft.id).unwrap();
         assert_eq!(receipt.status, ReceiptStatus::Incomplete);
         assert_eq!(receipt.session_id.as_deref(), Some(draft.id.as_str()));
@@ -4056,6 +4161,8 @@ mod tests {
                 ledger.receipts.push_back(Receipt {
                     request_id: 1,
                     prompt_sha256: prompt_hash.clone(),
+                    prompt_only_sha256: None,
+                    attachment_ids_sha256: None,
                     turn_id: "turn-retry".into(),
                     status: ReceiptStatus::Running,
                     session_id: Some(id.into()),
@@ -4510,6 +4617,20 @@ fn main() {{
         let router = build_router(host.state.clone());
         let image = b"\x89PNG\r\n\x1a\nfixture";
 
+        let (status, body) = round_trip_json(
+            &router,
+            api_multipart_request(
+                &host,
+                &format!("/api/sessions/{}/attachments", first.id),
+                "file",
+                "image/png",
+                b"not an image",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "attachment_invalid");
+
         let mut unauthorized = api_multipart_request(
             &host,
             &format!("/api/sessions/{}/attachments", first.id),
@@ -4578,14 +4699,48 @@ fn main() {{
         assert_eq!(status, StatusCode::OK, "{uploaded}");
         let reference: AttachmentRef = serde_json::from_value(uploaded).unwrap();
 
-        let content = vec![ContentBlock::image(reference.clone())];
+        let rejected_reference = host
+            .state
+            .inner
+            .attachments
+            .stage(&first.id, "image/png", image)
+            .unwrap();
+        let rejected_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(&first.id)
+            .join(&rejected_reference.id);
+        assert!(rejected_path.is_file());
+        let (status, body) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", first.id),
+                &json!({
+                    "request_id": 1,
+                    "prompt": "   ",
+                    "attachments": [rejected_reference.id]
+                })
+                .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "prompt_is_blank");
+        assert!(!rejected_path.exists(), "rejected send left staged bytes");
+
         let (status, body) = round_trip_json(
             &router,
             api_json_request(
                 &host,
                 Method::POST,
                 &format!("/api/sessions/{}/submit", second.id),
-                &json!({"request_id": 1, "prompt": "cross session", "content": content})
+                &json!({"request_id": 1, "prompt": "cross session", "attachments": [reference.id]})
                     .to_string(),
                 true,
             ),
@@ -4594,19 +4749,14 @@ fn main() {{
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert_eq!(body["error"], "attachment_missing");
 
-        let unknown = ContentBlock::image(AttachmentRef::new(
-            "upload-unknown",
-            "image/png",
-            image.len() as u64,
-            "a".repeat(64),
-        ));
         let (status, body) = round_trip_json(
             &router,
             api_json_request(
                 &host,
                 Method::POST,
                 &format!("/api/sessions/{}/submit", first.id),
-                &json!({"request_id": 1, "prompt": "unknown", "content": [unknown]}).to_string(),
+                &json!({"request_id": 1, "prompt": "unknown", "attachments": ["upload-unknown"]})
+                    .to_string(),
                 true,
             ),
         )
@@ -4614,27 +4764,84 @@ fn main() {{
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert_eq!(body["error"], "attachment_missing");
 
-        let escaped = ContentBlock::Image {
-            source: leg_ui_client::ImageSource::Attachment {
-                id: "../escape".into(),
-                media_type: "image/png".into(),
-                byte_len: image.len() as u64,
-                sha256: "b".repeat(64),
-            },
-        };
         let (status, body) = round_trip_json(
             &router,
             api_json_request(
                 &host,
                 Method::POST,
                 &format!("/api/sessions/{}/submit", first.id),
-                &json!({"request_id": 1, "prompt": "escaped", "content": [escaped]}).to_string(),
+                &json!({"request_id": 1, "prompt": "escaped", "attachments": ["../escape"]})
+                    .to_string(),
                 true,
             ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["error"], "invalid_content");
+        assert_eq!(body["error"], "attachment_invalid");
+
+        let expired_reference = host
+            .state
+            .inner
+            .attachments
+            .stage(&first.id, "image/png", image)
+            .unwrap();
+        host.state
+            .inner
+            .attachments
+            .expire_for_test(&first.id, &expired_reference.id)
+            .unwrap();
+        let (status, body) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", first.id),
+                &json!({
+                    "request_id": 1,
+                    "prompt": "expired",
+                    "attachments": [expired_reference.id]
+                })
+                .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error"], "attachment_expired");
+
+        let aggregate_bytes = {
+            let mut bytes = vec![0; 6_500_000];
+            bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            bytes
+        };
+        let aggregate_ids = (0..4)
+            .map(|_| {
+                host.state
+                    .inner
+                    .attachments
+                    .stage(&first.id, "image/png", &aggregate_bytes)
+                    .unwrap()
+                    .id
+            })
+            .collect::<Vec<_>>();
+        let (status, body) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", first.id),
+                &json!({
+                    "request_id": 1,
+                    "prompt": "aggregate overflow",
+                    "attachments": aggregate_ids
+                })
+                .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["error"], "attachment_too_large");
 
         let mut oversized_image = vec![0u8; attachments::MAX_RAW_IMAGE_BYTES + 1];
         oversized_image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -4686,6 +4893,78 @@ fn main() {{
         host.state.shutdown();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_attachment_submit_does_not_invoke_native_provider() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let leg = temp.path().join("leg-marker");
+        let provider_calls = temp.path().join("provider-calls");
+        fs::write(
+            &leg,
+            format!(
+                "#!/bin/sh\nprintf called > {}\nexit 1\n",
+                provider_calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&leg, fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("leg-ui-supervisor");
+        assert!(supervisor.is_file(), "missing supervisor at {supervisor:?}");
+        let host = test_host_with_driver(&temp, &leg, &supervisor);
+        let session = host
+            .state
+            .inner
+            .catalog
+            .create_draft(SessionInterface::Web, Some("reject".into()), None)
+            .unwrap();
+        let reference = host
+            .state
+            .inner
+            .attachments
+            .stage(&session.id, "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        let path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(&session.id)
+            .join(&reference.id);
+        let router = build_router(host.state.clone());
+        let (status, body) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", session.id),
+                &json!({
+                    "request_id": 1,
+                    "prompt": "",
+                    "attachments": [reference.id]
+                })
+                .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "prompt_is_blank");
+        assert!(!path.exists());
+        assert!(
+            !provider_calls.exists(),
+            "a rejected upload triggered a native/provider process"
+        );
+        host.state.shutdown();
+    }
+
     #[tokio::test]
     async fn terminal_attachment_cleanup_allows_image_receipt_replay() {
         let (host, _temp) = test_host();
@@ -4714,6 +4993,10 @@ fn main() {{
                 ledger.receipts.push_back(Receipt {
                     request_id: 1,
                     prompt_sha256: fingerprint.clone(),
+                    prompt_only_sha256: Some(prompt_only_fingerprint(prompt)),
+                    attachment_ids_sha256: Some(attachment_ids_fingerprint(std::slice::from_ref(
+                        &reference.id,
+                    ))),
                     turn_id: "turn-replay-image".into(),
                     status: ReceiptStatus::Succeeded,
                     session_id: Some(session.id.clone()),
@@ -4735,7 +5018,8 @@ fn main() {{
                 &host,
                 Method::POST,
                 &format!("/api/sessions/{}/submit", session.id),
-                &json!({"request_id": 1, "prompt": prompt, "content": content}).to_string(),
+                &json!({"request_id": 1, "prompt": prompt, "attachments": [reference.id]})
+                    .to_string(),
                 true,
             ),
         )
@@ -4770,7 +5054,7 @@ fn main() {{
             .sessions_dir()
             .join("attachments")
             .join(&session.id)
-            .join(reference.id);
+            .join(&reference.id);
         assert!(path.is_file());
         let submission = NewSubmission {
             requested_id: session.id.clone(),
@@ -4780,6 +5064,7 @@ fn main() {{
             turn_id: "turn-cleanup".into(),
             prompt: "cleanup".into(),
             content: Some(content),
+            attachment_ids: vec![reference.id.clone()],
             attachment_namespace: session.id.clone(),
             retry_turn_index: None,
             stop: PendingStop::new(),
@@ -4792,6 +5077,284 @@ fn main() {{
         );
         assert!(!path.exists());
         host.state.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_image_replay_preserves_the_active_attachment_and_native_call() {
+        use std::process::Command;
+
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let fixture_dir = workspace.join("fixture");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        let log_path = fixture_dir.join("image-input.log");
+        let release_path = fixture_dir.join("release");
+        let started_path = fixture_dir.join("started.id");
+        let leg = fixture_dir.join("fake-leg");
+        let source = fixture_dir.join("fake_leg.rs");
+        let log_literal = format!("{:?}", log_path.to_string_lossy().to_string());
+        let release_literal = format!("{:?}", release_path.to_string_lossy().to_string());
+        let started_literal = format!("{:?}", started_path.to_string_lossy().to_string());
+        fs::write(
+            &source,
+            format!(
+                r#"
+use std::env;
+use std::fs::{{self, OpenOptions}};
+use std::io::{{Read, Write}};
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+fn main() {{
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {{
+        println!("leg 0.14.0");
+        return;
+    }}
+    if args == ["--help"] {{
+        println!("usage: leg exchange --stream-json --new-session-id <id>");
+        return;
+    }}
+    if args.first().map(String::as_str) != Some("exchange") {{
+        std::process::exit(2);
+    }}
+    let session_id = args
+        .windows(2)
+        .find(|pair| pair[0] == "--new-session-id" || pair[0] == "--session")
+        .map(|pair| pair[1].clone())
+        .expect("session argument");
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap();
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PathBuf::from({log_literal}))
+        .unwrap();
+    log.write_all(input.as_bytes()).unwrap();
+    log.write_all(b"\n---CALL---\n").unwrap();
+    fs::write(PathBuf::from({started_literal}), &session_id).unwrap();
+    let session_dir = PathBuf::from(env::var_os("LEG_SESSION_DIR").unwrap());
+    fs::create_dir_all(&session_dir).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(session_dir.join(format!("{{session_id}}.jsonl")))
+        .unwrap();
+    while !PathBuf::from({release_literal}).exists() {{
+        thread::sleep(Duration::from_millis(10));
+    }}
+    let start = format!(
+        "{{{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_start\",\"seq\":0,\"provider\":\"fixture\",\"model\":\"fixture\",\"session_id\":\"{{session_id}}\",\"turn_index\":0,\"request\":{{{{\"schema\":\"baton.message/v1\",\"message_id\":\"request-1\",\"conversation_id\":\"{{session_id}}\",\"kind\":\"request\",\"body\":\"[REDACTED]\"}}}}}}}}"
+    );
+    let end = format!(
+        "{{{{\"schema\":\"leg.exchange.stream/v1\",\"event\":\"turn_end\",\"seq\":1,\"capped\":false,\"session_id\":\"{{session_id}}\",\"turn_index\":0,\"response\":{{{{\"schema\":\"baton.message/v1\",\"message_id\":\"response-1\",\"conversation_id\":\"{{session_id}}\",\"in_reply_to\":\"request-1\",\"kind\":\"response\",\"body\":\"ok\"}}}}}}}}"
+    );
+    println!("{{start}}");
+    println!("{{end}}");
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let compiled = Command::new("rustc")
+            .args(["--edition=2021"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&leg)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "failed to compile image replay fixture: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let supervisor = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("leg-ui-supervisor");
+        assert!(supervisor.is_file(), "missing supervisor at {supervisor:?}");
+
+        let host = test_host_with_driver(&temp, &leg, &supervisor);
+        let router = build_router(host.state.clone());
+        let draft = host
+            .state
+            .inner
+            .catalog
+            .create_draft(
+                SessionInterface::Web,
+                Some("image replay".into()),
+                Some(&workspace),
+            )
+            .unwrap();
+        let reference = host
+            .state
+            .inner
+            .attachments
+            .stage(&draft.id, "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        let attachment_id = reference.id.clone();
+        let first_request = json!({
+            "request_id": 1,
+            "prompt": "HOLD-IMAGE",
+            "attachments": [attachment_id.clone()]
+        })
+        .to_string();
+        let (status, accepted) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", draft.id),
+                &first_request,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        let bound_id = wait_for_fixture_id(&fixture_dir, "started").await;
+        let attachment_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(&bound_id)
+            .join(&attachment_id);
+        assert!(attachment_path.is_file());
+
+        let (status, duplicate) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", draft.id),
+                &first_request,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{duplicate}");
+        assert_eq!(duplicate["duplicate"], true);
+        assert!(matches!(
+            duplicate["status"].as_str(),
+            Some("accepted" | "running")
+        ));
+
+        let replacement = host
+            .state
+            .inner
+            .attachments
+            .stage(&bound_id, "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        let replacement_path = host
+            .state
+            .inner
+            .catalog
+            .sessions_dir()
+            .join("attachments")
+            .join(&bound_id)
+            .join(&replacement.id);
+        let changed_image = json!({
+            "request_id": 1,
+            "prompt": "HOLD-IMAGE",
+            "attachments": [replacement.id.clone()]
+        })
+        .to_string();
+        let (status, changed_image_body) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", draft.id),
+                &changed_image,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{changed_image_body}");
+        assert_eq!(changed_image_body["error"], "submission_id_conflict");
+        assert!(
+            !replacement_path.exists(),
+            "conflict cleanup kept a spare image"
+        );
+        assert!(attachment_path.is_file());
+
+        let conflict = json!({
+            "request_id": 1,
+            "prompt": "changed while running",
+            "attachments": [attachment_id.clone()]
+        })
+        .to_string();
+        let (status, conflict_body) = round_trip_json(
+            &router,
+            api_json_request(
+                &host,
+                Method::POST,
+                &format!("/api/sessions/{}/submit", draft.id),
+                &conflict,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict_body}");
+        assert_eq!(conflict_body["error"], "submission_id_conflict");
+        assert!(
+            attachment_path.is_file(),
+            "replay cleanup removed active image"
+        );
+
+        let input = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(input.matches("---CALL---").count(), 1, "{input}");
+        assert!(input.contains("\"type\":\"image\""), "{input}");
+        assert!(input.contains("\"media_type\":\"image/png\""), "{input}");
+
+        fs::write(&release_path, "release").unwrap();
+        let terminal = wait_for_receipt(&host, &router, &bound_id, 1).await;
+        assert_eq!(terminal["last_submission"]["status"], "succeeded");
+        assert!(!attachment_path.exists(), "terminal run left staged image");
+        assert_eq!(
+            fs::read_to_string(&log_path)
+                .unwrap()
+                .matches("---CALL---")
+                .count(),
+            1
+        );
+        host.state.shutdown();
+    }
+
+    #[test]
+    fn host_restart_removes_orphaned_staged_attachments() {
+        let (host, temp) = test_host();
+        let reference = host
+            .state
+            .inner
+            .attachments
+            .stage("orphan-session", "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+        let path = temp
+            .path()
+            .join("sessions")
+            .join("attachments")
+            .join("orphan-session")
+            .join(&reference.id);
+        assert!(path.is_file());
+        host.state.shutdown();
+        drop(host);
+
+        let recovered = Host::open(HostConfig {
+            catalog: SessionCatalogConfig {
+                state_dir: Some(temp.path().to_path_buf()),
+                ..SessionCatalogConfig::default()
+            },
+            ..HostConfig::default()
+        })
+        .unwrap();
+        assert!(!path.exists(), "restart left an orphaned staged image");
+        recovered.state.shutdown();
     }
 
     #[test]
@@ -4828,6 +5391,8 @@ fn main() {{
         let receipt = |request_id, prompt_sha256: &str| Receipt {
             request_id,
             prompt_sha256: prompt_sha256.into(),
+            prompt_only_sha256: None,
+            attachment_ids_sha256: None,
             turn_id: format!("turn-{request_id}"),
             status: ReceiptStatus::Succeeded,
             session_id: Some("session-a".into()),
@@ -4890,6 +5455,8 @@ fn main() {{
             receipts: VecDeque::from([Receipt {
                 request_id: 1,
                 prompt_sha256: first_hash.clone(),
+                prompt_only_sha256: None,
+                attachment_ids_sha256: None,
                 turn_id: "turn-1".into(),
                 status: ReceiptStatus::Succeeded,
                 session_id: Some("sess-1".into()),
@@ -4913,6 +5480,8 @@ fn main() {{
         let receipt = |request_id, status| Receipt {
             request_id,
             prompt_sha256: format!("hash-{request_id}"),
+            prompt_only_sha256: None,
+            attachment_ids_sha256: None,
             turn_id: format!("turn-{request_id}"),
             status,
             session_id: Some("session-a".into()),
@@ -4997,6 +5566,8 @@ fn main() {{
         let receipt = |request_id, status| Receipt {
             request_id,
             prompt_sha256: format!("hash-{request_id}"),
+            prompt_only_sha256: None,
+            attachment_ids_sha256: None,
             turn_id: format!("turn-{request_id}"),
             status,
             session_id: None,
