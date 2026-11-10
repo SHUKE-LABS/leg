@@ -3,28 +3,36 @@
 //! Catalog records contain UI metadata only. The leg-owned JSONL trail under
 //! the catalog's sessions directory remains the source of provider history.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::client::{
     Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,
     TurnRequest, TurnStopHandle, new_native_session_id,
 };
-use crate::content::{ContentBlock, ImageSource, turn_fingerprint};
+use crate::content::{
+    AttachmentRef, ContentBlock, ImageSource, MAX_IMAGE_ENCODED_BYTES,
+    MAX_TURN_IMAGE_ENCODED_BYTES, base64_encoded_len, detect_image_media_type, safe_attachment_id,
+    sha256_hex, turn_fingerprint,
+};
+use crate::draft::{
+    AttachmentError, DraftBlock, DraftImage, DraftSubmission, SubmissionClaim,
+    SubmissionResolution, attachment_label, draft_fingerprint, draft_images, draft_prompt,
+    validate_image_bytes,
+};
 use crate::process_owner::{OwnerState, ProcessOwner};
 use crate::protocol::StreamEvent;
 use crate::supervisor;
@@ -34,6 +42,12 @@ const LOCK_NAME: &str = ".catalog.lock";
 const INDEX_VERSION: u32 = 1;
 const EXCHANGE_SCHEMA: &str = "baton.exchange/v1";
 const ATTACHMENTS_DIR: &str = "attachments";
+const DRAFT_ATTACHMENTS_DIR: &str = "draft-attachments";
+/// Unreferenced staged images younger than this may belong to an attach or
+/// start that has not been recorded yet; older ones are crash leftovers.
+const STAGED_ORPHAN_GRACE: Duration = Duration::from_secs(10 * 60);
+/// Draft images that stay unsent this long expire.
+const DRAFT_ATTACHMENT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -162,6 +176,14 @@ pub struct CatalogSession {
     pub run_state: CatalogRunState,
     pub pending_new_turn: bool,
     pub ended: bool,
+    /// Ordered mixed draft content per interface. Kept out of serialized
+    /// catalog/Web projections; only image blocks whose staged bytes still
+    /// exist are listed.
+    #[serde(skip)]
+    pub draft_blocks: BTreeMap<SessionInterface, Vec<DraftBlock>>,
+    /// Recorded, unsettled draft sends per interface.
+    #[serde(skip)]
+    pub submissions: BTreeMap<SessionInterface, DraftSubmission>,
 }
 
 #[derive(Debug, Error)]
@@ -190,6 +212,10 @@ pub enum CatalogError {
     NoRetry(String),
     #[error("retry confirmation is stale; inspect the latest turn again")]
     StaleRetry,
+    #[error("request identity was already used for different text or images")]
+    SubmissionConflict,
+    #[error(transparent)]
+    Attachment(#[from] AttachmentError),
     #[error("session catalog could not be updated: {0}")]
     Catalog(String),
     #[error(transparent)]
@@ -288,6 +314,28 @@ struct SessionMetadata {
     bound_attempt_token: Option<String>,
     #[serde(default)]
     recovered: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    draft_blocks: BTreeMap<SessionInterface, Vec<DraftBlock>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    submissions: BTreeMap<SessionInterface, DraftSubmission>,
+}
+
+impl SessionMetadata {
+    /// Draft-store image ids this record keeps alive.
+    fn draft_image_ids(&self) -> impl Iterator<Item = &str> {
+        self.draft_blocks
+            .values()
+            .flatten()
+            .chain(
+                self.submissions
+                    .values()
+                    .flat_map(|submission| &submission.blocks),
+            )
+            .filter_map(|block| match block {
+                DraftBlock::Image(image) => Some(image.attachment.id.as_str()),
+                DraftBlock::Text { .. } => None,
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -354,6 +402,12 @@ fn merge_pending_session_metadata(
     for (key, value) in draft.display {
         session.display.entry(key).or_insert(value);
     }
+    for (interface, blocks) in draft.draft_blocks {
+        session.draft_blocks.entry(interface).or_insert(blocks);
+    }
+    for (interface, submission) in draft.submissions {
+        session.submissions.entry(interface).or_insert(submission);
+    }
     session.pending_new_turn = false;
     session.pending_attempt = None;
     session.bound_attempt_token = Some(attempt_token.to_string());
@@ -397,7 +451,8 @@ impl SessionCatalog {
                     sessions: BTreeMap::new(),
                 })?;
             } else {
-                let _ = catalog.read_index_unlocked()?;
+                let index = catalog.read_index_unlocked()?;
+                catalog.sweep_staged_attachments(&index);
             }
         }
         catalog.reconcile_pending_attempts(None)?;
@@ -446,8 +501,406 @@ impl SessionCatalog {
     ) -> Result<(), CatalogError> {
         self.mutate_metadata(id, |record| {
             record.drafts.insert(interface, draft);
+            record.draft_blocks.remove(&interface);
             Ok(())
         })
+    }
+
+    /// Validates and privately stages one draft image. Size, magic MIME, the
+    /// declared MIME, and the turn aggregate (with `existing`) are checked
+    /// before any byte is written. The caller records the returned image with
+    /// [`Self::save_draft_content`]; an unrecorded image is swept as an orphan.
+    pub fn stage_draft_image(
+        &self,
+        bytes: &[u8],
+        declared_media_type: Option<&str>,
+        label: &str,
+        existing: &[AttachmentRef],
+    ) -> Result<DraftImage, AttachmentError> {
+        let label = attachment_label(label);
+        let (media_type, sha256) =
+            validate_image_bytes(bytes, declared_media_type, &label, existing)?;
+        let directory = self.draft_attachments_dir();
+        let id = new_attachment_id("draft-image", &sha256);
+        let path = directory.join(&id);
+        let written = fs::create_dir_all(&directory)
+            .and_then(|()| set_private_directory(&directory))
+            .and_then(|()| write_private_file(&path, bytes));
+        if let Err(error) = written {
+            let _ = fs::remove_file(&path);
+            return Err(AttachmentError::Staging {
+                label,
+                reason: error.kind().to_string(),
+            });
+        }
+        sync_directory(&directory);
+        Ok(DraftImage {
+            attachment: AttachmentRef::new(id, media_type, bytes.len() as u64, sha256),
+            label,
+        })
+    }
+
+    /// Deletes a staged draft image that no record references, such as one
+    /// whose draft could not be saved.
+    pub fn discard_draft_image(&self, attachment: &AttachmentRef) -> Result<(), CatalogError> {
+        let _guard = self.lock_index()?;
+        let index = self.read_index_unlocked()?;
+        self.release_draft_images(&index, [attachment.id.as_str()]);
+        Ok(())
+    }
+
+    /// Saves an ordered text/image draft. A text-only draft is stored exactly
+    /// like [`Self::save_draft`]. Staged images no longer referenced by any
+    /// draft or pending submission are deleted.
+    pub fn save_draft_content(
+        &self,
+        id: &str,
+        interface: SessionInterface,
+        blocks: Vec<DraftBlock>,
+    ) -> Result<(), CatalogError> {
+        if draft_images(&blocks).any(|image| !safe_attachment_id(&image.attachment.id)) {
+            return Err(CatalogError::Catalog("draft image ref is invalid".into()));
+        }
+        let text = draft_prompt(&blocks);
+        let has_images = draft_images(&blocks).next().is_some();
+        self.mutate_metadata(id, |record| {
+            record.drafts.insert(interface, text);
+            if has_images {
+                record.draft_blocks.insert(interface, blocks);
+            } else {
+                record.draft_blocks.remove(&interface);
+            }
+            Ok(())
+        })
+    }
+
+    /// Records one draft send before it starts. Reusing a request identity
+    /// with the same ordered text and image digests is idempotent and returns
+    /// [`SubmissionClaim::Replay`]; reusing it for different content fails
+    /// with [`CatalogError::SubmissionConflict`].
+    pub fn claim_submission(
+        &self,
+        id: &str,
+        interface: SessionInterface,
+        request_id: &str,
+        blocks: &[DraftBlock],
+    ) -> Result<SubmissionClaim, CatalogError> {
+        if !safe_attachment_id(request_id) {
+            return Err(CatalogError::Catalog("request identity is invalid".into()));
+        }
+        let base_turns = if is_draft_id(id) {
+            0
+        } else {
+            self.get(id)?.turns.len() as u64
+        };
+        let fingerprint = draft_fingerprint(blocks);
+        let mut claim = SubmissionClaim::Fresh;
+        self.mutate_metadata(id, |record| {
+            if let Some(existing) = record.submissions.get(&interface)
+                && existing.request_id == request_id
+            {
+                if existing.fingerprint != fingerprint {
+                    return Err(CatalogError::SubmissionConflict);
+                }
+                claim = SubmissionClaim::Replay;
+                return Ok(());
+            }
+            record.submissions.insert(
+                interface,
+                DraftSubmission {
+                    request_id: request_id.to_string(),
+                    fingerprint,
+                    blocks: blocks.to_vec(),
+                    base_turns,
+                },
+            );
+            Ok(())
+        })?;
+        Ok(claim)
+    }
+
+    /// Removes a recorded submission and releases images only it referenced.
+    pub fn settle_submission(
+        &self,
+        id: &str,
+        interface: SessionInterface,
+        request_id: &str,
+    ) -> Result<(), CatalogError> {
+        self.mutate_metadata(id, |record| {
+            if record
+                .submissions
+                .get(&interface)
+                .is_some_and(|submission| submission.request_id == request_id)
+            {
+                record.submissions.remove(&interface);
+            }
+            Ok(())
+        })
+    }
+
+    /// Reconciles a recorded submission with the authoritative trail after a
+    /// reconnect. A finished submission is settled; a running one stays
+    /// pending.
+    pub fn resolve_submission(
+        &self,
+        id: &str,
+        interface: SessionInterface,
+    ) -> Result<SubmissionResolution, CatalogError> {
+        let session = self.get(id)?;
+        let Some(submission) = session.submissions.get(&interface) else {
+            return Ok(SubmissionResolution::None);
+        };
+        let request_id = submission.request_id.clone();
+        if session.run_state != CatalogRunState::Idle || session.pending_new_turn {
+            return Ok(SubmissionResolution::Pending { request_id });
+        }
+        let accepted = session
+            .turns
+            .iter()
+            .skip(submission.base_turns as usize)
+            .find(|turn| submission_fingerprint(turn) == submission.fingerprint)
+            .map(|turn| (turn.turn_index, turn.outcome));
+        self.settle_submission(id, interface, &request_id)?;
+        Ok(match accepted {
+            Some((turn_index, outcome)) => SubmissionResolution::Accepted {
+                request_id,
+                turn_index,
+                outcome,
+            },
+            None => SubmissionResolution::NotAccepted { request_id },
+        })
+    }
+
+    /// Starts an ordered draft turn. Text-only drafts use the legacy text
+    /// request. Image drafts are re-validated and copied from the draft store
+    /// into the target session's private staging directory under fresh refs
+    /// before the session starts; the copies are removed if the start fails
+    /// and after the turn finishes.
+    pub fn start_draft_turn(
+        &self,
+        id: &str,
+        interface: SessionInterface,
+        blocks: &[DraftBlock],
+    ) -> Result<CatalogTurn, CatalogError> {
+        validate_session_id(id)?;
+        let prompt = draft_prompt(blocks);
+        if draft_images(blocks).next().is_none() {
+            return if is_draft_id(id) {
+                self.start_new(id, interface, prompt)
+            } else {
+                self.start_existing(id, interface, prompt)
+            };
+        }
+        let session_id = if is_draft_id(id) {
+            self.allocate_new_session_id()?
+        } else {
+            id.to_string()
+        };
+        let (content, staged_paths) = self.transfer_draft_images(&session_id, blocks)?;
+        let started = if is_draft_id(id) {
+            self.start_new_with_id_content(id, session_id, interface, prompt, Some(content))
+        } else {
+            self.start_existing_with_content(id, interface, prompt, Some(content))
+        };
+        match started {
+            Ok(mut turn) => {
+                turn.staged_paths = staged_paths;
+                Ok(turn)
+            }
+            Err(error) => {
+                remove_staged_paths(&staged_paths);
+                Err(error)
+            }
+        }
+    }
+
+    fn transfer_draft_images(
+        &self,
+        session_id: &str,
+        blocks: &[DraftBlock],
+    ) -> Result<(Vec<ContentBlock>, Vec<PathBuf>), CatalogError> {
+        let session_dir = self.session_attachments_dir(session_id)?;
+        let mut created_paths = Vec::new();
+        let result = (|| {
+            let mut content = Vec::with_capacity(blocks.len());
+            let mut encoded_total = 0u64;
+            for block in blocks {
+                let image = match block {
+                    DraftBlock::Text { text } if text.trim().is_empty() => continue,
+                    DraftBlock::Text { text } => {
+                        content.push(ContentBlock::text(text.clone()));
+                        continue;
+                    }
+                    DraftBlock::Image(image) => image,
+                };
+                let bytes = self.read_draft_image(image)?;
+                encoded_total =
+                    encoded_total.saturating_add(base64_encoded_len(bytes.len() as u64));
+                if encoded_total > MAX_TURN_IMAGE_ENCODED_BYTES {
+                    return Err(CatalogError::Attachment(
+                        AttachmentError::AggregateTooLarge {
+                            label: image.label.clone(),
+                        },
+                    ));
+                }
+                let id = new_attachment_id("tui", &image.attachment.sha256);
+                let path = session_dir.join(&id);
+                write_private_file(&path, &bytes)?;
+                created_paths.push(path);
+                content.push(ContentBlock::image(AttachmentRef::new(
+                    id,
+                    image.attachment.media_type.clone(),
+                    image.attachment.byte_len,
+                    image.attachment.sha256.clone(),
+                )));
+            }
+            sync_directory(&session_dir);
+            Ok((content, std::mem::take(&mut created_paths)))
+        })();
+        if result.is_err() {
+            remove_staged_paths(&created_paths);
+        }
+        result
+    }
+
+    /// Reads one draft-store image and re-checks its recorded identity.
+    fn read_draft_image(&self, image: &DraftImage) -> Result<Vec<u8>, CatalogError> {
+        let changed = || {
+            CatalogError::Attachment(AttachmentError::Staging {
+                label: image.label.clone(),
+                reason: "the staged image is missing or changed; remove it and attach it again"
+                    .into(),
+            })
+        };
+        let attachment = &image.attachment;
+        if !safe_attachment_id(&attachment.id)
+            || base64_encoded_len(attachment.byte_len) > MAX_IMAGE_ENCODED_BYTES
+        {
+            return Err(changed());
+        }
+        let path = self.draft_attachments_dir().join(&attachment.id);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            _ => return Err(changed()),
+        }
+        let mut bytes = Vec::with_capacity(attachment.byte_len as usize);
+        File::open(&path)
+            .and_then(|file| {
+                file.take(attachment.byte_len.saturating_add(1))
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|_| changed())?;
+        if bytes.len() as u64 != attachment.byte_len
+            || detect_image_media_type(&bytes) != Some(attachment.media_type.as_str())
+            || sha256_hex(&bytes) != attachment.sha256
+        {
+            return Err(changed());
+        }
+        Ok(bytes)
+    }
+
+    fn draft_image_is_present(&self, attachment: &AttachmentRef) -> bool {
+        safe_attachment_id(&attachment.id)
+            && fs::symlink_metadata(self.draft_attachments_dir().join(&attachment.id)).is_ok_and(
+                |metadata| metadata.file_type().is_file() && metadata.len() == attachment.byte_len,
+            )
+    }
+
+    fn draft_attachments_dir(&self) -> PathBuf {
+        self.inner.state_dir.join(DRAFT_ATTACHMENTS_DIR)
+    }
+
+    fn session_attachments_dir(&self, session_id: &str) -> Result<PathBuf, CatalogError> {
+        validate_session_id(session_id)?;
+        let root = self.inner.sessions_dir.join(ATTACHMENTS_DIR);
+        let session_dir = root.join(session_id);
+        fs::create_dir_all(&session_dir)?;
+        set_private_directory(&root)?;
+        set_private_directory(&session_dir)?;
+        Ok(session_dir)
+    }
+
+    /// Deletes draft-store files that no record references any more.
+    fn release_draft_images<'a>(
+        &self,
+        index: &CatalogIndex,
+        candidates: impl IntoIterator<Item = &'a str>,
+    ) {
+        let referenced = index
+            .sessions
+            .values()
+            .flat_map(SessionMetadata::draft_image_ids)
+            .collect::<BTreeSet<_>>();
+        let directory = self.draft_attachments_dir();
+        for id in candidates {
+            if !referenced.contains(id) && safe_attachment_id(id) {
+                let _ = fs::remove_file(directory.join(id));
+            }
+        }
+    }
+
+    /// Host-restart cleanup, run with the index lock held. Draft images
+    /// expire after the retention period. Images owned by no live record, and
+    /// session staging copies left by an unfinished turn, are removed after a
+    /// short grace once no driver holds the session lock. A deleted session
+    /// (no managed trail) owns no draft images.
+    fn sweep_staged_attachments(&self, index: &CatalogIndex) {
+        let now = SystemTime::now();
+        let age = |metadata: &fs::Metadata| {
+            metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or_default()
+        };
+        let live = index
+            .sessions
+            .iter()
+            .filter(|(id, _)| is_draft_id(id) || self.managed_trail_exists(id))
+            .flat_map(|(_, record)| record.draft_image_ids())
+            .collect::<BTreeSet<_>>();
+        if let Ok(entries) = fs::read_dir(self.draft_attachments_dir()) {
+            for entry in entries.flatten() {
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let limit = if name.to_str().is_some_and(|name| live.contains(name)) {
+                    DRAFT_ATTACHMENT_RETENTION
+                } else {
+                    STAGED_ORPHAN_GRACE
+                };
+                if !metadata.is_dir() && age(&metadata) > limit {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        let Ok(sessions) = fs::read_dir(self.inner.sessions_dir.join(ATTACHMENTS_DIR)) else {
+            return;
+        };
+        for session in sessions.flatten() {
+            let Some(session_id) = session.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !safe_session_id(&session_id)
+                || !session.file_type().is_ok_and(|kind| kind.is_dir())
+                || supervisor::session_lock_is_held(&self.inner.sessions_dir, &session_id)
+                    != Ok(false)
+            {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(session.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                if file.metadata().is_ok_and(|metadata| {
+                    !metadata.is_dir() && age(&metadata) > STAGED_ORPHAN_GRACE
+                }) {
+                    let _ = fs::remove_file(file.path());
+                }
+            }
+            let _ = fs::remove_dir(session.path());
+        }
     }
 
     pub fn save_display_metadata(
@@ -661,6 +1114,7 @@ impl SessionCatalog {
                 session_id: None,
                 pending_event: VecDeque::new(),
                 finished: None,
+                staged_paths: Vec::new(),
             }),
             Err(error) => {
                 self.release_controller_attempt(draft_id, &token)?;
@@ -746,6 +1200,7 @@ impl SessionCatalog {
             session_id: Some(id.to_string()),
             pending_event: VecDeque::new(),
             finished: None,
+            staged_paths,
         })
     }
 
@@ -757,14 +1212,7 @@ impl SessionCatalog {
         session_id: &str,
         content: &[ContentBlock],
     ) -> Result<(Vec<ContentBlock>, Vec<PathBuf>), CatalogError> {
-        validate_session_id(session_id)?;
-        let session_dir = self
-            .inner
-            .sessions_dir
-            .join(ATTACHMENTS_DIR)
-            .join(session_id);
-        fs::create_dir_all(&session_dir)?;
-        set_private_directory(&session_dir)?;
+        let session_dir = self.session_attachments_dir(session_id)?;
 
         let mut created_paths = Vec::new();
         let result = (|| {
@@ -792,35 +1240,11 @@ impl SessionCatalog {
                     .map_err(|_| {
                         CatalogError::Catalog("replay image data is not valid base64".into())
                     })?;
-                let digest = Sha256::digest(&bytes);
-                let sha256 = digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                let id = new_replay_attachment_id(&sha256);
+                let sha256 = sha256_hex(&bytes);
+                let id = new_attachment_id("replay", &sha256);
                 let path = session_dir.join(&id);
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.file_type().is_file() => {
-                        let existing = fs::read(&path)?;
-                        if existing != bytes {
-                            return Err(CatalogError::Catalog(
-                                "replay staging contains different image bytes".into(),
-                            ));
-                        }
-                    }
-                    Ok(_) => {
-                        return Err(CatalogError::Catalog(
-                            "replay staging path is not a regular file".into(),
-                        ));
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        let mut file = private_create_new(&path)?;
-                        created_paths.push(path.clone());
-                        file.write_all(&bytes)?;
-                        file.sync_all()?;
-                    }
-                    Err(error) => return Err(CatalogError::Io(error)),
-                }
+                write_private_file(&path, &bytes)?;
+                created_paths.push(path);
                 staged.push(ContentBlock::Image {
                     source: ImageSource::Attachment {
                         id,
@@ -1025,6 +1449,24 @@ impl SessionCatalog {
         if run_state == CatalogRunState::Unknown {
             read_only = true;
         }
+        let mut draft_blocks = record.draft_blocks.clone();
+        let mut missing_images = false;
+        for blocks in draft_blocks.values_mut() {
+            blocks.retain(|block| match block {
+                DraftBlock::Image(image) => {
+                    let present = self.draft_image_is_present(&image.attachment);
+                    missing_images |= !present;
+                    present
+                }
+                DraftBlock::Text { .. } => true,
+            });
+        }
+        if missing_images {
+            warnings.push(
+                "a draft image expired or was removed from the staging store; attach it again"
+                    .into(),
+            );
+        }
 
         Ok(CatalogSession {
             id: id.to_string(),
@@ -1041,6 +1483,8 @@ impl SessionCatalog {
             run_state,
             pending_new_turn: record.pending_new_turn,
             ended,
+            draft_blocks,
+            submissions: record.submissions.clone(),
         })
     }
 
@@ -1382,9 +1826,15 @@ impl SessionCatalog {
             }
         }
         let record = index.sessions.get_mut(id).expect("record inserted above");
+        let held_images = record
+            .draft_image_ids()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         mutate(record)?;
         record.updated_at_ms = now_ms();
-        self.write_index_unlocked(&index)
+        self.write_index_unlocked(&index)?;
+        self.release_draft_images(&index, held_images.iter().map(String::as_str));
+        Ok(())
     }
 
     fn update_index<F>(&self, mutate: F) -> Result<CatalogIndex, CatalogError>
@@ -1755,6 +2205,8 @@ pub struct CatalogTurn {
     session_id: Option<String>,
     pending_event: VecDeque<StreamEvent>,
     finished: Option<TurnOutcome>,
+    /// Session staging copies owned by this turn.
+    staged_paths: Vec<PathBuf>,
 }
 
 impl CatalogTurn {
@@ -1818,6 +2270,10 @@ impl CatalogTurn {
         while self.observe()?.is_some() {}
         let outcome = self.turn.wait()?;
         self.finished = Some(outcome.clone());
+        // The native resolver also removes these at terminal cleanup; this
+        // covers a turn that ended before resolving them. An unfinished turn
+        // leaves them to the restart sweep.
+        remove_staged_paths(&std::mem::take(&mut self.staged_paths));
         if let (Some(draft_id), Some(attempt_token)) =
             (self.draft_id.as_deref(), self.attempt_token.as_deref())
         {
@@ -1942,15 +2398,24 @@ fn new_draft_id() -> String {
     format!("draft-{}-{}-{sequence}", std::process::id(), now_ms())
 }
 
-fn new_replay_attachment_id(sha256: &str) -> String {
+fn new_attachment_id(prefix: &str, sha256: &str) -> String {
     let sequence = ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     format!(
-        "replay-{sha256}-{}-{started}-{sequence}",
+        "{prefix}-{sha256}-{}-{started}-{sequence}",
         std::process::id()
+    )
+}
+
+/// The draft-send identity of a recorded turn: its unredacted prompt and the
+/// visible content projection, whose images keep their MIME/length/digest.
+fn submission_fingerprint(turn: &TrailTurn) -> String {
+    turn_fingerprint(
+        turn.retry_prompt.as_deref().unwrap_or(&turn.prompt),
+        turn.content.as_deref(),
     )
 }
 
@@ -1999,11 +2464,7 @@ fn parse_request_content(
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data)
             .map_err(|_| "resolved image data is not valid base64".to_string())?;
-        let digest = Sha256::digest(&bytes);
-        let sha256 = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let sha256 = sha256_hex(&bytes);
         *visible_block = ContentBlock::Image {
             source: ImageSource::Attachment {
                 id: format!("replay-{sha256}"),
@@ -2386,6 +2847,16 @@ fn sync_directory(path: &Path) {
     }
 }
 
+fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = private_create_new(path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    if written.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    written
+}
+
 fn remove_staged_paths(paths: &[PathBuf]) {
     for path in paths {
         let _ = fs::remove_file(path);
@@ -2620,6 +3091,498 @@ mod tests {
         assert!(second_paths[0].exists());
         remove_staged_paths(&first_paths);
         remove_staged_paths(&second_paths);
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nimage";
+
+    fn open_catalog(root: &Path) -> SessionCatalog {
+        SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(root.join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("opens catalog")
+    }
+
+    fn staged_files(directory: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let Ok(entries) = fs::read_dir(directory) else {
+            return files;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                files.extend(staged_files(&entry.path()));
+            } else {
+                files.push(entry.path());
+            }
+        }
+        files
+    }
+
+    fn backdate(path: &Path, age: Duration) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn write_image_trail(catalog: &SessionCatalog, id: &str, prompt: &str, failed: bool) {
+        let data = base64::engine::general_purpose::STANDARD.encode(PNG);
+        let outcome = if failed {
+            json!({"schema":EXCHANGE_SCHEMA,"event":"response_error","ts_ms":3,"kind":"image_input_unsupported","message":"image_input_unsupported: provider anthropic model m does not accept image input","session_id":id,"turn_index":0})
+        } else {
+            json!({"schema":EXCHANGE_SCHEMA,"event":"response_ok","ts_ms":3,"reply":"done","session_id":id,"turn_index":0})
+        };
+        let events = [
+            json!({"schema":EXCHANGE_SCHEMA,"event":"session_start","ts_ms":1,"session_id":id}),
+            json!({"schema":EXCHANGE_SCHEMA,"event":"request","ts_ms":2,"model":"m","base_url":"local","prompt":prompt,"content":[
+                {"type":"text","text":prompt},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}
+            ],"session_id":id,"turn_index":0}),
+            outcome,
+        ];
+        fs::write(
+            catalog.trail_path(id),
+            events
+                .into_iter()
+                .map(|event| serde_json::to_string(&event).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn draft_image_staging_validates_before_writing_private_bytes() {
+        let scratch = tempdir().unwrap();
+        let catalog = open_catalog(scratch.path());
+        let store = catalog.draft_attachments_dir();
+
+        for (bytes, declared) in [
+            (b"not an image".to_vec(), None),
+            (PNG.to_vec(), Some("image/jpeg")),
+            (vec![0u8; 7_500_001], None),
+        ] {
+            assert!(
+                catalog
+                    .stage_draft_image(&bytes, declared, "/private/dir/shot.png", &[])
+                    .is_err()
+            );
+        }
+        let full = AttachmentRef::new("x", "image/png", 7_500_000, "0".repeat(64));
+        let aggregate = catalog
+            .stage_draft_image(
+                PNG,
+                None,
+                "a.png",
+                &[full.clone(), full.clone(), full.clone(), full],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            aggregate,
+            AttachmentError::AggregateTooLarge { .. }
+        ));
+        assert!(!aggregate.to_string().contains("private"));
+        assert!(staged_files(&store).is_empty(), "rejections stage nothing");
+
+        let image = catalog
+            .stage_draft_image(PNG, Some("image/png"), "/private/dir/shot.png", &[])
+            .unwrap();
+        assert_eq!(image.label, "shot.png");
+        assert_eq!(image.attachment.media_type, "image/png");
+        assert_eq!(image.attachment.byte_len, PNG.len() as u64);
+        assert_eq!(image.attachment.sha256, sha256_hex(PNG));
+        assert!(ContentBlock::image(image.attachment.clone()).is_wire_safe());
+        assert_eq!(fs::read(store.join(&image.attachment.id)).unwrap(), PNG);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(store.join(&image.attachment.id))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+    }
+
+    #[test]
+    fn mixed_drafts_persist_privately_and_release_removed_images() {
+        let scratch = tempdir().unwrap();
+        let catalog = open_catalog(scratch.path());
+        let draft = catalog
+            .create_draft(SessionInterface::Tui, None, Some(scratch.path()))
+            .unwrap();
+        let first = catalog
+            .stage_draft_image(PNG, None, "first.png", &[])
+            .unwrap();
+        let second = catalog
+            .stage_draft_image(b"GIF89aimage", None, "second.gif", &[])
+            .unwrap();
+        let blocks = vec![
+            DraftBlock::text("look "),
+            DraftBlock::Image(first.clone()),
+            DraftBlock::text(" and "),
+            DraftBlock::Image(second.clone()),
+        ];
+        catalog
+            .save_draft_content(&draft.id, SessionInterface::Tui, blocks.clone())
+            .unwrap();
+        let reopened = open_catalog(scratch.path()).get(&draft.id).unwrap();
+        assert_eq!(reopened.draft_blocks[&SessionInterface::Tui], blocks);
+        assert_eq!(reopened.drafts[&SessionInterface::Tui], "look  and ");
+        let projection = serde_json::to_string(&reopened).unwrap();
+        for private in [
+            first.attachment.id.as_str(),
+            first.attachment.sha256.as_str(),
+            "first.png",
+        ] {
+            assert!(!projection.contains(private));
+        }
+
+        let store = catalog.draft_attachments_dir();
+        catalog
+            .save_draft_content(
+                &draft.id,
+                SessionInterface::Tui,
+                vec![DraftBlock::text("look "), DraftBlock::Image(first.clone())],
+            )
+            .unwrap();
+        assert!(store.join(&first.attachment.id).is_file());
+        assert!(!store.join(&second.attachment.id).exists());
+
+        catalog
+            .save_draft(&draft.id, SessionInterface::Tui, "text only".into())
+            .unwrap();
+        assert!(staged_files(&store).is_empty());
+        assert!(
+            !catalog
+                .get(&draft.id)
+                .unwrap()
+                .draft_blocks
+                .contains_key(&SessionInterface::Tui)
+        );
+    }
+
+    #[test]
+    fn submission_identity_is_idempotent_and_conflicts_on_changed_content() {
+        let scratch = tempdir().unwrap();
+        let catalog = open_catalog(scratch.path());
+        let draft = catalog
+            .create_draft(SessionInterface::Tui, None, Some(scratch.path()))
+            .unwrap();
+        let image = catalog.stage_draft_image(PNG, None, "a.png", &[]).unwrap();
+        let blocks = vec![
+            DraftBlock::text("describe "),
+            DraftBlock::Image(image.clone()),
+        ];
+        assert_eq!(
+            catalog
+                .claim_submission(&draft.id, SessionInterface::Tui, "req-1", &blocks)
+                .unwrap(),
+            SubmissionClaim::Fresh
+        );
+        assert_eq!(
+            catalog
+                .claim_submission(&draft.id, SessionInterface::Tui, "req-1", &blocks)
+                .unwrap(),
+            SubmissionClaim::Replay
+        );
+        let changed_text = vec![DraftBlock::text("other "), DraftBlock::Image(image.clone())];
+        assert!(matches!(
+            catalog.claim_submission(&draft.id, SessionInterface::Tui, "req-1", &changed_text),
+            Err(CatalogError::SubmissionConflict)
+        ));
+        let other = catalog
+            .stage_draft_image(b"\xff\xd8\xffimage", None, "b.jpg", &[])
+            .unwrap();
+        let changed_image = vec![
+            DraftBlock::text("describe "),
+            DraftBlock::Image(other.clone()),
+        ];
+        assert!(matches!(
+            catalog.claim_submission(&draft.id, SessionInterface::Tui, "req-1", &changed_image),
+            Err(CatalogError::SubmissionConflict)
+        ));
+        assert_ne!(
+            draft_fingerprint(&blocks),
+            draft_fingerprint(&changed_image)
+        );
+        assert!(matches!(
+            catalog.claim_submission(&draft.id, SessionInterface::Tui, "../req", &blocks),
+            Err(CatalogError::Catalog(_))
+        ));
+        let session = catalog.get(&draft.id).unwrap();
+        assert_eq!(
+            session.submissions[&SessionInterface::Tui].request_id,
+            "req-1"
+        );
+        assert!(!serde_json::to_string(&session).unwrap().contains("req-1"));
+
+        // The pending submission keeps its image after the draft is cleared.
+        catalog
+            .save_draft(&draft.id, SessionInterface::Tui, String::new())
+            .unwrap();
+        let store = catalog.draft_attachments_dir();
+        assert!(store.join(&image.attachment.id).is_file());
+        catalog
+            .settle_submission(&draft.id, SessionInterface::Tui, "req-1")
+            .unwrap();
+        assert!(!store.join(&image.attachment.id).exists());
+        catalog.discard_draft_image(&other.attachment).unwrap();
+        assert!(staged_files(&store).is_empty());
+    }
+
+    #[test]
+    fn reconnect_resolves_a_submission_against_the_authoritative_trail() {
+        let scratch = tempdir().unwrap();
+        let catalog = open_catalog(scratch.path());
+        let image = catalog.stage_draft_image(PNG, None, "a.png", &[]).unwrap();
+        let blocks = vec![
+            DraftBlock::text("describe "),
+            DraftBlock::Image(image.clone()),
+        ];
+
+        let id = "sess-1-1";
+        write_image_trail(&catalog, id, "describe ", false);
+        catalog
+            .save_draft_content(id, SessionInterface::Tui, blocks.clone())
+            .unwrap();
+        catalog
+            .mutate_metadata(id, |record| {
+                record.submissions.insert(
+                    SessionInterface::Tui,
+                    DraftSubmission {
+                        request_id: "req-1".into(),
+                        fingerprint: draft_fingerprint(&blocks),
+                        blocks: blocks.clone(),
+                        base_turns: 0,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            catalog
+                .resolve_submission(id, SessionInterface::Tui)
+                .unwrap(),
+            SubmissionResolution::Accepted {
+                request_id: "req-1".into(),
+                turn_index: 0,
+                outcome: TrailOutcome::Succeeded,
+            }
+        );
+        assert_eq!(
+            catalog
+                .resolve_submission(id, SessionInterface::Tui)
+                .unwrap(),
+            SubmissionResolution::None
+        );
+
+        let other = "sess-1-2";
+        write_image_trail(&catalog, other, "a different prompt", false);
+        catalog
+            .save_draft_content(other, SessionInterface::Tui, blocks.clone())
+            .unwrap();
+        assert_eq!(
+            catalog
+                .claim_submission(other, SessionInterface::Tui, "req-2", &blocks)
+                .unwrap(),
+            SubmissionClaim::Fresh
+        );
+        assert_eq!(
+            catalog.get(other).unwrap().submissions[&SessionInterface::Tui].base_turns,
+            1
+        );
+        assert_eq!(
+            catalog
+                .resolve_submission(other, SessionInterface::Tui)
+                .unwrap(),
+            SubmissionResolution::NotAccepted {
+                request_id: "req-2".into()
+            }
+        );
+
+        // Recorded replay rehydrates the same image from the trail.
+        let failed = "sess-1-3";
+        write_image_trail(&catalog, failed, "describe ", true);
+        let session = catalog.get(failed).unwrap();
+        assert_eq!(
+            session.turns[0].failure_kind.as_deref(),
+            Some("image_input_unsupported")
+        );
+        let (content, paths) = catalog
+            .stage_resolved_content(
+                failed,
+                session.turns[0].resolved_content.as_deref().unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            &content[1],
+            ContentBlock::Image { source: ImageSource::Attachment { sha256, .. } }
+                if *sha256 == image.attachment.sha256
+        ));
+        assert_eq!(fs::read(&paths[0]).unwrap(), PNG);
+        remove_staged_paths(&paths);
+    }
+
+    #[test]
+    fn draft_images_transfer_to_the_session_and_rejected_starts_clean_up() {
+        let scratch = tempdir().unwrap();
+        let catalog = open_catalog(scratch.path());
+        let image = catalog.stage_draft_image(PNG, None, "a.png", &[]).unwrap();
+        let blocks = vec![
+            DraftBlock::text("before "),
+            DraftBlock::Image(image.clone()),
+            DraftBlock::text(" "),
+            DraftBlock::text(" after"),
+        ];
+        let (content, paths) = catalog.transfer_draft_images("sess-2-1", &blocks).unwrap();
+        assert_eq!(content.len(), 3, "blank text segments are omitted");
+        let ContentBlock::Image {
+            source: ImageSource::Attachment { id, sha256, .. },
+        } = &content[1]
+        else {
+            panic!("expected a managed attachment");
+        };
+        assert_ne!(id, &image.attachment.id, "the session copy has a fresh ref");
+        assert_eq!(sha256, &image.attachment.sha256);
+        assert_eq!(
+            paths[0].parent().unwrap(),
+            catalog
+                .sessions_dir()
+                .join(ATTACHMENTS_DIR)
+                .join("sess-2-1")
+        );
+        assert_eq!(fs::read(&paths[0]).unwrap(), PNG);
+        remove_staged_paths(&paths);
+
+        // A draft without a workspace is rejected after transfer; the copies
+        // are removed and the draft image stays owned by the draft.
+        let draft = catalog
+            .create_draft(SessionInterface::Tui, None, None)
+            .unwrap();
+        catalog
+            .save_draft_content(&draft.id, SessionInterface::Tui, blocks.clone())
+            .unwrap();
+        assert!(matches!(
+            catalog.start_draft_turn(&draft.id, SessionInterface::Tui, &blocks),
+            Err(CatalogError::WorkspaceRequired(_))
+        ));
+        assert!(staged_files(&catalog.sessions_dir().join(ATTACHMENTS_DIR)).is_empty());
+        assert!(
+            catalog
+                .draft_attachments_dir()
+                .join(&image.attachment.id)
+                .is_file()
+        );
+
+        // Changed staged bytes are detected before anything is copied.
+        fs::write(
+            catalog.draft_attachments_dir().join(&image.attachment.id),
+            b"\x89PNG\r\n\x1a\nIMAGE",
+        )
+        .unwrap();
+        let error = catalog
+            .transfer_draft_images("sess-2-2", &blocks)
+            .unwrap_err();
+        assert!(error.to_string().contains("a.png"));
+        assert!(staged_files(&catalog.sessions_dir().join(ATTACHMENTS_DIR)).is_empty());
+
+        // A removed staged file disappears from the draft projection.
+        fs::remove_file(catalog.draft_attachments_dir().join(&image.attachment.id)).unwrap();
+        let session = catalog.get(&draft.id).unwrap();
+        assert!(
+            draft_images(&session.draft_blocks[&SessionInterface::Tui])
+                .next()
+                .is_none()
+        );
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("attach it again"))
+        );
+    }
+
+    #[test]
+    fn restart_sweep_expires_orphans_stale_staging_and_deleted_sessions() {
+        let scratch = tempdir().unwrap();
+        let catalog = open_catalog(scratch.path());
+        let store = catalog.draft_attachments_dir();
+        let draft = catalog
+            .create_draft(SessionInterface::Tui, None, Some(scratch.path()))
+            .unwrap();
+        let kept = catalog
+            .stage_draft_image(PNG, None, "kept.png", &[])
+            .unwrap();
+        let expired = catalog
+            .stage_draft_image(PNG, None, "old.png", &[])
+            .unwrap();
+        let fresh_orphan = catalog
+            .stage_draft_image(PNG, None, "new.png", &[])
+            .unwrap();
+        let old_orphan = catalog
+            .stage_draft_image(PNG, None, "lost.png", &[])
+            .unwrap();
+        let deleted = catalog
+            .stage_draft_image(PNG, None, "gone.png", &[])
+            .unwrap();
+        catalog
+            .save_draft_content(
+                &draft.id,
+                SessionInterface::Tui,
+                vec![
+                    DraftBlock::Image(kept.clone()),
+                    DraftBlock::Image(expired.clone()),
+                ],
+            )
+            .unwrap();
+        write_image_trail(&catalog, "sess-3-1", "describe ", false);
+        catalog
+            .save_draft_content(
+                "sess-3-1",
+                SessionInterface::Tui,
+                vec![DraftBlock::Image(deleted.clone())],
+            )
+            .unwrap();
+        fs::remove_file(catalog.trail_path("sess-3-1")).unwrap();
+        backdate(
+            &store.join(&expired.attachment.id),
+            DRAFT_ATTACHMENT_RETENTION * 2,
+        );
+        backdate(
+            &store.join(&old_orphan.attachment.id),
+            STAGED_ORPHAN_GRACE * 2,
+        );
+        backdate(&store.join(&deleted.attachment.id), STAGED_ORPHAN_GRACE * 2);
+        backdate(&store.join(&kept.attachment.id), STAGED_ORPHAN_GRACE * 2);
+
+        let session_dir = catalog.session_attachments_dir("sess-3-2").unwrap();
+        let stale = session_dir.join("tui-stale");
+        let young = session_dir.join("tui-young");
+        fs::write(&stale, PNG).unwrap();
+        fs::write(&young, PNG).unwrap();
+        backdate(&stale, STAGED_ORPHAN_GRACE * 2);
+
+        let reopened = open_catalog(scratch.path());
+        assert!(store.join(&kept.attachment.id).is_file());
+        assert!(store.join(&fresh_orphan.attachment.id).is_file());
+        assert!(!store.join(&expired.attachment.id).exists());
+        assert!(!store.join(&old_orphan.attachment.id).exists());
+        assert!(!store.join(&deleted.attachment.id).exists());
+        assert!(!stale.exists());
+        assert!(young.exists());
+        let session = reopened.get(&draft.id).unwrap();
+        assert_eq!(
+            session.draft_blocks[&SessionInterface::Tui],
+            vec![DraftBlock::Image(kept)]
+        );
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("attach it again"))
+        );
     }
 
     #[test]
