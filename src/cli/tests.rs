@@ -2747,14 +2747,14 @@ fn parse_exchange_request_valid_envelope_passes_through_unchanged() {
         1_700_000_000_000,
     );
     let raw = serde_json::to_string(&envelope).unwrap();
-    let (request, mode) = parse_exchange_request(&raw);
+    let (request, mode) = parse_exchange_request(&raw).unwrap();
     assert_eq!(mode, ExchangeMode::Envelope);
     assert_eq!(request, envelope);
 }
 
 #[test]
 fn parse_exchange_request_plain_text_synthesizes_a_request() {
-    let (request, mode) = parse_exchange_request("hello there\n");
+    let (request, mode) = parse_exchange_request("hello there\n").unwrap();
     assert_eq!(mode, ExchangeMode::PlainText);
     assert_eq!(request.body, "hello there");
     assert_eq!(request.kind, MessageKind::Request);
@@ -2762,7 +2762,7 @@ fn parse_exchange_request_plain_text_synthesizes_a_request() {
 
 #[test]
 fn parse_exchange_request_trims_trailing_newline_only_preserves_trailing_spaces() {
-    let (request, _) = parse_exchange_request("hello   \r\n");
+    let (request, _) = parse_exchange_request("hello   \r\n").unwrap();
     assert_eq!(request.body, "hello   ");
 }
 

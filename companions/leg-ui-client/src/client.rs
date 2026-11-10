@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::content::ContentBlock;
 use crate::protocol::{StreamDecoder, StreamEvent, StreamFailure};
 use crate::resolve::{ResolveError, resolve_leg};
 
@@ -44,6 +45,9 @@ pub struct TurnRequest {
     pub prompt: String,
     pub cwd: PathBuf,
     pub session: LegSession,
+    /// Optional ordered content. Image blocks contain attachment identities,
+    /// never paths or bytes.
+    pub content: Option<Vec<ContentBlock>>,
 }
 
 impl TurnRequest {
@@ -52,7 +56,27 @@ impl TurnRequest {
             prompt: prompt.into(),
             cwd: cwd.into(),
             session,
+            content: None,
         }
+    }
+
+    pub fn new_with_content(
+        prompt: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+        session: LegSession,
+        content: Vec<ContentBlock>,
+    ) -> Self {
+        Self {
+            prompt: prompt.into(),
+            cwd: cwd.into(),
+            session,
+            content: Some(content),
+        }
+    }
+
+    pub fn with_content(mut self, content: Vec<ContentBlock>) -> Self {
+        self.content = Some(content);
+        self
     }
 }
 
@@ -74,6 +98,8 @@ pub enum StartError {
     Busy,
     #[error("could not start the companion supervisor: {0}")]
     Supervisor(String),
+    #[error("turn content contains an inline image payload; use a managed attachment ref")]
+    InvalidContent,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -114,6 +140,8 @@ struct StartRequestWire<'a> {
     cwd: String,
     store_dir: String,
     prompt: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<&'a [ContentBlock]>,
     session: SessionWire<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt: Option<StartAttemptWire<'a>>,
@@ -165,6 +193,13 @@ impl Client {
         request: TurnRequest,
         attempt: Option<(&str, &str)>,
     ) -> Result<TurnHandle, StartError> {
+        if request
+            .content
+            .as_deref()
+            .is_some_and(|content| content.iter().any(|block| !block.is_wire_safe()))
+        {
+            return Err(StartError::InvalidContent);
+        }
         if attempt.is_some() && !matches!(&request.session, LegSession::NewWithId(_)) {
             return Err(StartError::InvalidSessionId);
         }
@@ -225,6 +260,7 @@ impl Client {
             cwd: cwd.to_string_lossy().into_owned(),
             store_dir: store_dir.to_string_lossy().into_owned(),
             prompt: &request.prompt,
+            content: request.content.as_deref(),
             session,
             attempt: attempt.map(|(draft_id, token)| StartAttemptWire { draft_id, token }),
         };
@@ -923,7 +959,26 @@ pub(crate) fn redact_value(value: &mut Value) {
     match value {
         Value::String(text) => *text = redact_credentials(std::mem::take(text)),
         Value::Array(items) => items.iter_mut().for_each(redact_value),
-        Value::Object(object) => object.values_mut().for_each(redact_value),
+        Value::Object(object) => {
+            let is_image = object.get("type").and_then(Value::as_str) == Some("image");
+            if is_image
+                && object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .and_then(|source| source.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("base64")
+            {
+                if let Some(data) = object
+                    .get_mut("source")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|source| source.get_mut("data"))
+                {
+                    *data = Value::String("[REDACTED_IMAGE]".to_string());
+                }
+            }
+            object.values_mut().for_each(redact_value)
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }

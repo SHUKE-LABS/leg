@@ -90,6 +90,21 @@ pub enum ImageSource {
         /// Base64-encoded image data.
         data: String,
     },
+    /// An opaque, session-scoped image staged by a trusted companion host.
+    ///
+    /// This representation is accepted only at the companion/exchange
+    /// boundary. The trusted resolver expands it to [`ImageSource::Base64`]
+    /// before a provider transport sees the message.
+    Attachment {
+        /// Opaque staged attachment identifier. It is never a filesystem path.
+        id: String,
+        /// MIME type asserted by the staging host.
+        media_type: String,
+        /// Raw byte length asserted by the staging host.
+        byte_len: u64,
+        /// Lowercase hexadecimal SHA-256 of the staged bytes.
+        sha256: String,
+    },
 }
 
 impl ContentBlock {
@@ -197,6 +212,15 @@ impl Conversation {
     /// The full history in order, oldest turn first.
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Replaces the accumulated history with an equivalent ordered copy.
+    ///
+    /// Session resolvers use this to retain validated provider content in
+    /// memory after an attachment has been expanded, so a later turn does
+    /// not depend on the staged file still existing.
+    pub(crate) fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
     }
 
     /// The number of accumulated turns.

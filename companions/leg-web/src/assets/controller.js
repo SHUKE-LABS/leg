@@ -361,6 +361,7 @@ export function startController(view) {
       if (!value) return null;
       const parsed = JSON.parse(value);
       if (!Number.isSafeInteger(parsed.request_id) || typeof parsed.prompt !== "string") return null;
+      if (parsed.content !== undefined && parsed.content !== null && !Array.isArray(parsed.content)) return null;
       return parsed;
     } catch {
       return null;
@@ -992,14 +993,51 @@ export function startController(view) {
     return JSON.stringify([sessionId, turnIndex, toolUseId]);
   }
 
-  function promptHash(prompt) {
-    const bytes = new TextEncoder().encode(prompt);
+  function promptHash(prompt, content = null) {
+    const sortJson = (value) => {
+      if (Array.isArray(value)) return value.map(sortJson);
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortJson(value[key])]));
+      }
+      return value;
+    };
+    const canonicalContent = content === null ? null : content.map((block) => {
+      switch (block?.type) {
+        case "text":
+          return { type: "text", text: block.text };
+        case "image":
+          return {
+            type: "image",
+            source: {
+              type: "attachment",
+              media_type: block.source?.media_type,
+              byte_len: block.source?.byte_len,
+              sha256: block.source?.sha256,
+            },
+          };
+        case "thinking":
+          return { type: "thinking", thinking: block.thinking, signature: block.signature };
+        case "tool_use":
+          return { type: "tool_use", id: block.id, name: block.name, input: sortJson(block.input) };
+        case "tool_result": {
+          const result = { type: "tool_result", tool_use_id: block.tool_use_id, content: block.content };
+          if (block.is_error !== undefined && block.is_error !== null) result.is_error = block.is_error;
+          return result;
+        }
+        default:
+          return block;
+      }
+    });
+    const canonical = content === null
+      ? prompt
+      : JSON.stringify({ prompt, content: canonicalContent });
+    const bytes = new TextEncoder().encode(canonical);
     return crypto.subtle.digest("SHA-256", bytes).then((digest) =>
       [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join(""),
     );
   }
 
-  async function submitPrompt({ retry = false, recordedPrompt = null, preserveDraft = false } = {}) {
+  async function submitPrompt({ retry = false, recordedPrompt = null, recordedContent = null, preserveDraft = false } = {}) {
     if (!state.sessionId || state.submitting || state.active || state.reconnecting) return;
     const sessionId = state.sessionId;
     const switchGeneration = state.switchGeneration;
@@ -1020,7 +1058,14 @@ export function startController(view) {
       }
       if (preserveDraft) saveDraft();
       state.preserveDraftRetry = preserveDraft ? { sessionId, requestId } : null;
-      state.pending = { request_id: requestId, prompt, phase: "sending", retryAllowed: false, preserveDraft };
+      state.pending = {
+        request_id: requestId,
+        prompt,
+        content: Array.isArray(recordedContent) ? recordedContent : null,
+        phase: "sending",
+        retryAllowed: false,
+        preserveDraft,
+      };
       savePending();
     }
 
@@ -1032,7 +1077,10 @@ export function startController(view) {
     try {
       const receipt = await api(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
         method: "POST",
-        body: { request_id: pending.request_id, prompt: pending.prompt },
+        body: Object.assign(
+          { request_id: pending.request_id, prompt: pending.prompt },
+          pending.content === null || pending.content === undefined ? {} : { content: pending.content },
+        ),
       });
       if (!isCurrentSession(sessionId, switchGeneration)) return;
       await acceptSubmission(receipt, pending, { sessionId, switchGeneration });
@@ -1123,7 +1171,7 @@ export function startController(view) {
     const receipt = snapshot.last_submission;
     if (Number(snapshot.high_water) >= pending.request_id) {
       if (receipt?.request_id === pending.request_id) {
-        const expectedHash = await promptHash(pending.prompt);
+        const expectedHash = await promptHash(pending.prompt, pending.content ?? null);
         if (!isCurrentSession(sessionId, switchGeneration) || state.pending !== pending) return;
         if (receipt.prompt_sha256 !== expectedHash) {
           pending.phase = "conflict";
@@ -1340,7 +1388,13 @@ export function startController(view) {
     stopTurn: () => void stopTurn(),
     retryRecordedTurn(turnIndex) {
       const turn = state.snapshot?.session?.turns?.find((item) => Number(item.turn_index) === Number(turnIndex));
-      if (turn && canRetryTurn(turn)) void submitPrompt({ recordedPrompt: turn.prompt, preserveDraft: true });
+      if (turn && canRetryTurn(turn)) {
+        void submitPrompt({
+          recordedPrompt: turn.prompt,
+          recordedContent: Array.isArray(turn.content) ? turn.content : null,
+          preserveDraft: true,
+        });
+      }
     },
     saveCurrentSessionView,
     online() {

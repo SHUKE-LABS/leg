@@ -80,6 +80,17 @@ pub enum Provider {
     OpenAiResponses,
 }
 
+impl Provider {
+    /// Stable wire/display name for this provider protocol.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAiChatCompletions => "openai-chat-completions",
+            Self::OpenAiResponses => "openai-responses",
+        }
+    }
+}
+
 /// Authentication credential for the selected provider.
 ///
 /// Variants map 1:1 onto the wire-format header the transport emits, including

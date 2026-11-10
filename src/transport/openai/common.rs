@@ -56,10 +56,22 @@ pub(crate) fn serialize_request(
     Ok(body)
 }
 
+pub(crate) fn has_image_input(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    })
+}
+
 pub(crate) fn image_data_url(source: &ImageSource) -> String {
     match source {
         ImageSource::Base64 { media_type, data } => {
             format!("data:{media_type};base64,{data}")
+        }
+        ImageSource::Attachment { .. } => {
+            unreachable!("attachment refs must be resolved before provider serialization")
         }
     }
 }

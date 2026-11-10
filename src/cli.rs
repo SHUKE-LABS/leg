@@ -15,6 +15,7 @@ use crate::events::{
 };
 use crate::guest;
 use crate::hooks::HookEvent;
+use crate::image_input::{cleanup_staged_content, resolve_content, resolve_messages};
 use crate::install::{self, InstallOptions};
 use crate::interrupt;
 use crate::message::{MessageEnvelope, MessageKind};
@@ -906,9 +907,14 @@ enum ExchangeMode {
 /// `ts_ms`). A parse failure falls back to treating the whole input as the
 /// prompt body, trimmed only of a trailing `\r`/`\n` so intentional trailing
 /// spaces/tabs survive.
-fn parse_exchange_request(raw: &str) -> (MessageEnvelope, ExchangeMode) {
-    if let Ok(envelope) = serde_json::from_str::<MessageEnvelope>(raw) {
-        return (envelope, ExchangeMode::Envelope);
+fn parse_exchange_request(raw: &str) -> Result<(MessageEnvelope, ExchangeMode)> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        if value.get("schema").and_then(serde_json::Value::as_str) == Some(crate::message::SCHEMA) {
+            let envelope = serde_json::from_value::<MessageEnvelope>(value).map_err(|error| {
+                LegError::Usage(format!("invalid baton.message/v1 envelope: {error}"))
+            })?;
+            return Ok((envelope, ExchangeMode::Envelope));
+        }
     }
     let body = raw.trim_end_matches(['\r', '\n']);
     let envelope = MessageEnvelope::new(
@@ -920,7 +926,7 @@ fn parse_exchange_request(raw: &str) -> (MessageEnvelope, ExchangeMode) {
         body,
         now_ms(),
     );
-    (envelope, ExchangeMode::PlainText)
+    Ok((envelope, ExchangeMode::PlainText))
 }
 
 /// Runs one `leg exchange` request/response round-trip: reads `in_path`
@@ -1011,7 +1017,6 @@ fn execute_exchange_session(
     let base_system_prompt = config.system_prompt.clone();
     let meta = exchange_meta(&config);
     let raw = read_exchange_input(in_path)?;
-
     let mut output = open_output(out_path)?;
     if create_new {
         std::fs::create_dir_all(&store_dir).map_err(|err| {
@@ -1075,10 +1080,10 @@ fn execute_exchange_core(
     output: impl Write,
     sink: &mut dyn EventSink,
 ) -> Result<()> {
-    let (request, mode) = parse_exchange_request(raw);
-    let content = [ContentBlock::text(request.body.clone())];
-    let response = respond_with_trail(meta, &request, &content, sink, |envelope| {
-        participant.respond(envelope)
+    let (request, mode) = parse_exchange_request(raw)?;
+    let content = resolve_content(&request.content_blocks(), None)?;
+    let response = respond_with_trail(meta, &request, sink, |envelope| {
+        participant.respond_with_content(envelope, &content)
     })?;
 
     write_exchange_response(mode, &response, output)
@@ -1094,12 +1099,24 @@ fn execute_exchange_session_core(
     resumed: &mut ResumedSession,
     base_system_prompt: Option<&str>,
 ) -> Result<()> {
-    let (request, mode) = parse_exchange_request(raw);
+    let (request, mode) = parse_exchange_request(raw)?;
     let system_prompt = system_prompt_for_turn(base_system_prompt)?;
     let session_id = resumed.session_id.clone();
     let turn_index = resumed.next_turn_index;
     let request_ts_ms = now_ms();
-    resumed.conversation.push_user(request.body.as_str());
+    let request_content = request.content_blocks();
+    let resolved_content = resolve_content(&request_content, Some(&session_id));
+    let provider_request_content = match &resolved_content {
+        Ok(content) => content.clone(),
+        Err(_) => request_content.clone(),
+    };
+    resumed
+        .conversation
+        .push(Message::new(Role::User, provider_request_content.clone()));
+    let trail_request_content = match &resolved_content {
+        Ok(content) => content.as_slice(),
+        Err(_) => request_content.as_slice(),
+    };
 
     let stderr = std::io::stderr();
     let mut warning = stderr.lock();
@@ -1109,6 +1126,7 @@ fn execute_exchange_session_core(
         TimedSessionExchangeContext {
             meta,
             prompt: &request.body,
+            trail_content: trail_request_content,
             session_id: &session_id,
             turn_index,
             max_tool_rounds: transport.max_tool_rounds(),
@@ -1135,13 +1153,23 @@ fn execute_exchange_session_core(
                     ),
                 );
             };
-            transport.run_observed_with_system_prompt_and_context_with_attempts(
-                resumed.conversation.messages(),
-                system_prompt.as_deref(),
-                ContextTurn::new(&session_id, turn_index),
-                &mut observe_tool,
-                &mut observe_compaction,
-            )
+            let provider_messages =
+                resolve_messages(resumed.conversation.messages(), Some(&session_id));
+            match provider_messages {
+                Ok(provider_messages) => {
+                    resumed
+                        .conversation
+                        .replace_messages(provider_messages.clone());
+                    transport.run_observed_with_system_prompt_and_context_with_attempts(
+                        &provider_messages,
+                        system_prompt.as_deref(),
+                        ContextTurn::new(&session_id, turn_index),
+                        &mut observe_tool,
+                        &mut observe_compaction,
+                    )
+                }
+                Err(error) => TransportCall::completed(Err(error), 0),
+            }
         },
     );
     let attempts = Some(call.attempts);
@@ -1198,12 +1226,16 @@ fn execute_exchange_session_core(
         model: meta.model.clone(),
         base_url: meta.base_url.clone(),
         prompt: request.body.clone(),
-        content: None,
-        session_id: Some(session_id),
+        // The private trail already carries the resolved provider content;
+        // keep the returned envelope on the opaque-ref boundary.
+        content: trail_content(&request_content),
+        session_id: Some(session_id.clone()),
         turn_index: Some(turn_index),
     };
     let response =
         build_response_envelope(&request, request_record, kind, body, outcome_ts_ms, outcome);
+
+    cleanup_staged_content(&request_content, &session_id);
 
     write_exchange_response(mode, &response, output)
 }
@@ -1355,13 +1387,13 @@ fn tool_trail_observer(mut sink: Rc<RefCell<Box<dyn EventSink>>>) -> ToolObserve
 fn respond_with_trail(
     meta: &ExchangeMeta,
     request: &MessageEnvelope,
-    content: &[ContentBlock],
     sink: &mut dyn EventSink,
     respond: impl FnOnce(&MessageEnvelope) -> MessageEnvelope,
 ) -> Result<MessageEnvelope> {
     emit(
         sink,
-        &ExchangeEvent::request(now_ms(), meta, &request.body).with_content(content),
+        &ExchangeEvent::request(now_ms(), meta, &request.body)
+            .with_content(&request.content_blocks()),
     );
 
     let start = Instant::now();
@@ -1437,7 +1469,7 @@ fn run_ask_inner(
     sink: &mut dyn EventSink,
     respond: impl FnOnce(&MessageEnvelope) -> MessageEnvelope,
 ) -> Result<()> {
-    let request = MessageEnvelope::new(
+    let mut request = MessageEnvelope::new(
         "ask-1",
         "ask",
         "user",
@@ -1446,7 +1478,10 @@ fn run_ask_inner(
         prompt,
         crate::events::now_ms(),
     );
-    let response = respond_with_trail(meta, &request, content, sink, respond)?;
+    if trail_content(content).is_some() {
+        request.content = Some(content.to_vec());
+    }
+    let response = respond_with_trail(meta, &request, sink, respond)?;
     interrupt::check()?;
 
     match response.kind {
@@ -1660,13 +1695,16 @@ fn run_session_repl_with_warning_and_system_prompt(
         }
 
         let system_prompt = system_prompt_for_turn(base_system_prompt)?;
-        conversation.push_user(line.as_str());
+        let content = [ContentBlock::text(line.clone())];
+        conversation.push(Message::new(Role::User, content.to_vec()));
+        let provider_messages = resolve_messages(conversation.messages(), Some(&session_id));
         let mut streamed_text = false;
         let call = timed_session_exchange(
             sink,
             TimedSessionExchangeContext {
                 meta,
                 prompt: &line,
+                trail_content: &content,
                 session_id: &session_id,
                 turn_index,
                 max_tool_rounds: transport.max_tool_rounds(),
@@ -1693,24 +1731,28 @@ fn run_session_repl_with_warning_and_system_prompt(
                         ),
                     );
                 };
-                transport.run_streaming_observed_with_system_prompt_and_context_with_attempts(
-                    conversation.messages(),
-                    system_prompt.as_deref(),
-                    ContextTurn::new(&session_id, turn_index),
-                    &mut observe_tool,
-                    &mut observe_compaction,
-                    &mut |event| {
-                        if let Some(text) = stream_event_text(&event)
-                            && !text.is_empty()
-                        {
-                            interrupt::check()?;
-                            output.write_all(text.as_bytes()).map_err(io_err)?;
-                            output.flush().map_err(io_err)?;
-                            streamed_text = true;
-                        }
-                        Ok(())
-                    },
-                )
+                match provider_messages {
+                    Ok(provider_messages) => transport
+                        .run_streaming_observed_with_system_prompt_and_context_with_attempts(
+                            &provider_messages,
+                            system_prompt.as_deref(),
+                            ContextTurn::new(&session_id, turn_index),
+                            &mut observe_tool,
+                            &mut observe_compaction,
+                            &mut |event| {
+                                if let Some(text) = stream_event_text(&event)
+                                    && !text.is_empty()
+                                {
+                                    interrupt::check()?;
+                                    output.write_all(text.as_bytes()).map_err(io_err)?;
+                                    output.flush().map_err(io_err)?;
+                                    streamed_text = true;
+                                }
+                                Ok(())
+                            },
+                        ),
+                    Err(error) => TransportCall::completed(Err(error), 0),
+                }
             },
         );
         turn_index += 1;
@@ -1804,6 +1846,7 @@ fn stream_event_text(event: &StreamEvent) -> Option<&str> {
 struct TimedSessionExchangeContext<'a> {
     meta: &'a ExchangeMeta,
     prompt: &'a str,
+    trail_content: &'a [ContentBlock],
     session_id: &'a str,
     turn_index: u64,
     max_tool_rounds: Option<usize>,
@@ -1821,11 +1864,13 @@ fn timed_session_exchange(
     let TimedSessionExchangeContext {
         meta,
         prompt,
+        trail_content,
         session_id,
         turn_index,
         max_tool_rounds,
     } = context;
-    let request = ExchangeEvent::session_request(now_ms(), meta, prompt, session_id, turn_index);
+    let request = ExchangeEvent::session_request(now_ms(), meta, prompt, session_id, turn_index)
+        .with_content(trail_content);
     emit(sink, &request);
 
     let start = Instant::now();

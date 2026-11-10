@@ -117,6 +117,15 @@ pub enum LegError {
     /// The active conversation cannot fit in the configured provider context
     /// window without dropping an in-flight turn or tool result.
     ContextWindow(String),
+    /// The selected provider/model does not accept image input. This is a
+    /// stable, non-retryable failure; the caller may switch models or remove
+    /// the image and deliberately resubmit the preserved turn.
+    ImageInputUnsupported {
+        /// Stable provider protocol name.
+        provider: String,
+        /// Configured model id.
+        model: String,
+    },
     /// A local I/O operation failed.
     Io(String),
     /// The `leg install` command could not materialize the native binaries.
@@ -171,6 +180,7 @@ impl LegError {
             LegError::Api { .. } => "api",
             LegError::Decode(_) | LegError::TokenLimit { .. } => "decode",
             LegError::ContextWindow(_) => "context_window",
+            LegError::ImageInputUnsupported { .. } => "image_input_unsupported",
             LegError::Io(_) => "io",
             LegError::Install(_) => "install",
             LegError::Guest(_) => "guest",
@@ -220,6 +230,110 @@ impl LegError {
             || message.contains("context_length_exceeded")
             || message.contains("reduce the length of the input")
     }
+
+    /// Reclassifies an explicit provider modality rejection without retaining
+    /// provider text that could contain a credential, path, or uploaded data.
+    pub(crate) fn classify_image_input_rejection(
+        self,
+        provider: &str,
+        model: &str,
+        has_image: bool,
+    ) -> Self {
+        if !has_image {
+            return self;
+        }
+        let LegError::Api {
+            status,
+            error_type,
+            message,
+        } = &self
+        else {
+            return self;
+        };
+        if !(400..500).contains(status) || !is_image_input_rejection(error_type.as_deref(), message)
+        {
+            return self;
+        }
+        LegError::ImageInputUnsupported {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    /// Reclassifies a provider response before a retry wrapper can discard the
+    /// response body. This also covers a provider that uses a retryable HTTP
+    /// status for a deterministic modality rejection.
+    pub(crate) fn classify_image_input_response(
+        self,
+        provider: &str,
+        model: &str,
+        has_image: bool,
+        status: u16,
+        body: &str,
+    ) -> Self {
+        if has_image && is_image_input_rejection_response(status, body) {
+            return LegError::ImageInputUnsupported {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            };
+        }
+        self.classify_image_input_rejection(provider, model, has_image)
+    }
+}
+
+fn is_image_input_rejection(error_type: Option<&str>, message: &str) -> bool {
+    let error_type = error_type.unwrap_or_default().to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    let combined = format!("{error_type} {message}");
+    let image_term = [
+        "image",
+        "vision",
+        "visual",
+        "multimodal",
+        "modality",
+        "image_url",
+    ]
+    .iter()
+    .any(|term| combined.contains(term));
+    let rejection_term = [
+        "unsupported",
+        "not support",
+        "does not support",
+        "not accept",
+        "cannot accept",
+        "invalid modality",
+        "invalid input type",
+    ]
+    .iter()
+    .any(|term| combined.contains(term));
+    image_term && rejection_term
+}
+
+/// Detects a deterministic image-modality rejection from a provider's raw
+/// error response without exposing the response text to callers.
+pub(crate) fn is_image_input_rejection_response(status: u16, body: &str) -> bool {
+    if !(400..500).contains(&status) {
+        return false;
+    }
+
+    let body_match = is_image_input_rejection(None, body);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body_match;
+    };
+    let error = value
+        .pointer("/response/error")
+        .filter(|value| value.is_object())
+        .or_else(|| value.get("error").filter(|value| value.is_object()))
+        .unwrap_or(&value);
+    let error_type = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str));
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(body);
+    body_match || is_image_input_rejection(error_type, message)
 }
 
 impl fmt::Display for LegError {
@@ -271,6 +385,10 @@ impl fmt::Display for LegError {
                 "response decode error: reply hit max_tokens ({max_tokens}) before producing text or a tool call; raise LEG_MAX_TOKENS"
             ),
             LegError::ContextWindow(msg) => write!(f, "context window error: {msg}"),
+            LegError::ImageInputUnsupported { provider, model } => write!(
+                f,
+                "image_input_unsupported: provider {provider} model {model} does not accept image input"
+            ),
             LegError::Io(msg) => write!(f, "io error: {msg}"),
             LegError::Install(msg) => write!(f, "install error: {msg}"),
             LegError::Guest(failure) => {

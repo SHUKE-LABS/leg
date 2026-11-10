@@ -39,6 +39,17 @@ The event-specific fields are:
 Session coordinates are omitted on cold exchanges. A new session's id appears
 in `turn_start`, even when the first provider turn fails.
 
+Multimodal requests put an optional ordered `content` array on the correlated
+request envelope. Companion image blocks carry only a managed `attachment`
+identity (`id`, `media_type`, `byte_len`, and `sha256`); the native resolver
+opens the session staging store immediately before the provider call. Resolved
+base64 bytes are retained only in the private session trail needed for
+resume/replay; stream records, catalog metadata, UI events, and diagnostics
+redact them. Terminal cleanup removes the staged ref. The catalog projects
+private trail images back to opaque refs and can re-stage their validated bytes
+for an explicit retry after cleanup. Legacy text-only envelopes omit `content`
+and retain their existing behavior.
+
 `round_index` counts provider calls in this user turn, starting at zero. A
 `tool_round` identifies the provider call that requested the tools; its
 `tool_call` and `tool_result` records use that same index. `block_index` is the

@@ -13,15 +13,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::client::{
     Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,
     TurnRequest, TurnStopHandle, new_native_session_id,
 };
+use crate::content::{ContentBlock, ImageSource, turn_fingerprint};
 use crate::process_owner::{OwnerState, ProcessOwner};
 use crate::protocol::StreamEvent;
 use crate::supervisor;
@@ -30,6 +33,7 @@ const INDEX_NAME: &str = "catalog.json";
 const LOCK_NAME: &str = ".catalog.lock";
 const INDEX_VERSION: u32 = 1;
 const EXCHANGE_SCHEMA: &str = "baton.exchange/v1";
+const ATTACHMENTS_DIR: &str = "attachments";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -93,6 +97,15 @@ pub struct TrailTool {
 pub struct TrailTurn {
     pub turn_index: u64,
     pub prompt: String,
+    /// Ordered request content. Image blocks retain only managed attachment
+    /// identity, never resolved provider bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentBlock>>,
+    /// Authoritative provider content retained only inside the catalog
+    /// process. It is omitted from UI/export serialization and is used to
+    /// re-stage cleaned attachments for retry/replay.
+    #[serde(skip)]
+    resolved_content: Option<Vec<ContentBlock>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<u64>,
     #[serde(skip)]
@@ -120,6 +133,7 @@ impl fmt::Debug for TrailTurn {
             .debug_struct("TrailTurn")
             .field("turn_index", &self.turn_index)
             .field("prompt", &self.prompt)
+            .field("content", &self.content)
             .field("outcome", &self.outcome)
             .field("reply", &self.reply)
             .field("failure_kind", &self.failure_kind)
@@ -193,6 +207,9 @@ pub struct RetryIntent {
     session_id: String,
     turn_index: u64,
     prompt: String,
+    content: Option<Vec<ContentBlock>>,
+    resolved_content: Option<Vec<ContentBlock>>,
+    fingerprint: String,
 }
 
 impl RetryIntent {
@@ -202,6 +219,14 @@ impl RetryIntent {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn content(&self) -> Option<&[ContentBlock]> {
+        self.content.as_deref()
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     pub fn warning(&self) -> &'static str {
@@ -518,6 +543,17 @@ impl SessionCatalog {
         self.start_new_with_id(draft_id, session_id, _interface, prompt)
     }
 
+    pub fn start_new_with_content(
+        &self,
+        draft_id: &str,
+        _interface: SessionInterface,
+        prompt: impl Into<String>,
+        content: Option<Vec<ContentBlock>>,
+    ) -> Result<CatalogTurn, CatalogError> {
+        let session_id = self.allocate_new_session_id()?;
+        self.start_new_with_id_content(draft_id, session_id, _interface, prompt, content)
+    }
+
     /// Mints a native-format ID that is not already present in this catalog.
     /// The supervisor reserves the per-session lock before the ID is published.
     pub fn allocate_new_session_id(&self) -> Result<String, CatalogError> {
@@ -541,6 +577,17 @@ impl SessionCatalog {
         session_id: String,
         _interface: SessionInterface,
         prompt: impl Into<String>,
+    ) -> Result<CatalogTurn, CatalogError> {
+        self.start_new_with_id_content(draft_id, session_id, _interface, prompt, None)
+    }
+
+    pub fn start_new_with_id_content(
+        &self,
+        draft_id: &str,
+        session_id: String,
+        _interface: SessionInterface,
+        prompt: impl Into<String>,
+        content: Option<Vec<ContentBlock>>,
     ) -> Result<CatalogTurn, CatalogError> {
         validate_session_id(draft_id)?;
         if !is_draft_id(draft_id) {
@@ -583,7 +630,15 @@ impl SessionCatalog {
         drop(_guard);
 
         let client = self.client();
-        let request = TurnRequest::new(prompt, cwd, LegSession::NewWithId(session_id));
+        let request = match content {
+            Some(content) => TurnRequest::new_with_content(
+                prompt,
+                cwd,
+                LegSession::NewWithId(session_id),
+                content,
+            ),
+            None => TurnRequest::new(prompt, cwd, LegSession::NewWithId(session_id)),
+        };
         match client.start_catalog_new(request, draft_id, &token) {
             Ok(turn) => Ok(CatalogTurn {
                 turn,
@@ -607,6 +662,27 @@ impl SessionCatalog {
         _interface: SessionInterface,
         prompt: impl Into<String>,
     ) -> Result<CatalogTurn, CatalogError> {
+        self.start_existing_with_content(id, _interface, prompt, None)
+    }
+
+    pub fn start_existing_with_content(
+        &self,
+        id: &str,
+        _interface: SessionInterface,
+        prompt: impl Into<String>,
+        content: Option<Vec<ContentBlock>>,
+    ) -> Result<CatalogTurn, CatalogError> {
+        self.start_existing_with_replay_content(id, _interface, prompt, content, None)
+    }
+
+    fn start_existing_with_replay_content(
+        &self,
+        id: &str,
+        _interface: SessionInterface,
+        prompt: impl Into<String>,
+        content: Option<Vec<ContentBlock>>,
+        resolved_content: Option<Vec<ContentBlock>>,
+    ) -> Result<CatalogTurn, CatalogError> {
         validate_session_id(id)?;
         if is_draft_id(id) {
             return Err(CatalogError::NotFound(id.into()));
@@ -625,14 +701,30 @@ impl SessionCatalog {
         ensure_idle(&session)?;
         let cwd = self.validated_cwd(id, record)?;
         drop(_guard);
+        let (content, staged_paths) = match resolved_content {
+            Some(resolved_content) => {
+                let (content, paths) = self.stage_resolved_content(id, &resolved_content)?;
+                (Some(content), paths)
+            }
+            None => (content, Vec::new()),
+        };
         let client = self.client();
-        let turn = client
-            .start(TurnRequest::new(
+        let request = match content {
+            Some(content) => TurnRequest::new_with_content(
                 prompt,
                 cwd,
                 LegSession::Existing(id.to_string()),
-            ))
-            .map_err(map_start_error)?;
+                content,
+            ),
+            None => TurnRequest::new(prompt, cwd, LegSession::Existing(id.to_string())),
+        };
+        let turn = match client.start(request) {
+            Ok(turn) => turn,
+            Err(error) => {
+                remove_staged_paths(&staged_paths);
+                return Err(map_start_error(error));
+            }
+        };
         Ok(CatalogTurn {
             turn,
             catalog: self.clone(),
@@ -642,6 +734,96 @@ impl SessionCatalog {
             pending_event: VecDeque::new(),
             finished: None,
         })
+    }
+
+    /// Re-materializes the private resolved trail content under fresh managed
+    /// refs. The native resolver removes those refs at terminal cleanup; the
+    /// private trail remains the replay source for the next attempt.
+    fn stage_resolved_content(
+        &self,
+        session_id: &str,
+        content: &[ContentBlock],
+    ) -> Result<(Vec<ContentBlock>, Vec<PathBuf>), CatalogError> {
+        validate_session_id(session_id)?;
+        let session_dir = self
+            .inner
+            .sessions_dir
+            .join(ATTACHMENTS_DIR)
+            .join(session_id);
+        fs::create_dir_all(&session_dir)?;
+        set_private_directory(&session_dir)?;
+
+        let mut created_paths = Vec::new();
+        let result = (|| {
+            let mut staged = Vec::with_capacity(content.len());
+            for block in content {
+                let ContentBlock::Image { source } = block else {
+                    staged.push(block.clone());
+                    continue;
+                };
+                let ImageSource::Base64 { media_type, data } = source else {
+                    return Err(CatalogError::Catalog(
+                        "replay content has no authoritative image bytes".into(),
+                    ));
+                };
+                if !matches!(
+                    media_type.as_str(),
+                    "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+                ) {
+                    return Err(CatalogError::Catalog(
+                        "replay content has an unsupported image MIME type".into(),
+                    ));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| {
+                        CatalogError::Catalog("replay image data is not valid base64".into())
+                    })?;
+                let digest = Sha256::digest(&bytes);
+                let sha256 = digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let id = format!("replay-{sha256}");
+                let path = session_dir.join(&id);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_file() => {
+                        let existing = fs::read(&path)?;
+                        if existing != bytes {
+                            return Err(CatalogError::Catalog(
+                                "replay staging contains different image bytes".into(),
+                            ));
+                        }
+                    }
+                    Ok(_) => {
+                        return Err(CatalogError::Catalog(
+                            "replay staging path is not a regular file".into(),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        let mut file = private_create_new(&path)?;
+                        created_paths.push(path.clone());
+                        file.write_all(&bytes)?;
+                        file.sync_all()?;
+                    }
+                    Err(error) => return Err(CatalogError::Io(error)),
+                }
+                staged.push(ContentBlock::Image {
+                    source: ImageSource::Attachment {
+                        id,
+                        media_type: media_type.clone(),
+                        byte_len: bytes.len() as u64,
+                        sha256,
+                    },
+                });
+            }
+            sync_directory(&session_dir);
+            Ok((staged, std::mem::take(&mut created_paths)))
+        })();
+        if result.is_err() {
+            remove_staged_paths(&created_paths);
+        }
+        result
     }
 
     /// Prepares an explicit retry but does not start a turn. The caller must
@@ -670,6 +852,12 @@ impl SessionCatalog {
                 .as_deref()
                 .unwrap_or(&turn.prompt)
                 .to_string(),
+            fingerprint: turn_fingerprint(
+                turn.retry_prompt.as_deref().unwrap_or(&turn.prompt),
+                turn.content.as_deref(),
+            ),
+            content: turn.content.clone(),
+            resolved_content: turn.resolved_content.clone(),
         })
     }
 
@@ -679,10 +867,19 @@ impl SessionCatalog {
         interface: SessionInterface,
     ) -> Result<CatalogTurn, CatalogError> {
         let current = self.prepare_retry(&intent.session_id)?;
-        if current.turn_index != intent.turn_index || current.prompt != intent.prompt {
+        if current.turn_index != intent.turn_index
+            || current.prompt != intent.prompt
+            || current.fingerprint != intent.fingerprint
+        {
             return Err(CatalogError::StaleRetry);
         }
-        self.start_existing(&intent.session_id, interface, intent.prompt.clone())
+        self.start_existing_with_replay_content(
+            &intent.session_id,
+            interface,
+            intent.prompt.clone(),
+            intent.content.clone(),
+            intent.resolved_content.clone(),
+        )
     }
 
     /// Exports only the parsed leg trail. Catalog metadata and process
@@ -1709,6 +1906,61 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Parses a request's private trail content into a UI-safe projection and an
+/// in-process replay copy. Resolved base64 images become deterministic opaque
+/// refs in the public projection while their original blocks stay skipped from
+/// all catalog serialization.
+fn parse_request_content(
+    raw_value: Option<&Value>,
+    visible_value: Option<&Value>,
+) -> Result<(Option<Vec<ContentBlock>>, Option<Vec<ContentBlock>>), String> {
+    let Some(raw_value) = raw_value else {
+        return Ok((None, None));
+    };
+    let Some(visible_value) = visible_value else {
+        return Err("content disappeared during redaction".into());
+    };
+    if !raw_value.is_array() || !visible_value.is_array() {
+        return Err("content must be an array".into());
+    }
+    let raw = serde_json::from_value::<Vec<ContentBlock>>(raw_value.clone())
+        .map_err(|error| error.to_string())?;
+    let mut visible = serde_json::from_value::<Vec<ContentBlock>>(visible_value.clone())
+        .map_err(|error| error.to_string())?;
+    if raw.len() != visible.len() {
+        return Err("content block order changed during redaction".into());
+    }
+
+    let mut has_resolved_image = false;
+    for (raw_block, visible_block) in raw.iter().zip(visible.iter_mut()) {
+        let ContentBlock::Image {
+            source: ImageSource::Base64 { media_type, data },
+        } = raw_block
+        else {
+            continue;
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|_| "resolved image data is not valid base64".to_string())?;
+        let digest = Sha256::digest(&bytes);
+        let sha256 = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        *visible_block = ContentBlock::Image {
+            source: ImageSource::Attachment {
+                id: format!("replay-{sha256}"),
+                media_type: media_type.clone(),
+                byte_len: bytes.len() as u64,
+                sha256,
+            },
+        };
+        has_resolved_image = true;
+    }
+
+    Ok((Some(visible), has_resolved_image.then_some(raw)))
+}
+
 fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -1746,6 +1998,7 @@ fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
             .get("prompt")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let raw_content = record.get("content").cloned();
         redact_trail_content(&mut record);
         let Some(event) = record.get("event").and_then(Value::as_str) else {
             continue;
@@ -1826,10 +2079,23 @@ fn read_trail(path: &Path, expected_id: &str) -> io::Result<TrailSnapshot> {
                     read_only = true;
                     continue;
                 }
+                let (content, resolved_content) =
+                    match parse_request_content(raw_content.as_ref(), record.get("content")) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            warnings.push(format!(
+                                "line {line_number}: request content is malformed: {error}"
+                            ));
+                            read_only = true;
+                            (None, None)
+                        }
+                    };
                 positions.insert(turn_index, turns.len());
                 turns.push(TrailTurn {
                     turn_index,
                     prompt: prompt.to_string(),
+                    content,
+                    resolved_content,
                     timestamp_ms: record.get("ts_ms").and_then(Value::as_u64),
                     retry_prompt: original_prompt,
                     outcome: TrailOutcome::Incomplete,
@@ -2051,6 +2317,12 @@ fn sync_directory(path: &Path) {
     }
 }
 
+fn remove_staged_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2107,6 +2379,113 @@ mod tests {
         assert_eq!(snapshot.turns[1].outcome, TrailOutcome::Incomplete);
         assert!(snapshot.warnings.is_empty());
         assert!(!snapshot.read_only);
+    }
+
+    #[test]
+    fn trail_browser_preserves_attachment_refs_but_never_resolved_image_data() {
+        let scratch = tempdir().unwrap();
+        let id = "sess-12-36";
+        let path = scratch.path().join(format!("{id}.jsonl"));
+        let attachment = json!({
+            "type": "image",
+            "source": {
+                "type": "attachment",
+                "id": "upload-1",
+                "media_type": "image/png",
+                "byte_len": 5,
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+        });
+        let resolved = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}
+        });
+        let events = [
+            json!({"schema":EXCHANGE_SCHEMA,"event":"session_start","ts_ms":1,"session_id":id}),
+            json!({"schema":EXCHANGE_SCHEMA,"event":"request","ts_ms":2,"model":"m","base_url":"local","prompt":"describe","content":[attachment.clone()],"session_id":id,"turn_index":0}),
+            json!({"schema":EXCHANGE_SCHEMA,"event":"response_ok","ts_ms":3,"reply":"done","session_id":id,"turn_index":0}),
+        ];
+        fs::write(
+            &path,
+            events
+                .into_iter()
+                .map(|event| serde_json::to_string(&event).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let snapshot = read_trail(&path, id).unwrap();
+
+        assert!(!snapshot.read_only);
+        assert_eq!(
+            snapshot.turns[0].content,
+            Some(vec![ContentBlock::Image {
+                source: ImageSource::Attachment {
+                    id: "upload-1".to_string(),
+                    media_type: "image/png".to_string(),
+                    byte_len: 5,
+                    sha256: "0".repeat(64),
+                },
+            }])
+        );
+        assert!(
+            !serde_json::to_string(&snapshot.turns)
+                .unwrap()
+                .contains("aGVsbG8=")
+        );
+        assert_ne!(attachment, resolved);
+    }
+
+    #[test]
+    fn resolved_trail_image_is_projected_and_can_be_restaged() {
+        let bytes = b"\x89PNG\r\n\x1a\nimage";
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let raw = json!([{
+            "type": "text",
+            "text": "describe"
+        }, {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data}
+        }]);
+        let mut visible = raw.clone();
+        crate::client::redact_value(&mut visible);
+        let (projected, resolved) =
+            parse_request_content(Some(&raw), Some(&visible)).expect("parses resolved content");
+        let projected = projected.expect("projects content");
+        let resolved = resolved.expect("retains private content");
+        assert!(matches!(
+            &projected[1],
+            ContentBlock::Image {
+                source: ImageSource::Attachment { id, byte_len: 13, .. }
+            } if id.starts_with("replay-")
+        ));
+        assert_eq!(
+            resolved[1],
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data,
+                }
+            }
+        );
+
+        let scratch = tempdir().unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(scratch.path().join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("opens catalog");
+        let (staged, paths) = catalog
+            .stage_resolved_content("sess-12-37", &resolved)
+            .expect("stages replay content");
+        assert!(matches!(
+            &staged[1],
+            ContentBlock::Image {
+                source: ImageSource::Attachment { id, sha256, .. }
+            } if id.starts_with("replay-") && sha256.len() == 64
+        ));
+        assert_eq!(fs::read(&paths[0]).unwrap(), bytes);
+        remove_staged_paths(&paths);
     }
 
     #[test]

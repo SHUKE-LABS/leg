@@ -21,12 +21,12 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use fs2::FileExt;
 use leg_ui_client::{
-    CatalogError, CatalogRunState, CatalogSession, CatalogTurn, SessionCatalog,
+    CatalogError, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock, SessionCatalog,
     SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome, TurnStopHandle,
+    turn_fingerprint,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
@@ -402,6 +402,7 @@ struct NewSubmission {
     request_id: u64,
     turn_id: String,
     prompt: String,
+    content: Option<Vec<ContentBlock>>,
     stop: PendingStop,
 }
 
@@ -577,6 +578,8 @@ struct SelectSession {
 struct SubmitTurn {
     request_id: u64,
     prompt: String,
+    #[serde(default)]
+    content: Option<Vec<ContentBlock>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1379,8 +1382,15 @@ impl HostState {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
+        if body
+            .content
+            .as_deref()
+            .is_some_and(|content| content.iter().any(|block| !block.is_wire_safe()))
+        {
+            return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
+        }
         let ledger_id = self.ledger_id(id);
-        let prompt_hash = hex(&Sha256::digest(body.prompt.as_bytes()));
+        let prompt_hash = turn_fingerprint(&body.prompt, body.content.as_deref());
         let decision = self.inner.durable.read(|data| {
             submission_decision(data.sessions.get(&ledger_id), body.request_id, &prompt_hash)
         });
@@ -1538,6 +1548,7 @@ impl HostState {
             request_id: body.request_id,
             turn_id: turn_id.clone(),
             prompt: body.prompt,
+            content: body.content,
             stop: pending_stop,
         };
         let owner_submission = submission.clone();
@@ -1597,6 +1608,7 @@ impl HostState {
         let mut turn = match self.start_turn(
             &submission.requested_id,
             &submission.prompt,
+            submission.content.as_deref(),
             submission.bound_session_id.as_deref(),
         ) {
             Ok(turn) => turn,
@@ -1741,30 +1753,36 @@ impl HostState {
         &self,
         id: &str,
         prompt: &str,
+        content: Option<&[ContentBlock]>,
         bound_session_id: Option<&str>,
     ) -> Result<CatalogTurn, CatalogError> {
         if id.starts_with("draft-") {
             let bound_session_id = bound_session_id.ok_or_else(|| {
                 CatalogError::Catalog("draft submission has no reserved native id".into())
             })?;
-            return self.inner.catalog.start_new_with_id(
+            return self.inner.catalog.start_new_with_id_content(
                 id,
                 bound_session_id.to_string(),
                 SessionInterface::Web,
                 prompt.to_string(),
+                content.map(ToOwned::to_owned),
             );
         }
         if let Ok(intent) = self.inner.catalog.prepare_retry(id)
             && intent.prompt() == prompt
+            && intent.fingerprint() == turn_fingerprint(prompt, content)
         {
             return self
                 .inner
                 .catalog
                 .confirm_retry(&intent, SessionInterface::Web);
         }
-        self.inner
-            .catalog
-            .start_existing(id, SessionInterface::Web, prompt.to_string())
+        self.inner.catalog.start_existing_with_content(
+            id,
+            SessionInterface::Web,
+            prompt.to_string(),
+            content.map(ToOwned::to_owned),
+        )
     }
 
     fn reap_finished_workers(&self) {
@@ -4379,6 +4397,7 @@ fn main() {
             .start_turn(
                 pending_stop_draft,
                 "HOLD-PENDING-STOP",
+                None,
                 Some(&pending_stop_session),
             )
             .unwrap();

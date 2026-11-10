@@ -2,6 +2,7 @@
 
 mod catalog;
 mod client;
+mod content;
 mod process_owner;
 mod protocol;
 mod resolve;
@@ -16,5 +17,6 @@ pub use client::{
     Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,
     TurnRequest, TurnStopHandle,
 };
+pub use content::{AttachmentRef, ContentBlock, ImageSource, turn_fingerprint};
 pub use protocol::{StreamEvent, StreamFailure};
 pub use resolve::ResolveError;

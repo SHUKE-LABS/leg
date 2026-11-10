@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sysinfo::{ProcessStatus, ProcessesToUpdate, System};
 
+use crate::content::ContentBlock;
 use crate::process_owner::{OwnerState, ProcessOwner};
 
 const MAX_START_REQUEST: usize = 16 * 1024 * 1024;
@@ -31,6 +32,8 @@ struct StartRequest {
     cwd: PathBuf,
     store_dir: PathBuf,
     prompt: String,
+    #[serde(default)]
+    content: Option<Vec<ContentBlock>>,
     session: SessionMode,
     #[serde(default)]
     attempt: Option<StartAttempt>,
@@ -85,6 +88,13 @@ pub fn run_from_stdin() -> Result<i32, String> {
 }
 
 fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, String> {
+    if request
+        .content
+        .as_deref()
+        .is_some_and(|content| content.iter().any(|block| !block.is_wire_safe()))
+    {
+        return Err("turn content must use validated managed attachment refs".to_string());
+    }
     fs::create_dir_all(&request.store_dir).map_err(|error| {
         format!(
             "could not create session store {}: {error}",
@@ -205,9 +215,7 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     spawn_control_reader(input, message_tx);
 
     let mut child_stdin = child_stdin;
-    let prompt_write = child_stdin
-        .write_all(request.prompt.as_bytes())
-        .and_then(|()| child_stdin.flush());
+    let prompt_write = write_turn_input(&mut child_stdin, &request);
     drop(child_stdin);
     if let Err(error) = prompt_write {
         let _ = child.kill();
@@ -459,6 +467,41 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
     drop(session_lock.take());
     drop(creation_lock.take());
     if forced { Ok(124) } else { Ok(child_code) }
+}
+
+fn write_turn_input(stdin: &mut impl Write, request: &StartRequest) -> io::Result<()> {
+    let Some(content) = request.content.as_ref() else {
+        return stdin
+            .write_all(request.prompt.as_bytes())
+            .and_then(|()| stdin.flush());
+    };
+    if content.iter().any(|block| !block.is_wire_safe()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "turn content must use validated managed attachment refs",
+        ));
+    }
+    let session_id = match &request.session {
+        SessionMode::New { session_id } | SessionMode::Existing { session_id } => session_id,
+    };
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let envelope = json!({
+        "schema": "baton.message/v1",
+        "message_id": format!("companion-{session_id}-{ts_ms}"),
+        "conversation_id": session_id,
+        "from": "companion",
+        "to": "leg",
+        "kind": "request",
+        "body": request.prompt,
+        "content": content,
+        "ts_ms": ts_ms,
+    });
+    serde_json::to_writer(&mut *stdin, &envelope)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    stdin.write_all(b"\n").and_then(|()| stdin.flush())
 }
 
 fn open_lock_file(path: &Path) -> Result<File, String> {
@@ -1023,6 +1066,44 @@ mod tests {
         assert!(!native_session_id("sess-12"));
         assert!(!native_session_id("sess-12-x"));
         assert!(!native_session_id("sess-12-34/../trail"));
+    }
+
+    #[test]
+    fn content_envelope_carries_attachment_identity_without_payload_or_path() {
+        let request = StartRequest {
+            kind: "start".to_string(),
+            leg_path: PathBuf::from("/opt/leg"),
+            cwd: PathBuf::from("/workspace"),
+            store_dir: PathBuf::from("/state"),
+            prompt: "describe".to_string(),
+            content: Some(vec![
+                ContentBlock::Text {
+                    text: "describe".to_string(),
+                },
+                ContentBlock::Image {
+                    source: crate::content::ImageSource::Attachment {
+                        id: "upload-1".to_string(),
+                        media_type: "image/png".to_string(),
+                        byte_len: 5,
+                        sha256: "0".repeat(64),
+                    },
+                },
+            ]),
+            session: SessionMode::New {
+                session_id: "sess-1-2".to_string(),
+            },
+            attempt: None,
+        };
+        let mut bytes = Vec::new();
+
+        write_turn_input(&mut bytes, &request).expect("writes envelope");
+
+        let value: Value = serde_json::from_slice(&bytes).expect("valid envelope");
+        assert_eq!(value["content"][1]["source"]["type"], "attachment");
+        assert_eq!(value["content"][1]["source"]["id"], "upload-1");
+        assert!(!value.to_string().contains("/workspace"));
+        assert!(!value.to_string().contains("/state"));
+        assert!(!value.to_string().contains("aGVsbG8="));
     }
 
     #[test]

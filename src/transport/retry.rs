@@ -5,7 +5,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::error::{LegError, Result};
+use crate::error::{LegError, Result, is_image_input_rejection_response};
 use crate::interrupt;
 
 use super::http::{HttpCall, HttpClient, HttpResponse};
@@ -83,7 +83,10 @@ impl<H: HttpClient> HttpClient for RetryingHttpClient<H> {
 
             match call.result {
                 Ok(response) => {
-                    if !is_retryable_status(response.status) || retries >= self.policy.max_retries {
+                    if !is_retryable_status(response.status)
+                        || is_image_input_rejection_response(response.status, &response.body)
+                        || retries >= self.policy.max_retries
+                    {
                         return HttpCall::new(Ok(response), attempts);
                     }
 
@@ -130,7 +133,10 @@ impl<H: HttpClient> HttpClient for RetryingHttpClient<H> {
 
             match call.result {
                 Ok(response) => {
-                    if !is_retryable_status(response.status) || retries >= self.policy.max_retries {
+                    if !is_retryable_status(response.status)
+                        || is_image_input_rejection_response(response.status, &response.body)
+                        || retries >= self.policy.max_retries
+                    {
                         return HttpCall::new(Ok(response), attempts);
                     }
 
@@ -248,6 +254,14 @@ mod tests {
         })
     }
 
+    fn response_with_body(status: u16, body: &str) -> Result<HttpResponse> {
+        Ok(HttpResponse {
+            status,
+            body: body.to_string(),
+            retry_after: None,
+        })
+    }
+
     fn post(client: &impl HttpClient) -> HttpCall {
         client.post_json_with_attempts("https://provider.invalid", &[], "{}")
     }
@@ -283,6 +297,29 @@ mod tests {
             assert_eq!(call.attempts, 2, "status {status}");
             assert_eq!(inner.calls.get(), 2, "status {status}");
         }
+    }
+
+    #[test]
+    fn does_not_retry_a_retryable_status_with_image_modality_rejection() {
+        let inner = ScriptedHttp::new(vec![
+            response_with_body(
+                429,
+                r#"{"error":{"type":"invalid_request_error","message":"model does not support image input"}}"#,
+            ),
+            response(200, None),
+        ]);
+        let client = RetryingHttpClient::new(&inner, RetryPolicy::new(2, Duration::ZERO));
+
+        let call = post(&client);
+
+        assert_eq!(
+            call.result
+                .expect("the rejection response is returned")
+                .status,
+            429
+        );
+        assert_eq!(call.attempts, 1);
+        assert_eq!(inner.calls.get(), 1);
     }
 
     #[test]
