@@ -71,6 +71,9 @@ pub(crate) fn cleanup_staged_content(content: &[ContentBlock], session_id: &str)
 }
 
 fn cleanup_staged_content_from_root(root: &Path, content: &[ContentBlock], session_id: &str) {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return;
+    };
     let session_dir = root.join(ATTACHMENTS_DIR).join(session_id);
     let mut removed = std::collections::HashSet::new();
     for block in content {
@@ -209,6 +212,8 @@ fn read_staged_attachment_from_root(
     byte_len: u64,
     sha256: &str,
 ) -> Result<Vec<u8>> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|_| LegError::Usage("image attachment staging is unavailable".to_string()))?;
     let session_dir = root.join(ATTACHMENTS_DIR).join(session_id);
     let path = session_dir.join(id);
     let metadata = std::fs::symlink_metadata(&path)

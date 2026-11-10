@@ -968,14 +968,12 @@ pub(crate) fn redact_value(value: &mut Value) {
                     .and_then(|source| source.get("type"))
                     .and_then(Value::as_str)
                     == Some("base64")
-            {
-                if let Some(data) = object
+                && let Some(data) = object
                     .get_mut("source")
                     .and_then(Value::as_object_mut)
                     .and_then(|source| source.get_mut("data"))
-                {
-                    *data = Value::String("[REDACTED_IMAGE]".to_string());
-                }
+            {
+                *data = Value::String("[REDACTED_IMAGE]".to_string());
             }
             object.values_mut().for_each(redact_value)
         }

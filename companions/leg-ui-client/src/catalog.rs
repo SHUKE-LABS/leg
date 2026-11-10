@@ -1906,6 +1906,8 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+type ParsedRequestContent = (Option<Vec<ContentBlock>>, Option<Vec<ContentBlock>>);
+
 /// Parses a request's private trail content into a UI-safe projection and an
 /// in-process replay copy. Resolved base64 images become deterministic opaque
 /// refs in the public projection while their original blocks stay skipped from
@@ -1913,7 +1915,7 @@ fn now_ms() -> u64 {
 fn parse_request_content(
     raw_value: Option<&Value>,
     visible_value: Option<&Value>,
-) -> Result<(Option<Vec<ContentBlock>>, Option<Vec<ContentBlock>>), String> {
+) -> Result<ParsedRequestContent, String> {
     let Some(raw_value) = raw_value else {
         return Ok((None, None));
     };

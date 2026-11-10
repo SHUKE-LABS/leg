@@ -42,7 +42,7 @@ fn execute_cold_exchange(in_path: Option<&str>) -> Result<()> {
     let stderr = std::io::stderr();
     let mut warning = stderr.lock();
 
-    let result = execute_cold_exchange_core(
+    execute_cold_exchange_core(
         &transport,
         &meta,
         provider,
@@ -50,8 +50,7 @@ fn execute_cold_exchange(in_path: Option<&str>) -> Result<()> {
         sink.as_mut(),
         &mut warning,
         &writer,
-    );
-    result
+    )
 }
 
 fn execute_session_exchange(

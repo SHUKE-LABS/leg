@@ -908,13 +908,13 @@ enum ExchangeMode {
 /// prompt body, trimmed only of a trailing `\r`/`\n` so intentional trailing
 /// spaces/tabs survive.
 fn parse_exchange_request(raw: &str) -> Result<(MessageEnvelope, ExchangeMode)> {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-        if value.get("schema").and_then(serde_json::Value::as_str) == Some(crate::message::SCHEMA) {
-            let envelope = serde_json::from_value::<MessageEnvelope>(value).map_err(|error| {
-                LegError::Usage(format!("invalid baton.message/v1 envelope: {error}"))
-            })?;
-            return Ok((envelope, ExchangeMode::Envelope));
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+        && value.get("schema").and_then(serde_json::Value::as_str) == Some(crate::message::SCHEMA)
+    {
+        let envelope = serde_json::from_value::<MessageEnvelope>(value).map_err(|error| {
+            LegError::Usage(format!("invalid baton.message/v1 envelope: {error}"))
+        })?;
+        return Ok((envelope, ExchangeMode::Envelope));
     }
     let body = raw.trim_end_matches(['\r', '\n']);
     let envelope = MessageEnvelope::new(
