@@ -209,6 +209,7 @@ pub struct RetryIntent {
     session_id: String,
     turn_index: u64,
     prompt: String,
+    visible_prompt: String,
     content: Option<Vec<ContentBlock>>,
     resolved_content: Option<Vec<ContentBlock>>,
     fingerprint: String,
@@ -221,6 +222,12 @@ impl RetryIntent {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// The prompt projection safe for UI comparison. The provider prompt may
+    /// retain credentials that were redacted from this value.
+    pub fn visible_prompt(&self) -> &str {
+        &self.visible_prompt
     }
 
     pub fn turn_index(&self) -> u64 {
@@ -850,32 +857,17 @@ impl SessionCatalog {
                 )
             })
             .ok_or_else(|| CatalogError::NoRetry(id.into()))?;
-        Ok(RetryIntent {
-            session_id: id.to_string(),
-            turn_index: turn.turn_index,
-            prompt: turn
-                .retry_prompt
-                .as_deref()
-                .unwrap_or(&turn.prompt)
-                .to_string(),
-            fingerprint: turn_fingerprint(
-                turn.retry_prompt.as_deref().unwrap_or(&turn.prompt),
-                turn.content.as_deref(),
-            ),
-            content: turn.content.clone(),
-            resolved_content: turn.resolved_content.clone(),
-        })
+        Ok(Self::retry_intent_from_turn(id, turn))
     }
 
-    /// Returns the durable identity for a recorded retry without requiring
-    /// the session to be idle. The Web host uses this to resolve duplicate
-    /// request IDs before the active-session retry gate is checked.
-    pub fn retry_fingerprint_for_turn(
+    /// Returns a recorded retry without requiring the session to be idle. The
+    /// Web host uses this to resolve duplicate request IDs before the
+    /// active-session retry gate is checked.
+    pub fn retry_intent_for_turn(
         &self,
         id: &str,
         turn_index: u64,
-        prompt: &str,
-    ) -> Result<String, CatalogError> {
+    ) -> Result<RetryIntent, CatalogError> {
         let session = self.get(id)?;
         if session.read_only {
             return Err(CatalogError::ReadOnly(id.into()));
@@ -891,7 +883,25 @@ impl SessionCatalog {
                 )
             })
             .ok_or_else(|| CatalogError::NoRetry(id.into()))?;
-        Ok(turn_fingerprint(prompt, turn.content.as_deref()))
+        Ok(Self::retry_intent_from_turn(id, turn))
+    }
+
+    fn retry_intent_from_turn(id: &str, turn: &TrailTurn) -> RetryIntent {
+        let prompt = turn
+            .retry_prompt
+            .as_deref()
+            .unwrap_or(&turn.prompt)
+            .to_string();
+        let fingerprint_content = turn.resolved_content.as_deref().or(turn.content.as_deref());
+        RetryIntent {
+            session_id: id.to_string(),
+            turn_index: turn.turn_index,
+            visible_prompt: turn.prompt.clone(),
+            fingerprint: turn_fingerprint(&prompt, fingerprint_content),
+            prompt,
+            content: turn.content.clone(),
+            resolved_content: turn.resolved_content.clone(),
+        }
     }
 
     pub fn confirm_retry(

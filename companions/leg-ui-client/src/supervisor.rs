@@ -523,9 +523,19 @@ pub(crate) fn try_session_lock(store_dir: &Path, session_id: &str) -> Result<Opt
     let lock = open_lock_file(&path)?;
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock)),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if is_lock_contended(&error) => Ok(None),
         Err(error) => Err(format!("could not lock session {session_id}: {error}")),
     }
+}
+
+/// `fs2` uses `WouldBlock` on Unix but the platform lock-contended error on
+/// Windows. Match the dependency's exact sentinel so genuine I/O failures
+/// still make ownership unknown instead of being treated as an active lock.
+fn is_lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || fs2::lock_contended_error()
+            .raw_os_error()
+            .is_some_and(|code| error.raw_os_error() == Some(code))
 }
 
 /// Reads whether a driver lock is held without creating the primary lock. The
@@ -562,7 +572,7 @@ fn lock_is_held_if_present_after_coordination_release(
             after_coordination_release();
             Ok(false)
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) if is_lock_contended(&error) => Ok(true),
         Err(error) => Err(format!("could not inspect {label} lock: {error}")),
     }
 }
