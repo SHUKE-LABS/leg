@@ -1,3 +1,4 @@
+mod attachments;
 mod editor;
 mod sanitize;
 mod transcript;
@@ -19,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use attachments::{ClipboardImageSource, NativeClipboard, is_image_marker};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -30,8 +32,10 @@ use crossterm::terminal::{
 };
 use editor::{ComposerEditor, normalize_paste};
 use leg_ui_client::{
-    CatalogRunState, CatalogSession, CatalogTurn, RetryIntent, SessionCatalog,
-    SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome, TurnStopHandle,
+    AttachmentRef, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock, DraftBlock,
+    DraftImage, ImageSource, RetryIntent, SessionCatalog, SessionCatalogConfig, SessionInterface,
+    StreamEvent, SubmissionClaim, SubmissionResolution, TrailOutcome, TurnOutcome, TurnStopHandle,
+    draft_fingerprint, draft_images, draft_prompt,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -62,6 +66,7 @@ const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(34);
 const ACTIVE_CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 const SMALL_TERMINAL_REJECTION: &str = "Send rejected: terminal must be at least 80x24.";
 static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Args {
     leg_bin: Option<PathBuf>,
@@ -318,6 +323,7 @@ enum Screen {
     Rename,
     Export,
     CopyFallback,
+    AttachFile,
 }
 
 #[derive(Clone)]
@@ -356,6 +362,9 @@ enum PaletteAction {
     Exit,
     Send,
     FocusTools,
+    AttachImage,
+    PasteImage,
+    RemoveImage,
 }
 
 struct PaletteEntry {
@@ -407,6 +416,8 @@ struct App {
     stop_chooser_open: bool,
     stop_targets: Vec<StopTarget>,
     stop_picker_index: usize,
+    attachment_chooser: Option<usize>,
+    clipboard: Box<dyn ClipboardImageSource>,
     quit: bool,
     exit_after_turn: bool,
     render_counters: RenderCounters,
@@ -517,6 +528,12 @@ struct ConversationState {
     draft_id: Option<String>,
     session_id: Option<String>,
     composer: ComposerEditor,
+    /// Draft images keyed by their composer marker. Entries outlive their
+    /// marker so a failed send can restore the submitted draft.
+    draft_images: HashMap<char, DraftImage>,
+    next_image_marker: u32,
+    /// The recorded send of this view's draft, settled when its turn ends.
+    submission: Option<ViewSubmission>,
     transcript: Vec<TranscriptTurn>,
     transcript_rows_cache: TranscriptRowsCache,
     status: String,
@@ -611,6 +628,9 @@ impl ConversationState {
             draft_id: None,
             session_id: None,
             composer: ComposerEditor::default(),
+            draft_images: HashMap::new(),
+            next_image_marker: 0,
+            submission: None,
             transcript: Vec::new(),
             transcript_rows_cache: TranscriptRowsCache::default(),
             status: "Choose a workspace".to_string(),
@@ -639,20 +659,21 @@ impl ConversationState {
 
     fn from_catalog(session: &CatalogSession) -> Self {
         let is_draft = session.id.starts_with("draft-");
-        let mut composer = ComposerEditor::default();
-        composer.set_text(
-            session
-                .drafts
-                .get(&SessionInterface::Tui)
-                .cloned()
-                .unwrap_or_default(),
-        );
         let mut state = Self::empty();
         state.state_key = session.id.clone();
         state.workspace = session.cwd.clone();
         state.draft_id = Some(session.id.clone());
         state.session_id = (!is_draft).then(|| session.id.clone());
-        state.composer = composer;
+        match session.draft_blocks.get(&SessionInterface::Tui) {
+            Some(blocks) => state.load_draft(blocks),
+            None => state.composer.set_text(
+                session
+                    .drafts
+                    .get(&SessionInterface::Tui)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        }
         let persisted_warnings = session
             .display
             .get("tui_completion_warnings")
@@ -681,6 +702,100 @@ impl ConversationState {
             (status, false) => state.status = status,
         }
         state
+    }
+}
+
+struct ViewSubmission {
+    request_id: String,
+    fingerprint: String,
+    /// Records that may hold the submission: a new session's draft record is
+    /// rebound to its native session id while the turn runs.
+    record_ids: Vec<String>,
+}
+
+impl ConversationState {
+    /// The ordered text/image draft, split at the composer's image markers.
+    fn draft_blocks(&self) -> Vec<DraftBlock> {
+        let mut blocks = Vec::new();
+        let mut text = String::new();
+        for character in self.composer.text().chars() {
+            if let Some(image) = self.draft_images.get(&character) {
+                if !text.is_empty() {
+                    blocks.push(DraftBlock::text(std::mem::take(&mut text)));
+                }
+                blocks.push(DraftBlock::Image(image.clone()));
+            } else if !is_image_marker(character) {
+                text.push(character);
+            }
+        }
+        if !text.is_empty() {
+            blocks.push(DraftBlock::text(text));
+        }
+        blocks
+    }
+
+    fn load_draft(&mut self, blocks: &[DraftBlock]) {
+        let mut text = String::new();
+        for block in blocks {
+            match block {
+                DraftBlock::Text { text: segment } => text.extend(
+                    segment
+                        .chars()
+                        .filter(|character| !is_image_marker(*character)),
+                ),
+                DraftBlock::Image(image) => {
+                    if let Some(marker) = self.register_draft_image(image.clone()) {
+                        text.push(marker);
+                    }
+                }
+            }
+        }
+        self.composer.set_text(text);
+    }
+
+    fn register_draft_image(&mut self, image: DraftImage) -> Option<char> {
+        let marker = attachments::image_marker(self.next_image_marker)?;
+        self.next_image_marker += 1;
+        self.draft_images.insert(marker, image);
+        Some(marker)
+    }
+
+    /// Draft images in composer order.
+    fn draft_image_entries(&self) -> Vec<(char, &DraftImage)> {
+        self.composer
+            .text()
+            .chars()
+            .filter_map(|character| {
+                self.draft_images
+                    .get(&character)
+                    .map(|image| (character, image))
+            })
+            .collect()
+    }
+
+    fn draft_has_text(&self) -> bool {
+        self.composer
+            .text()
+            .chars()
+            .any(|character| !character.is_whitespace() && !is_image_marker(character))
+    }
+
+    fn composer_layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
+        let labels = self
+            .draft_image_entries()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (marker, _))| (marker, format!("[image {}]", index + 1)))
+            .collect::<HashMap<_, _>>();
+        self.composer.layout_with(width, |grapheme| {
+            let marker = grapheme.chars().next()?;
+            is_image_marker(marker).then(|| {
+                labels
+                    .get(&marker)
+                    .cloned()
+                    .unwrap_or_else(|| "[image]".to_string())
+            })
+        })
     }
 }
 
@@ -789,6 +904,8 @@ impl App {
             stop_chooser_open: false,
             stop_targets: Vec::new(),
             stop_picker_index: 0,
+            attachment_chooser: None,
+            clipboard: Box::new(NativeClipboard),
             quit: false,
             exit_after_turn: false,
             render_counters: RenderCounters::default(),
@@ -1034,10 +1151,10 @@ impl App {
             self.screen = Screen::Conversation;
             return false;
         }
-        let incoming = if let Some(saved) = self.views.remove(&target_key) {
-            saved
+        let (incoming, from_catalog) = if let Some(saved) = self.views.remove(&target_key) {
+            (saved, false)
         } else {
-            ConversationState::from_catalog(&session)
+            (ConversationState::from_catalog(&session), true)
         };
         self.view_aliases
             .insert(session.id.clone(), incoming.state_key.clone());
@@ -1067,6 +1184,9 @@ impl App {
             match session_action_status(&session) {
                 (status, true) => self.set_blocking_status(status),
                 (status, false) => self.status = status,
+            }
+            if from_catalog {
+                self.reconcile_submission(&session);
             }
         }
         true
@@ -1301,6 +1421,172 @@ impl App {
         self.screen = Screen::Export;
     }
 
+    fn begin_attach_file(&mut self) {
+        if self.current_record_id().is_none() {
+            self.set_blocking_status("Choose a workspace before attaching an image");
+            return;
+        }
+        self.palette = None;
+        self.dialog_input.clear();
+        self.overwrite_export = None;
+        self.screen = Screen::AttachFile;
+        self.status = "JPEG, PNG, GIF, or WebP; 10 MB per image, 32 MB per turn".to_string();
+    }
+
+    fn handle_attach_file_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            self.dialog_input.clear();
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::Conversation;
+                self.status = "Attachment cancelled".to_string();
+            }
+            KeyCode::Enter if self.dialog_input.trim().is_empty() => {
+                self.status = "Enter an image file path".to_string();
+            }
+            KeyCode::Enter => {
+                let path = self.resolve_output_path();
+                self.screen = Screen::Conversation;
+                let acquired = attachments::read_image_file(&path);
+                self.attach_acquired_image(acquired);
+            }
+            KeyCode::Backspace => {
+                self.dialog_input.pop();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && !character.is_control() =>
+            {
+                self.dialog_input.push(character);
+            }
+            _ => {}
+        }
+    }
+
+    fn paste_clipboard_image(&mut self) {
+        if self.current_record_id().is_none() {
+            self.set_blocking_status("Choose a workspace before attaching an image");
+            return;
+        }
+        let acquired = attachments::clipboard_image(self.clipboard.as_mut());
+        self.attach_acquired_image(acquired);
+    }
+
+    /// Stages validated bytes and records the image in the saved draft at the
+    /// composer cursor. Nothing is staged when validation fails, and a staged
+    /// image whose draft cannot be saved is discarded.
+    fn attach_acquired_image(&mut self, acquired: Result<attachments::AcquiredImage, String>) {
+        let image = match acquired {
+            Ok(image) => image,
+            Err(message) => {
+                if message.ends_with("cancelled") {
+                    self.status = message;
+                } else {
+                    self.set_blocking_status(message);
+                }
+                return;
+            }
+        };
+        let existing = self
+            .draft_image_entries()
+            .into_iter()
+            .map(|(_, image)| image.attachment.clone())
+            .collect::<Vec<AttachmentRef>>();
+        let staged = match self.catalog.stage_draft_image(
+            &image.bytes,
+            image.declared_media_type,
+            &image.label,
+            &existing,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.set_blocking_status(error.to_string());
+                return;
+            }
+        };
+        let Some(marker) = self.register_draft_image(staged.clone()) else {
+            let _ = self.catalog.discard_draft_image(&staged.attachment);
+            self.set_blocking_status("This draft cannot hold more images");
+            return;
+        };
+        self.composer.insert_image_marker(marker);
+        if let Err(error) = self.persist_draft() {
+            self.composer.remove_image_marker(marker);
+            self.draft_images.remove(&marker);
+            let _ = self.catalog.discard_draft_image(&staged.attachment);
+            self.set_blocking_status(format!("Could not save the image draft: {error}"));
+            return;
+        }
+        self.mark_active_draft_edited(true);
+        self.status = format!(
+            "Attached {} · {} · {}",
+            staged.label,
+            staged.attachment.media_type,
+            attachments::format_byte_size(staged.attachment.byte_len)
+        );
+    }
+
+    fn begin_attachment_chooser(&mut self) {
+        if self.draft_image_entries().is_empty() {
+            self.status = "No draft images to remove".to_string();
+            return;
+        }
+        self.palette = None;
+        self.attachment_chooser = Some(0);
+        self.status = "Choose a draft image to remove".to_string();
+    }
+
+    fn handle_attachment_chooser_key(&mut self, key: KeyEvent) {
+        let entries = self
+            .draft_image_entries()
+            .into_iter()
+            .map(|(marker, _)| marker)
+            .collect::<Vec<_>>();
+        let selected = self
+            .attachment_chooser
+            .unwrap_or_default()
+            .min(entries.len().saturating_sub(1));
+        match key.code {
+            KeyCode::Esc => {
+                self.attachment_chooser = None;
+                self.status = "Image removal cancelled".to_string();
+            }
+            KeyCode::Up => self.attachment_chooser = Some(selected.saturating_sub(1)),
+            KeyCode::Down => {
+                self.attachment_chooser = Some((selected + 1).min(entries.len().saturating_sub(1)));
+            }
+            KeyCode::Enter | KeyCode::Delete => {
+                self.attachment_chooser = None;
+                if let Some(marker) = entries.get(selected).copied() {
+                    self.remove_draft_image(marker);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Removes one image from the draft. Saving the draft without it releases
+    /// its staged bytes unless a pending submission still owns them.
+    fn remove_draft_image(&mut self, marker: char) {
+        let label = self
+            .draft_images
+            .get(&marker)
+            .map(|image| image.label.clone())
+            .unwrap_or_default();
+        if !self.composer.remove_image_marker(marker) {
+            return;
+        }
+        self.mark_active_draft_edited(true);
+        self.status = match self.persist_draft() {
+            Ok(()) => format!("Removed {label} from the draft"),
+            Err(error) => format!("Removed {label}; the draft could not be saved: {error}"),
+        };
+    }
+
     fn current_record_id(&self) -> Option<&str> {
         self.session_id.as_deref().or(self.draft_id.as_deref())
     }
@@ -1496,11 +1782,20 @@ impl App {
             PaletteAction::Send if !inputs.workspace_available => {
                 Some("Choose an existing workspace.".to_string())
             }
-            PaletteAction::Send if self.composer.text().trim().is_empty() => {
-                Some("Prompt is empty.".to_string())
-            }
+            PaletteAction::Send if !self.draft_has_text() => Some("Prompt is empty.".to_string()),
             PaletteAction::FocusTools if !self.has_tool_rows() => {
                 Some("No tool rows in this conversation.".to_string())
+            }
+            PaletteAction::AttachImage | PaletteAction::PasteImage
+                if self.current_record_id().is_none() =>
+            {
+                Some("Choose a workspace first.".to_string())
+            }
+            PaletteAction::AttachImage | PaletteAction::PasteImage if inputs.current_read_only => {
+                Some("Session is read-only.".to_string())
+            }
+            PaletteAction::RemoveImage if self.draft_image_entries().is_empty() => {
+                Some("No draft images.".to_string())
             }
             _ => None,
         }
@@ -1568,6 +1863,21 @@ impl App {
                     "Choose background session to stop".to_string()
                 },
                 "Ctrl-C",
+            ),
+            (
+                PaletteAction::AttachImage,
+                "Attach image file".to_string(),
+                "F2",
+            ),
+            (
+                PaletteAction::PasteImage,
+                "Paste image from clipboard".to_string(),
+                "F2",
+            ),
+            (
+                PaletteAction::RemoveImage,
+                "Remove draft image".to_string(),
+                "F2",
             ),
             (PaletteAction::Help, "Keyboard help".to_string(), "F1"),
             (
@@ -1787,6 +2097,9 @@ impl App {
             PaletteAction::Stop => self.stop_from_palette(),
             PaletteAction::Help => self.show_help = true,
             PaletteAction::Exit => self.quit = true,
+            PaletteAction::AttachImage => self.begin_attach_file(),
+            PaletteAction::PasteImage => self.paste_clipboard_image(),
+            PaletteAction::RemoveImage => self.begin_attachment_chooser(),
             PaletteAction::Send | PaletteAction::FocusTools => {}
         }
     }
@@ -2149,6 +2462,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.show_help = false;
             self.palette = None;
+            self.attachment_chooser = None;
             self.handle_ctrl_c();
             return;
         }
@@ -2162,6 +2476,7 @@ impl App {
             Screen::Rename => self.handle_rename_key(key),
             Screen::Export => self.handle_export_key(key),
             Screen::CopyFallback => self.handle_copy_fallback_key(key),
+            Screen::AttachFile => self.handle_attach_file_key(key),
         }
     }
 
@@ -2306,6 +2621,10 @@ impl App {
     fn handle_conversation_key(&mut self, key: KeyEvent) {
         if self.retry_confirmation.is_some() {
             self.handle_retry_confirmation_key(key);
+            return;
+        }
+        if self.attachment_chooser.is_some() {
+            self.handle_attachment_chooser_key(key);
             return;
         }
         if self.show_help {
@@ -2484,7 +2803,7 @@ impl App {
         }
         if matches!(
             self.screen,
-            Screen::Rename | Screen::Export | Screen::CopyFallback
+            Screen::Rename | Screen::Export | Screen::CopyFallback | Screen::AttachFile
         ) {
             self.dialog_input.push_str(&normalize_paste(pasted));
             return;
@@ -2492,6 +2811,7 @@ impl App {
         if self.screen != Screen::Conversation
             || self.show_help
             || self.retry_confirmation.is_some()
+            || self.attachment_chooser.is_some()
         {
             return;
         }
@@ -2707,7 +3027,7 @@ impl App {
             self.set_blocking_status("Busy: wait for the active turn");
             return;
         }
-        if self.composer.text().trim().is_empty() {
+        if !self.draft_has_text() {
             self.set_blocking_status("Blank prompts are not sent");
             return;
         }
@@ -2728,9 +3048,18 @@ impl App {
             return;
         }
         let prompt = self.composer.text().to_string();
-        if let Some(session_id) = self.session_id.as_deref()
+        let blocks = self.draft_blocks();
+        // An unsupported-image failure is not retried; resending after a
+        // model switch is a new explicit turn.
+        let latest_retryable = !self
+            .transcript
+            .last()
+            .is_some_and(TranscriptTurn::image_input_unsupported);
+        if latest_retryable
+            && let Some(session_id) = self.session_id.as_deref()
             && let Ok(intent) = self.catalog.prepare_retry(session_id)
-            && intent.prompt() == prompt
+            && intent.prompt() == draft_prompt(&blocks)
+            && content_image_identity(intent.content()) == draft_image_identity(&blocks)
         {
             self.retry_confirmation = Some(intent);
             self.status.clear();
@@ -2794,28 +3123,37 @@ impl App {
             self.set_blocking_status("Choose a workspace before sending");
             return;
         };
-        let session_id = self.session_id.clone();
-        let record_id = session_id.as_deref().unwrap_or(draft_id);
+        let record_id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| draft_id.to_string());
         let is_retry = retry.is_some();
-        if retry.is_none()
-            && let Err(error) =
-                self.catalog
-                    .save_draft(record_id, SessionInterface::Tui, prompt.clone())
-        {
-            self.set_blocking_status(format!("Could not save the prompt draft: {error}"));
-            return;
-        }
-        let started = match retry {
-            Some(intent) => self.catalog.confirm_retry(&intent, SessionInterface::Tui),
-            None => match session_id {
-                Some(session_id) => {
-                    self.catalog
-                        .start_existing(&session_id, SessionInterface::Tui, prompt.clone())
+        let (started, display_prompt) = match retry {
+            Some(intent) => (
+                self.catalog.confirm_retry(&intent, SessionInterface::Tui),
+                transcript::prompt_display(&prompt, intent.content()),
+            ),
+            None => {
+                let blocks = self.draft_blocks();
+                if let Err(error) = self.catalog.save_draft_content(
+                    &record_id,
+                    SessionInterface::Tui,
+                    blocks.clone(),
+                ) {
+                    self.set_blocking_status(format!("Could not save the prompt draft: {error}"));
+                    return;
                 }
-                None => self
-                    .catalog
-                    .start_new(draft_id, SessionInterface::Tui, prompt.clone()),
-            },
+                if !self.claim_submission(&record_id, &blocks) {
+                    return;
+                }
+                let started =
+                    self.catalog
+                        .start_draft_turn(&record_id, SessionInterface::Tui, &blocks);
+                if started.is_err() {
+                    self.settle_submission();
+                }
+                (started, draft_display(&blocks))
+            }
         };
         let turn = match started {
             Ok(turn) => turn,
@@ -2824,11 +3162,17 @@ impl App {
                 return;
             }
         };
+        if let Some(session_id) = turn.session_id()
+            && let Some(submission) = self.submission.as_mut()
+            && !submission.record_ids.iter().any(|id| id == session_id)
+        {
+            submission.record_ids.push(session_id.to_string());
+        }
         let stop_handle = turn.stop_handle();
         let owner = self.state_key.clone();
         match spawn_turn_reader(turn, self.turn_tx.clone(), owner) {
             Ok(()) => {
-                self.transcript.push(TranscriptTurn::new(&prompt));
+                self.transcript.push(TranscriptTurn::new(&display_prompt));
                 self.note_transcript_change();
                 self.stop_handle = Some(stop_handle);
                 self.turn_status = TurnStatus::Starting;
@@ -2845,7 +3189,103 @@ impl App {
             }
             Err(error) => {
                 let _ = stop_handle.stop();
+                self.settle_submission();
                 self.set_blocking_status(format!("Could not observe the turn: {error}"));
+            }
+        }
+    }
+
+    /// Records this draft send under a request identity. The identity is
+    /// reused while the draft fingerprint is unchanged, so a send that was
+    /// already recorded is not started a second time.
+    fn claim_submission(&mut self, record_id: &str, blocks: &[DraftBlock]) -> bool {
+        let fingerprint = draft_fingerprint(blocks);
+        let request_id = match &self.submission {
+            Some(submission) if submission.fingerprint == fingerprint => {
+                submission.request_id.clone()
+            }
+            _ => new_request_id(),
+        };
+        let claim =
+            self.catalog
+                .claim_submission(record_id, SessionInterface::Tui, &request_id, blocks);
+        let mut record_ids = vec![record_id.to_string()];
+        if let Some(previous) = self.submission.take() {
+            record_ids.extend(previous.record_ids.into_iter().filter(|id| id != record_id));
+        }
+        self.submission = Some(ViewSubmission {
+            request_id,
+            fingerprint,
+            record_ids,
+        });
+        match claim {
+            Ok(SubmissionClaim::Fresh) => true,
+            Ok(SubmissionClaim::Replay) => {
+                self.status = "This draft was already sent; its recorded result appears when that turn finishes.".to_string();
+                false
+            }
+            Err(error) => {
+                self.submission = None;
+                self.set_blocking_status(format!("Could not record the send: {error}"));
+                false
+            }
+        }
+    }
+
+    /// Clears the recorded send; images only it still owned are released.
+    fn settle_submission(&mut self) {
+        let Some(submission) = self.submission.take() else {
+            return;
+        };
+        for record_id in &submission.record_ids {
+            let _ = self.catalog.settle_submission(
+                record_id,
+                SessionInterface::Tui,
+                &submission.request_id,
+            );
+        }
+    }
+
+    /// Reconciles a send recorded before this view was opened against the
+    /// authoritative trail.
+    fn reconcile_submission(&mut self, session: &CatalogSession) {
+        let Some(recorded) = session.submissions.get(&SessionInterface::Tui) else {
+            return;
+        };
+        let fingerprint = recorded.fingerprint.clone();
+        match self
+            .catalog
+            .resolve_submission(&session.id, SessionInterface::Tui)
+        {
+            Ok(SubmissionResolution::None) => {}
+            Ok(SubmissionResolution::Pending { request_id }) => {
+                self.submission = Some(ViewSubmission {
+                    request_id,
+                    fingerprint,
+                    record_ids: vec![session.id.clone()],
+                });
+                self.status = "A previous send is still pending; sending this draft again reuses its request.".to_string();
+            }
+            Ok(SubmissionResolution::Accepted {
+                turn_index,
+                outcome,
+                ..
+            }) => {
+                if outcome == TrailOutcome::Succeeded
+                    && draft_fingerprint(&self.draft_blocks()) == fingerprint
+                {
+                    self.composer.clear();
+                    let _ = self.persist_draft();
+                }
+                self.status = format!("The previous send was recorded as turn {}", turn_index + 1);
+            }
+            Ok(SubmissionResolution::NotAccepted { .. }) => {
+                self.status =
+                    "The previous send was not recorded; review the draft and send it again."
+                        .to_string();
+            }
+            Err(error) => {
+                self.status = format!("Could not check the previous send: {error}");
             }
         }
     }
@@ -3044,7 +3484,8 @@ impl App {
             Ok(TurnOutcome::Failed { message, .. }) => {
                 self.restore_unedited_prompt(submitted_prompt, draft_edited);
                 self.turn_status = TurnStatus::Failed;
-                self.terminal_detail = Some(sanitize::terminal_safe_text(&message));
+                self.terminal_detail =
+                    Some(sanitize::terminal_safe_text(&failure_detail(&message)));
                 if let Some(turn) = self.transcript.last_mut() {
                     turn.set_outcome("failed", Some(&message));
                 }
@@ -3067,6 +3508,7 @@ impl App {
             }
         }
         let _ = self.persist_draft();
+        self.settle_submission();
         if self.exit_after_turn {
             self.quit = true;
         }
@@ -3086,28 +3528,13 @@ impl App {
     }
 
     fn persist_draft(&self) -> Result<(), Box<dyn Error>> {
-        let record_id = self.session_id.as_deref().or(self.draft_id.as_deref());
-        if let Some(record_id) = record_id {
-            self.catalog.save_draft(
-                record_id,
-                SessionInterface::Tui,
-                self.composer.text().to_string(),
-            )?;
-        }
-        Ok(())
+        persist_view_draft(&self.catalog, &self.view)
     }
 
     fn persist_all_drafts(&self) -> Result<(), Box<dyn Error>> {
         self.persist_draft()?;
         for view in self.views.values() {
-            let record_id = view.session_id.as_deref().or(view.draft_id.as_deref());
-            if let Some(record_id) = record_id {
-                self.catalog.save_draft(
-                    record_id,
-                    SessionInterface::Tui,
-                    view.composer.text().to_string(),
-                )?;
-            }
+            persist_view_draft(&self.catalog, view)?;
         }
         Ok(())
     }
@@ -3946,6 +4373,82 @@ fn byte_offset_after_wrapped_rows(text: &str, start: usize, width: usize, rows: 
     text.len()
 }
 
+fn persist_view_draft(
+    catalog: &SessionCatalog,
+    view: &ConversationState,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(record_id) = view.session_id.as_deref().or(view.draft_id.as_deref()) {
+        catalog.save_draft_content(record_id, SessionInterface::Tui, view.draft_blocks())?;
+    }
+    Ok(())
+}
+
+fn new_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("tui-{nanos:x}-{:x}-{sequence}", process::id())
+}
+
+/// The transcript prompt for a draft: text with an `[image: ...]` marker in
+/// each image position.
+fn draft_display(blocks: &[DraftBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            DraftBlock::Text { text } => text.clone(),
+            DraftBlock::Image(image) => {
+                transcript::image_label(&image.attachment.media_type, image.attachment.byte_len)
+            }
+        })
+        .collect()
+}
+
+fn draft_image_identity(blocks: &[DraftBlock]) -> Vec<(String, u64, String)> {
+    draft_images(blocks)
+        .map(|image| {
+            (
+                image.attachment.media_type.clone(),
+                image.attachment.byte_len,
+                image.attachment.sha256.clone(),
+            )
+        })
+        .collect()
+}
+
+fn content_image_identity(content: Option<&[ContentBlock]>) -> Vec<(String, u64, String)> {
+    content
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image {
+                source:
+                    ImageSource::Attachment {
+                        media_type,
+                        byte_len,
+                        sha256,
+                        ..
+                    },
+            } => Some((media_type.clone(), *byte_len, sha256.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Adds the next action to an unsupported-image failure; the draft keeps
+/// its images for an explicit model switch or removal.
+fn failure_detail(message: &str) -> String {
+    if message.starts_with("image_input_unsupported") {
+        format!(
+            "{message}. Switch to an image-capable model (LEG_MODEL) or remove the image (F2 → Remove draft image), then send again."
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 fn restored_draft(current: &str, submitted: Option<String>, draft_edited: bool) -> String {
     if draft_edited {
         current.to_string()
@@ -3970,6 +4473,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Screen::CopyFallback => {
             draw_text_dialog(frame, app, "Save selected text", "Save copied text to:")
         }
+        Screen::AttachFile => draw_text_dialog(frame, app, "Attach image", "Image file path:"),
     }
 }
 
@@ -4256,18 +4760,27 @@ fn draw_text_dialog(frame: &mut Frame<'_>, app: &App, title: &str, prompt: &str)
 fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     let frame_area = frame.area();
     let composer_width = frame_area.width.saturating_sub(2).max(1) as usize;
-    let (composer_lines, (cursor_row, cursor_column)) = app.composer.layout(composer_width);
+    let (composer_lines, (cursor_row, cursor_column)) = app.composer_layout(composer_width);
     let composer_content_rows = composer_lines.len().clamp(1, MAX_COMPOSER_CONTENT_ROWS);
     let composer_panel_height = (composer_content_rows as u16).saturating_add(2);
-    let chunks = Layout::default()
+    let image_lines = draft_image_lines(app, composer_width);
+    let images_panel_height = if image_lines.is_empty() {
+        0
+    } else {
+        (image_lines.len() as u16).saturating_add(2)
+    };
+    let mut chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
+            Constraint::Length(images_panel_height),
             Constraint::Length(composer_panel_height),
             Constraint::Length(1),
         ])
-        .split(frame_area);
+        .split(frame_area)
+        .to_vec();
+    let images_area = chunks.remove(2);
 
     let active_id = app.session_id.as_deref().or(app.draft_id.as_deref());
     let active = active_id.and_then(|id| app.sessions.iter().find(|session| session.id == id));
@@ -4500,6 +5013,16 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         "Composer (Ctrl-S send)"
     };
+    if !image_lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(image_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Draft images · F2 → Remove draft image"),
+            ),
+            images_area,
+        );
+    }
     let composer_height = chunks[2].height.saturating_sub(2).max(1) as usize;
     let composer_text = composer_lines
         .into_iter()
@@ -4542,6 +5065,8 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
 
     if app.stop_chooser_open {
         draw_stop_chooser(frame, app);
+    } else if let Some(selected) = app.attachment_chooser {
+        draw_attachment_chooser(frame, app, selected);
     } else if app.retry_confirmation.is_some() {
         let area = centered_rect(76, 28, frame.area());
         frame.render_widget(Clear, area);
@@ -4574,6 +5099,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("Ctrl-Up/Down focuses the previous/next tool row without editing the composer."),
                 Line::from("F1 help · F2/Ctrl-P actions · F3 sessions: / filter · N new · R rename · W workspace · Enter reopen."),
                 Line::from("F8 shows or hides the session rail at 105 columns and wider."),
+                Line::from("F2 → Attach image file / Paste image from clipboard adds JPEG, PNG, GIF, or WebP; pasted text stays text."),
                 Line::from("F3 picker: S search · Ctrl-F searches titles and complete transcript source · Up/Down move through results."),
                 Line::from("Search: Enter opens the match and matching tool details · Ctrl-U clears · Esc closes."),
                 Line::from("F4 inspects the focused tool call; without a focused row, it toggles the latest turn inspector."),
@@ -4603,6 +5129,70 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
             .min(chunks[2].bottom().saturating_sub(2));
         frame.set_cursor_position((x, y));
     }
+}
+
+/// One row per draft image: position, label, MIME, and size. Labels are
+/// basenames or the clipboard marker, never paths.
+fn draft_image_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let entries = app.draft_image_entries();
+    let shown = if entries.len() > 3 { 2 } else { entries.len() };
+    let mut lines = entries
+        .iter()
+        .take(shown)
+        .enumerate()
+        .map(|(index, (_, image))| {
+            Line::from(truncate_to_width(
+                &sanitize::terminal_safe_text(&draft_image_summary(index, image)),
+                width,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if entries.len() > shown {
+        lines.push(Line::from(format!(
+            "+{} more · F2 → Remove draft image lists all",
+            entries.len() - shown
+        )));
+    }
+    lines
+}
+
+fn draft_image_summary(index: usize, image: &DraftImage) -> String {
+    format!(
+        "[image {}] {} · {} · {}",
+        index + 1,
+        image.label,
+        image.attachment.media_type,
+        attachments::format_byte_size(image.attachment.byte_len)
+    )
+}
+
+fn draw_attachment_chooser(frame: &mut Frame<'_>, app: &App, selected: usize) {
+    let area = centered_rect(78, 60, frame.area());
+    let width = area.width.saturating_sub(4) as usize;
+    let mut lines = vec![Line::from("Choose a draft image to remove"), Line::from("")];
+    for (index, (_, image)) in app.draft_image_entries().iter().enumerate() {
+        let marker = if index == selected { ">" } else { " " };
+        lines.push(Line::from(truncate_to_width(
+            &sanitize::terminal_safe_text(&format!(
+                "{marker} {}",
+                draft_image_summary(index, image)
+            )),
+            width,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("↑/↓ select · Enter/Delete remove · Esc cancel"));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Remove draft image"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_command_palette(frame: &mut Frame<'_>, app: &App) {
@@ -6051,5 +6641,462 @@ mod tests {
     fn elapsed_time_is_rendered_as_minutes_and_seconds() {
         assert_eq!(super::format_duration(Duration::from_secs(0)), "0:00");
         assert_eq!(super::format_duration(Duration::from_secs(83)), "1:23");
+    }
+}
+
+#[cfg(test)]
+mod image_draft_tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use leg_ui_client::{
+        AttachmentRef, CatalogError, DraftBlock, DraftImage, SessionInterface, SubmissionClaim,
+        TurnOutcome, draft_fingerprint, draft_images,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use serde_json::json;
+
+    use super::attachments::{ClipboardError, ClipboardImageSource};
+    use super::{
+        App, ConversationState, PaletteAction, Screen, SessionCatalog, SessionCatalogConfig,
+        TranscriptTurn, TurnStatus, ViewSubmission, draw_terminal,
+    };
+
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0jpeg";
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\npng";
+    const GIF: &[u8] = b"GIF89agif";
+    const WEBP: &[u8] = b"RIFF\x04\0\0\0WEBPwebp";
+
+    struct FixedClipboard(Option<Result<Vec<u8>, ClipboardError>>);
+
+    impl ClipboardImageSource for FixedClipboard {
+        fn read_image(&mut self) -> Result<Vec<u8>, ClipboardError> {
+            self.0.take().expect("clipboard is read once")
+        }
+    }
+
+    struct Fixture {
+        app: App,
+        root: PathBuf,
+        workspace: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn open_app(root: &Path) -> App {
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(root.join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("temporary test catalog opens");
+        let mut app = App::new(catalog);
+        app.use_color = false;
+        app.warning_acknowledged = true;
+        app.set_terminal_size(80, 24);
+        app
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "leg-tui-image-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut app = open_app(&root);
+        let session = app
+            .catalog
+            .create_draft(SessionInterface::Tui, None, Some(&workspace))
+            .expect("draft session is created");
+        app.activate_new_session(session);
+        assert!(app.screen == Screen::Conversation);
+        Fixture {
+            app,
+            root,
+            workspace,
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn staged_count(app: &App) -> usize {
+        std::fs::read_dir(app.catalog.state_dir().join("draft-attachments"))
+            .map(|entries| entries.count())
+            .unwrap_or_default()
+    }
+
+    fn attach_file(app: &mut App, name: &str) {
+        app.invoke_palette_action(PaletteAction::AttachImage);
+        assert!(app.screen == Screen::AttachFile);
+        for character in name.chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.screen == Screen::Conversation);
+    }
+
+    fn rendered(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal opens");
+        draw_terminal(&mut terminal, app).expect("headless draw succeeds");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn media_types(app: &App) -> Vec<String> {
+        draft_images(&app.draft_blocks())
+            .map(|image| image.attachment.media_type.clone())
+            .collect()
+    }
+
+    #[test]
+    fn supported_file_and_clipboard_images_build_an_ordered_rendered_draft() {
+        let mut fixture = fixture("attach");
+        for (name, bytes) in [
+            ("a.jpg", JPEG),
+            ("b.png", PNG),
+            ("c.gif", GIF),
+            ("d.webp", WEBP),
+        ] {
+            std::fs::write(fixture.workspace.join(name), bytes).unwrap();
+        }
+        let app = &mut fixture.app;
+        app.handle_paste("before ");
+        for name in ["a.jpg", "b.png", "c.gif", "d.webp"] {
+            attach_file(app, name);
+        }
+        assert_eq!(app.status, "Attached d.webp · image/webp · 16 B");
+        app.clipboard = Box::new(FixedClipboard(Some(Ok(PNG.to_vec()))));
+        app.invoke_palette_action(PaletteAction::PasteImage);
+        assert_eq!(app.status, "Attached clipboard image · image/png · 11 B");
+        // Bracketed paste stays on the text path, and image markers cannot be
+        // pasted or typed into the composer.
+        app.handle_paste(" after\u{F0000}");
+        app.handle_key(key(KeyCode::Char('\u{F0001}')));
+
+        let blocks = app.draft_blocks();
+        assert_eq!(blocks.len(), 7);
+        assert_eq!(blocks[0], DraftBlock::text("before "));
+        assert_eq!(blocks[6], DraftBlock::text(" after"));
+        assert_eq!(
+            media_types(app),
+            [
+                "image/jpeg",
+                "image/png",
+                "image/gif",
+                "image/webp",
+                "image/png"
+            ]
+        );
+        let labels = draft_images(&blocks)
+            .map(|image| image.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            ["a.jpg", "b.png", "c.gif", "d.webp", "clipboard image"]
+        );
+        assert_eq!(staged_count(app), 5);
+        app.persist_draft().unwrap();
+        let record = app.current_record_id().unwrap().to_string();
+        let saved = app.catalog.get(&record).unwrap();
+        assert_eq!(
+            saved.draft_blocks.get(&SessionInterface::Tui),
+            Some(&blocks)
+        );
+
+        let screen = rendered(app);
+        assert!(screen.contains("before [image 1][image 2]"), "{screen}");
+        assert!(
+            screen.contains("Draft images · F2 → Remove draft image"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("[image 1] a.jpg · image/jpeg · 8 B"),
+            "{screen}"
+        );
+        assert!(screen.contains("+3 more"), "{screen}");
+        app.invoke_palette_action(PaletteAction::RemoveImage);
+        let chooser = rendered(app);
+        for line in [
+            "[image 3] c.gif · image/gif · 9 B",
+            "[image 4] d.webp · image/webp · 16 B",
+            "[image 5] clipboard image · image/png · 11 B",
+            "Enter/Delete remove",
+        ] {
+            assert!(chooser.contains(line), "{line}: {chooser}");
+        }
+        let workspace = fixture.workspace.to_string_lossy().to_string();
+        assert!(!screen.contains(&workspace) && !chooser.contains(&workspace));
+    }
+
+    #[test]
+    fn invalid_images_fail_before_staging_with_bounded_errors() {
+        let mut fixture = fixture("invalid");
+        let workspace = fixture.workspace.clone();
+        std::fs::write(workspace.join("notes.png"), b"plain text").unwrap();
+        std::fs::write(workspace.join("photo.jpg"), PNG).unwrap();
+        let mut oversized = PNG.to_vec();
+        oversized.resize(7_500_001, 0);
+        std::fs::write(workspace.join("huge.png"), &oversized).unwrap();
+        let mut small = PNG.to_vec();
+        small.resize(1_500_001, 0);
+        std::fs::write(workspace.join("small.png"), &small).unwrap();
+        let root = fixture.root.to_string_lossy().to_string();
+        let app = &mut fixture.app;
+
+        for (name, expected) in [
+            (
+                "notes.png",
+                "notes.png: not a supported JPEG, PNG, GIF, or WebP image",
+            ),
+            (
+                "photo.jpg",
+                "photo.jpg: named as image/jpeg but the bytes are image/png",
+            ),
+            (
+                "huge.png",
+                "huge.png: exceeds the 10 MB per-image limit (base64-encoded)",
+            ),
+            ("missing.png", "missing.png: file not found"),
+        ] {
+            attach_file(app, name);
+            assert_eq!(app.status, expected);
+            assert!(app.status_is_blocking());
+        }
+
+        // Three images already at the per-image limit leave no room for a
+        // fourth under the per-turn limit.
+        for index in 0..3 {
+            let marker = app
+                .register_draft_image(DraftImage {
+                    attachment: AttachmentRef::new(
+                        format!("existing-{index}"),
+                        "image/png",
+                        7_500_000,
+                        "0".repeat(64),
+                    ),
+                    label: "existing.png".into(),
+                })
+                .unwrap();
+            app.composer.insert_image_marker(marker);
+        }
+        attach_file(app, "small.png");
+        assert_eq!(
+            app.status,
+            "small.png: draft images would exceed the 32 MB per-turn limit (base64-encoded)"
+        );
+
+        app.invoke_palette_action(PaletteAction::AttachImage);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.status, "Attachment cancelled");
+        for (result, expected) in [
+            (
+                ClipboardError::Unavailable("no supported clipboard on this host".into()),
+                "Clipboard images are unavailable (no supported clipboard on this host). Attach a local file instead, or use Web/iOS.",
+            ),
+            (
+                ClipboardError::Empty,
+                "The clipboard has no image. Attach a local file instead, or use Web/iOS.",
+            ),
+            (ClipboardError::Cancelled, "Clipboard image paste cancelled"),
+        ] {
+            app.clipboard = Box::new(FixedClipboard(Some(Err(result))));
+            app.invoke_palette_action(PaletteAction::PasteImage);
+            assert_eq!(app.status, expected);
+            assert!(!app.status.contains(&root));
+        }
+
+        assert_eq!(staged_count(app), 0);
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.turn_status, TurnStatus::Idle);
+        assert!(app.submission.is_none());
+    }
+
+    #[test]
+    fn removing_an_image_changes_the_fingerprint_and_releases_its_bytes() {
+        let mut fixture = fixture("remove");
+        std::fs::write(fixture.workspace.join("a.png"), PNG).unwrap();
+        std::fs::write(fixture.workspace.join("b.gif"), GIF).unwrap();
+        let app = &mut fixture.app;
+        app.handle_paste("look ");
+        attach_file(app, "a.png");
+        app.handle_paste(" and ");
+        attach_file(app, "b.gif");
+        let before = draft_fingerprint(&app.draft_blocks());
+        assert_eq!(staged_count(app), 2);
+
+        app.invoke_palette_action(PaletteAction::RemoveImage);
+        assert_eq!(app.attachment_chooser, Some(0));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.attachment_chooser, None);
+        assert_eq!(app.status, "Removed b.gif from the draft");
+        assert_eq!(media_types(app), ["image/png"]);
+        assert_ne!(draft_fingerprint(&app.draft_blocks()), before);
+        assert_eq!(staged_count(app), 1);
+        // Removal is not undoable: its bytes were released with the save.
+        assert!(!app.composer.undo());
+
+        app.invoke_palette_action(PaletteAction::RemoveImage);
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(staged_count(app), 0);
+        let inputs = app.action_disabled_inputs();
+        assert_eq!(
+            app.action_disabled_reason_with_inputs(PaletteAction::RemoveImage, &inputs)
+                .as_deref(),
+            Some("No draft images.")
+        );
+    }
+
+    #[test]
+    fn a_recorded_request_identity_is_replayed_without_a_second_start() {
+        let mut fixture = fixture("replay");
+        std::fs::write(fixture.workspace.join("a.png"), PNG).unwrap();
+        let app = &mut fixture.app;
+        app.handle_paste("describe ");
+        attach_file(app, "a.png");
+        let blocks = app.draft_blocks();
+        let record = app.current_record_id().unwrap().to_string();
+        assert_eq!(
+            app.catalog
+                .claim_submission(&record, SessionInterface::Tui, "tui-recorded", &blocks)
+                .unwrap(),
+            SubmissionClaim::Fresh
+        );
+        app.view.submission = Some(ViewSubmission {
+            request_id: "tui-recorded".into(),
+            fingerprint: draft_fingerprint(&blocks),
+            record_ids: vec![record.clone()],
+        });
+
+        app.submit();
+        assert!(app.status.contains("already sent"), "{}", app.status);
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.turn_status, TurnStatus::Idle);
+        let mut changed = blocks.clone();
+        changed.push(DraftBlock::text("!"));
+        assert!(matches!(
+            app.catalog
+                .claim_submission(&record, SessionInterface::Tui, "tui-recorded", &changed),
+            Err(CatalogError::SubmissionConflict)
+        ));
+    }
+
+    #[test]
+    fn reopened_unrecorded_send_keeps_the_draft_for_an_explicit_resend() {
+        let mut fixture = fixture("reopen");
+        std::fs::write(fixture.workspace.join("a.png"), PNG).unwrap();
+        let app = &mut fixture.app;
+        app.handle_paste("describe ");
+        attach_file(app, "a.png");
+        let blocks = app.draft_blocks();
+        let record = app.current_record_id().unwrap().to_string();
+        app.catalog
+            .claim_submission(&record, SessionInterface::Tui, "tui-crashed", &blocks)
+            .unwrap();
+
+        let mut reopened = open_app(&fixture.root);
+        reopened.refresh_sessions();
+        assert!(reopened.open_session(&record, None, None));
+        assert_eq!(
+            reopened.status,
+            "The previous send was not recorded; review the draft and send it again."
+        );
+        assert_eq!(
+            draft_fingerprint(&reopened.draft_blocks()),
+            draft_fingerprint(&blocks)
+        );
+        assert_eq!(staged_count(&reopened), 1);
+        let session = reopened.catalog.get(&record).unwrap();
+        assert!(session.submissions.is_empty());
+    }
+
+    #[test]
+    fn unsupported_image_failure_names_the_model_and_keeps_the_image() {
+        let mut fixture = fixture("unsupported");
+        std::fs::write(fixture.workspace.join("a.png"), PNG).unwrap();
+        let app = &mut fixture.app;
+        app.handle_paste("describe ");
+        attach_file(app, "a.png");
+        // The state start_prompt leaves behind for a running turn.
+        app.active_prompt = Some(app.composer.text().to_string());
+        let display = super::draft_display(&app.draft_blocks());
+        app.transcript.push(TranscriptTurn::new(&display));
+        app.composer.clear();
+        app.turn_status = TurnStatus::Running;
+
+        app.finish_turn(Ok(TurnOutcome::Failed {
+            response: None,
+            message:
+                "image_input_unsupported: provider openai model o3-mini does not accept image input"
+                    .into(),
+        }));
+
+        let detail = app.terminal_detail.clone().unwrap();
+        assert!(detail.contains("provider openai model o3-mini"), "{detail}");
+        assert!(
+            detail.contains("Switch to an image-capable model (LEG_MODEL) or remove the image"),
+            "{detail}"
+        );
+        assert_eq!(media_types(app), ["image/png"]);
+        assert_eq!(staged_count(app), 1);
+        let latest = app.transcript.last().unwrap();
+        assert!(latest.image_input_unsupported());
+        assert!(!latest.retryable());
+    }
+
+    #[test]
+    fn recorded_image_turns_render_their_image_identity_from_the_trail() {
+        let fixture = fixture("trail");
+        let id = "sess-image-trail";
+        // Base64 of the PNG fixture bytes.
+        let data = "iVBORw0KGgpwbmc=";
+        let events = [
+            json!({"schema":"baton.exchange/v1","event":"session_start","ts_ms":1,"session_id":id}),
+            json!({"schema":"baton.exchange/v1","event":"request","ts_ms":2,"model":"m","base_url":"local","prompt":"describe ","content":[
+                {"type":"text","text":"describe "},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}
+            ],"session_id":id,"turn_index":0}),
+            json!({"schema":"baton.exchange/v1","event":"response_error","ts_ms":3,"kind":"image_input_unsupported","message":"image_input_unsupported: provider anthropic model m does not accept image input","session_id":id,"turn_index":0}),
+        ];
+        std::fs::write(
+            fixture
+                .app
+                .catalog
+                .sessions_dir()
+                .join(format!("{id}.jsonl")),
+            events
+                .iter()
+                .map(|event| event.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let session = fixture.app.catalog.get(id).unwrap();
+        let view = ConversationState::from_catalog(&session);
+        let turn = &view.transcript[0];
+        assert_eq!(
+            turn.detail_fields()[0].1,
+            "describe [image: image/png · 11 B]"
+        );
+        assert!(!turn.retryable());
+        assert!(!turn.searchable_text().contains("iVBORw0KGgp"));
     }
 }

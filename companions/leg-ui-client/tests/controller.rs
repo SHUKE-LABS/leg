@@ -12,8 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use leg_ui_client::{
-    CatalogError, Client, ClientConfig, LegSession, ResolveError, SessionCatalog,
-    SessionCatalogConfig, SessionInterface, StartError, StreamEvent, TurnOutcome, TurnRequest,
+    CatalogError, Client, ClientConfig, DraftBlock, LegSession, ResolveError, SessionCatalog,
+    SessionCatalogConfig, SessionInterface, StartError, StreamEvent, SubmissionClaim,
+    SubmissionResolution, TurnOutcome, TurnRequest,
 };
 use serde_json::{Value, json};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -631,6 +632,12 @@ fn shared_catalog_controller_contract(
             json!({"error":{"type":"api_error","message":format!("first turn fixture failure: {sentinel}")}})
                 .to_string(),
         ),
+        MockReply::stream(text_reply("image final answer")),
+        MockReply::error(
+            400,
+            json!({"type":"error","error":{"type":"invalid_request_error","message":"model does not support image input"}})
+                .to_string(),
+        ),
     ]);
     let mut environment = EnvGuard::new();
     environment.set("ANTHROPIC_BASE_URL", &provider.base_url);
@@ -811,8 +818,101 @@ fn shared_catalog_controller_contract(
         .expect("export failed trail");
     assert!(!failed_transcript.contains(sentinel));
 
+    // An ordered text/image/text draft, including whitespace between images,
+    // reaches the provider under one recorded request identity; staged bytes
+    // are released once the turn ends and the draft no longer holds the image.
+    let image_bytes: &[u8] = b"\x89PNG\r\n\x1a\ncontroller-image";
+    let image = second_controller
+        .stage_draft_image(image_bytes, Some("image/png"), "/private/shot.png", &[])
+        .expect("stage draft image");
+    assert_eq!(image.label, "shot.png");
+    let image_blocks = vec![
+        DraftBlock::text("before image "),
+        DraftBlock::Image(image.clone()),
+        DraftBlock::text(
+            "
+",
+        ),
+        DraftBlock::Image(image.clone()),
+        DraftBlock::text(" after image"),
+    ];
+    let image_draft = second_controller
+        .create_draft(SessionInterface::Tui, None, Some(first_cwd.as_path()))
+        .expect("create image draft");
+    second_controller
+        .save_draft_content(&image_draft.id, SessionInterface::Tui, image_blocks.clone())
+        .expect("save image draft");
+    assert_eq!(
+        second_controller
+            .claim_submission(
+                &image_draft.id,
+                SessionInterface::Tui,
+                "controller-image-request",
+                &image_blocks,
+            )
+            .expect("record the image send"),
+        SubmissionClaim::Fresh
+    );
+    let mut image_turn = second_controller
+        .start_draft_turn(&image_draft.id, SessionInterface::Tui, &image_blocks)
+        .expect("start image turn");
+    let _ = collect_catalog_events(&mut image_turn);
+    assert_success(image_turn.wait().expect("finish image turn"));
+    let image_session_id = image_turn
+        .session_id()
+        .expect("image turn binds a session id")
+        .to_string();
+    assert_eq!(
+        second_controller
+            .resolve_submission(&image_session_id, SessionInterface::Tui)
+            .expect("resolve the image send"),
+        SubmissionResolution::Accepted {
+            request_id: "controller-image-request".into(),
+            turn_index: 0,
+            outcome: leg_ui_client::TrailOutcome::Succeeded,
+        }
+    );
+
+    // An unknown model's explicit unsupported-image 4xx is non-retryable and
+    // leaves the draft image for an explicit switch or removal.
+    let mut unsupported = second_controller
+        .start_draft_turn(&image_session_id, SessionInterface::Tui, &image_blocks)
+        .expect("start unsupported image turn");
+    let _ = collect_catalog_events(&mut unsupported);
+    match unsupported
+        .wait()
+        .expect("collect unsupported image failure")
+    {
+        TurnOutcome::Failed { message, .. } => assert!(
+            message.starts_with(
+                "image_input_unsupported: provider anthropic model claude-controller-fixture"
+            ),
+            "unexpected failure: {message}"
+        ),
+        outcome => panic!("expected unsupported image failure, got {outcome:?}"),
+    }
+    let image_session = second_controller
+        .get(&image_session_id)
+        .expect("read image session");
+    assert_eq!(image_session.turns.len(), 2);
+    assert_eq!(
+        image_session.turns[1].failure_kind.as_deref(),
+        Some("image_input_unsupported")
+    );
+    let draft_store = state_dir.join("draft-attachments");
+    let session_staging = state_dir
+        .join("sessions/attachments")
+        .join(&image_session_id);
+    let file_count = |dir: &Path| fs::read_dir(dir).map_or(0, |entries| entries.count());
+    assert_eq!(file_count(&session_staging), 0);
+    assert_eq!(file_count(&draft_store), 1);
+    second_controller
+        .save_draft_content(&image_session_id, SessionInterface::Tui, Vec::new())
+        .expect("remove the draft image");
+    assert_eq!(file_count(&draft_store), 0);
+
     let records = provider.finish();
-    assert_eq!(records.len(), 8);
+    assert_eq!(records.len(), 10);
     for record in &records {
         let request = record.body.to_string();
         assert!(!request.contains("shared session"));
@@ -831,6 +931,42 @@ fn shared_catalog_controller_contract(
     let retry_request = records[6].body.to_string();
     assert_eq!(retry_request.matches(failed_prompt).count(), 1);
     assert!(retry_request.contains("first final answer"));
+    let image_message = records[8].body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .expect("image request has a final message");
+    let image_parts = image_message["content"]
+        .as_array()
+        .expect("image request content blocks")
+        .iter()
+        .map(|block| {
+            block["text"]
+                .as_str()
+                .or_else(|| block["source"]["data"].as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let png = "iVBORw0KGgpjb250cm9sbGVyLWltYWdl";
+    let expected = [
+        "before image ",
+        png,
+        "
+",
+        png,
+        " after image",
+    ];
+    assert!(
+        image_parts
+            .windows(expected.len())
+            .any(|parts| parts == expected),
+        "{image_message}"
+    );
+    for record in &records[8..] {
+        let request = record.body.to_string();
+        assert!(!request.contains(&image.attachment.id));
+        assert!(!request.contains("shot.png"));
+        assert!(!request.contains(state_dir.to_string_lossy().as_ref()));
+    }
 
     let sessions_dir = state_dir.join("sessions");
     assert!(sessions_dir.join(format!("{session_id}.jsonl")).is_file());

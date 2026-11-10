@@ -3,6 +3,8 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::attachments::is_image_marker;
+
 #[derive(Debug, Default)]
 pub(super) struct ComposerEditor {
     text: String,
@@ -41,11 +43,35 @@ impl ComposerEditor {
         self.set_text(String::new());
     }
 
+    /// Inserts typed or pasted text. Image markers are only placed by
+    /// [`Self::insert_image_marker`].
     pub(super) fn insert(&mut self, value: &str) -> bool {
+        let value = value
+            .chars()
+            .filter(|character| !is_image_marker(*character))
+            .collect::<String>();
         if value.is_empty() {
             return false;
         }
-        self.replace(self.cursor..self.cursor, value);
+        self.replace(self.cursor..self.cursor, &value);
+        true
+    }
+
+    pub(super) fn insert_image_marker(&mut self, marker: char) {
+        self.replace(self.cursor..self.cursor, marker.encode_utf8(&mut [0; 4]));
+    }
+
+    pub(super) fn remove_image_marker(&mut self, marker: char) -> bool {
+        let Some(start) = self.text.find(marker) else {
+            return false;
+        };
+        let cursor = self.cursor;
+        self.replace(start..start + marker.len_utf8(), "");
+        self.cursor = if cursor > start {
+            cursor - marker.len_utf8()
+        } else {
+            cursor
+        };
         true
     }
 
@@ -108,7 +134,18 @@ impl ComposerEditor {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
+        self.layout_with(width, |_| None)
+    }
+
+    /// Wraps the text for display; `display` may substitute a grapheme, such
+    /// as an image marker, with visible text.
+    pub(super) fn layout_with(
+        &self,
+        width: usize,
+        display: impl Fn(&str) -> Option<String>,
+    ) -> (Vec<String>, (usize, usize)) {
         let width = width.max(1);
         let mut lines = Vec::new();
         let mut line = String::new();
@@ -134,7 +171,9 @@ impl ComposerEditor {
                 }
                 continue;
             }
-            let grapheme_width = UnicodeWidthStr::width(grapheme).min(width);
+            let substituted = display(grapheme);
+            let shown = substituted.as_deref().unwrap_or(grapheme);
+            let grapheme_width = UnicodeWidthStr::width(shown).min(width);
             if column == width || column + grapheme_width > width {
                 lines.push(std::mem::take(&mut line));
                 row += 1;
@@ -143,7 +182,7 @@ impl ComposerEditor {
             if self.cursor == start {
                 cursor_position = (row, column);
             }
-            line.push_str(grapheme);
+            line.push_str(shown);
             column += grapheme_width;
             if self.cursor == end {
                 cursor_position = (row, column);
@@ -170,6 +209,13 @@ impl ComposerEditor {
         let start = range.start;
         self.text.replace_range(range, inserted);
         self.cursor = start + inserted.len();
+        // Image edits are not replayable: their staged bytes are released
+        // when the draft is saved without them, so history restarts here.
+        if removed.chars().chain(inserted.chars()).any(is_image_marker) {
+            self.undo.clear();
+            self.redo.clear();
+            return;
+        }
         let edit = Edit {
             start,
             removed,
@@ -201,7 +247,9 @@ pub(super) fn normalize_paste(input: &str) -> String {
         .replace("\r\n", "\n")
         .replace('\r', "\n")
         .chars()
-        .filter(|character| *character == '\n' || !character.is_control())
+        .filter(|character| {
+            (*character == '\n' || !character.is_control()) && !is_image_marker(*character)
+        })
         .collect()
 }
 
@@ -255,11 +303,39 @@ mod tests {
     }
 
     #[test]
+    fn image_markers_are_atomic_rendered_and_reset_history() {
+        let marker = '\u{F0000}';
+        let mut editor = ComposerEditor::default();
+        editor.insert("ab");
+        editor.move_left();
+        editor.insert_image_marker(marker);
+        assert_eq!(editor.text(), "a\u{F0000}b");
+        assert!(!editor.undo());
+        assert!(!editor.insert("\u{F0001}"));
+
+        let (lines, cursor) = editor.layout_with(20, |grapheme| {
+            grapheme
+                .starts_with(marker)
+                .then(|| "[image 1]".to_string())
+        });
+        assert_eq!(lines, ["a[image 1]b"]);
+        assert_eq!(cursor, (0, 10));
+
+        editor.insert("x");
+        assert!(editor.remove_image_marker(marker));
+        assert_eq!(editor.text(), "axb");
+        assert_eq!(&editor.text()[editor.cursor()..], "b");
+        assert!(!editor.undo());
+        assert!(!editor.remove_image_marker(marker));
+    }
+
+    #[test]
     fn paste_normalizes_newlines_and_discards_controls() {
         assert_eq!(
             normalize_paste("一\r\n二\r三\n四\u{13}\u{1b}\u{7f}\0"),
             "一\n二\n三\n四"
         );
+        assert_eq!(normalize_paste("a\u{F0000}b"), "ab");
     }
 
     #[test]

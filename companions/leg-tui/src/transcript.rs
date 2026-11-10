@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use leg_ui_client::StreamEvent;
+use leg_ui_client::{ContentBlock, ImageSource, StreamEvent};
 use leg_ui_client::{TrailOutcome, TrailTurn};
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +8,44 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::sanitize::{TerminalSanitizer, terminal_safe_text};
 
 const MAX_TOOL_SUMMARY_CHARS: usize = 240;
+const IMAGE_INPUT_UNSUPPORTED: &str = "image_input_unsupported";
+
+/// Prompt text for display: ordered text with an `[image: MIME · size]`
+/// marker per image when the turn carries content.
+pub fn prompt_display(prompt: &str, content: Option<&[ContentBlock]>) -> String {
+    let Some(content) = content.filter(|content| {
+        content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }) else {
+        return prompt.to_string();
+    };
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Image {
+                source:
+                    ImageSource::Attachment {
+                        media_type,
+                        byte_len,
+                        ..
+                    },
+            } => Some(image_label(media_type, *byte_len)),
+            ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, .. },
+            } => Some(format!("[image: {media_type}]")),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn image_label(media_type: &str, byte_len: u64) -> String {
+    format!(
+        "[image: {media_type} · {}]",
+        crate::attachments::format_byte_size(byte_len)
+    )
+}
 
 #[derive(Clone, Debug, Default)]
 struct TextBlock {
@@ -111,7 +149,7 @@ impl TranscriptTurn {
     }
 
     pub fn from_trail(turn: &TrailTurn) -> Self {
-        let mut transcript = Self::new(&turn.prompt);
+        let mut transcript = Self::new(&prompt_display(&turn.prompt, turn.content.as_deref()));
         transcript.turn_index = Some(turn.turn_index);
         transcript.timestamp_ms = turn.timestamp_ms;
         transcript.outcome_timestamp_ms = turn.outcome_timestamp_ms;
@@ -866,11 +904,19 @@ impl TranscriptTurn {
         self.turn_index
     }
 
+    /// An unsupported-image failure is not retried: the same request would
+    /// fail again, so the user switches model or removes the image instead.
     pub fn retryable(&self) -> bool {
         matches!(
             self.outcome.as_deref(),
             Some("failed" | "interrupted" | "incomplete")
-        )
+        ) && !self.image_input_unsupported()
+    }
+
+    pub fn image_input_unsupported(&self) -> bool {
+        self.failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with(IMAGE_INPUT_UNSUPPORTED))
     }
 
     fn finish_round_sanitizers(&mut self, round_index: u64) {

@@ -120,6 +120,22 @@ values. Failed and incomplete turns are displayed but are not included in
 resumed provider history; leg reconstructs history from complete successful
 turns in its own trail.
 
+Drafts may hold ordered text and image blocks. `stage_draft_image` checks the
+JPEG, PNG, GIF, or WebP magic bytes, any declared MIME, and the base64-encoded
+limits (10 MB per image, 32 MB per turn) before it writes private bytes under
+`draft-attachments/`. Draft records keep only an opaque ref, MIME, byte size,
+SHA-256, and a basename or `clipboard image` label. `start_draft_turn` copies
+the images into the session's private staging directory and sends opaque refs;
+leg reads the bytes, records them in its trail, and removes the copies when
+the turn ends. `claim_submission` records a request identity with the ordered
+text and SHA-256 fingerprint: the same identity with the same draft replays
+without a second start, and with changed text or images it conflicts. After a
+reconnect, `resolve_submission` reports the send as pending, accepted (with its
+turn and outcome), or not accepted. Staged bytes no draft or pending send
+references are deleted; unsent draft images expire after seven days, and a
+catalog reopen sweeps orphans, stale staging, and images of deleted sessions.
+Retrying a recorded image turn restages the same image from the trail.
+
 For example, a host UI creates a draft and submits it explicitly:
 
 ```rust,ignore
@@ -377,6 +393,39 @@ cannot be abandoned silently. External SIGINT and SIGTERM
 use the shared turn controller to stop an active turn, wait for process
 cleanup, save the draft, and restore the terminal. Editing stays available
 during a turn, but another Ctrl-S is rejected while busy.
+
+Palette actions add images to the draft at the cursor. **Attach image file**
+asks for a path; **Paste image from clipboard** reads the host clipboard
+through PowerShell on Windows, `osascript` on macOS, or `wl-paste`/`xclip` on
+Linux. Without a supported clipboard tool, the status says to attach a local
+file instead or use Web/iOS. A bracketed paste always stays text. The composer
+shows each image as `[image N]`, and a panel above it lists the filename or
+`clipboard image`, MIME, and size. **Remove draft image** opens a chooser;
+Enter or Delete removes the selected image. Invalid bytes, a MIME mismatch,
+size overflow, an unreadable file, or a cancelled paste is rejected before
+anything is staged, with a status that names only the basename. Image edits
+reset undo history. A prompt still needs text.
+
+Each send keeps one request identity while the draft is unchanged. Reopening a
+session after the TUI exits mid-send reconciles that identity with the trail.
+A recorded success clears the draft. An unrecorded send keeps the draft for an
+explicit resend. Removing an image changes the draft, so the next Ctrl-S is a
+new send. When the provider or model rejects images, the turn fails as
+`image_input_unsupported`, naming the provider and model. That failure is not
+retryable. The draft keeps its images; restart with an image-capable
+`LEG_MODEL` or remove the image, then send again. Images are never stripped or
+resent automatically. Transcript rows show `[image: MIME · size]`; no image
+bytes or local paths reach PTY input, supervisor records, events, or
+diagnostics.
+
+The TUI image fixtures use an injected clipboard. On Linux and macOS, the
+controller contract also sends an ordered text/image/text turn and an
+unsupported-image 4xx to the fake provider. Run both with:
+
+```sh
+cargo test --locked --manifest-path companions/Cargo.toml -p leg-ui-client
+cargo test --locked --manifest-path companions/Cargo.toml -p leg-tui
+```
 
 F3 opens the session picker. It shows each title, workspace, recent activity,
 turn count, and state. Use `/` to filter titles, Up/Down to select, Enter to
