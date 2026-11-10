@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -97,9 +97,11 @@ pub struct TrailTool {
 pub struct TrailTurn {
     pub turn_index: u64,
     pub prompt: String,
-    /// Ordered request content. Image blocks retain only managed attachment
-    /// identity, never resolved provider bytes.
+    /// Ordered request content. Image blocks retain managed attachment
+    /// identity inside the catalog process, while serialization exposes only
+    /// a redacted image marker and never resolved provider bytes or identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_visible_content")]
     pub content: Option<Vec<ContentBlock>>,
     /// Authoritative provider content retained only inside the catalog
     /// process. It is omitted from UI/export serialization and is used to
@@ -219,6 +221,10 @@ impl RetryIntent {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn turn_index(&self) -> u64 {
+        self.turn_index
     }
 
     pub fn content(&self) -> Option<&[ContentBlock]> {
@@ -784,7 +790,7 @@ impl SessionCatalog {
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>();
-                let id = format!("replay-{sha256}");
+                let id = new_replay_attachment_id(&sha256);
                 let path = session_dir.join(&id);
                 match fs::symlink_metadata(&path) {
                     Ok(metadata) if metadata.file_type().is_file() => {
@@ -1899,6 +1905,18 @@ fn new_draft_id() -> String {
     format!("draft-{}-{}-{sequence}", std::process::id(), now_ms())
 }
 
+fn new_replay_attachment_id(sha256: &str) -> String {
+    let sequence = ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "replay-{sha256}-{}-{started}-{sequence}",
+        std::process::id()
+    )
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2275,9 +2293,21 @@ fn redact_trail_content(record: &mut Value) {
         "prompt", "reply", "message", "content", "input", "result", "error",
     ] {
         if let Some(value) = record.get_mut(field) {
-            crate::client::redact_value(value);
+            crate::client::redact_trail_value(value);
         }
     }
+}
+
+fn serialize_visible_content<S>(
+    content: &Option<Vec<ContentBlock>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut value = serde_json::to_value(content).map_err(serde::ser::Error::custom)?;
+    crate::client::redact_value(&mut value);
+    value.serialize(serializer)
 }
 
 fn set_private_directory(path: &Path) -> io::Result<()> {
@@ -2329,6 +2359,7 @@ fn remove_staged_paths(paths: &[PathBuf]) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
 
     fn sample_trail(id: &str, event_suffix: &str) -> String {
@@ -2435,6 +2466,9 @@ mod tests {
                 .unwrap()
                 .contains("aGVsbG8=")
         );
+        let serialized = serde_json::to_string(&snapshot.turns).unwrap();
+        assert!(!serialized.contains("upload-1"));
+        assert!(!serialized.contains("0000000000000000000000000000000000000000000000000000000000000000"));
         assert_ne!(attachment, resolved);
     }
 
@@ -2488,6 +2522,64 @@ mod tests {
         ));
         assert_eq!(fs::read(&paths[0]).unwrap(), bytes);
         remove_staged_paths(&paths);
+    }
+
+    #[test]
+    fn concurrent_replay_staging_uses_attempt_owned_paths() {
+        let scratch = tempdir().unwrap();
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(scratch.path().join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("opens catalog");
+        let bytes = b"\x89PNG\r\n\x1a\nimage";
+        let content = vec![ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+        }];
+        let barrier = Arc::new(Barrier::new(3));
+        let first_catalog = catalog.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first_content = content.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_catalog
+                .stage_resolved_content("sess-12-38", &first_content)
+                .expect("stages first replay")
+        });
+        let second_catalog = catalog.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_catalog
+                .stage_resolved_content("sess-12-38", &content)
+                .expect("stages second replay")
+        });
+        barrier.wait();
+
+        let (first_content, first_paths) = first.join().expect("first staging thread");
+        let (second_content, second_paths) = second.join().expect("second staging thread");
+        let first_id = match &first_content[0] {
+            ContentBlock::Image {
+                source: ImageSource::Attachment { id, .. },
+            } => id,
+            other => panic!("expected staged image, got {other:?}"),
+        };
+        let second_id = match &second_content[0] {
+            ContentBlock::Image {
+                source: ImageSource::Attachment { id, .. },
+            } => id,
+            other => panic!("expected staged image, got {other:?}"),
+        };
+        assert_ne!(first_id, second_id);
+        assert_eq!(first_paths.len(), 1);
+        assert_eq!(second_paths.len(), 1);
+        assert!(first_paths[0].exists());
+        assert!(second_paths[0].exists());
+        remove_staged_paths(&first_paths);
+        remove_staged_paths(&second_paths);
     }
 
     #[test]

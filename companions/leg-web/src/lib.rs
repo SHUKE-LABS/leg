@@ -403,6 +403,7 @@ struct NewSubmission {
     turn_id: String,
     prompt: String,
     content: Option<Vec<ContentBlock>>,
+    retry_turn_index: Option<u64>,
     stop: PendingStop,
 }
 
@@ -580,6 +581,8 @@ struct SubmitTurn {
     prompt: String,
     #[serde(default)]
     content: Option<Vec<ContentBlock>>,
+    #[serde(default)]
+    retry_turn_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1382,6 +1385,22 @@ impl HostState {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
+        let retry_intent = if let Some(turn_index) = body.retry_turn_index {
+            if body.content.is_some() {
+                return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
+            }
+            let intent = self
+                .inner
+                .catalog
+                .prepare_retry(id)
+                .map_err(map_catalog_error)?;
+            if intent.turn_index() != turn_index || intent.prompt() != body.prompt {
+                return Err(api_error(StatusCode::CONFLICT, "retry_unavailable"));
+            }
+            Some(intent)
+        } else {
+            None
+        };
         if body
             .content
             .as_deref()
@@ -1390,7 +1409,10 @@ impl HostState {
             return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
         }
         let ledger_id = self.ledger_id(id);
-        let prompt_hash = turn_fingerprint(&body.prompt, body.content.as_deref());
+        let prompt_hash = retry_intent.as_ref().map_or_else(
+            || turn_fingerprint(&body.prompt, body.content.as_deref()),
+            |intent| intent.fingerprint().to_string(),
+        );
         let decision = self.inner.durable.read(|data| {
             submission_decision(data.sessions.get(&ledger_id), body.request_id, &prompt_hash)
         });
@@ -1549,6 +1571,7 @@ impl HostState {
             turn_id: turn_id.clone(),
             prompt: body.prompt,
             content: body.content,
+            retry_turn_index: body.retry_turn_index,
             stop: pending_stop,
         };
         let owner_submission = submission.clone();
@@ -1609,6 +1632,7 @@ impl HostState {
             &submission.requested_id,
             &submission.prompt,
             submission.content.as_deref(),
+            submission.retry_turn_index,
             submission.bound_session_id.as_deref(),
         ) {
             Ok(turn) => turn,
@@ -1754,8 +1778,19 @@ impl HostState {
         id: &str,
         prompt: &str,
         content: Option<&[ContentBlock]>,
+        retry_turn_index: Option<u64>,
         bound_session_id: Option<&str>,
     ) -> Result<CatalogTurn, CatalogError> {
+        if let Some(turn_index) = retry_turn_index {
+            let intent = self.inner.catalog.prepare_retry(id)?;
+            if intent.turn_index() != turn_index || intent.prompt() != prompt {
+                return Err(CatalogError::StaleRetry);
+            }
+            return self
+                .inner
+                .catalog
+                .confirm_retry(&intent, SessionInterface::Web);
+        }
         if id.starts_with("draft-") {
             let bound_session_id = bound_session_id.ok_or_else(|| {
                 CatalogError::Catalog("draft submission has no reserved native id".into())
@@ -4397,6 +4432,7 @@ fn main() {
             .start_turn(
                 pending_stop_draft,
                 "HOLD-PENDING-STOP",
+                None,
                 None,
                 Some(&pending_stop_session),
             )

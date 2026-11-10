@@ -45,10 +45,18 @@ identity (`id`, `media_type`, `byte_len`, and `sha256`); the native resolver
 opens the session staging store immediately before the provider call. Resolved
 base64 bytes are retained only in the private session trail needed for
 resume/replay; stream records, catalog metadata, UI events, and diagnostics
-redact them. Terminal cleanup removes the staged ref. The catalog projects
-private trail images back to opaque refs and can re-stage their validated bytes
-for an explicit retry after cleanup. Legacy text-only envelopes omit `content`
-and retain their existing behavior.
+redact them. Terminal cleanup removes the staged ref. The catalog retains
+opaque refs only in its private retry state; catalog, export, and UI event
+projections omit attachment ids and digests, and can re-stage their validated
+bytes for an explicit retry after cleanup. Legacy text-only envelopes omit `content`
+and retain their existing behavior. Supported image formats are JPEG, PNG, GIF,
+and WebP. Every base64 image is limited to 10,000,000 encoded bytes, and the
+combined image data in one request is limited to 32,000,000 encoded bytes.
+The untrusted envelope boundary validates base64, MIME type, and image
+signature before provider invocation; invalid content is rejected without a
+provider call. A provider/model capability rejection is reported with the
+stable `image_input_unsupported` error kind and is non-retryable; remove the
+image or select an image-capable provider/model before sending again.
 
 `round_index` counts provider calls in this user turn, starting at zero. A
 `tool_round` identifies the provider call that requested the tools; its

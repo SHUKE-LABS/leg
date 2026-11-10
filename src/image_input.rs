@@ -171,6 +171,58 @@ fn resolve_content_with_total(
     Ok(resolved)
 }
 
+/// Validates image payloads supplied by an untrusted message envelope.
+///
+/// Companion attachment refs are checked by the managed staging resolver;
+/// inline base64 is checked here before a provider transport can see it.
+pub(crate) fn validate_untrusted_content(content: &[ContentBlock]) -> Result<()> {
+    let mut encoded_total = 0usize;
+    for block in content {
+        let ContentBlock::Image {
+            source: ImageSource::Base64 { media_type, data },
+        } = block
+        else {
+            continue;
+        };
+        validate_base64_image(media_type, data)?;
+        encoded_total = encoded_total.saturating_add(data.len());
+        if encoded_total > MAX_IMAGE_REQUEST_BYTES {
+            return Err(LegError::Usage(
+                "combined image data exceeds the 32 MB Messages API request limit".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_base64_image(media_type: &str, data: &str) -> Result<()> {
+    if data.len() > MAX_BASE64_IMAGE_BYTES {
+        return Err(LegError::Usage(
+            "base64-encoded image exceeds the 10 MB Messages API per-image limit".to_string(),
+        ));
+    }
+    if !matches!(
+        media_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    ) {
+        return Err(LegError::Usage(
+            "image has an unsupported MIME type; use JPEG, PNG, GIF, or WebP".to_string(),
+        ));
+    }
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|_| LegError::Usage("image data is not valid base64".to_string()))?;
+    let detected = detect_media_type(&bytes).ok_or_else(|| {
+        LegError::Usage("image data is not a supported JPEG, PNG, GIF, or WebP image".to_string())
+    })?;
+    if detected != media_type {
+        return Err(LegError::Usage(
+            "image MIME type does not match its bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn read_staged_attachment(
     session_id: &str,
     id: &str,
@@ -492,6 +544,28 @@ mod tests {
             validate_message_image_limits(&messages),
             Err(LegError::Usage(_))
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_inline_image_payloads_before_provider_use() {
+        for (media_type, data, message) in [
+            ("image/png", "not-base64", "image data is not valid base64"),
+            ("image/tiff", "iVBORw0KGgo=", "unsupported MIME type"),
+            (
+                "image/png",
+                "aGVsbG8=",
+                "supported JPEG, PNG, GIF, or WebP image",
+            ),
+        ] {
+            let content = [ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: media_type.to_string(),
+                    data: data.to_string(),
+                },
+            }];
+            let error = validate_untrusted_content(&content).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
 
     #[test]

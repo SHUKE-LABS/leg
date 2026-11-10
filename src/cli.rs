@@ -15,7 +15,9 @@ use crate::events::{
 };
 use crate::guest;
 use crate::hooks::HookEvent;
-use crate::image_input::{cleanup_staged_content, resolve_content, resolve_messages};
+use crate::image_input::{
+    cleanup_staged_content, resolve_content, resolve_messages, validate_untrusted_content,
+};
 use crate::install::{self, InstallOptions};
 use crate::interrupt;
 use crate::message::{MessageEnvelope, MessageKind};
@@ -914,6 +916,7 @@ fn parse_exchange_request(raw: &str) -> Result<(MessageEnvelope, ExchangeMode)> 
         let envelope = serde_json::from_value::<MessageEnvelope>(value).map_err(|error| {
             LegError::Usage(format!("invalid baton.message/v1 envelope: {error}"))
         })?;
+        validate_untrusted_content(&envelope.content_blocks())?;
         return Ok((envelope, ExchangeMode::Envelope));
     }
     let body = raw.trim_end_matches(['\r', '\n']);
