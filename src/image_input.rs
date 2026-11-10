@@ -4,12 +4,17 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use leg_image_policy::{MAX_RAW_IMAGE_BYTES, detect_media_type};
+use leg_ui_client::{
+    MAX_IMAGE_ENCODED_BYTES, MAX_TURN_IMAGE_ENCODED_BYTES, base64_encoded_len,
+    detect_image_media_type,
+};
 
 use crate::error::{LegError, Result};
 use crate::model::{ContentBlock, ImageSource, Message};
 
-pub(crate) use leg_image_policy::{MAX_BASE64_IMAGE_BYTES, MAX_IMAGE_REQUEST_BYTES};
+pub(crate) const MAX_BASE64_IMAGE_BYTES: usize = MAX_IMAGE_ENCODED_BYTES as usize;
+pub(crate) const MAX_IMAGE_REQUEST_BYTES: usize = MAX_TURN_IMAGE_ENCODED_BYTES as usize;
+const MAX_RAW_IMAGE_BYTES: usize = (MAX_IMAGE_ENCODED_BYTES / 4 * 3) as usize;
 const ATTACHMENTS_DIR: &str = "attachments";
 
 /// Resolves companion attachment references into provider-ready image blocks.
@@ -211,7 +216,7 @@ fn validate_base64_image(media_type: &str, data: &str) -> Result<()> {
     let bytes = STANDARD
         .decode(data)
         .map_err(|_| LegError::Usage("image data is not valid base64".to_string()))?;
-    let detected = detect_media_type(&bytes).ok_or_else(|| {
+    let detected = detect_image_media_type(&bytes).ok_or_else(|| {
         LegError::Usage("image data is not a supported JPEG, PNG, GIF, or WebP image".to_string())
     })?;
     if detected != media_type {
@@ -288,7 +293,9 @@ fn read_staged_attachment_from_root(
             "image attachment length does not match its metadata".to_string(),
         ));
     }
-    if byte_len > MAX_RAW_IMAGE_BYTES as u64 {
+    if byte_len > MAX_RAW_IMAGE_BYTES as u64
+        || base64_encoded_len(byte_len) > MAX_IMAGE_ENCODED_BYTES
+    {
         return Err(LegError::Usage(
             "image attachment exceeds the 10 MB base64-encoded size limit".to_string(),
         ));
@@ -302,7 +309,7 @@ fn read_staged_attachment_from_root(
             "image attachment length does not match its metadata".to_string(),
         ));
     }
-    let detected = detect_media_type(&bytes).ok_or_else(|| {
+    let detected = detect_image_media_type(&bytes).ok_or_else(|| {
         LegError::Usage(
             "image attachment is not a supported JPEG, PNG, GIF, or WebP image".to_string(),
         )
@@ -342,7 +349,9 @@ pub(crate) fn load_images(paths: &[String]) -> Result<Vec<ContentBlock>> {
             .metadata()
             .map_err(|err| LegError::Io(format!("failed to inspect --image file {path:?}: {err}")))?
             .len();
-        if file_size > MAX_RAW_IMAGE_BYTES as u64 {
+        if file_size > MAX_RAW_IMAGE_BYTES as u64
+            || base64_encoded_len(file_size) > MAX_IMAGE_ENCODED_BYTES
+        {
             return Err(image_too_large(path));
         }
 
@@ -355,7 +364,7 @@ pub(crate) fn load_images(paths: &[String]) -> Result<Vec<ContentBlock>> {
             return Err(image_too_large(path));
         }
 
-        let media_type = detect_media_type(&bytes).ok_or_else(|| {
+        let media_type = detect_image_media_type(&bytes).ok_or_else(|| {
             LegError::Usage(format!(
                 "--image file {path:?} is not a supported JPEG, PNG, GIF, or WebP image"
             ))
@@ -440,9 +449,9 @@ mod tests {
             (&b"GIF89a"[..], "image/gif"),
             (&b"RIFFxxxxWEBP"[..], "image/webp"),
         ] {
-            assert_eq!(detect_media_type(bytes), Some(media_type));
+            assert_eq!(detect_image_media_type(bytes), Some(media_type));
         }
-        assert_eq!(detect_media_type(b"not an image"), None);
+        assert_eq!(detect_image_media_type(b"not an image"), None);
     }
 
     #[test]

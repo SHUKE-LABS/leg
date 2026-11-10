@@ -11,13 +11,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use leg_image_policy::{
-    detect_media_type, encoded_len, is_supported_media_type, normalize_media_type,
+use leg_ui_client::{
+    AttachmentRef, ContentBlock, ImageSource, MAX_IMAGE_ENCODED_BYTES,
+    MAX_TURN_IMAGE_ENCODED_BYTES, base64_encoded_len, detect_image_media_type,
 };
-use leg_ui_client::{AttachmentRef, ContentBlock, ImageSource};
 use sha2::{Digest, Sha256};
 
-pub use leg_image_policy::{MAX_BASE64_IMAGE_BYTES, MAX_IMAGE_REQUEST_BYTES, MAX_RAW_IMAGE_BYTES};
+pub(crate) const MAX_RAW_IMAGE_BYTES: usize = (MAX_IMAGE_ENCODED_BYTES / 4 * 3) as usize;
 /// Leaves bounded room for multipart headers while keeping the upload route
 /// stricter than the JSON submit route's 64 KiB limit.
 pub const MAX_UPLOAD_BODY_BYTES: usize = MAX_RAW_IMAGE_BYTES + 64 * 1024;
@@ -74,17 +74,14 @@ impl AttachmentStore {
     ) -> Result<AttachmentRef, AttachmentError> {
         validate_component(namespace)?;
         let declared_media_type = normalize_media_type(declared_media_type);
-        if !is_supported_media_type(declared_media_type) {
-            return Err(AttachmentError::MimeMismatch);
-        }
         if bytes.len() > MAX_RAW_IMAGE_BYTES {
             return Err(AttachmentError::TooLarge);
         }
-        let detected = detect_media_type(bytes).ok_or(AttachmentError::Invalid)?;
+        let detected = detect_image_media_type(bytes).ok_or(AttachmentError::Invalid)?;
         if detected != declared_media_type {
             return Err(AttachmentError::MimeMismatch);
         }
-        if encoded_len(bytes.len()) > MAX_BASE64_IMAGE_BYTES {
+        if base64_encoded_len(bytes.len() as u64) > MAX_IMAGE_ENCODED_BYTES {
             return Err(AttachmentError::TooLarge);
         }
 
@@ -134,7 +131,7 @@ impl AttachmentStore {
         content: &[ContentBlock],
     ) -> Result<(), AttachmentError> {
         validate_component(namespace)?;
-        let mut encoded_total = 0usize;
+        let mut encoded_total = 0u64;
         for block in content {
             let ContentBlock::Image { source } = block else {
                 continue;
@@ -149,8 +146,8 @@ impl AttachmentStore {
                 return Err(AttachmentError::Invalid);
             };
             let bytes = self.read_ref(namespace, id, media_type, *byte_len, sha256)?;
-            encoded_total = encoded_total.saturating_add(encoded_len(bytes.len()));
-            if encoded_total > MAX_IMAGE_REQUEST_BYTES {
+            encoded_total = encoded_total.saturating_add(base64_encoded_len(bytes.len() as u64));
+            if encoded_total > MAX_TURN_IMAGE_ENCODED_BYTES {
                 return Err(AttachmentError::TooLarge);
             }
         }
@@ -166,12 +163,12 @@ impl AttachmentStore {
         ids: &[String],
     ) -> Result<Vec<ContentBlock>, AttachmentError> {
         validate_component(namespace)?;
-        let mut encoded_total = 0usize;
+        let mut encoded_total = 0u64;
         let mut content = Vec::with_capacity(ids.len());
         for id in ids {
             let reference = self.read_reference(namespace, id)?;
-            encoded_total = encoded_total.saturating_add(encoded_len(reference.byte_len as usize));
-            if encoded_total > MAX_IMAGE_REQUEST_BYTES {
+            encoded_total = encoded_total.saturating_add(base64_encoded_len(reference.byte_len));
+            if encoded_total > MAX_TURN_IMAGE_ENCODED_BYTES {
                 return Err(AttachmentError::TooLarge);
             }
             content.push(ContentBlock::image(reference));
@@ -433,10 +430,10 @@ impl AttachmentStore {
         if bytes.len() > MAX_RAW_IMAGE_BYTES {
             return Err(AttachmentError::TooLarge);
         }
-        if encoded_len(bytes.len()) > MAX_BASE64_IMAGE_BYTES {
+        if base64_encoded_len(bytes.len() as u64) > MAX_IMAGE_ENCODED_BYTES {
             return Err(AttachmentError::TooLarge);
         }
-        let media_type = detect_media_type(&bytes).ok_or(AttachmentError::Invalid)?;
+        let media_type = detect_image_media_type(&bytes).ok_or(AttachmentError::Invalid)?;
         Ok(AttachmentRef::new(
             id,
             media_type,
@@ -462,6 +459,10 @@ fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
     for (source, destination) in moved.iter().rev() {
         let _ = fs::rename(destination, source);
     }
+}
+
+fn normalize_media_type(value: &str) -> &str {
+    value.split(';').next().unwrap_or(value).trim()
 }
 
 fn validate_component(value: &str) -> Result<(), AttachmentError> {
