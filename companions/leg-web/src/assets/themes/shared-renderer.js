@@ -33,6 +33,7 @@ export function createSharedRenderer(ui, features) {
     "provider-model", "elapsed-time", "turn-status", "active-tool", "stop-turn",
     "workspace-warning", "connection-message", "transcript-warnings", "transcript",
     "messages", "empty-transcript", "new-content", "composer", "prompt",
+    "attachment-list", "attach-image", "attachment-input", "attachment-error",
     "retry-submission", "send-error", "live-status",
   ];
   const featureElements = {
@@ -52,7 +53,8 @@ export function createSharedRenderer(ui, features) {
   if (missing.length) throw new Error(`theme_contract_missing:${missing.join(",")}`);
   const state = {
     sessionId: null, sessions: [], snapshot: null, active: null, pending: null,
-    transcriptItems: [], transcriptHeights: new Map(), transcriptAverageHeight: INITIAL_TURN_HEIGHT,
+    transcriptItems: [], attachments: [], attachmentBusy: false, attachmentError: "",
+    transcriptHeights: new Map(), transcriptAverageHeight: INITIAL_TURN_HEIGHT,
     transcriptRange: null, transcriptRenderQueued: false, followTranscriptToBottom: false,
     transcriptSearchMatches: [], transcriptSearchIndex: -1, expandedTools: new Set(),
     restoreReadingPosition: null, transcriptSessionId: null, renderedSessionSignature: "",
@@ -288,6 +290,7 @@ export function createSharedRenderer(ui, features) {
     ui["active-tool"].hidden = !activeTool;
     ui["stop-turn"].hidden = !state.active;
     ui["stop-turn"].disabled = !state.availability.stop;
+    ui["attach-image"].disabled = !state.availability.attach || state.attachmentBusy;
     if (features.download) ui["download-transcript"].disabled = !state.snapshot;
     if (ui.send) ui.send.disabled = !state.availability.send || !state.draft.trim();
     ui["new-conversation"].disabled = !state.availability.createSession;
@@ -304,6 +307,63 @@ export function createSharedRenderer(ui, features) {
         ? `${current.text}. Active tool: ${activeTool.tool_name || "tool"}.`
         : current.text;
     }
+  }
+
+  function renderAttachmentList() {
+    const signature = JSON.stringify([
+      state.attachments.map((attachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        media_type: attachment.media_type,
+        byte_len: attachment.byte_len,
+        preview_url: attachment.preview_url || null,
+      })),
+      state.attachmentBusy,
+    ]);
+    if (renderAttachmentList.signature === signature) return;
+    renderAttachmentList.signature = signature;
+    ui["attachment-list"].replaceChildren();
+    for (const [index, attachment] of state.attachments.entries()) {
+      const item = document.createElement("figure");
+      item.className = "attachment-item";
+      const preview = document.createElement("img");
+      preview.className = "attachment-preview";
+      preview.alt = attachment.name || "Attached image";
+      if (attachment.preview_url) preview.src = attachment.preview_url;
+      item.append(preview);
+      const caption = document.createElement("figcaption");
+      const name = document.createElement("span");
+      name.className = "attachment-name";
+      name.textContent = attachment.name || "Attached image";
+      const detail = document.createElement("span");
+      detail.className = "attachment-detail";
+      detail.textContent = `${attachment.media_type} · ${formatAttachmentBytes(attachment.byte_len)}`;
+      caption.append(name, detail);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "attachment-remove";
+      remove.dataset.attachmentIndex = String(index);
+      remove.textContent = "Remove";
+      remove.setAttribute("aria-label", `Remove ${attachment.name || "attached image"}`);
+      caption.append(remove);
+      item.append(caption);
+      ui["attachment-list"].append(item);
+    }
+    if (state.attachmentBusy) {
+      const status = document.createElement("span");
+      status.className = "attachment-upload-status";
+      status.textContent = "Uploading image…";
+      status.setAttribute("role", "status");
+      ui["attachment-list"].append(status);
+    }
+  }
+
+  function formatAttachmentBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) return "size unavailable";
+    if (bytes < 1024) return `${bytes} bytes`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
   }
 
   function renderTranscriptWarnings() {
@@ -362,6 +422,8 @@ export function createSharedRenderer(ui, features) {
     ui["setup-error"].hidden = !state.setupError;
     ui["send-error"].textContent = state.sendError;
     ui["send-error"].hidden = !state.sendError;
+    ui["attachment-error"].textContent = state.attachmentError;
+    ui["attachment-error"].hidden = !state.attachmentError;
     ui["rename-error"].textContent = state.renameError;
     ui["rename-error"].hidden = !state.renameError;
     ui["rename-form"].hidden = !state.renamingSessionId;
@@ -374,6 +436,7 @@ export function createSharedRenderer(ui, features) {
       ? "Reconnecting to the local host. The draft is kept, and no message will be resent."
       : "";
     ui["start-form"].querySelector("button[type=submit]").disabled = state.startBusy;
+    renderAttachmentList();
     renderSessionList();
     if (!hasSession) {
       ui.messages.replaceChildren();
@@ -947,6 +1010,7 @@ export function createSharedRenderer(ui, features) {
     } else {
       updateMessageBody(user, item.prompt || "");
     }
+    renderMessageAttachments(user, item.content);
 
     const assistant = getMessage(existingMessages, "assistant", item.assistantKey);
     updateMessageMetadata(assistant, { provider: item.provider, model: item.model });
@@ -1018,7 +1082,13 @@ export function createSharedRenderer(ui, features) {
     const content = document.createElement("div");
     content.className = "message-content";
     article.append(content);
-    messageRenderState.set(article, { bodyMode: null, bodyText: null, metadata: null, details: null });
+    messageRenderState.set(article, {
+      bodyMode: null,
+      bodyText: null,
+      metadata: null,
+      details: null,
+      attachments: null,
+    });
     return article;
   }
 
@@ -1053,6 +1123,31 @@ export function createSharedRenderer(ui, features) {
     content.replaceChildren();
     if (mode === "markdown") appendMarkdown(content, value);
     else if (value) appendTextParagraph(content, value);
+  }
+
+  function renderMessageAttachments(article, content) {
+    const images = (Array.isArray(content) ? content : [])
+      .filter((block) => block?.type === "image" && block.source)
+      .map((block) => ({
+        media_type: String(block.source.media_type || "image/*"),
+        byte_len: Number(block.source.byte_len),
+      }));
+    const signature = JSON.stringify(images);
+    const rendered = messageRenderState.get(article);
+    if (rendered.attachments === signature) return;
+    rendered.attachments = signature;
+    for (const node of article.querySelectorAll(".message-attachments")) node.remove();
+    if (!images.length) return;
+    const container = document.createElement("div");
+    container.className = "message-attachments";
+    container.setAttribute("aria-label", `${images.length} image attachment${images.length === 1 ? "" : "s"}`);
+    for (const image of images) {
+      const marker = document.createElement("span");
+      marker.className = "message-attachment-marker";
+      marker.textContent = `Image attachment · ${image.media_type} · ${formatAttachmentBytes(image.byte_len)}`;
+      container.append(marker);
+    }
+    article.append(container);
   }
 
   function updateMessageDetails(article, item, status) {
@@ -1749,7 +1844,9 @@ export function createSharedRenderer(ui, features) {
     }
     Object.assign(state, {
       sessions: model.sessions, snapshot: model.snapshot, active: model.active, pending: model.pending,
-      transcriptItems: model.transcript, draft: model.draft, workspaceDraft: model.workspaceDraft,
+      transcriptItems: model.transcript, attachments: model.attachments || [],
+      attachmentBusy: Boolean(model.attachmentBusy), attachmentError: model.errors.attachments || "",
+      draft: model.draft, workspaceDraft: model.workspaceDraft,
       recoveryWorkspaceDraft: model.recoveryWorkspaceDraft, renameDraft: model.renameDraft,
       workspaceBrowser: model.workspaceBrowser,
       connectionText: model.connection.text, reconnecting: model.connection.reconnecting,
@@ -1841,6 +1938,32 @@ export function createSharedRenderer(ui, features) {
     ui["cancel-rename"].addEventListener("click", actions.cancelRename);
     ui["set-workspace-form"].addEventListener("submit", (event) => { event.preventDefault(); actions.setSessionWorkspace(ui["recovery-workspace-input"].value); });
     ui["cancel-workspace"].addEventListener("click", actions.cancelWorkspace);
+    ui["attach-image"].addEventListener("click", () => ui["attachment-input"].click());
+    ui["attachment-input"].addEventListener("change", () => {
+      actions.selectAttachmentFiles([...ui["attachment-input"].files]);
+      ui["attachment-input"].value = "";
+    });
+    ui["attachment-list"].addEventListener("click", (event) => {
+      const target = event.target.closest("[data-attachment-index]");
+      if (target) actions.removeAttachment(Number(target.dataset.attachmentIndex));
+    });
+    ui.composer.addEventListener("dragover", (event) => {
+      if (Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault();
+    });
+    ui.composer.addEventListener("drop", (event) => {
+      if (!event.dataTransfer?.files?.length) return;
+      event.preventDefault();
+      actions.selectAttachmentFiles([...event.dataTransfer.files]);
+    });
+    ui.prompt.addEventListener("paste", (event) => {
+      const items = [...(event.clipboardData?.items || [])];
+      const imageItem = items.find((item) => item.kind === "file" && item.type.startsWith("image/"));
+      if (!imageItem) return;
+      const file = imageItem.getAsFile();
+      if (!file) return;
+      event.preventDefault();
+      actions.selectAttachmentFiles([file]);
+    });
     ui.conversation.addEventListener("click", (event) => {
       const target = event.target.closest("[data-action]");
       if (target?.dataset.action === "show-workspace") actions.showWorkspaceForm();

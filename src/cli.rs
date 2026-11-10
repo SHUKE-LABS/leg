@@ -21,7 +21,7 @@ use crate::image_input::{
 use crate::install::{self, InstallOptions};
 use crate::interrupt;
 use crate::message::{MessageEnvelope, MessageKind};
-use crate::model::{ContentBlock, Conversation, Message, Role, StopReason};
+use crate::model::{ContentBlock, Conversation, Message, Role, StopReason, content_with_prompt};
 use crate::participant::{LocalParticipant, Participant, build_response_envelope};
 use crate::tools::{
     BashTool, ContextCompaction, ContextTurn, EditTool, HookContext, ReadSet, ReadTool, ToolLoop,
@@ -1085,6 +1085,7 @@ fn execute_exchange_core(
 ) -> Result<()> {
     let (request, mode) = parse_exchange_request(raw)?;
     let content = resolve_content(&request.content_blocks(), None)?;
+    let content = content_with_prompt(&request.body, &content);
     let response = respond_with_trail(meta, &request, sink, |envelope| {
         participant.respond_with_content(envelope, &content)
     })?;
@@ -1110,8 +1111,8 @@ fn execute_exchange_session_core(
     let request_content = request.content_blocks();
     let resolved_content = resolve_content(&request_content, Some(&session_id));
     let provider_request_content = match &resolved_content {
-        Ok(content) => content.clone(),
-        Err(_) => request_content.clone(),
+        Ok(content) => content_with_prompt(&request.body, content),
+        Err(_) => content_with_prompt(&request.body, &request_content),
     };
     resumed
         .conversation

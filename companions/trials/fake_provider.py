@@ -168,6 +168,7 @@ class Fixture:
         messages = payload.get("messages", [])
         markers = (
             "TRIAL-CHINESE",
+            "TRIAL-IMAGE",
             "TRIAL-SEED-SESSION",
             "TRIAL-NAV-SEED",
             "TRIAL-NAV-CONTINUE",

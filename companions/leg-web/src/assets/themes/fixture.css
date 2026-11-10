@@ -60,6 +60,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .turn-outcome, .turn-warning, .tool-summary { margin: .2rem 0; border-radius: .45rem; padding: .4rem .55rem; color: #453568; background: #f3efff; font-size: .82rem; }
 #composer { display: grid; gap: .45rem; }
 #prompt { width: 100%; min-height: 2.8rem; max-height: 40dvh; resize: none; border: 1px solid #aaa4c8; border-radius: .65rem; padding: .65rem; }
+.fixture-attachment-actions { display: flex; gap: .5rem; }
+.attachment-list { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .5rem; }
+.attachment-item { display: grid; grid-template-columns: 3rem minmax(0, 1fr); gap: .5rem; align-items: center; max-width: 20rem; margin: 0; padding: .35rem; border: 1px solid #d5d0e9; border-radius: .55rem; background: #fff; }
+.attachment-preview { width: 3rem; height: 3rem; object-fit: cover; border-radius: .35rem; background: #f0eef8; }
+.attachment-item figcaption { display: grid; min-width: 0; gap: .15rem; }
+.attachment-name, .attachment-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-name { font-weight: 600; }
+.attachment-detail { color: #625d78; font-size: .8rem; }
+.attachment-remove { justify-self: start; padding: .15rem .35rem; font-size: .8rem; }
+.attachment-upload-status { color: #625d78; font-size: .85rem; }
+.message-attachments { display: grid; gap: .35rem; margin-top: .5rem; }
+.message-attachment-marker { display: inline-block; width: fit-content; padding: .3rem .5rem; border: 1px solid #d5d0e9; border-radius: .45rem; color: #413b63; background: #f5f2ff; font-size: .85rem; }
 .fixture-compose-actions { display: flex; justify-content: flex-end; gap: .5rem; }
 .fixture-status { display: flex; flex-wrap: wrap; gap: .6rem 1rem; border-top: 1px solid #e1def0; padding-top: .6rem; color: #5c5870; font-size: .8rem; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }

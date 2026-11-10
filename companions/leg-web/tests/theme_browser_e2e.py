@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import signal
@@ -15,6 +16,11 @@ from urllib.parse import urlsplit
 from playwright.async_api import async_playwright
 
 import browser_e2e as common
+
+
+ONE_PIXEL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 async def wait_theme(page, theme_id: str) -> None:
@@ -110,6 +116,31 @@ async def start_session(page, workspace: Path) -> str:
     return await page.evaluate("sessionStorage.getItem('leg-web-current-session')")
 
 
+async def dispatch_file_drop(page, selector: str, name: str, mime_type: str, data: bytes) -> None:
+    await page.locator(selector).evaluate(
+        """(element, value) => {
+          const transfer = new DataTransfer();
+          transfer.items.add(new File([new Uint8Array(value.bytes)], value.name, {type: value.mimeType}));
+          const event = new DragEvent('drop', {bubbles: true, cancelable: true, dataTransfer: transfer});
+          element.dispatchEvent(event);
+        }""",
+        {"name": name, "mimeType": mime_type, "bytes": list(data)},
+    )
+
+
+async def dispatch_image_paste(page, name: str, data: bytes) -> None:
+    await page.locator("#prompt").evaluate(
+        """(element, value) => {
+          const transfer = new DataTransfer();
+          transfer.items.add(new File([new Uint8Array(value.bytes)], value.name, {type: 'image/png'}));
+          const event = new Event('paste', {bubbles: true, cancelable: true});
+          Object.defineProperty(event, 'clipboardData', {value: transfer});
+          element.dispatchEvent(event);
+        }""",
+        {"name": name, "bytes": list(data)},
+    )
+
+
 async def inject_bind_failure(route, theme_id: str) -> None:
     response = await route.fetch()
     source = await response.text()
@@ -190,6 +221,7 @@ async def run(
                 browser, context, persistent_context = await common.launch_test_browser_context(
                     playwright, browser_name, root / "browser-profile"
                 )
+                await common.grant_clipboard_permissions(context, browser_name, f"http://{authority}")
                 page = await context.new_page()
                 requests: list[tuple[str, str, dict[str, object] | None]] = []
                 page_errors: list[str] = []
@@ -528,6 +560,89 @@ async def run(
                 await choose_theme(page, "fixture")
                 assert await page.locator("#send").is_disabled()
                 assert "read-only" in (await page.locator("#session-guidance").inner_text()).lower()
+
+                # Picker, drop, and image-paste all stage the same opaque attachment contract.
+                await page.locator("#new-conversation").click()
+                await page.locator("#welcome").wait_for(state="visible")
+                session_image = await start_session(page, workspace)
+                await page.wait_for_function("document.querySelector('#connection-state')?.textContent === ''")
+
+                async def assert_attachment(name: str) -> None:
+                    item = page.locator("#attachment-list .attachment-item")
+                    await item.wait_for(state="visible")
+                    preview_src = await item.locator("img.attachment-preview").get_attribute("src")
+                    assert preview_src and preview_src.startswith("blob:")
+                    assert await item.get_by_role("button", name=f"Remove {name}").count() == 1
+                    details = await item.inner_text()
+                    assert name in details and "image/png" in details and "bytes" in details
+
+                async def remove_attachment(name: str) -> None:
+                    await page.get_by_role("button", name=f"Remove {name}").click()
+                    await page.locator("#attachment-list .attachment-item").wait_for(state="detached")
+
+                await page.locator("#attachment-input").set_input_files(
+                    {"name": "picker.png", "mimeType": "image/png", "buffer": ONE_PIXEL_PNG}
+                )
+                await assert_attachment("picker.png")
+                await remove_attachment("picker.png")
+
+                await dispatch_file_drop(page, "#composer", "drop.png", "image/png", ONE_PIXEL_PNG)
+                await assert_attachment("drop.png")
+                await remove_attachment("drop.png")
+
+                await page.locator("#prompt").fill("draft survives image acquisition")
+                await dispatch_image_paste(page, "pasted.png", ONE_PIXEL_PNG)
+                await assert_attachment("pasted.png")
+                assert await page.locator("#prompt").input_value() == "draft survives image acquisition"
+
+                text_clipboard = "ordinary text paste stays in the draft"
+                await page.evaluate("text => navigator.clipboard.writeText(text)", text_clipboard)
+                await page.locator("#prompt").fill("")
+                await page.locator("#prompt").focus()
+                await page.keyboard.press("Control+V")
+                assert await page.locator("#prompt").input_value() == text_clipboard
+
+                image_prompt = "TRIAL-IMAGE: preserve ordered image content"
+                await page.locator("#prompt").fill(image_prompt)
+                await dispatch_file_drop(page, "#composer", "notes.txt", "text/plain", b"not an image")
+                await page.locator("#attachment-error").wait_for(state="visible")
+                assert "JPEG" in await page.locator("#attachment-error").inner_text()
+                assert await page.locator("#prompt").input_value() == image_prompt
+                assert await page.locator("#attachment-list .attachment-item").count() == 1
+
+                oversized = root / "over-limit.png"
+                oversized.write_bytes(b"x" * 7_500_001)
+                await page.locator("#attachment-input").set_input_files(oversized)
+                await page.locator("#attachment-error").wait_for(state="visible")
+                assert "10 MB" in await page.locator("#attachment-error").inner_text()
+                assert await page.locator("#prompt").input_value() == image_prompt
+                assert await page.locator("#attachment-list .attachment-item").count() == 1
+
+                await page.get_by_role("button", name="Send").click()
+                image_turn = await asyncio.to_thread(
+                    common.wait_completed_submission, authority, token, session_image, 1
+                )
+                await common.wait_status(page, "Succeeded")
+                assert image_turn["last_submission"]["status"] == "succeeded", image_turn
+                image_request = next(
+                    body
+                    for method, url, body in requests
+                    if method == "POST" and url.endswith("/submit")
+                    and body and body.get("prompt") == image_prompt
+                )
+                assert image_request["request_id"] == 1
+                assert len(image_request["content"]) == 1
+                assert image_request["content"][0]["type"] == "image"
+                image_source = image_request["content"][0]["source"]
+                assert image_source["type"] == "attachment"
+                assert image_source["media_type"] == "image/png"
+                assert isinstance(image_source["byte_len"], int)
+                assert len(image_source["sha256"]) == 64
+                assert "data" not in json.dumps(image_request)
+                await page.locator(".message-attachment-marker").wait_for()
+                marker = await page.locator(".message-attachment-marker").inner_text()
+                assert "image/png" in marker and "upload-" not in marker and "sha256" not in marker
+                assert common.fixture_status(provider_authority)["scenario_requests"].get("TRIAL-IMAGE") == 1
 
                 # Exercise independent first-send warnings and exact/IME-safe drafts in each theme.
                 await page.locator("#new-conversation").click()

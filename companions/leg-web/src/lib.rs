@@ -1,6 +1,8 @@
 //! Authenticated loopback HTTP host for companion session control.
 
-use std::collections::{HashMap, VecDeque};
+mod attachments;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -12,18 +14,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::extract::{Path as RoutePath, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path as RoutePath, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response, Sse, sse::Event};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use fs2::FileExt;
 use leg_ui_client::{
-    CatalogError, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock, SessionCatalog,
-    SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome, TurnStopHandle,
-    turn_fingerprint,
+    AttachmentRef, CatalogError, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock,
+    SessionCatalog, SessionCatalogConfig, SessionInterface, StreamEvent, TurnOutcome,
+    TurnStopHandle, turn_fingerprint,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -139,19 +141,36 @@ impl Host {
             ));
         }
         let catalog = SessionCatalog::open(config.catalog)?;
-        let host_lock = acquire_host_lock(catalog.state_dir())?;
-        let token = random_hex(32)?;
+        let attachments = attachments::AttachmentStore::open(catalog.sessions_dir())
+            .map_err(|error| HostError::State(error.to_string()))?;
+        attachments.cleanup_expired();
         let durable =
             DurableStore::open(catalog.state_dir().join(STORE_NAME), config.receipt_limit)?;
+        let live_namespaces = catalog
+            .list()?
+            .into_iter()
+            .map(|session| session.id)
+            .chain(durable.read(|data| {
+                data.aliases
+                    .iter()
+                    .flat_map(|(actual, ledger)| [actual.clone(), ledger.clone()])
+                    .collect::<Vec<_>>()
+            }))
+            .collect::<HashSet<_>>();
+        attachments.cleanup_orphans(&live_namespaces);
+        let host_lock = acquire_host_lock(catalog.state_dir())?;
+        let token = random_hex(32)?;
         let runtime = Runtime::default();
         let (shutdown_tx, _) = broadcast::channel(1);
         let state = HostState {
             inner: Arc::new(HostInner {
                 catalog,
+                attachments,
                 token,
                 authority: Arc::new(Mutex::new(None)),
                 durable,
                 runtime: Mutex::new(runtime),
+                attachment_reservations: Mutex::new(HashSet::new()),
                 acceptance_gates: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 test_hooks: TestHooks::default(),
@@ -233,10 +252,12 @@ struct HostState {
 
 struct HostInner {
     catalog: SessionCatalog,
+    attachments: attachments::AttachmentStore,
     token: String,
     authority: Arc<Mutex<Option<String>>>,
     durable: DurableStore,
     runtime: Mutex<Runtime>,
+    attachment_reservations: Mutex<HashSet<String>>,
     acceptance_gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     #[cfg(test)]
     test_hooks: TestHooks,
@@ -403,6 +424,7 @@ struct NewSubmission {
     turn_id: String,
     prompt: String,
     content: Option<Vec<ContentBlock>>,
+    attachment_namespace: String,
     retry_turn_index: Option<u64>,
     stop: PendingStop,
 }
@@ -740,6 +762,16 @@ fn directory_entries(
 }
 
 fn build_router(state: HostState) -> Router {
+    let attachment_routes = Router::new()
+        .route(
+            "/api/sessions/{id}/attachments",
+            post(upload_attachment),
+        )
+        .route(
+            "/api/sessions/{id}/attachments/{attachment_id}",
+            delete(delete_attachment),
+        )
+        .layer(DefaultBodyLimit::max(attachments::MAX_UPLOAD_BODY_BYTES));
     let router = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -757,14 +789,17 @@ fn build_router(state: HostState) -> Router {
         .route("/api/sessions/{id}/submit", post(submit_turn))
         .route("/api/sessions/{id}/stop", post(stop_turn))
         .route("/api/sessions/{id}/snapshot", get(get_snapshot))
-        .route("/api/sessions/{id}/events", get(events));
+        .route("/api/sessions/{id}/events", get(events))
+        // Keep the legacy JSON API capped at 64 KiB. The attachment routes
+        // are merged after this layer and carry their own multipart limit.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     #[cfg(feature = "browser-e2e-themes")]
     let router = router
         .route("/themes/fixture.js", get(fixture_theme_js))
         .route("/themes/fixture.html", get(fixture_theme_html))
         .route("/themes/fixture.css", get(fixture_theme_css));
     router
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .merge(attachment_routes)
         .layer(middleware::from_fn_with_state(state.clone(), guard_request))
         .with_state(state)
 }
@@ -853,9 +888,11 @@ fn response_is_json(response: &Response) -> bool {
 fn api_rejection_code(path: &str, status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST if path.ends_with("/events") => "invalid_cursor",
+        StatusCode::BAD_REQUEST if path.contains("/attachments") => "attachment_invalid",
         StatusCode::BAD_REQUEST => "invalid_request",
         StatusCode::NOT_FOUND => "not_found",
         StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        StatusCode::PAYLOAD_TOO_LARGE if path.contains("/attachments") => "attachment_too_large",
         StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
         StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
         StatusCode::UNPROCESSABLE_ENTITY => "invalid_request",
@@ -942,7 +979,61 @@ async fn list_sessions(State(state): State<HostState>) -> Result<Json<Value>, Ap
         .catalog
         .list()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "catalog_unavailable"))?;
+    let live_namespaces = state.live_attachment_namespaces(&sessions);
+    state.inner.attachments.cleanup_orphans(&live_namespaces);
     Ok(Json(json!({"sessions": sessions})))
+}
+
+async fn upload_attachment(
+    State(state): State<HostState>,
+    RoutePath(id): RoutePath<String>,
+    mut multipart: Multipart,
+) -> Result<Json<AttachmentRef>, ApiError> {
+    let namespace = state.attachment_namespace(&id)?;
+    let mut uploaded = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "attachment_invalid"))?
+    {
+        if field.name() != Some("file") || uploaded.is_some() {
+            return Err(api_error(StatusCode::BAD_REQUEST, "attachment_invalid"));
+        }
+        let media_type = field
+            .content_type()
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "attachment_mime_invalid"))?
+            .to_string();
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|_| api_error(StatusCode::BAD_REQUEST, "attachment_invalid"))?;
+        uploaded = Some((media_type, bytes));
+    }
+    let Some((media_type, bytes)) = uploaded else {
+        return Err(api_error(StatusCode::BAD_REQUEST, "attachment_missing"));
+    };
+    let reference = state
+        .inner
+        .attachments
+        .stage(&namespace, &media_type, &bytes)
+        .map_err(map_attachment_error)?;
+    Ok(Json(reference))
+}
+
+async fn delete_attachment(
+    State(state): State<HostState>,
+    RoutePath((id, attachment_id)): RoutePath<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let namespace = state.attachment_namespace(&id)?;
+    let removed = state
+        .inner
+        .attachments
+        .remove_id(&namespace, &attachment_id)
+        .map_err(map_attachment_error)?;
+    if !removed {
+        return Err(api_error(StatusCode::NOT_FOUND, "attachment_missing"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_directories(
@@ -1100,12 +1191,14 @@ async fn submit_turn(
     Json(body): Json<SubmitTurn>,
 ) -> Result<(StatusCode, Json<SubmissionReceipt>), ApiError> {
     if body.prompt.trim().is_empty() {
+        state.cleanup_attachment_content(&id, body.content.as_deref());
         return Err(api_error(StatusCode::BAD_REQUEST, "prompt_is_blank"));
     }
     if !valid_session_id(&id) {
         return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
     }
     if state.inner.shutting_down.load(Ordering::Acquire) {
+        state.cleanup_attachment_content(&id, body.content.as_deref());
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "host_shutting_down",
@@ -1117,6 +1210,7 @@ async fn submit_turn(
     let gate = state.acceptance_gate(&ledger_id);
     let gate_guard = gate.lock_owned().await;
     if state.inner.shutting_down.load(Ordering::Acquire) {
+        state.cleanup_attachment_content(&id, body.content.as_deref());
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "host_shutting_down",
@@ -1276,6 +1370,29 @@ impl HostState {
         gate
     }
 
+    fn live_attachment_namespaces(&self, sessions: &[CatalogSession]) -> HashSet<String> {
+        let mut namespaces = sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<HashSet<_>>();
+        self.inner.durable.read(|data| {
+            for (actual, ledger) in &data.aliases {
+                namespaces.insert(actual.clone());
+                namespaces.insert(ledger.clone());
+            }
+        });
+        namespaces.extend(lock(&self.inner.attachment_reservations).iter().cloned());
+        namespaces
+    }
+
+    fn reserve_attachment_namespace(&self, namespace: &str) {
+        lock(&self.inner.attachment_reservations).insert(namespace.to_string());
+    }
+
+    fn release_attachment_namespace(&self, namespace: &str) {
+        lock(&self.inner.attachment_reservations).remove(namespace);
+    }
+
     fn catalog_session(&self, id: &str) -> Result<CatalogSession, ApiError> {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
@@ -1311,6 +1428,27 @@ impl HostState {
                 .cloned()
                 .unwrap_or_else(|| id.to_string())
         })
+    }
+
+    fn attachment_namespace(&self, id: &str) -> Result<String, ApiError> {
+        self.catalog_session_or_bound_alias(id)?;
+        if id.starts_with("draft-") && self.inner.catalog.get(id).is_err() {
+            if let Some(bound_id) = self.inner.durable.read(|data| {
+                data.aliases.iter().find_map(|(actual, ledger_id)| {
+                    (ledger_id == id && actual != id).then(|| actual.clone())
+                })
+            }) {
+                return Ok(bound_id);
+            }
+        }
+        Ok(id.to_string())
+    }
+
+    fn cleanup_attachment_content(&self, id: &str, content: Option<&[ContentBlock]>) {
+        let namespace = self
+            .attachment_namespace(id)
+            .unwrap_or_else(|_| id.to_string());
+        self.inner.attachments.remove_content(&namespace, content);
     }
 
     fn latest_receipt(&self, id: &str) -> Option<Receipt> {
@@ -1385,15 +1523,38 @@ impl HostState {
         if !valid_session_id(id) {
             return Err(api_error(StatusCode::NOT_FOUND, "session_not_found"));
         }
+        let source_attachment_namespace = self.attachment_namespace(id)?;
         if body
             .content
             .as_deref()
-            .is_some_and(|content| content.iter().any(|block| !block.is_wire_safe()))
+            .is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|block| !block.is_managed_attachment() || !block.is_wire_safe())
+            })
         {
+            self.inner
+                .attachments
+                .remove_content(&source_attachment_namespace, body.content.as_deref());
             return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
         }
         if body.retry_turn_index.is_some() && body.content.is_some() {
+            self.inner
+                .attachments
+                .remove_content(&source_attachment_namespace, body.content.as_deref());
             return Err(api_error(StatusCode::BAD_REQUEST, "invalid_content"));
+        }
+        if let Some(content) = body.content.as_deref() {
+            if let Err(error) = self
+                .inner
+                .attachments
+                .validate_content(&source_attachment_namespace, content)
+            {
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, Some(content));
+                return Err(map_attachment_error(error));
+            }
         }
         let ledger_id = self.ledger_id(id);
         let retry_intent = body.retry_turn_index.map(|turn_index| {
@@ -1402,7 +1563,15 @@ impl HostState {
                 .retry_intent_for_turn(id, turn_index)
                 .map_err(map_catalog_error)
         });
-        let retry_intent = retry_intent.transpose()?;
+        let retry_intent = match retry_intent.transpose() {
+            Ok(intent) => intent,
+            Err(error) => {
+                self.inner
+                    .attachments
+                    .remove_content(&source_attachment_namespace, body.content.as_deref());
+                return Err(error);
+            }
+        };
         let prompt_hash = retry_intent.as_ref().map_or_else(
             || turn_fingerprint(&body.prompt, body.content.as_deref()),
             |intent| intent.fingerprint().to_string(),
@@ -1416,6 +1585,10 @@ impl HostState {
                     .as_ref()
                     .is_some_and(|intent| intent.visible_prompt() != body.prompt)
                 {
+                    self.inner.attachments.remove_content(
+                        &source_attachment_namespace,
+                        body.content.as_deref(),
+                    );
                     return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
                 }
                 return Ok(SubmissionAcceptance {
@@ -1430,15 +1603,31 @@ impl HostState {
             }
             Ok(SubmissionDecision::New) => {}
             Err(SubmissionReject::Stale) => {
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_stale"));
             }
             Err(SubmissionReject::Conflict) => {
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_conflict"));
             }
             Err(SubmissionReject::Unexpected) => {
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_unexpected"));
             }
             Err(SubmissionReject::Exhausted) => {
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
                 return Err(api_error(StatusCode::CONFLICT, "submission_id_exhausted"));
             }
         }
@@ -1454,24 +1643,50 @@ impl HostState {
                 || current_intent.visible_prompt() != body.prompt
                 || current_intent.fingerprint() != submitted_intent.fingerprint()
             {
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
                 return Err(api_error(StatusCode::CONFLICT, "retry_unavailable"));
             }
         }
         if self.runtime_is_busy(&ledger_id) {
+            self.inner.attachments.remove_content(
+                &source_attachment_namespace,
+                body.content.as_deref(),
+            );
             return Err(api_error(StatusCode::CONFLICT, "session_busy"));
         }
-        let current = self.catalog_session(id)?;
+        let current = match self.catalog_session(id) {
+            Ok(current) => current,
+            Err(error) => {
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
+                return Err(error);
+            }
+        };
         if current.run_state != CatalogRunState::Idle {
+            self.inner.attachments.remove_content(
+                &source_attachment_namespace,
+                body.content.as_deref(),
+            );
             return Err(api_error(StatusCode::CONFLICT, "session_busy"));
         }
         let bound_session_id = if id.starts_with("draft-") {
             let mut available = None;
             for _ in 0..128 {
-                let candidate = self
-                    .inner
-                    .catalog
-                    .allocate_new_session_id()
-                    .map_err(map_catalog_error)?;
+                let candidate = match self.inner.catalog.allocate_new_session_id() {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        self.inner.attachments.remove_content(
+                            &source_attachment_namespace,
+                            body.content.as_deref(),
+                        );
+                        return Err(map_catalog_error(error));
+                    }
+                };
                 let reserved = self.inner.durable.read(|data| {
                     data.aliases.contains_key(&candidate) || data.sessions.contains_key(&candidate)
                 });
@@ -1480,15 +1695,60 @@ impl HostState {
                     break;
                 }
             }
-            Some(available.ok_or(api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "session_id_unavailable",
-            ))?)
+            let Some(candidate) = available else {
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session_id_unavailable",
+                ));
+            };
+            Some(candidate)
         } else {
             None
         };
+        let mut attachment_namespace = source_attachment_namespace.clone();
+        let mut reserved_attachment_namespace = None;
+        if let Some(bound_id) = &bound_session_id
+            && body
+                .content
+                .as_deref()
+                .is_some_and(|content| content.iter().any(ContentBlock::is_managed_attachment))
+        {
+            // The native catalog does not publish the preallocated session
+            // until its first turn_start. Keep its staged bytes live while a
+            // concurrent session-list refresh performs orphan cleanup.
+            self.reserve_attachment_namespace(bound_id);
+            reserved_attachment_namespace = Some(bound_id.clone());
+            if let Err(error) = self.inner.attachments.rehome(
+                &source_attachment_namespace,
+                bound_id,
+                body.content.as_deref(),
+            ) {
+                self.release_attachment_namespace(bound_id);
+                self.inner.attachments.remove_content(
+                    &source_attachment_namespace,
+                    body.content.as_deref(),
+                );
+                self.inner
+                    .attachments
+                    .remove_content(bound_id, body.content.as_deref());
+                return Err(map_attachment_error(error));
+            }
+            attachment_namespace = bound_id.clone();
+        }
         let turn_id = random_hex(16)
-            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "random_unavailable"))?;
+            .map_err(|_| {
+                if let Some(namespace) = reserved_attachment_namespace.as_deref() {
+                    self.release_attachment_namespace(namespace);
+                }
+                self.inner
+                    .attachments
+                    .remove_content(&attachment_namespace, body.content.as_deref());
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "random_unavailable")
+            })?;
         let accepted = Receipt {
             request_id: body.request_id,
             prompt_sha256: prompt_hash.clone(),
@@ -1498,7 +1758,8 @@ impl HostState {
             outcome: None,
             recovery_evidence: None,
         };
-        self.inner
+        if self
+            .inner
             .durable
             .transact(|data| {
                 if !matches!(
@@ -1529,7 +1790,16 @@ impl HostState {
                 }
                 Ok(())
             })
-            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"))?;
+            .is_err()
+        {
+            if let Some(namespace) = reserved_attachment_namespace.as_deref() {
+                self.release_attachment_namespace(namespace);
+            }
+            self.inner
+                .attachments
+                .remove_content(&attachment_namespace, body.content.as_deref());
+            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"));
+        }
         #[cfg(test)]
         self.pause_after_durable_receipt();
         let pending_stop = PendingStop::new();
@@ -1586,6 +1856,7 @@ impl HostState {
             turn_id: turn_id.clone(),
             prompt: body.prompt,
             content: body.content,
+            attachment_namespace,
             retry_turn_index: body.retry_turn_index,
             stop: pending_stop,
         };
@@ -1743,6 +2014,11 @@ impl HostState {
         status: ReceiptStatus,
         outcome: Value,
     ) {
+        self.inner.attachments.remove_content(
+            &submission.attachment_namespace,
+            submission.content.as_deref(),
+        );
+        self.release_attachment_namespace(&submission.attachment_namespace);
         let _ = self.finish_receipt(
             &submission.ledger_id,
             submission.request_id,
@@ -2224,6 +2500,10 @@ impl HostState {
             } else {
                 id.clone()
             };
+            let _ = self.inner.attachments.remove_namespace(&id);
+            if session_id != id {
+                let _ = self.inner.attachments.remove_namespace(&session_id);
+            }
             let evidence = self
                 .inner
                 .catalog
@@ -2571,6 +2851,28 @@ fn map_catalog_error(error: CatalogError) -> ApiError {
     }
 }
 
+fn map_attachment_error(error: attachments::AttachmentError) -> ApiError {
+    use attachments::AttachmentError;
+
+    match error {
+        AttachmentError::Missing => api_error(StatusCode::NOT_FOUND, "attachment_missing"),
+        AttachmentError::Expired => api_error(StatusCode::GONE, "attachment_expired"),
+        AttachmentError::TooLarge => {
+            api_error(StatusCode::PAYLOAD_TOO_LARGE, "attachment_too_large")
+        }
+        AttachmentError::MimeMismatch => {
+            api_error(StatusCode::BAD_REQUEST, "attachment_mime_invalid")
+        }
+        AttachmentError::DigestMismatch | AttachmentError::Invalid => {
+            api_error(StatusCode::BAD_REQUEST, "attachment_invalid")
+        }
+        AttachmentError::Io => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "attachment_unavailable",
+        ),
+    }
+}
+
 fn acquire_host_lock(state_dir: &Path) -> Result<File, HostError> {
     let path = state_dir.join(LOCK_NAME);
     let mut options = OpenOptions::new();
@@ -2838,6 +3140,34 @@ mod tests {
             request = request.header(CONTENT_TYPE, "application/json");
         }
         request.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    fn api_multipart_request(
+        host: &Host,
+        path: &str,
+        field_name: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> HttpRequest<Body> {
+        let boundary = "leg-web-test-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"fixture.png\"\r\nContent-Type: {media_type}\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        HttpRequest::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(HOST, "127.0.0.1:43127")
+            .header(ORIGIN, "http://127.0.0.1:43127")
+            .header(AUTHORIZATION, format!("Bearer {}", host.state.inner.token))
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
     }
 
     async fn assert_api_error_json(
@@ -4131,6 +4461,54 @@ fn main() {{
         assert!(host.inner_sessions().is_empty());
     }
 
+    #[tokio::test]
+    async fn authenticated_multipart_upload_returns_only_opaque_metadata() {
+        let (host, _temp) = test_host();
+        let session = host
+            .state
+            .inner
+            .catalog
+            .create_draft(SessionInterface::Web, Some("attachment".into()), None)
+            .unwrap();
+        let router = build_router(host.state.clone());
+        let response = router
+            .clone()
+            .oneshot(api_multipart_request(
+                &host,
+                &format!("/api/sessions/{}/attachments", session.id),
+                "file",
+                "image/png",
+                b"\x89PNG\r\n\x1a\nfixture",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["media_type"], "image/png");
+        assert_eq!(value["byte_len"], 15);
+        assert_eq!(value["sha256"].as_str().unwrap().len(), 64);
+        assert!(value.get("path").is_none());
+        assert!(value.get("token").is_none());
+        assert!(value["id"].as_str().unwrap().starts_with("upload-"));
+
+        let mut delete_request = api_request(
+                &host,
+                &format!(
+                    "/api/sessions/{}/attachments/{}",
+                    session.id,
+                    value["id"].as_str().unwrap()
+                ),
+            );
+        *delete_request.method_mut() = Method::DELETE;
+        let delete = router
+            .oneshot(delete_request)
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+        host.state.shutdown();
+    }
+
     #[test]
     fn authorization_check_uses_fixed_work_and_token_is_256_bits() {
         let (host, _temp) = test_host();
@@ -4200,6 +4578,47 @@ fn main() {{
         assert_eq!(
             submission_decision(Some(&ledger), 1, "hash-one"),
             Err(SubmissionReject::Exhausted)
+        );
+    }
+
+    #[test]
+    fn reusing_a_request_id_with_a_changed_image_conflicts() {
+        let first_content = [ContentBlock::image(AttachmentRef::new(
+            "upload-first",
+            "image/png",
+            13,
+            "0".repeat(64),
+        ))];
+        let changed_content = [ContentBlock::image(AttachmentRef::new(
+            "upload-second",
+            "image/png",
+            13,
+            "1".repeat(64),
+        ))];
+        let first_hash = turn_fingerprint("describe", Some(&first_content));
+        let changed_hash = turn_fingerprint("describe", Some(&changed_content));
+        assert_ne!(first_hash, changed_hash);
+
+        let ledger = SessionLedger {
+            high_water: 1,
+            cursor: 0,
+            receipts: VecDeque::from([Receipt {
+                request_id: 1,
+                prompt_sha256: first_hash.clone(),
+                turn_id: "turn-1".into(),
+                status: ReceiptStatus::Succeeded,
+                session_id: Some("sess-1".into()),
+                outcome: None,
+                recovery_evidence: None,
+            }]),
+        };
+        assert!(matches!(
+            submission_decision(Some(&ledger), 1, &first_hash),
+            Ok(SubmissionDecision::Replay(_))
+        ));
+        assert_eq!(
+            submission_decision(Some(&ledger), 1, &changed_hash),
+            Err(SubmissionReject::Conflict)
         );
     }
 

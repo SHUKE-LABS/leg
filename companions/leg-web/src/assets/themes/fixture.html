@@ -76,10 +76,16 @@
       <form id="composer">
         <label class="visually-hidden" for="prompt">Message</label>
         <textarea id="prompt" rows="1" aria-label="Message" placeholder="Enter for a new line · Ctrl+Enter to send" autocomplete="off"></textarea>
+        <div id="attachment-list" class="attachment-list" aria-live="polite" aria-label="Attached images"></div>
+        <div class="fixture-attachment-actions">
+          <button id="attach-image" type="button">Attach image</button>
+          <input id="attachment-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple hidden />
+        </div>
         <div class="fixture-compose-actions">
           <button id="retry-submission" type="button" hidden>Retry same send</button>
           <button id="send" type="submit">Send</button>
         </div>
+        <p id="attachment-error" role="alert" hidden></p>
         <p id="send-error" role="alert" hidden></p>
       </form>
       <div class="fixture-status" role="group" aria-label="Conversation status">

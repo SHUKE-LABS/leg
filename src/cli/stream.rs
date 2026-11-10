@@ -170,10 +170,14 @@ fn execute_cold_exchange_core<T: Transport, W: Write>(
     );
 
     let start = Instant::now();
-    let call = match resolve_content(&request.content_blocks(), None) {
+    let request_content = request.content_blocks();
+    let call = match resolve_content(&request_content, None) {
         Ok(content) => run_streaming_turn(
             transport,
-            &[Message::new(Role::User, content)],
+            &[Message::new(
+                Role::User,
+                crate::model::content_with_prompt(&request.body, &content),
+            )],
             sink,
             None,
             writer,
@@ -283,8 +287,8 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
     let request_content = request.content_blocks();
     let resolved_content = resolve_content(&request_content, Some(&session_id));
     let provider_request_content = match &resolved_content {
-        Ok(content) => content.clone(),
-        Err(_) => request_content.clone(),
+        Ok(content) => crate::model::content_with_prompt(&request.body, content),
+        Err(_) => crate::model::content_with_prompt(&request.body, &request_content),
     };
     let trail_request_content = match &resolved_content {
         Ok(content) => content.as_slice(),

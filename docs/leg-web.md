@@ -88,7 +88,9 @@ echo credentials, paths, request bodies, or tokens.
 | `PATCH /api/sessions/{id}` | Rename or clear a session name. |
 | `PUT /api/sessions/{id}/workspace` | Set an existing workspace from an absolute or `~` path while idle. |
 | `GET /api/sessions/{id}/snapshot` | Read the authoritative session, host turn ID, cursor, next request ID, active provisional state, and last receipt. |
-| `POST /api/sessions/{id}/submit` | Submit `{ "request_id": N, "prompt": "..." }`. |
+| `POST /api/sessions/{id}/attachments` | Upload one multipart `file` image and return only `{ id, media_type, byte_len, sha256 }`. |
+| `DELETE /api/sessions/{id}/attachments/{attachment_id}` | Remove one staged image owned by the session. |
+| `POST /api/sessions/{id}/submit` | Submit `{ "request_id": N, "prompt": "...", "content": [{ "type": "image", "source": { "type": "attachment", "id": "...", "media_type": "...", "byte_len": N, "sha256": "..." } }] }`; `content` remains optional for text-only clients. |
 | `POST /api/sessions/{id}/stop` | Idempotently stop the host-owned run through the shared driver. |
 | `GET /api/sessions/{id}/events?after=N` | Reconnect to authenticated server-sent events using `fetch`. |
 
@@ -100,6 +102,40 @@ selection records a canonical existing directory; leg uses it as its working
 directory, not as a sandbox. Session listing, locking, trail parsing, cwd
 validation, and process ownership reuse `leg-ui-client`.
 
+### Images and staged content
+
+The composer supports the **Attach image** picker, an image drop on the
+composer, and image items from `ClipboardEvent`. Supported formats are JPEG,
+PNG, GIF, and WebP. Text clipboard paste remains ordinary textarea paste.
+The browser shows a local object-URL preview, filename, MIME type, byte size,
+and an explicit remove action; object URLs are revoked when removed or when a
+session is left. The host checks magic bytes against the declared MIME, stores
+bytes in a private `0600` file under the catalog-managed session directory,
+and returns no path, upload token, or image bytes.
+
+The fixed limits are 10,000,000 base64 bytes per image, 32,000,000 encoded
+image bytes per request, and the equivalent 7,500,000 raw-byte upload bound.
+Staged files expire after 24 hours and are removed on terminal cleanup,
+rejected sends, restart recovery, or session disappearance. Upload and submit
+errors use bounded codes such as `attachment_mime_invalid`,
+`attachment_too_large`, `attachment_expired`, and `attachment_missing`; an
+invalid or expired image is shown to the user and is never silently stripped
+or resent as text.
+
+Submit JSON carries only prompt text, request ID, and ordered opaque
+attachment metadata. The durable fingerprint includes ordered image MIME,
+byte length, and SHA-256 digest while ignoring ephemeral staged IDs, so a
+reused request ID with changed text or image conflicts. Lost-response
+reconciliation and **Retry same send** preserve the exact request ID and image
+identity. Recorded **Retry turn** uses the catalog's private authoritative
+trail to re-stage the same image bytes after ordinary staged files have been
+cleaned, while leaving an independently edited composer draft untouched.
+Provider capability failures remain explicit: known unsupported provider/model
+combinations fail locally as `image_input_unsupported`, and an explicit
+unsupported-image response from an unknown/custom model is not retried or
+downgraded. The attachment remains available through the recorded trail for an
+explicit model choice or removal.
+
 ## Submission and event recovery
 
 The snapshot supplies the next per-session monotonically increasing request
@@ -110,8 +146,9 @@ still name the draft until `turn_start` confirms the binding. Snapshot and
 event requests using that draft ID continue to resolve to the bound session,
 so a reconnect can recover the native ID from the snapshot. Binding and
 catalog work run outside the Tokio request worker and outside other sessions'
-acceptance locks. A retry with the same ID and prompt hash returns the existing
-receipt; using that ID with different content conflicts. New work for the same
+acceptance locks. A retry with the same ID and durable content fingerprint
+returns the existing receipt; using that ID with different text or image
+content conflicts. New work for the same
 logical session while a run is active is busy. IDs older than the retained
 receipts remain stale because the high-water mark is durable. Receipts are
 bounded to 128 per session by default; prompts are not copied into host state.
