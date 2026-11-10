@@ -12,12 +12,12 @@ w│Filter: ▏                                                                 
 ││× Retry latest failed turn  [Ctrl-R] · disabled                             ││
 ││× Show/hide session rail  [F8] · disabled                                   ││
 ││× Choose background session to stop  [Ctrl-C] · disabled                    ││
+││  Attach image file  [F2]                                                   ││
+││  Paste image from clipboard  [F2]                                          ││
+││× Remove draft image  [F2] · disabled                                       ││
 ││  Keyboard help  [F1]                                                       ││
 ││  Exit and save drafts  [Ctrl-C]                                            ││
-││Enter invokes enabled · ↑/↓ select · Ctrl-U clear · Esc close               ││
-││                                                                            ││
-││                                                                            ││
-└│                                                                            │┘
+└│Enter invokes enabled · ↑/↓ select · Ctrl-U clear · Esc close               │┘
 ┌│                                                                            │┐
 ││                                                                            ││
 └│                                                                            │┘
