@@ -559,8 +559,9 @@ The Responses protocol also accepts two optional settings:
   it.
 - `LEG_OPENAI_FLAVOR` selects the request shape: `api` (default) leaves the
   request unchanged; `chatgpt` adds `"store": false` for the ChatGPT backend.
-  `chatgpt` requires `LEG_PROVIDER=openai-responses`; unknown flavors are
-  rejected at startup.
+  Only Responses consumes it: Anthropic ignores it, `chatgpt` with
+  `LEG_PROVIDER=openai-chat-completions` is rejected at startup, and so are
+  unknown flavors.
 
 ```
 LEG_PROVIDER=openai-responses OPENAI_API_KEY=<token> \
