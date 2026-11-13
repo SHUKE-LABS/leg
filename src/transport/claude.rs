@@ -1126,6 +1126,8 @@ mod tests {
             provider: crate::config::Provider::Anthropic,
             credential,
             base_url: base_url.to_string(),
+            openai_responses_url: None,
+            openai_flavor: crate::config::OpenAiFlavor::Api,
             model: model.to_string(),
             timeout: Duration::from_secs(60),
             stream_idle_timeout: Duration::from_secs(120),

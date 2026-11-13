@@ -387,6 +387,9 @@ fn help_text() -> String {
          use an Anthropic Console API key with ANTHROPIC_API_KEY instead.\n\
          LEG_PROVIDER defaults to anthropic; openai-chat-completions and\n\
          openai-responses use OPENAI_API_KEY and OPENAI_BASE_URL.\n\
+         openai-responses also takes OPENAI_RESPONSES_URL, a full endpoint URL\n\
+         used verbatim, and LEG_OPENAI_FLAVOR=api|chatgpt (default api;\n\
+         chatgpt sends store:false for the ChatGPT backend).\n\
          `leg ask --image <path>` accepts JPEG, PNG, GIF, and WebP; repeat the\n\
          flag to attach multiple images. Each base64 image is limited to 10 MB,\n\
          and image requests to 32 MB.\n\
