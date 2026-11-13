@@ -796,10 +796,11 @@ test_changelog_without_release_tags() (
 
 test_npm_platform_matrix_and_staging() (
     set -euo pipefail
-    local repo version expected output status host_platform command
+    local repo version expected output status host_platform command repository_url
     repo="$(mktemp -d)"
     trap 'rm -rf "${repo}"' EXIT
     version="0.4.25"
+    repository_url='git+https://github.com/SHUKE-LABS/leg.git'
 
     expected="leg
 leg-linux-x64
@@ -821,8 +822,14 @@ leg-win32-x64"
     assert_eq 'leg,leg-tui,leg-web' \
         "$(node -e 'console.log(Object.keys(require(process.argv[1]).bin).sort().join(","))' "${repo}/npm-packages/leg/package.json")" \
         "root exposes the three user commands only"
+    assert_eq "${repository_url}" \
+        "$(node -e 'console.log(require(process.argv[1]).repository.url)' "${repo}/npm-packages/leg/package.json")" \
+        "root npm package repository URL"
     local package_key target _npm_os _npm_cpu archive binary suffix name
     while IFS='|' read -r package_key target _npm_os _npm_cpu archive binary; do
+        assert_eq "${repository_url}" \
+            "$(node -e 'console.log(require(process.argv[1]).repository.url)' "${repo}/npm-packages/leg-${package_key}/package.json")" \
+            "${package_key} npm package repository URL"
         suffix="${binary#leg}"
         for name in leg leg-tui leg-web leg-ui-supervisor; do
             [[ -f "${repo}/npm-packages/leg-${package_key}/bin/${name}${suffix}" ]] || fail "${package_key} missing ${name}"
@@ -889,6 +896,17 @@ NODE
         mv "${repo}/binary-backup" "${repo}/npm-packages/leg-win32-x64/bin/${name}.exe"
     done
     cp "${repo}/npm-packages/leg/package.json" "${repo}/manifest-backup"
+    node - "${repo}/npm-packages/leg/package.json" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(file));
+manifest.repository.url = 'git+https://github.com/example/other.git';
+fs.writeFileSync(file, JSON.stringify(manifest));
+NODE
+    status=0
+    release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    cp "${repo}/manifest-backup" "${repo}/npm-packages/leg/package.json"
     for command in leg-tui leg-web leg-ui-supervisor; do
         node - "${repo}/npm-packages/leg/package.json" "${command}" <<'NODE'
 const fs = require('fs');
@@ -946,10 +964,11 @@ test_npm_staging_rejects_incomplete_archives() (
 test_npm_pack_checksums() (
     set -euo pipefail
     local repo version package_dir tarball package_key target _npm_os _npm_cpu archive binary
-    local expected actual suffix
+    local expected actual suffix repository_url
     repo="$(mktemp -d)"
     trap 'rm -rf "${repo}"' EXIT
     version="0.4.25"
+    repository_url='git+https://github.com/SHUKE-LABS/leg.git'
     make_npm_archive_fixture "${repo}" "${version}"
     release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages"
 
@@ -972,6 +991,9 @@ test_npm_pack_checksums() (
         'package/package.json' | sort)"
     actual="$(tar -tzf "${tarball}" | sort)"
     assert_eq "${expected}" "${actual}" "root npm tarball contains only its three shims, manifest, and notice"
+    assert_eq "${repository_url}" \
+        "$(tar -xzOf "${tarball}" package/package.json | node -e 'console.log(JSON.parse(require("node:fs").readFileSync(0, "utf8")).repository.url)')" \
+        "root npm tarball carries the repository URL"
     while IFS='|' read -r package_key target _npm_os _npm_cpu archive binary; do
         tarball="${repo}/npm-tarballs/shukelabs-leg-${package_key}-${version}.tgz"
         suffix="${binary#leg}"
@@ -985,6 +1007,9 @@ test_npm_pack_checksums() (
         actual="$(tar -tzf "${tarball}" | sort)"
         assert_eq "${expected}" "${actual}" \
             "${package_key} npm tarball contains only its four native binaries, manifest, and notice"
+        assert_eq "${repository_url}" \
+            "$(tar -xzOf "${tarball}" package/package.json | node -e 'console.log(JSON.parse(require("node:fs").readFileSync(0, "utf8")).repository.url)')" \
+            "${package_key} npm tarball carries the repository URL"
     done < <(release_npm_platform_rows)
 
     release_npm_verify_tarballs "${repo}/npm-tarballs"

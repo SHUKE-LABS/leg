@@ -943,6 +943,10 @@ release_npm_write_root_manifest() {
   "version": "${version}",
   "description": "Agent-friendly headless agent (ask/session) CLI.",
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SHUKE-LABS/leg.git"
+  },
   "bin": {
     "leg": "bin/leg.js",
     "leg-tui": "bin/leg-tui.js",
@@ -991,6 +995,10 @@ release_npm_write_platform_manifest() {
   "version": "${version}",
   "description": "Native leg and UI companion binaries for ${npm_os}/${npm_cpu}.",
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SHUKE-LABS/leg.git"
+  },
   "files": [
     "bin",
     "THIRD_PARTY_NOTICES.txt"
@@ -1054,6 +1062,11 @@ function sameObject(actual, expected) {
   return actualKeys.length === expectedKeys.length &&
     actualKeys.every((key, index) => key === expectedKeys[index] && actual[key] === expected[key]);
 }
+
+if (!sameObject(manifest.repository, {
+  type: 'git',
+  url: 'git+https://github.com/SHUKE-LABS/leg.git',
+})) fail("repository must be { type: 'git', url: 'git+https://github.com/SHUKE-LABS/leg.git' }");
 
 if (kind === 'root') {
   if (!sameObject(manifest.bin, {
