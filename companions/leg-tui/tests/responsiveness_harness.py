@@ -1234,7 +1234,7 @@ class ResponsivenessStreamPairManager:
             if previous_marker:
                 self.terminal.write_control("u")
                 self.terminal.write(stream_ids[side])
-            self.terminal.write_control("s")
+            self.terminal.write("\r")
             _wait_fixture_requests(self.fixture, requests_before + 1, terminal=self.terminal)
             previous_markers[side] = stream_ids[side]
         pool["last_markers"] = previous_markers

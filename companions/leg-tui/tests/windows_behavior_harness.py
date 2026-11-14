@@ -214,8 +214,8 @@ def check_paste(args: argparse.Namespace) -> dict[str, Any]:
         terminal.wait_contains("Line three: keep this third.")
         terminal.wait_contains("Emoji:")
         if server.fixture.status()["requests"] != 0:
-            raise AssertionError("paste submitted a request before Ctrl-S")
-        terminal.write_control("s")
+            raise AssertionError("paste submitted a request before Enter")
+        terminal.write("\r")
         terminal.wait_contains("Three lines received, including the Chinese second line.")
         status = server.fixture.status()
         if (
@@ -242,13 +242,13 @@ def check_resize(args: argparse.Namespace) -> dict[str, Any]:
         terminal.wait_contains(draft)
         terminal.resize(23, 79)
         terminal.wait_contains("Terminal too small")
-        terminal.write_control("s")
+        terminal.write("\r")
         terminal.wait_contains("Send rejected")
         if server.fixture.status()["requests"] != 0:
             raise AssertionError("below-minimum send reached the fixture")
         terminal.resize(24, 80)
         terminal.wait_contains(draft)
-        terminal.write_control("s")
+        terminal.write("\r")
         terminal.wait_contains("Succeeded")
         status = server.fixture.status()
         if status["requests"] != 1:
@@ -281,7 +281,7 @@ def check_no_color(args: argparse.Namespace) -> dict[str, Any]:
 def check_clipboard_fallback(args: argparse.Namespace) -> dict[str, Any]:
     def action(terminal: harness.TerminalProcess, workspace: Path, server: harness.FixtureServer) -> dict[str, Any]:
         terminal.write("COPY-FALLBACK-CHECK")
-        terminal.write_control("s")
+        terminal.write("\r")
         terminal.wait_contains("Fixture ready. This answer came from a local fake provider.")
         terminal.write("\x1bOS")
         terminal.wait_contains(harness.INSPECTOR_HEADER)
@@ -324,7 +324,7 @@ def check_normal_terminal_restoration(args: argparse.Namespace) -> dict[str, Any
 def check_stop_process_tree(args: argparse.Namespace) -> dict[str, Any]:
     def action(terminal: harness.TerminalProcess, workspace: Path, server: harness.FixtureServer) -> dict[str, Any]:
         terminal.write("TRIAL-STOP")
-        terminal.write_control("s")
+        terminal.write("\r")
         root_pid_file = workspace / "trial-stalled-root.pid"
         child_pid_file = workspace / "trial-stalled-child.pid"
         deadline = time.monotonic() + 15.0
@@ -377,7 +377,7 @@ def check_session_switching(args: argparse.Namespace) -> dict[str, Any]:
     def action(terminal: harness.TerminalProcess, _workspace: Path, server: harness.FixtureServer) -> dict[str, Any]:
         rename_current_session(terminal, "Alpha")
         terminal.write("TRIAL-PAUSE")
-        terminal.write_control("s")
+        terminal.write("\r")
         terminal.wait_contains("The first live text is visible.")
         wait_for_fixture(server, lambda status: status["pause_gates"].get("1") == "held", "Alpha stream pause")
         create_new_session(terminal, "Beta")
@@ -418,7 +418,7 @@ def check_session_switching(args: argparse.Namespace) -> dict[str, Any]:
 def check_retry_cancel(args: argparse.Namespace) -> dict[str, Any]:
     def action(terminal: harness.TerminalProcess, _workspace: Path, server: harness.FixtureServer) -> dict[str, Any]:
         terminal.write("TRIAL-RETRY cancellation must not resend")
-        terminal.write_control("s")
+        terminal.write("\r")
         terminal.wait_contains("Failed")
         if server.fixture.status()["requests"] != 1:
             raise AssertionError("initial retry fixture request count was not one")
@@ -447,11 +447,11 @@ def check_retry_cancel(args: argparse.Namespace) -> dict[str, Any]:
 def check_same_session_busy(args: argparse.Namespace) -> dict[str, Any]:
     def action(terminal: harness.TerminalProcess, _workspace: Path, server: harness.FixtureServer) -> dict[str, Any]:
         terminal.write("TRIAL-PAUSE")
-        terminal.write_control("s")
+        terminal.write("\r")
         terminal.wait_contains("The first live text is visible.")
         wait_for_fixture(server, lambda status: status["pause_gates"].get("1") == "held", "active same-session request")
         terminal.write("DO-NOT-SUBMIT-WHILE-BUSY")
-        terminal.write_control("s")
+        terminal.write("\r")
         terminal.wait_contains("Busy: wait for the active turn")
         held = server.fixture.status()
         if held["requests"] != 1 or held["active_requests"] != [1]:

@@ -376,9 +376,10 @@ and 36 for details; otherwise it opens as an Esc-dismissible overlay. Long
 header values are elided to fit, and the session picker retains complete
 titles and workspace paths plus the current model when known.
 
-Enter inserts a newline; Ctrl-S sends a nonblank prompt. Left/Right move by
-grapheme, Home/End move within the current line, and Backspace/Delete remove a
-grapheme. Ctrl-Z undoes and Ctrl-Y redoes; a bracketed paste is one edit,
+Enter sends a nonblank prompt. Alt-Enter and Ctrl-J insert a newline at the
+editor cursor. Ctrl-S has no action. Left/Right move by grapheme, Home/End move
+within the current line, and Backspace/Delete remove a grapheme. Ctrl-Z undoes
+and Ctrl-Y redoes; a bracketed paste is one edit,
 preserves Unicode and line breaks, normalizes CRLF/CR to LF, and discards other
 control characters. A literal `?` is prompt text. F1 opens the full keyboard
 guide. F2 and Ctrl-P open the same searchable command palette; type to filter
@@ -392,7 +393,7 @@ drafts and exits. An active turn owned by another interface disables Exit so it
 cannot be abandoned silently. External SIGINT and SIGTERM
 use the shared turn controller to stop an active turn, wait for process
 cleanup, save the draft, and restore the terminal. Editing stays available
-during a turn, but another Ctrl-S is rejected while busy.
+during a turn, but another Enter is rejected while busy.
 
 Palette actions add images to the draft at the cursor. **Attach image file**
 asks for a path; **Paste image from clipboard** reads the host clipboard
@@ -409,7 +410,7 @@ reset undo history. A prompt still needs text.
 Each send keeps one request identity while the draft is unchanged. Reopening a
 session after the TUI exits mid-send reconciles that identity with the trail.
 A recorded success clears the draft. An unrecorded send keeps the draft for an
-explicit resend. Removing an image changes the draft, so the next Ctrl-S is a
+explicit resend. Removing an image changes the draft, so the next Enter is a
 new send. When the provider or model rejects images, the turn fails as
 `image_input_unsupported`, naming the provider and model. That failure is not
 retryable. The draft keeps its images; restart with an image-capable
@@ -483,7 +484,7 @@ background activity keep priority. F1 remains the complete keyboard guide.
 Ctrl-R in the inspector and palette retry offer an explicit retry only for the
 latest failed, interrupted, or incomplete turn. Confirm with Y after reading
 `Retry sends this prompt again and may repeat tool side effects.` Press N or Esc
-to cancel; Enter does not retry.
+to cancel; Enter also cancels without resending.
 
 User prompts, assistant messages, tool placeholders, outcomes, errors, and
 warnings have separate labels and spacing, including when color is disabled.
@@ -513,10 +514,10 @@ and show a new-content indication. Resize keeps that source position as wrapping
 changes. Search jumps into the matching block, and long unbroken text wraps
 without splitting graphemes. Sending clears the editor for a new draft. On
 failure, interruption, or incomplete cleanup, the submitted prompt returns only
-when the editor has not changed; a newer editable draft is kept. Ctrl-S on the
+when the editor has not changed; a newer editable draft is kept. Enter on the
 unchanged failed prompt opens an explicit retry confirmation with `Retry sends
-this prompt again and may repeat tool side effects.` Press Y to retry or N/Esc to
-cancel. Enter remains a newline and never retries.
+this prompt again and may repeat tool side effects.` Only Y retries; Enter, N,
+and Esc cancel without resending.
 
 Focused Rust rendering/navigation checks use a generated 10,000-line answer
 with a long unbroken Chinese and emoji line. The native Linux/macOS PTY smoke

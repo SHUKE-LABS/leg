@@ -137,7 +137,7 @@ fn print_help() {
          Usage: leg-tui [--leg-bin PATH] [--supervisor-bin PATH]\n\n\
          --version prints the package version and exits.\n\n\
          Choose an existing workspace, review the first-run warning, then compose a prompt.\n\
-         Ctrl-S sends. Ctrl-C stops an active turn or exits when idle.\n\
+         Enter sends. Alt-Enter/Ctrl-J insert a newline. Ctrl-C stops an active turn or exits when idle.\n\
          Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox."
     );
 }
@@ -1930,7 +1930,8 @@ impl App {
         };
         let mut hints = vec!["F2/Ctrl-P actions".to_string()];
         if enabled(PaletteAction::Send) {
-            hints.push("Ctrl-S send".to_string());
+            hints.push("Enter send".to_string());
+            hints.push("Alt-Enter/Ctrl-J newline".to_string());
         }
         hints.push("F1 help".to_string());
         if enabled(PaletteAction::Stop) {
@@ -2638,10 +2639,6 @@ impl App {
             self.handle_palette_key(key);
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            self.submit();
-            return;
-        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
             self.begin_search();
             return;
@@ -2764,7 +2761,13 @@ impl App {
                 self.mark_active_draft_edited(changed);
                 self.status = "Ready".to_string();
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => self.submit(),
+            KeyCode::Enter if key.modifiers == KeyModifiers::ALT => {
+                let changed = self.composer.insert("\n");
+                self.mark_active_draft_edited(changed);
+                self.status = "Ready".to_string();
+            }
+            KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
                 let changed = self.composer.insert("\n");
                 self.mark_active_draft_edited(changed);
                 self.status = "Ready".to_string();
@@ -3103,6 +3106,10 @@ impl App {
                     let prompt = intent.prompt().to_string();
                     self.start_prompt(prompt, Some(intent));
                 }
+            }
+            KeyCode::Enter => {
+                self.retry_confirmation = None;
+                self.status = "Retry cancelled".to_string();
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 self.retry_confirmation = None;
@@ -4518,7 +4525,7 @@ fn draw_warning(frame: &mut Frame<'_>, use_color: bool) {
         Line::from("Press Esc to choose another workspace."),
         Line::from(""),
         Line::from(
-            "Composer: Enter newline; Ctrl-S send; arrows, Home/End, Backspace/Delete edit.",
+            "Composer: Enter sends; Alt-Enter/Ctrl-J insert a newline; arrows, Home/End, Backspace/Delete edit.",
         ),
         Line::from("Ctrl-Z undo; Ctrl-Y redo. Ctrl-C stops a turn or exits when idle."),
         Line::from(
@@ -4958,7 +4965,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     let end_row = (start_row + transcript_height).min(total_rows);
     let wrapped_transcript = if transcript_len == 0 {
         wrap_transcript(
-            "Choose a workspace, acknowledge the warning, then send a prompt with Ctrl-S.",
+            "Choose a workspace, acknowledge the warning, then send a prompt with Enter.",
             transcript_width,
         )
     } else {
@@ -5007,11 +5014,11 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let composer_title = if app.turn_status.is_active() {
-        "Composer (turn active; Ctrl-S disabled)"
+        "Composer (turn active; Enter disabled)"
     } else if app.read_only {
         "Composer (read-only session)"
     } else {
-        "Composer (Ctrl-S send)"
+        "Composer (Enter send)"
     };
     if !image_lines.is_empty() {
         frame.render_widget(
@@ -5081,7 +5088,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from(""),
                 Line::from(sanitize::terminal_safe_text(warning)),
                 Line::from(""),
-                Line::from("Press Y to resend, N or Esc to cancel. Enter does not confirm."),
+                Line::from("Press Y to resend; Enter, N, or Esc to cancel."),
             ])
             .block(Block::default().borders(Borders::ALL).title("Retry"))
             .wrap(Wrap { trim: false }),
@@ -5093,7 +5100,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from("Keyboard help"),
-                Line::from("Enter newline · Ctrl-S send · Ctrl-C stop/exit · Ctrl-Z/Y undo/redo."),
+                Line::from("Enter sends · Alt-Enter/Ctrl-J insert newline · Ctrl-C stop/exit · Ctrl-Z/Y undo/redo."),
                 Line::from("Left/Right move · Home/End line · Backspace/Delete remove · paste keeps Unicode/newlines."),
                 Line::from("PageUp/Down browse transcript rows · Ctrl-End follows the tail · Esc closes the current overlay."),
                 Line::from("Ctrl-Up/Down focuses the previous/next tool row without editing the composer."),
@@ -5109,7 +5116,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("F6 asks before replacing an existing export. Viewing and searching never send."),
                 Line::from("Ctrl-R in the inspector retries the latest failed turn only after this warning:"),
                 Line::from("Retry sends this prompt again and may repeat tool side effects."),
-                Line::from("Press Y to retry; N/Esc cancels. Enter never confirms a retry."),
+                Line::from("Press Y to retry; Enter, N, or Esc cancels without resending."),
             ])
             .block(Block::default().borders(Borders::ALL).title("Help"))
             .wrap(Wrap { trim: false }),
@@ -6767,6 +6774,153 @@ mod image_draft_tests {
             .collect()
     }
 
+    fn write_retryable_trail(app: &App, id: &str, prompt: &str, failure_kind: Option<&str>) {
+        let mut events = vec![
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "session_start",
+                "ts_ms": 1,
+                "session_id": id
+            }),
+            json!({
+                "schema": "baton.exchange/v1",
+                "event": "request",
+                "ts_ms": 2,
+                "model": "m",
+                "base_url": "local",
+                "prompt": prompt,
+                "session_id": id,
+                "turn_index": 0
+            }),
+        ];
+        if let Some(kind) = failure_kind {
+            events.push(json!({
+                "schema": "baton.exchange/v1",
+                "event": "response_error",
+                "ts_ms": 3,
+                "kind": kind,
+                "message": "retryable turn ended",
+                "session_id": id,
+                "turn_index": 0
+            }));
+        }
+        std::fs::write(
+            app.catalog.sessions_dir().join(format!("{id}.jsonl")),
+            events
+                .iter()
+                .map(|event| event.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn composer_newline_bindings_insert_once_and_ctrl_s_is_inert() {
+        let mut fixture = fixture("bindings");
+        let app = &mut fixture.app;
+        app.handle_paste("first");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(app.composer.text(), "first\n");
+        app.handle_paste("second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.composer.text(), "first\nsecond\n");
+
+        let draft = app.composer.text().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.composer.text(), draft);
+        assert!(app.submission.is_none());
+        assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn enter_rejects_a_blank_prompt_without_starting_a_turn() {
+        let mut fixture = fixture("blank-enter");
+        fixture
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(fixture.app.status, "Blank prompts are not sent");
+        assert_eq!(fixture.app.turn_status, TurnStatus::Idle);
+        assert!(fixture.app.submission.is_none());
+        assert!(fixture.app.transcript.is_empty());
+    }
+
+    #[test]
+    fn enter_opens_retry_confirmation_without_resending() {
+        let mut fixture = fixture("retry-bindings");
+        let id = "sess-123-456";
+        let prompt = "retry this prompt";
+        write_retryable_trail(&fixture.app, id, prompt, Some("provider_error"));
+        fixture
+            .app
+            .catalog
+            .set_workspace(id, &fixture.workspace)
+            .unwrap();
+        fixture.app.refresh_sessions();
+        assert!(fixture.app.open_session(id, None, None));
+        fixture.app.composer.set_text(prompt.to_string());
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_some());
+        assert_eq!(fixture.app.turn_status, TurnStatus::Idle);
+        let turn_count = fixture.app.transcript.len();
+
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_none());
+        assert_eq!(fixture.app.transcript.len(), turn_count);
+        assert_eq!(fixture.app.status, "Retry cancelled");
+
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_some());
+        fixture.app.handle_key(key(KeyCode::Char('n')));
+        assert!(fixture.app.retry_confirmation.is_none());
+
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_some());
+        fixture.app.handle_key(key(KeyCode::Esc));
+        assert!(fixture.app.retry_confirmation.is_none());
+        assert_eq!(fixture.app.transcript.len(), turn_count);
+    }
+
+    fn enter_dismisses_retry_confirmation_for_outcome(name: &str, failure_kind: Option<&str>) {
+        let mut fixture = fixture(name);
+        let id = "sess-123-456";
+        let prompt = "retry this prompt";
+        write_retryable_trail(&fixture.app, id, prompt, failure_kind);
+        fixture
+            .app
+            .catalog
+            .set_workspace(id, &fixture.workspace)
+            .unwrap();
+        fixture.app.refresh_sessions();
+        assert!(fixture.app.open_session(id, None, None));
+        assert!(
+            fixture
+                .app
+                .transcript
+                .last()
+                .is_some_and(TranscriptTurn::retryable)
+        );
+        fixture.app.composer.set_text(prompt.to_string());
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_some());
+        let turn_count = fixture.app.transcript.len();
+
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_none());
+        assert_eq!(fixture.app.transcript.len(), turn_count);
+        assert_eq!(fixture.app.status, "Retry cancelled");
+    }
+
+    #[test]
+    fn enter_dismisses_retry_confirmation_for_interrupted_turn() {
+        enter_dismisses_retry_confirmation_for_outcome("retry-interrupted", Some("interrupted"));
+    }
+
+    #[test]
+    fn enter_dismisses_retry_confirmation_for_incomplete_turn() {
+        enter_dismisses_retry_confirmation_for_outcome("retry-incomplete", None);
+    }
+
     #[test]
     fn supported_file_and_clipboard_images_build_an_ordered_rendered_draft() {
         let mut fixture = fixture("attach");
@@ -6987,7 +7141,7 @@ mod image_draft_tests {
             record_ids: vec![record.clone()],
         });
 
-        app.submit();
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.status.contains("already sent"), "{}", app.status);
         assert!(app.transcript.is_empty());
         assert_eq!(app.turn_status, TurnStatus::Idle);
