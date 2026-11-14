@@ -438,6 +438,16 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Remove npm token auth for trusted publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          npmrc="${NPM_CONFIG_USERCONFIG:?}"
+          sed -i '/:_authToken=/d' "${npmrc}"
+          if npm config list --json | grep -Fq '_authToken'; then
+            echo '::error::npm config still contains a token auth entry; refusing non-OIDC publish'
+            exit 1
+          fi
       - name: Upgrade npm for trusted publishing (OIDC)
         # npm >= 11.5.1 exchanges the job's GitHub OIDC token for a short-lived
         # publish credential when a trusted publisher is configured on npmjs.com.
