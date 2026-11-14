@@ -58,6 +58,15 @@ provider call. A provider/model capability rejection is reported with the
 stable `image_input_unsupported` error kind and is non-retryable; remove the
 image or select an image-capable provider/model before sending again.
 
+A session request may also carry an optional `workspace_context` object,
+`{"directories":["<primary>","<additional>",...]}`, with the primary working
+directory first. Leg appends it to that turn's system prompt as one non-user
+block, `Workspace context (non-user):` followed by the compact JSON, for the
+initial provider call and every tool continuation. `body`, user content, and
+the session trail are unchanged, and tools still resolve relative paths against
+the process working directory. Requests without additional directories omit the
+field.
+
 `round_index` counts provider calls in this user turn, starting at zero. A
 `tool_round` identifies the provider call that requested the tools; its
 `tool_call` and `tool_result` records use that same index. `block_index` is the

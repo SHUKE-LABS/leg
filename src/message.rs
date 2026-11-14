@@ -108,10 +108,47 @@ pub struct MessageEnvelope {
     /// block, preserving the legacy envelope shape and behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentBlock>>,
+    /// Optional workspace directories the sender wants the model to know
+    /// about. Absent for legacy requests and for a primary workspace alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_context: Option<WorkspaceContext>,
     /// Wall-clock emission time, Unix epoch milliseconds.
     pub ts_ms: u64,
     /// The provider call this message wrapped, if any (zero-or-one).
     pub exchange: Option<WrappedExchange>,
+}
+
+/// Ordered workspace directories: the primary (process `cwd`) first, then
+/// additional context directories. It is model context only; tools still
+/// resolve relative paths against the process working directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceContext {
+    /// Canonical directory paths, primary first.
+    pub directories: Vec<String>,
+}
+
+impl WorkspaceContext {
+    /// The non-user system block appended to a turn's system prompt.
+    pub fn system_block(&self) -> String {
+        let json = serde_json::to_string(self).expect("workspace context serializes");
+        format!("Workspace context (non-user):\n{json}")
+    }
+}
+
+/// Appends the workspace-context block, if any, after the turn's base system
+/// prompt. The user prompt is never changed.
+pub fn with_workspace_context(
+    system_prompt: Option<String>,
+    context: Option<&WorkspaceContext>,
+) -> Option<String> {
+    let Some(context) = context.filter(|context| !context.directories.is_empty()) else {
+        return system_prompt;
+    };
+    let block = context.system_block();
+    Some(match system_prompt {
+        Some(base) => format!("{base}\n\n{block}"),
+        None => block,
+    })
 }
 
 impl MessageEnvelope {
@@ -137,6 +174,7 @@ impl MessageEnvelope {
             kind,
             body: body.into(),
             content: None,
+            workspace_context: None,
             ts_ms,
             exchange: None,
         }
@@ -315,6 +353,56 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serializes");
         let back: MessageEnvelope = serde_json::from_str(&json).expect("parses");
         assert_eq!(msg, back);
+    }
+
+    /// A legacy envelope has no workspace context and serializes without the
+    /// key; a present context round-trips as the ordered directory object.
+    #[test]
+    fn workspace_context_is_optional_and_round_trips() {
+        let legacy = base();
+        assert_eq!(legacy.workspace_context, None);
+        let value: Value = serde_json::to_value(&legacy).unwrap();
+        assert!(value.get("workspace_context").is_none());
+
+        let mut msg = base();
+        msg.workspace_context = Some(WorkspaceContext {
+            directories: vec!["/primary".to_string(), "/extra dir".to_string()],
+        });
+        let value: Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            value["workspace_context"],
+            serde_json::json!({"directories": ["/primary", "/extra dir"]})
+        );
+        let back: MessageEnvelope = serde_json::from_value(value).unwrap();
+        assert_eq!(msg, back);
+        assert_eq!(back.body, "hello");
+    }
+
+    /// The block follows the base prompt, stands alone without one, and is
+    /// omitted for an absent or empty context.
+    #[test]
+    fn workspace_context_block_is_appended_after_the_base_prompt() {
+        let context = WorkspaceContext {
+            directories: vec!["/primary".to_string(), "/extra".to_string()],
+        };
+        let block = "Workspace context (non-user):\n{\"directories\":[\"/primary\",\"/extra\"]}";
+        assert_eq!(context.system_block(), block);
+        assert_eq!(
+            with_workspace_context(Some("base".to_string()), Some(&context)).as_deref(),
+            Some(format!("base\n\n{block}").as_str())
+        );
+        assert_eq!(
+            with_workspace_context(None, Some(&context)).as_deref(),
+            Some(block)
+        );
+        assert_eq!(
+            with_workspace_context(Some("base".to_string()), None).as_deref(),
+            Some("base")
+        );
+        let empty = WorkspaceContext {
+            directories: Vec::new(),
+        };
+        assert_eq!(with_workspace_context(None, Some(&empty)), None);
     }
 
     /// Unknown top-level fields are ignored on read, not errors — the
