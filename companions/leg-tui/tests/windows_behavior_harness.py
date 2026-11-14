@@ -214,8 +214,8 @@ def check_paste(args: argparse.Namespace) -> dict[str, Any]:
         terminal.wait_contains("Line three: keep this third.")
         terminal.wait_contains("Emoji:")
         if server.fixture.status()["requests"] != 0:
-            raise AssertionError("paste submitted a request before Ctrl-S")
-        terminal.write_control("s")
+            raise AssertionError("paste submitted a request before Enter")
+        terminal.write("\r")
         terminal.wait_contains("Three lines received, including the Chinese second line.")
         status = server.fixture.status()
         if (

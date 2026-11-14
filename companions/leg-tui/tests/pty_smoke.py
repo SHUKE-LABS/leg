@@ -37,7 +37,7 @@ WARNING = (
 )
 DEFAULT_ROWS = 40
 DEFAULT_COLUMNS = 120
-PASTED_TEXT = "first line: 中文\r\nsecond: 👩‍👩‍👧‍👦 e\u0301\rthird line\x13\x03\x1b\x7f\nfourth line?"
+PASTED_TEXT = "third line\x13\x03\x1b\x7f\nfourth line?"
 PROMPT = "?typed line\nfirst line: 中文\nsecond: 👩‍👩‍👧‍👦 e\u0301\nthird line\nfourth line?"
 NEXT_DRAFT = "next draft"
 EXCHANGE_SCHEMA = "baton.exchange/v1"
@@ -728,7 +728,8 @@ def start_prompt(
         drain_for(master_fd, capture, 0.1, child)
         first_run_help = capture.text()
         for hint in (
-            "Ctrl-S send",
+            "Enter sends",
+            "Alt-Enter/Ctrl-J insert a newline",
             "F1 help",
             "F2/Ctrl-P actions",
             "F3 sessions",
@@ -746,11 +747,16 @@ def start_prompt(
 
     os.write(master_fd, b"\r")
     read_until(master_fd, child, capture, "Ready")
-    os.write(master_fd, b"\x13")
+    os.write(master_fd, b"\r")
     drain_for(master_fd, capture, child=child)
     blank_prompt = request_status(status_url)
     assert blank_prompt["requests"] == expected_requests, (
         "a blank prompt started a provider request", blank_prompt
+    )
+    os.write(master_fd, b"\x13")
+    drain_for(master_fd, capture, child=child)
+    assert request_status(status_url)["requests"] == expected_requests, (
+        "Ctrl-S changed the blank draft or started a provider request"
     )
 
     if exercise_keyboard:
@@ -759,6 +765,8 @@ def start_prompt(
         read_until(master_fd, child, capture, "Enter never confirms a retry")
         keyboard_help = capture.text()
         for hint in (
+            "Enter sends",
+            "Alt-Enter/Ctrl-J insert newline",
             "Ctrl-Z/Y undo/redo",
             "Backspace/Delete remove",
             "Ctrl-End follows the tail",
@@ -776,7 +784,7 @@ def start_prompt(
         os.write(master_fd, b"\x1b")
         drain_for(master_fd, capture, 0.15, child)
         os.write(master_fd, b"a\x1b[D")
-        read_until(master_fd, child, capture, "Composer (Ctrl-S send)")
+        read_until(master_fd, child, capture, "Composer (Enter send)")
         os.write(master_fd, b"\x1bOQ")
         read_until(master_fd, child, capture, "Command palette")
         assert "Browse/switch sessions" in capture.text(), capture.text()
@@ -797,7 +805,7 @@ def start_prompt(
         os.write(master_fd, b"\x1b[200~paste-filter\x1b[201~")
         read_until(master_fd, child, capture, "paste-filter")
         os.write(master_fd, b"\x1b")
-        read_until(master_fd, child, capture, "Composer (Ctrl-S send)")
+        read_until(master_fd, child, capture, "Composer (Enter send)")
         os.write(master_fd, b"x")
         read_until(master_fd, child, capture, "xa")
         os.write(master_fd, b"\x1a\x1a")
@@ -810,17 +818,22 @@ def start_prompt(
         read_until(master_fd, child, capture, "Search history")
         assert request_status(status_url)["requests"] == expected_requests
         os.write(master_fd, b"\x1b")
-        read_until(master_fd, child, capture, "Composer (Ctrl-S send)")
+        read_until(master_fd, child, capture, "Composer (Enter send)")
         drain_for(master_fd, capture, 0.15, child)
         assert request_status(status_url)["requests"] == expected_requests, (
             "opening or filtering the command palette started a provider request"
         )
 
-        os.write(master_fd, b"?typed line\r")
-        read_until(master_fd, child, capture, "?typed line")
+        os.write(master_fd, b"?typed line")
+        os.write(master_fd, b"\x1b\r")
+        os.write(master_fd, "first line: 中文".encode())
+        os.write(master_fd, b"\x0a")
+        os.write(master_fd, "second: 👩‍👩‍👧‍👦 e\u0301".encode())
+        os.write(master_fd, b"\x0a")
+        read_until(master_fd, child, capture, "second:")
         question_screen = capture.text()
         assert "?typed line" in question_screen, (
-            "? or Enter did not insert literal text and a newline in the composer: "
+            "Alt-Enter did not insert a newline in the composer: "
             f"{question_screen[-1800:]!r}"
         )
         assert "Keyboard help" not in question_screen, "? opened help instead of entering the draft"
@@ -833,8 +846,14 @@ def start_prompt(
 
     if exercise_keyboard:
         os.write(master_fd, b"\x13")
+        drain_for(master_fd, capture, child=child)
+        assert request_status(status_url)["requests"] == expected_requests, (
+            "Ctrl-S submitted the composer draft"
+        )
+        os.write(master_fd, b"\r")
     else:
-        os.write(master_fd, PROMPT.encode() + b"\x13")
+        os.write(master_fd, b"\x1b[200~" + PROMPT.encode() + b"\x1b[201~")
+        os.write(master_fd, b"\r")
     read_until(master_fd, child, capture, expected_live_text)
     assert capture.contains(expected_live_text), (
         f"streamed response was not visible: {capture.text()[-2000:]!r}"
@@ -940,7 +959,7 @@ def run_smoke(args: argparse.Namespace) -> None:
                 resize_pty(slave_fd, ROWS, COLUMNS)
                 drain_for(master_fd, capture, 0.2, child)
 
-                os.write(master_fd, b"\x13")
+                os.write(master_fd, b"\r")
                 read_until(master_fd, child, capture, "Busy: wait for the active turn")
                 busy = request_status(status_url)
                 assert busy["requests"] == 1, busy
@@ -961,7 +980,7 @@ def run_smoke(args: argparse.Namespace) -> None:
                 # Submit the preserved draft. The second request is the one held
                 # for Stop, and its unique first chunk proves the current screen
                 # shows this turn rather than stale text from the first one.
-                os.write(master_fd, b"\x13")
+                os.write(master_fd, b"\r")
                 held_stop = wait_for_status(
                     status_url,
                     lambda value: value["requests"] == 2
@@ -1707,7 +1726,7 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
                 args, env, workspace
             )
 
-            os.write(master_fd, b"TRIAL-TOOL-TEXT\x13")
+            os.write(master_fd, b"TRIAL-TOOL-TEXT\r")
             read_until(
                 master_fd, child, output, "The write result returned; this is the final text."
             )
@@ -1719,7 +1738,7 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             status = request_status(status_url)
             assert status["requests"] == 2, status
 
-            os.write(master_fd, b"TRIAL-TUI-MULTI-TOOL\x13")
+            os.write(master_fd, b"TRIAL-TUI-MULTI-TOOL\r")
             read_until(master_fd, child, output, "Final multi-round text.")
             drain_for(master_fd, output, 0.25)
             multi_round_screen = output.text()
@@ -1731,16 +1750,16 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
                 assert multi_round_screen.count(segment) == 1, multi_round_screen
             assert request_status(status_url)["requests"] == 5
 
-            os.write(master_fd, b"TRIAL-TUI-MAX-TOKENS\x13")
+            os.write(master_fd, b"TRIAL-TUI-MAX-TOKENS\r")
             read_until(master_fd, child, output, "Reply truncated at max tokens.")
             assert request_status(status_url)["requests"] == 6
 
-            os.write(master_fd, b"TRIAL-CAP\x13")
+            os.write(master_fd, b"TRIAL-CAP\r")
             read_until(master_fd, child, output, "Capped")
             read_until(master_fd, child, output, "Tool-round limit reached.")
             assert request_status(status_url)["requests"] == 9
 
-            os.write(master_fd, b"TRIAL-TUI-ANSI\x13")
+            os.write(master_fd, b"TRIAL-TUI-ANSI\r")
             read_until(master_fd, child, output, "Before red after Ω")
             drain_for(master_fd, output, 0.25)
             ansi_screen = output.text()
@@ -1748,7 +1767,7 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
             assert "Before red after Ω" in ansi_screen, ansi_screen
             assert request_status(status_url)["requests"] == 10
 
-            os.write(master_fd, b"TRIAL-LARGE-TOOL\x13")
+            os.write(master_fd, b"TRIAL-LARGE-TOOL\r")
             read_until(master_fd, child, output, "The large tool result was returned.")
             drain_for(master_fd, output, 0.25)
             large_tool_screen = output.text()
@@ -1774,7 +1793,7 @@ def run_turn_contract_smoke(args: argparse.Namespace) -> None:
 
             os.write(master_fd, b"TRIAL-TUI-LONG-PAUSE")
             read_until(master_fd, child, output, "TRIAL-TUI-LONG-PAUSE")
-            os.write(master_fd, b"\x13")
+            os.write(master_fd, b"\r")
             read_until(master_fd, child, output, "Long fixture line 090")
             for _ in range(6):
                 screen = output.text()
@@ -1930,12 +1949,12 @@ def run_issue82_trial_coverage_smoke(args: argparse.Namespace) -> None:
                 "Line three: keep this third."
             )
             os.write(master_fd, b"\x1b[200~" + chinese_prompt.encode() + b"\x1b[201~")
-            os.write(master_fd, b"\x13")
+            os.write(master_fd, b"\r")
             read_until(master_fd, child, output, "Three lines received, including the Chinese second line.")
             chinese_status = request_status(status_url)
             assert chinese_status["input_checks"].get("chinese_multiline_prompt") is True, chinese_status
 
-            os.write(master_fd, b"TRIAL-TOOL-TEXT: inspect this write\x13")
+            os.write(master_fd, b"TRIAL-TOOL-TEXT: inspect this write\r")
             read_until(master_fd, child, output, "The write result returned; this is the final text.")
             read_until(master_fd, child, output, "write · completed · fixture-write.txt")
             read_until(master_fd, child, output, "Succeeded")
@@ -1950,7 +1969,7 @@ def run_issue82_trial_coverage_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "› write · completed · fixture-write.txt")
             os.write(master_fd, b"\x1b[1;5F")
 
-            os.write(master_fd, b"TRIAL-CONTINUE: continue after inspecting the tool\x13")
+            os.write(master_fd, b"TRIAL-CONTINUE: continue after inspecting the tool\r")
             read_until(
                 master_fd,
                 child,
@@ -1958,23 +1977,23 @@ def run_issue82_trial_coverage_smoke(args: argparse.Namespace) -> None:
                 "Continuation response: the earlier fixture answer is still in this session.",
             )
 
-            os.write(master_fd, b"TRIAL-AUTH: verify the fixture auth failure\x13")
+            os.write(master_fd, b"TRIAL-AUTH: verify the fixture auth failure\r")
             read_until(master_fd, child, output, "Failed")
             auth_status = request_status(status_url)
             assert auth_status["input_checks"].get("auth_error_sent") is True, auth_status
 
-            os.write(master_fd, b"TRIAL-DENIED: exercise the pretool hook\x13")
+            os.write(master_fd, b"TRIAL-DENIED: exercise the pretool hook\r")
             read_until(master_fd, child, output, "The tool was denied and its error result was returned.")
             denied_status = request_status(status_url)
             assert denied_status["input_checks"].get("denied_tool_error_returned") is True, denied_status
             assert not (workspace / "denied-marker.txt").exists()
 
-            os.write(master_fd, b"TRIAL-FAILED: exercise an invalid tool call\x13")
+            os.write(master_fd, b"TRIAL-FAILED: exercise an invalid tool call\r")
             read_until(master_fd, child, output, "The tool failed and its error result was returned.")
             final_status = request_status(status_url)
             assert final_status["input_checks"].get("failed_tool_error_returned") is True, final_status
             assert not (workspace / "failed-marker.txt").exists()
-            os.write(master_fd, b"TRIAL-STOP: stop the active tool process tree\x13")
+            os.write(master_fd, b"TRIAL-STOP: stop the active tool process tree\r")
             pid_file = workspace / "trial-stalled-child.pid"
             wait_for_file(pid_file, master_fd, output, child)
             stopped_pid = int(pid_file.read_text(encoding="utf-8").strip())
@@ -2087,17 +2106,25 @@ def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
                 args, env, workspace
             )
             retry_prompt = "TRIAL-REOPEN-FAILURE retry this failed prompt"
-            os.write(master_fd, retry_prompt.encode() + b"\x13")
+            os.write(master_fd, retry_prompt.encode() + b"\r")
             read_until(master_fd, child, output, "Failed")
             assert request_status(status_url)["requests"] == 1
             drain_for(master_fd, output, 0.15)
             assert request_status(status_url)["requests"] == 1, "reading a failure retried it"
 
+            os.write(master_fd, b"\x13")
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "Ctrl-S retried a failed prompt"
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, "Retry sends this prompt again")
+            assert request_status(status_url)["requests"] == 1
             os.write(master_fd, b"\r")
             drain_for(master_fd, output, 0.15)
-            assert request_status(status_url)["requests"] == 1, "Enter retried a failed prompt"
-            os.write(master_fd, b"\x7f")
+            assert request_status(status_url)["requests"] == 1, "Enter confirmed a retry"
+            os.write(master_fd, b"\x1b")
             drain_for(master_fd, output, 0.1)
+            assert request_status(status_url)["requests"] == 1
+            assert "Explicit retry confirmation" not in output.text()
 
             warning = "Retry sends this prompt again and may repeat tool side effects."
             os.write(master_fd, b"\x1bOQReTrY")
@@ -2116,7 +2143,7 @@ def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
             assert request_status(status_url)["requests"] == 1
             assert "Explicit retry confirmation" not in output.text()
 
-            os.write(master_fd, b"\x13")
+            os.write(master_fd, b"\r")
             read_until(master_fd, child, output, warning)
             assert request_status(status_url)["requests"] == 1
             os.write(master_fd, b"\r")
@@ -2128,7 +2155,7 @@ def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
             drain_for(master_fd, output, 0.1)
             assert request_status(status_url)["requests"] == 1
             assert "Explicit retry confirmation" not in output.text()
-            os.write(master_fd, b"\x13")
+            os.write(master_fd, b"\r")
             read_until(master_fd, child, output, warning)
             assert request_status(status_url)["requests"] == 1
             os.write(master_fd, b"y")
@@ -2190,7 +2217,7 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Alpha  |  model:")
 
             seed_prompt = "TRIAL-NAV-SEED: create successful tool history"
-            os.write(master_fd, seed_prompt.encode() + b"\x13")
+            os.write(master_fd, seed_prompt.encode() + b"\r")
             read_until(master_fd, child, output, "The navigation seed is complete.")
             read_until(master_fd, child, output, "Succeeded")
             seed_status = request_status(status_url)
@@ -2210,7 +2237,7 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Beta  |  model:")
 
             loser_prompt = "TRIAL-NAV-LOSER: belongs only to Beta"
-            os.write(master_fd, loser_prompt.encode() + b"\x13")
+            os.write(master_fd, loser_prompt.encode() + b"\r")
             read_until(master_fd, child, output, "Deterministic fixture response for TRIAL-NAV-LOSER.")
             read_until(master_fd, child, output, "Succeeded")
             beta_draft = "Beta draft before restart"
@@ -2319,7 +2346,7 @@ def run_session_navigation_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"\x7f" * len(alpha_draft))
             drain_for(master_fd, output, 0.1, child)
             continuation = "TRIAL-NAV-CONTINUE: inspect the reopened tool history and cwd"
-            os.write(master_fd, continuation.encode() + b"\x13")
+            os.write(master_fd, continuation.encode() + b"\r")
             read_until(
                 master_fd,
                 child,
@@ -2603,7 +2630,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, WARNING)
             assert "Press Enter to acknowledge" in output.text(), output.text()
             blocked_prompt = "This must not be sent before warning acknowledgement"
-            os.write(master_fd, blocked_prompt.encode() + b"\x13")
+            os.write(master_fd, blocked_prompt.encode() + b"\r")
             drain_for(master_fd, output, 0.15, child)
             assert blocked_prompt not in output.text(), output.text()
             assert output.contains(WARNING), output.text()
@@ -2683,7 +2710,7 @@ def run_background_session_busy_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Rename session")
             os.write(master_fd, b"Alpha\r\r")
             read_until(master_fd, child, output, "Alpha  |  model:")
-            os.write(master_fd, b"Hold this turn while another session is open\x13")
+            os.write(master_fd, b"Hold this turn while another session is open\r")
             read_until(master_fd, child, output, "The first live text is visible.")
             held = wait_for_status(
                 status_url,
@@ -2820,7 +2847,7 @@ def run_background_stop_chooser_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Rename session")
             os.write(master_fd, b"Alpha\r\r")
             read_until(master_fd, child, output, "Alpha  |  model:")
-            os.write(master_fd, b"Alpha run held for chooser\x13")
+            os.write(master_fd, b"Alpha run held for chooser\r")
             read_until(master_fd, child, output, LIVE_TEXT)
             wait_for_status(
                 status_url,
@@ -2841,7 +2868,7 @@ def run_background_stop_chooser_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, "Beta")
             os.write(master_fd, b"\r")
             read_until(master_fd, child, output, "Beta  |  model:")
-            os.write(master_fd, b"Beta run held for chooser\x13")
+            os.write(master_fd, b"Beta run held for chooser\r")
             read_until(master_fd, child, output, STOP_LIVE_TEXT)
             wait_for_status(
                 status_url,
@@ -2946,7 +2973,7 @@ def run_background_stop_chooser_smoke(args: argparse.Namespace) -> None:
             # the stale entry must then refuse to stop anything.
             os.write(master_fd, b"\x7f" * len(gamma_draft))
             palette_race_prompt = "Gamma run held for palette race"
-            os.write(master_fd, palette_race_prompt.encode() + b"\x13")
+            os.write(master_fd, palette_race_prompt.encode() + b"\r")
             read_until(master_fd, child, output, "Request 3:")
             wait_for_status(
                 status_url,
@@ -3418,7 +3445,12 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
             os.write(master_fd, b"q")
             read_until(master_fd, child, output, "q")
             # The composer echo can land before the rest of the footer row is flushed.
-            footer_hints = ("F2/Ctrl-P actions", "Ctrl-S send", "F8 rail")
+            footer_hints = (
+                "F2/Ctrl-P actions",
+                "Enter send",
+                "Alt-Enter/Ctrl-J newline",
+                "F8 rail",
+            )
             deadline = time.monotonic() + 8.0
             while True:
                 screen_120 = terminal_screen_text(bytes(output.raw), 40, 120)
@@ -3427,7 +3459,8 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
                     break
                 drain_for(master_fd, output, 0.05, child)
             assert "F2/Ctrl-P actions" in footer_120, footer_120
-            assert "Ctrl-S send" in footer_120, footer_120
+            assert "Enter send" in footer_120, footer_120
+            assert "Alt-Enter/Ctrl-J newline" in footer_120, footer_120
             assert "F8 rail" in footer_120, footer_120
             os.write(master_fd, b"\x1bOQ")
             read_until(master_fd, child, output, "Command palette")
@@ -3474,7 +3507,8 @@ def run_tool_summary_smoke(args: argparse.Namespace) -> None:
             screen_80 = terminal_screen_text(bytes(output.raw), 24, 80)
             footer_80 = screen_80.rstrip().splitlines()[-1]
             assert "F2/Ctrl-P actions" in footer_80, footer_80
-            assert "Ctrl-S send" in footer_80, footer_80
+            assert "Enter send" in footer_80, footer_80
+            assert "Alt-Enter/Ctrl-J newline" in footer_80, footer_80
             assert "F8 rail" not in footer_80, footer_80
             for summary in (
                 "bash · exit 7 · check nonzero status",
@@ -3798,7 +3832,7 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             )
             small_screen = terminal_screen_text(bytes(output), 23, 79)
             assert "Minimum supported size: 80 columns x 24 rows" in small_screen, small_screen
-            os.write(master_fd, b"\x13")
+            os.write(master_fd, b"\r")
             read_until_screen_text(
                 master_fd,
                 child,
@@ -3817,7 +3851,7 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             assert prompt in restored_screen, f"draft was lost after resize recovery: {restored_screen!r}"
             assert "Composer" in restored_screen
             assert request_status(status_url)["requests"] == 0
-            os.write(master_fd, b"\x13")
+            os.write(master_fd, b"\r")
             read_until_screen_text(
                 master_fd, child, output, "Succeeded", rows=24, columns=80
             )
@@ -4016,7 +4050,7 @@ def run_signal_smoke(args: argparse.Namespace) -> None:
                         args, env, workspace
                     )
                     if active:
-                        os.write(master_fd, b"TRIAL-STOP\x13")
+                        os.write(master_fd, b"TRIAL-STOP\r")
                         pid_file = workspace / "trial-stalled-child.pid"
                         wait_for_file(pid_file, master_fd, output, child)
                         next_draft = f"draft survives {signal_name}"

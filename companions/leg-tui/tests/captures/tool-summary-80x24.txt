@@ -18,7 +18,7 @@ workspace: <workspace> · catalog: Ready · <elapsed>
 │Outcome: succeeded                                                            │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌Composer (Ctrl-S send)────────────────────────────────────────────────────────┐
+┌Composer (Enter send)─────────────────────────────────────────────────────────┐
 │Alpha draft survives session changes                                          │
 └──────────────────────────────────────────────────────────────────────────────┘
-F2/Ctrl-P actions · Ctrl-S send · F1 help · Ctrl-C exit · F3 sessions
+F2/Ctrl-P actions · Enter send · Alt-Enter/Ctrl-J newline · F1 help · Ctrl-C ex…
