@@ -1393,9 +1393,12 @@ mod tests {
         assert_sequence(&examples);
     }
 
+    /// Each provider call's system prompt and messages.
+    type CapturedCalls = Rc<RefCell<Vec<(Option<String>, Vec<Message>)>>>;
+
     struct SystemCapturingTransport {
         replies: RefCell<std::collections::VecDeque<AssistantReply>>,
-        calls: Rc<RefCell<Vec<(Option<String>, Vec<Message>)>>>,
+        calls: CapturedCalls,
     }
 
     impl Transport for SystemCapturingTransport {
