@@ -315,6 +315,9 @@ fn help_text_documents_usage_env_and_failure_contract() {
     assert!(text.contains("openai-chat-completions"));
     assert!(text.contains("OPENAI_API_KEY"));
     assert!(text.contains("OPENAI_BASE_URL"));
+    assert!(text.contains("OPENAI_RESPONSES_URL"));
+    assert!(text.contains("LEG_OPENAI_FLAVOR=api|chatgpt"));
+    assert!(text.contains("store:false"));
     assert!(text.contains("Anthropic-compatible endpoints"));
     assert!(text.contains("Claude subscription OAuth tokens"));
     assert!(text.contains("`claude setup-token`"));
