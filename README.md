@@ -75,6 +75,16 @@ Conventional Commit subject of type `feat` bumps the minor version; every
 other subject bumps patch. The first release uses the current Cargo version
 (`0.1.0`) unchanged.
 
+Maintainers: the release workflow publishes all seven npm packages through
+npm trusted publishing (GitHub OIDC). Configure a GitHub Actions trusted
+publisher for each package on npmjs.com with repository `SHUKE-LABS/leg` and
+set the Trusted Publisher's Workflow filename field to `release.yml` (the
+workflow file is `.github/workflows/release.yml`). The workflow's `publish`
+job must retain `id-token: write`. The workflow deliberately has no token
+fallback. An OIDC error stops the publish step and reports how many packages
+were published, so inspect the exact npm error and repair the
+trusted-publisher or workflow configuration before retrying.
+
 Every published npm package includes `THIRD_PARTY_NOTICES.txt` with the
 licenses of the bundled third-party Rust crates and vendored material.
 
