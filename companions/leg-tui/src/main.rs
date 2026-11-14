@@ -3107,6 +3107,10 @@ impl App {
                     self.start_prompt(prompt, Some(intent));
                 }
             }
+            KeyCode::Enter => {
+                self.retry_confirmation = None;
+                self.status = "Retry cancelled".to_string();
+            }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 self.retry_confirmation = None;
                 self.status = "Retry cancelled".to_string();
@@ -5084,7 +5088,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from(""),
                 Line::from(sanitize::terminal_safe_text(warning)),
                 Line::from(""),
-                Line::from("Press Y to resend, N or Esc to cancel. Enter does not confirm."),
+                Line::from("Press Y to resend; Enter, N, or Esc to cancel."),
             ])
             .block(Block::default().borders(Borders::ALL).title("Retry"))
             .wrap(Wrap { trim: false }),
@@ -5112,7 +5116,7 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
                 Line::from("F6 asks before replacing an existing export. Viewing and searching never send."),
                 Line::from("Ctrl-R in the inspector retries the latest failed turn only after this warning:"),
                 Line::from("Retry sends this prompt again and may repeat tool side effects."),
-                Line::from("Press Y to retry; N/Esc cancels. Enter never confirms a retry."),
+                Line::from("Press Y to retry; Enter, N, or Esc cancels without resending."),
             ])
             .block(Block::default().borders(Borders::ALL).title("Help"))
             .wrap(Wrap { trim: false }),
@@ -6770,8 +6774,8 @@ mod image_draft_tests {
             .collect()
     }
 
-    fn write_failed_trail(app: &App, id: &str, prompt: &str) {
-        let events = [
+    fn write_retryable_trail(app: &App, id: &str, prompt: &str, failure_kind: Option<&str>) {
+        let mut events = vec![
             json!({
                 "schema": "baton.exchange/v1",
                 "event": "session_start",
@@ -6788,16 +6792,18 @@ mod image_draft_tests {
                 "session_id": id,
                 "turn_index": 0
             }),
-            json!({
+        ];
+        if let Some(kind) = failure_kind {
+            events.push(json!({
                 "schema": "baton.exchange/v1",
                 "event": "response_error",
                 "ts_ms": 3,
-                "kind": "provider_error",
-                "message": "provider failed",
+                "kind": kind,
+                "message": "retryable turn ended",
                 "session_id": id,
                 "turn_index": 0
-            }),
-        ];
+            }));
+        }
         std::fs::write(
             app.catalog.sessions_dir().join(format!("{id}.jsonl")),
             events
@@ -6844,7 +6850,7 @@ mod image_draft_tests {
         let mut fixture = fixture("retry-bindings");
         let id = "sess-123-456";
         let prompt = "retry this prompt";
-        write_failed_trail(&fixture.app, id, prompt);
+        write_retryable_trail(&fixture.app, id, prompt, Some("provider_error"));
         fixture
             .app
             .catalog
@@ -6859,8 +6865,12 @@ mod image_draft_tests {
         let turn_count = fixture.app.transcript.len();
 
         fixture.app.handle_key(key(KeyCode::Enter));
-        assert!(fixture.app.retry_confirmation.is_some());
+        assert!(fixture.app.retry_confirmation.is_none());
         assert_eq!(fixture.app.transcript.len(), turn_count);
+        assert_eq!(fixture.app.status, "Retry cancelled");
+
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_some());
         fixture.app.handle_key(key(KeyCode::Char('n')));
         assert!(fixture.app.retry_confirmation.is_none());
 
@@ -6869,6 +6879,46 @@ mod image_draft_tests {
         fixture.app.handle_key(key(KeyCode::Esc));
         assert!(fixture.app.retry_confirmation.is_none());
         assert_eq!(fixture.app.transcript.len(), turn_count);
+    }
+
+    fn enter_dismisses_retry_confirmation_for_outcome(name: &str, failure_kind: Option<&str>) {
+        let mut fixture = fixture(name);
+        let id = "sess-123-456";
+        let prompt = "retry this prompt";
+        write_retryable_trail(&fixture.app, id, prompt, failure_kind);
+        fixture
+            .app
+            .catalog
+            .set_workspace(id, &fixture.workspace)
+            .unwrap();
+        fixture.app.refresh_sessions();
+        assert!(fixture.app.open_session(id, None, None));
+        assert!(
+            fixture
+                .app
+                .transcript
+                .last()
+                .is_some_and(TranscriptTurn::retryable)
+        );
+        fixture.app.composer.set_text(prompt.to_string());
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_some());
+        let turn_count = fixture.app.transcript.len();
+
+        fixture.app.handle_key(key(KeyCode::Enter));
+        assert!(fixture.app.retry_confirmation.is_none());
+        assert_eq!(fixture.app.transcript.len(), turn_count);
+        assert_eq!(fixture.app.status, "Retry cancelled");
+    }
+
+    #[test]
+    fn enter_dismisses_retry_confirmation_for_interrupted_turn() {
+        enter_dismisses_retry_confirmation_for_outcome("retry-interrupted", Some("interrupted"));
+    }
+
+    #[test]
+    fn enter_dismisses_retry_confirmation_for_incomplete_turn() {
+        enter_dismisses_retry_confirmation_for_outcome("retry-incomplete", None);
     }
 
     #[test]

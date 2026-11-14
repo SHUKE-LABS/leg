@@ -484,7 +484,7 @@ background activity keep priority. F1 remains the complete keyboard guide.
 Ctrl-R in the inspector and palette retry offer an explicit retry only for the
 latest failed, interrupted, or incomplete turn. Confirm with Y after reading
 `Retry sends this prompt again and may repeat tool side effects.` Press N or Esc
-to cancel; Enter does not retry.
+to cancel; Enter also cancels without resending.
 
 User prompts, assistant messages, tool placeholders, outcomes, errors, and
 warnings have separate labels and spacing, including when color is disabled.

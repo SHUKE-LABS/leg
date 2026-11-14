@@ -762,7 +762,7 @@ def start_prompt(
     if exercise_keyboard:
         os.write(master_fd, b"\x1bOP")
         read_until(master_fd, child, capture, "Keyboard help")
-        read_until(master_fd, child, capture, "Enter never confirms a retry")
+        read_until(master_fd, child, capture, "Enter, N, or Esc cancels without resending")
         keyboard_help = capture.text()
         for hint in (
             "Enter sends",
@@ -777,7 +777,7 @@ def start_prompt(
             "F7 saves",
             "F6 exports transcript data only",
             "Retry sends this prompt again and may repeat tool side effects.",
-            "Enter never confirms a retry",
+            "Enter, N, or Esc cancels without resending",
         ):
             assert hint in keyboard_help, f"keyboard help omitted {hint!r}: {keyboard_help[-2200:]!r}"
         os.write(master_fd, b"ignored-help")
@@ -2120,10 +2120,7 @@ def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
             assert request_status(status_url)["requests"] == 1
             os.write(master_fd, b"\r")
             drain_for(master_fd, output, 0.15)
-            assert request_status(status_url)["requests"] == 1, "Enter confirmed a retry"
-            os.write(master_fd, b"\x1b")
-            drain_for(master_fd, output, 0.1)
-            assert request_status(status_url)["requests"] == 1
+            assert request_status(status_url)["requests"] == 1, "Enter retried a failed prompt"
             assert "Explicit retry confirmation" not in output.text()
 
             warning = "Retry sends this prompt again and may repeat tool side effects."
@@ -2136,25 +2133,31 @@ def run_retry_confirmation_smoke(args: argparse.Namespace) -> None:
             assert request_status(status_url)["requests"] == 1
             os.write(master_fd, b"\r")
             drain_for(master_fd, output, 0.15)
-            assert request_status(status_url)["requests"] == 1, "Enter confirmed a palette retry"
-            assert warning in output.text()
-            os.write(master_fd, b"n")
-            drain_for(master_fd, output, 0.1)
-            assert request_status(status_url)["requests"] == 1
+            assert request_status(status_url)["requests"] == 1, "Enter retried a palette prompt"
             assert "Explicit retry confirmation" not in output.text()
 
+            os.write(master_fd, b"\x1bOQReTrY")
+            read_until(master_fd, child, output, "Retry latest failed turn")
             os.write(master_fd, b"\r")
             read_until(master_fd, child, output, warning)
             assert request_status(status_url)["requests"] == 1
-            os.write(master_fd, b"\r")
-            drain_for(master_fd, output, 0.15)
-            assert request_status(status_url)["requests"] == 1, "Enter confirmed a retry"
-            assert warning in output.text()
-
             os.write(master_fd, b"n")
-            drain_for(master_fd, output, 0.1)
-            assert request_status(status_url)["requests"] == 1
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "N retried a prompt"
             assert "Explicit retry confirmation" not in output.text()
+
+            os.write(master_fd, b"\x1bOQReTrY")
+            read_until(master_fd, child, output, "Retry latest failed turn")
+            os.write(master_fd, b"\r")
+            read_until(master_fd, child, output, warning)
+            assert request_status(status_url)["requests"] == 1
+            os.write(master_fd, b"\x1b")
+            drain_for(master_fd, output, 0.15)
+            assert request_status(status_url)["requests"] == 1, "Esc retried a prompt"
+            assert "Explicit retry confirmation" not in output.text()
+
+            os.write(master_fd, b"\x1bOQReTrY")
+            read_until(master_fd, child, output, "Retry latest failed turn")
             os.write(master_fd, b"\r")
             read_until(master_fd, child, output, warning)
             assert request_status(status_url)["requests"] == 1
@@ -2630,7 +2633,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
             read_until(master_fd, child, output, WARNING)
             assert "Press Enter to acknowledge" in output.text(), output.text()
             blocked_prompt = "This must not be sent before warning acknowledgement"
-            os.write(master_fd, blocked_prompt.encode() + b"\r")
+            os.write(master_fd, blocked_prompt.encode() + b"\x13")
             drain_for(master_fd, output, 0.15, child)
             assert blocked_prompt not in output.text(), output.text()
             assert output.contains(WARNING), output.text()
