@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use leg_ui_client::{
-    CatalogError, CatalogRunState, SessionCatalog, SessionCatalogConfig, SessionInterface,
+    CatalogError, CatalogRunState, DirectoryAddition, SessionCatalog, SessionCatalogConfig,
+    SessionInterface,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -275,6 +276,179 @@ fn missing_workspace_blocks_submission_until_explicit_replacement() {
         catalog.get(&draft.id).unwrap().cwd.as_deref(),
         Some(canonical_replacement.as_path())
     );
+}
+
+#[test]
+fn legacy_records_load_without_additional_directories() {
+    let scratch = tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let cwd = scratch.path().join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let cwd = fs::canonicalize(&cwd).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("catalog.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "sessions": {"draft-legacy": {"name": "legacy", "cwd": cwd}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let catalog = SessionCatalog::open(config(&state)).unwrap();
+    let legacy = catalog.get("draft-legacy").unwrap();
+    assert_eq!(legacy.cwd.as_deref(), Some(cwd.as_path()));
+    assert!(legacy.additional_directories.is_empty());
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("additional_directories")
+            .is_none()
+    );
+    catalog
+        .save_draft(
+            "draft-legacy",
+            SessionInterface::Tui,
+            "still editable".into(),
+        )
+        .unwrap();
+    let index = fs::read_to_string(state.join("catalog.json")).unwrap();
+    assert!(!index.contains("additional_directories"));
+}
+
+#[test]
+fn added_directories_are_canonical_ordered_idempotent_and_persisted() {
+    let scratch = tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let primary = scratch.path().join("primary");
+    let spaced = primary.join("extra dir");
+    let absolute = scratch.path().join("other");
+    fs::create_dir_all(&spaced).unwrap();
+    fs::create_dir_all(&absolute).unwrap();
+    let primary = fs::canonicalize(&primary).unwrap();
+    let spaced = fs::canonicalize(&spaced).unwrap();
+    let absolute = fs::canonicalize(&absolute).unwrap();
+    let catalog = SessionCatalog::open(config(&state)).unwrap();
+    let draft = catalog
+        .create_draft(SessionInterface::Tui, None, Some(&primary))
+        .unwrap();
+    assert!(draft.additional_directories.is_empty());
+
+    assert_eq!(
+        catalog
+            .add_directory(&draft.id, Path::new("extra dir"))
+            .unwrap(),
+        DirectoryAddition::Added(spaced.clone())
+    );
+    assert_eq!(
+        catalog.add_directory(&draft.id, &absolute).unwrap(),
+        DirectoryAddition::Added(absolute.clone())
+    );
+    let index_before = fs::read(state.join("catalog.json")).unwrap();
+    assert_eq!(
+        catalog.add_directory(&draft.id, Path::new(".")).unwrap(),
+        DirectoryAddition::AlreadyAdded(primary.clone())
+    );
+    assert_eq!(
+        catalog
+            .add_directory(&draft.id, &spaced.join("..").join("extra dir"))
+            .unwrap(),
+        DirectoryAddition::AlreadyAdded(spaced.clone())
+    );
+    assert_eq!(fs::read(state.join("catalog.json")).unwrap(), index_before);
+
+    let reopened = SessionCatalog::open(config(&state)).unwrap();
+    let session = reopened.get(&draft.id).unwrap();
+    assert_eq!(session.cwd.as_deref(), Some(primary.as_path()));
+    assert_eq!(session.additional_directories, vec![spaced, absolute]);
+}
+
+#[test]
+fn rejected_directories_leave_metadata_unchanged() {
+    let scratch = tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let primary = scratch.path().join("primary");
+    fs::create_dir_all(&primary).unwrap();
+    fs::write(primary.join("file.txt"), "not a directory").unwrap();
+    let catalog = SessionCatalog::open(config(&state)).unwrap();
+    let draft = catalog
+        .create_draft(SessionInterface::Tui, None, Some(&primary))
+        .unwrap();
+    let no_workspace = catalog
+        .create_draft(SessionInterface::Tui, None, None)
+        .unwrap();
+    let index_before = fs::read(state.join("catalog.json")).unwrap();
+
+    for input in ["missing", "file.txt", ""] {
+        assert!(
+            matches!(
+                catalog.add_directory(&draft.id, Path::new(input)),
+                Err(CatalogError::DirectoryUnavailable { .. })
+            ),
+            "{input:?} must be rejected"
+        );
+    }
+    assert!(matches!(
+        catalog.add_directory(&no_workspace.id, Path::new(".")),
+        Err(CatalogError::WorkspaceRequired(_))
+    ));
+    assert!(matches!(
+        catalog.add_directory("draft-unknown", Path::new(".")),
+        Err(CatalogError::NotFound(_))
+    ));
+    assert_eq!(fs::read(state.join("catalog.json")).unwrap(), index_before);
+    assert!(
+        catalog
+            .get(&draft.id)
+            .unwrap()
+            .additional_directories
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_directories_are_rejected_without_a_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let primary = scratch.path().join("primary");
+    let unreadable = primary.join("unreadable");
+    let unsearchable = primary.join("unsearchable");
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::create_dir_all(&unsearchable).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o300)).unwrap();
+    fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o600)).unwrap();
+    let restore = || {
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    if fs::read_dir(&unreadable).is_ok() || fs::metadata(unsearchable.join(".")).is_ok() {
+        // Privileged runs bypass permission bits; nothing to prove here.
+        restore();
+        return;
+    }
+    let catalog = SessionCatalog::open(config(&state)).unwrap();
+    let draft = catalog
+        .create_draft(SessionInterface::Tui, None, Some(&primary))
+        .unwrap();
+    let index_before = fs::read(state.join("catalog.json")).unwrap();
+
+    for input in ["unreadable", "unsearchable"] {
+        let result = catalog.add_directory(&draft.id, Path::new(input));
+        assert!(
+            matches!(
+                &result,
+                Err(CatalogError::DirectoryUnavailable { reason, .. })
+                    if reason.contains("not accessible")
+            ),
+            "{input} must be rejected: {result:?}"
+        );
+    }
+    restore();
+    assert_eq!(fs::read(state.join("catalog.json")).unwrap(), index_before);
 }
 
 #[test]

@@ -34,6 +34,8 @@ struct StartRequest {
     prompt: String,
     #[serde(default)]
     content: Option<Vec<ContentBlock>>,
+    #[serde(default)]
+    additional_directories: Vec<PathBuf>,
     session: SessionMode,
     #[serde(default)]
     attempt: Option<StartAttempt>,
@@ -470,12 +472,17 @@ fn supervise(request: StartRequest, input: BufReader<io::Stdin>) -> Result<i32, 
 }
 
 fn write_turn_input(stdin: &mut impl Write, request: &StartRequest) -> io::Result<()> {
-    let Some(content) = request.content.as_ref() else {
+    if request.content.is_none() && request.additional_directories.is_empty() {
         return stdin
             .write_all(request.prompt.as_bytes())
             .and_then(|()| stdin.flush());
-    };
-    if content.iter().any(|block| !block.is_wire_safe()) {
+    }
+    if request
+        .content
+        .iter()
+        .flatten()
+        .any(|block| !block.is_wire_safe())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "turn content must use validated managed attachment refs",
@@ -488,7 +495,7 @@ fn write_turn_input(stdin: &mut impl Write, request: &StartRequest) -> io::Resul
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let envelope = json!({
+    let mut envelope = json!({
         "schema": "baton.message/v1",
         "message_id": format!("companion-{session_id}-{ts_ms}"),
         "conversation_id": session_id,
@@ -496,12 +503,30 @@ fn write_turn_input(stdin: &mut impl Write, request: &StartRequest) -> io::Resul
         "to": "leg",
         "kind": "request",
         "body": request.prompt,
-        "content": content,
         "ts_ms": ts_ms,
     });
+    if let Some(content) = &request.content {
+        envelope["content"] = json!(content);
+    }
+    if let Some(context) = workspace_context(request) {
+        envelope["workspace_context"] = context;
+    }
     serde_json::to_writer(&mut *stdin, &envelope)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     stdin.write_all(b"\n").and_then(|()| stdin.flush())
+}
+
+/// The primary `cwd` followed by the ordered additional directories, or `None`
+/// when there are no additional directories so legacy requests keep their shape.
+fn workspace_context(request: &StartRequest) -> Option<Value> {
+    if request.additional_directories.is_empty() {
+        return None;
+    }
+    let directories = std::iter::once(&request.cwd)
+        .chain(&request.additional_directories)
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    Some(json!({ "directories": directories }))
 }
 
 fn open_lock_file(path: &Path) -> Result<File, String> {
@@ -1086,6 +1111,7 @@ mod tests {
             cwd: PathBuf::from("/workspace"),
             store_dir: PathBuf::from("/state"),
             prompt: "describe".to_string(),
+            additional_directories: Vec::new(),
             content: Some(vec![
                 ContentBlock::Text {
                     text: "describe".to_string(),
@@ -1114,6 +1140,49 @@ mod tests {
         assert!(!value.to_string().contains("/workspace"));
         assert!(!value.to_string().contains("/state"));
         assert!(!value.to_string().contains("aGVsbG8="));
+        assert!(value.get("workspace_context").is_none());
+    }
+
+    fn text_request(additional_directories: Vec<PathBuf>) -> StartRequest {
+        StartRequest {
+            kind: "start".to_string(),
+            leg_path: PathBuf::from("/opt/leg"),
+            cwd: PathBuf::from("/workspace"),
+            store_dir: PathBuf::from("/state"),
+            prompt: "line one\nline two".to_string(),
+            content: None,
+            additional_directories,
+            session: SessionMode::Existing {
+                session_id: "sess-1-2".to_string(),
+            },
+            attempt: None,
+        }
+    }
+
+    #[test]
+    fn text_turn_without_additional_directories_keeps_the_raw_prompt() {
+        let mut bytes = Vec::new();
+
+        write_turn_input(&mut bytes, &text_request(Vec::new())).expect("writes prompt");
+
+        assert_eq!(bytes, b"line one\nline two");
+    }
+
+    #[test]
+    fn additional_directories_emit_ordered_workspace_context_with_unchanged_body() {
+        let mut bytes = Vec::new();
+        let request = text_request(vec![PathBuf::from("/extra dir"), PathBuf::from("/another")]);
+
+        write_turn_input(&mut bytes, &request).expect("writes envelope");
+
+        let value: Value = serde_json::from_slice(&bytes).expect("valid envelope");
+        assert_eq!(value["schema"], "baton.message/v1");
+        assert_eq!(value["body"], "line one\nline two");
+        assert!(value.get("content").is_none());
+        assert_eq!(
+            value["workspace_context"],
+            json!({"directories": ["/workspace", "/extra dir", "/another"]})
+        );
     }
 
     #[test]

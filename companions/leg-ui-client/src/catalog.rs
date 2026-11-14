@@ -165,6 +165,9 @@ pub struct CatalogSession {
     pub id: String,
     pub name: Option<String>,
     pub cwd: Option<PathBuf>,
+    /// Ordered canonical context directories added after the primary `cwd`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub drafts: BTreeMap<SessionInterface, String>,
@@ -202,6 +205,8 @@ pub enum CatalogError {
     WorkspaceRequired(String),
     #[error("workspace {0:?} is missing or is no longer the recorded directory")]
     WorkspaceMissing(PathBuf),
+    #[error("directory {path:?} cannot be added: {reason}")]
+    DirectoryUnavailable { path: PathBuf, reason: String },
     #[error("session is busy: another companion turn owns it")]
     Busy,
     #[error("could not verify companion process ownership: {0}")]
@@ -228,6 +233,14 @@ pub enum CatalogTurnError {
     Client(#[from] ClientError),
     #[error("session catalog could not be updated: {0}")]
     Catalog(String),
+}
+
+/// Result of [`SessionCatalog::add_directory`]; both carry the canonical path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectoryAddition {
+    Added(PathBuf),
+    /// The directory is the primary workspace or was already added.
+    AlreadyAdded(PathBuf),
 }
 
 #[derive(Clone)]
@@ -298,6 +311,8 @@ struct SessionMetadata {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    additional_directories: Vec<PathBuf>,
     #[serde(default)]
     created_at_ms: u64,
     #[serde(default)]
@@ -390,6 +405,11 @@ fn merge_pending_session_metadata(
     }
     if session.cwd.is_none() {
         session.cwd = draft.cwd;
+    }
+    for directory in draft.additional_directories {
+        if !session.additional_directories.contains(&directory) {
+            session.additional_directories.push(directory);
+        }
     }
     if session.created_at_ms == 0
         || (draft.created_at_ms != 0 && draft.created_at_ms < session.created_at_ms)
@@ -960,6 +980,43 @@ impl SessionCatalog {
         self.write_index_unlocked(&index)
     }
 
+    /// Adds a context directory for later turns. A relative `input` resolves
+    /// against the recorded primary workspace. The directory must exist and be
+    /// listable; the primary workspace or an existing entry is an idempotent
+    /// success without a write. An active turn keeps the list it started with.
+    pub fn add_directory(&self, id: &str, input: &Path) -> Result<DirectoryAddition, CatalogError> {
+        validate_session_id(id)?;
+        if input.as_os_str().is_empty() {
+            return Err(CatalogError::DirectoryUnavailable {
+                path: PathBuf::new(),
+                reason: "no path was given".into(),
+            });
+        }
+        let _guard = self.lock_index()?;
+        let mut index = self.read_index_unlocked()?;
+        let primary = index
+            .sessions
+            .get(id)
+            .map(|record| record.cwd.clone())
+            .ok_or_else(|| {
+                if self.managed_trail_exists(id) {
+                    CatalogError::WorkspaceRequired(id.into())
+                } else {
+                    CatalogError::NotFound(id.into())
+                }
+            })?
+            .ok_or_else(|| CatalogError::WorkspaceRequired(id.into()))?;
+        let directory = accessible_directory(&primary.join(input))?;
+        let record = index.sessions.get_mut(id).expect("record checked above");
+        if directory == primary || record.additional_directories.contains(&directory) {
+            return Ok(DirectoryAddition::AlreadyAdded(directory));
+        }
+        record.additional_directories.push(directory.clone());
+        record.updated_at_ms = now_ms();
+        self.write_index_unlocked(&index)?;
+        Ok(DirectoryAddition::Added(directory))
+    }
+
     pub fn get(&self, id: &str) -> Result<CatalogSession, CatalogError> {
         validate_session_id(id)?;
         self.reconcile_pending_attempts(Some(id))?;
@@ -1080,6 +1137,7 @@ impl SessionCatalog {
             return Err(CatalogError::Busy);
         }
         let cwd = self.validated_cwd(draft_id, record)?;
+        let additional_directories = record.additional_directories.clone();
         record.pending_new_turn = true;
         record.pending_attempt = Some(PendingAttempt {
             token: token.clone(),
@@ -1104,7 +1162,8 @@ impl SessionCatalog {
                 content,
             ),
             None => TurnRequest::new(prompt, cwd, LegSession::NewWithId(session_id)),
-        };
+        }
+        .with_additional_directories(additional_directories);
         match client.start_catalog_new(request, draft_id, &token) {
             Ok(turn) => Ok(CatalogTurn {
                 turn,
@@ -1167,6 +1226,7 @@ impl SessionCatalog {
         }
         ensure_idle(&session)?;
         let cwd = self.validated_cwd(id, record)?;
+        let additional_directories = record.additional_directories.clone();
         drop(_guard);
         let (content, staged_paths) = match resolved_content {
             Some(resolved_content) => {
@@ -1184,7 +1244,8 @@ impl SessionCatalog {
                 content,
             ),
             None => TurnRequest::new(prompt, cwd, LegSession::Existing(id.to_string())),
-        };
+        }
+        .with_additional_directories(additional_directories);
         let turn = match client.start(request) {
             Ok(turn) => turn,
             Err(error) => {
@@ -1472,6 +1533,7 @@ impl SessionCatalog {
             id: id.to_string(),
             name: record.name.clone(),
             cwd: record.cwd.clone(),
+            additional_directories: record.additional_directories.clone(),
             created_at_ms: record.created_at_ms,
             updated_at_ms: record.updated_at_ms,
             drafts: record.drafts.clone(),
@@ -2367,6 +2429,31 @@ fn canonical_workspace(path: &Path) -> Result<PathBuf, CatalogError> {
     if !canonical.is_dir() {
         return Err(CatalogError::WorkspaceMissing(path.to_path_buf()));
     }
+    Ok(canonical)
+}
+
+/// Canonicalizes an existing directory and proves it can be listed and
+/// searched, so an inaccessible path is rejected before it is recorded.
+fn accessible_directory(path: &Path) -> Result<PathBuf, CatalogError> {
+    let unavailable = |reason: String| CatalogError::DirectoryUnavailable {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        unavailable(if error.kind() == io::ErrorKind::NotFound {
+            "it does not exist".into()
+        } else {
+            format!("it cannot be resolved ({error})")
+        })
+    })?;
+    if !canonical.is_dir() {
+        return Err(unavailable("it is not a directory".into()));
+    }
+    let listed = fs::read_dir(&canonical).and_then(|mut entries| entries.next().transpose());
+    // Listing needs read permission; entering the directory needs search.
+    #[cfg(unix)]
+    let listed = listed.and_then(|_| fs::metadata(canonical.join(".")));
+    listed.map_err(|error| unavailable(format!("it is not accessible ({error})")))?;
     Ok(canonical)
 }
 
@@ -4001,6 +4088,26 @@ mod tests {
                 .bound_attempt_token
                 .as_deref(),
             Some("second-token")
+        );
+    }
+
+    #[test]
+    fn pending_merge_keeps_target_directories_first_and_appends_draft_only_entries() {
+        let mut target = SessionMetadata::new(None, Some(PathBuf::from("/primary")));
+        target.additional_directories = vec![PathBuf::from("/b"), PathBuf::from("/a")];
+        let mut draft = SessionMetadata::new(None, Some(PathBuf::from("/primary")));
+        draft.additional_directories = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/c"),
+            PathBuf::from("/b"),
+            PathBuf::from("/d"),
+        ];
+
+        let merged = merge_pending_session_metadata(target, draft, "token");
+
+        assert_eq!(
+            merged.additional_directories,
+            ["/b", "/a", "/c", "/d"].map(PathBuf::from)
         );
     }
 
