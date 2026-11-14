@@ -440,8 +440,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Upgrade npm for trusted publishing (OIDC)
         # npm >= 11.5.1 exchanges the job's GitHub OIDC token for a short-lived
-        # publish credential when a trusted publisher is configured on npmjs.com,
-        # and falls back to NODE_AUTH_TOKEN otherwise.
+        # publish credential when a trusted publisher is configured on npmjs.com.
         run: npm install -g npm@11
 
       - name: Stage npm packages and preflight publish
@@ -492,8 +491,6 @@ jobs:
 
       - name: Publish npm packages
         shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
@@ -506,10 +503,6 @@ jobs:
             "shukelabs-leg-win32-x64-${version}.tgz"
             "shukelabs-leg-${version}.tgz"
           )
-          test -n "${NODE_AUTH_TOKEN:-}" || {
-            echo '::error::NPM_TOKEN release secret is required to publish npm packages'
-            exit 1
-          }
 
           # npm has no multi-package transaction. All seven packages and their
           # checksums are preflighted before this loop; publish the root last
