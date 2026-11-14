@@ -334,9 +334,10 @@ exact bundle files. These resource measurements describe setup cost; they do
 not determine a usability winner.
 
 Startup time begins when the interface process starts and ends when its first
-workspace-selection control is visible. For TUI, use the first rendered
-workspace chooser. For Web, start the host, open its printed authenticated URL
-in the selected browser, and stop when the workspace field is visible.
+interactive screen is visible. For TUI, launch from the workspace fixture with
+an empty catalog and use the first rendered first-run warning. For Web, start
+the host, open its printed authenticated URL in the selected browser, and stop
+when the workspace field is visible.
 
 For idle RSS, leave the initial screen idle for 10 seconds, then sample once
 per second for 10 samples with

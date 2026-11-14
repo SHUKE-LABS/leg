@@ -86,6 +86,17 @@ recovered, read-only session until a person selects an existing workspace; the
 catalog never derives a workspace from tool output. If a saved workspace
 disappears, submission stays blocked until a replacement is selected.
 
+A session may also record an ordered list of additional directories. Each is
+canonical, an accessible directory, and distinct from the primary workspace and
+earlier entries; legacy records load with none. The primary workspace stays
+the process and tool working directory. A turn copies the list under the catalog
+lock before it starts, and the supervisor sends it to leg in the input envelope
+as `workspace_context: {"directories":[primary, additional...]}` with the prompt
+`body` unchanged. Leg adds that object to the turn's system prompt as one
+`Workspace context (non-user):` block; it is not user text and is not written to
+the trail. The field is omitted when there are no additional directories.
+Adding a directory during a turn affects only later turns.
+
 Catalog updates use a cross-process lock and atomic file replacement. Starting
 a new session writes a tokenized pending attempt with the controller's process
 birth identity and a candidate session ID, then releases the catalog lock
@@ -338,9 +349,14 @@ cargo run --locked --manifest-path companions/Cargo.toml -p leg-tui -- \
 
 The UI inherits provider configuration from its launching environment. It
 requires terminals on both stdin and stdout; `leg-tui --help` and `--version` work with
-redirected streams. On first use, choose a workspace directory, review the
-warning and keyboard guide, then compose a prompt. Later starts open the session
-picker when the catalog contains sessions. The first-run warning reads exactly:
+redirected streams. New sessions use the canonical directory leg-tui was
+started from as their workspace. On first use, it opens a draft there and shows
+the warning and keyboard guide, then the composer; Esc on the warning chooses
+another workspace for that draft. If the launch directory cannot be resolved,
+the TUI shows the error, creates no session, and asks for a workspace path.
+Later starts open the session picker when the catalog contains sessions;
+reopened sessions keep their recorded workspace, and N creates a session in the
+launch directory. The first-run warning reads exactly:
 
 > Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox.
 
@@ -395,6 +411,15 @@ use the shared turn controller to stop an active turn, wait for process
 cleanup, save the draft, and restore the terminal. Editing stays available
 during a turn, but another Enter is rejected while busy.
 
+Sending a draft of exactly `/add-dir <path>` adds a directory to the session's
+workspace context instead of sending a prompt. A relative path starts at the
+primary workspace and keeps interior spaces; there is no shell expansion. On
+success, or when the directory is already the primary or an added directory,
+the draft is cleared and the status names the canonical path. A missing,
+non-directory, inaccessible, empty, or multi-line path leaves the draft and
+the session unchanged. `/add-dir` works while a turn is running and applies to
+later turns. Added directories cannot be removed from the TUI.
+
 Palette actions add images to the draft at the cursor. **Attach image file**
 asks for a path; **Paste image from clipboard** reads the host clipboard
 through PowerShell on Windows, `osascript` on macOS, or `wl-paste`/`xclip` on
@@ -431,7 +456,12 @@ cargo test --locked --manifest-path companions/Cargo.toml -p leg-tui
 F3 opens the session picker. It shows each title, workspace, recent activity,
 turn count, and state. Use `/` to filter titles, Up/Down to select, Enter to
 reopen, N to create, R to rename, W to replace a missing workspace, and S to
-search. Busy, recovered, read-only, missing-workspace, and unverified ownership
+search. A session with added directories shows `+N dirs` after its
+workspace, and the selected session lists them in order on an `also:` line,
+marking any that no longer exist as `(missing)`. Opening such a session reports
+the missing directory without blocking sends or replacing the primary
+workspace; restore it or add a replacement with `/add-dir`. Busy, recovered,
+read-only, missing-workspace, and unverified ownership
 states are labeled in the picker and have an actionable status when opened.
 Reopening only reads history; it does not send a request. Each open session keeps
 its own composer draft and scroll position. An active turn continues in the
@@ -495,7 +525,8 @@ fence shows its content as code. Inspector copy/save and transcript export keep
 the sanitized source and original line breaks; Markdown formatting and visual
 wrapping are only for the reader.
 
-The two-row conversation header shows the viewed session title, workspace,
+The two-row conversation header shows the viewed session title, workspace
+(followed by `+N` when directories were added),
 model, turn state, elapsed time, and active tool when present. It shows Idle,
 Starting, Running, Stopping, Succeeded, Failed, Interrupted, Incomplete, Capped,
 or `Succeeded (truncated)` as text, including when color is disabled. A missing

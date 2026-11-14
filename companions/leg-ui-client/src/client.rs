@@ -48,6 +48,9 @@ pub struct TurnRequest {
     /// Optional ordered content. Image blocks contain attachment identities,
     /// never paths or bytes.
     pub content: Option<Vec<ContentBlock>>,
+    /// Ordered canonical context directories after the primary `cwd`. They are
+    /// sent to leg as workspace context only; `cwd` stays the process cwd.
+    pub additional_directories: Vec<PathBuf>,
 }
 
 impl TurnRequest {
@@ -57,6 +60,7 @@ impl TurnRequest {
             cwd: cwd.into(),
             session,
             content: None,
+            additional_directories: Vec::new(),
         }
     }
 
@@ -71,11 +75,17 @@ impl TurnRequest {
             cwd: cwd.into(),
             session,
             content: Some(content),
+            additional_directories: Vec::new(),
         }
     }
 
     pub fn with_content(mut self, content: Vec<ContentBlock>) -> Self {
         self.content = Some(content);
+        self
+    }
+
+    pub fn with_additional_directories(mut self, directories: Vec<PathBuf>) -> Self {
+        self.additional_directories = directories;
         self
     }
 }
@@ -142,6 +152,8 @@ struct StartRequestWire<'a> {
     prompt: &'a str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content: Option<&'a [ContentBlock]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    additional_directories: Vec<String>,
     session: SessionWire<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt: Option<StartAttemptWire<'a>>,
@@ -261,6 +273,11 @@ impl Client {
             store_dir: store_dir.to_string_lossy().into_owned(),
             prompt: &request.prompt,
             content: request.content.as_deref(),
+            additional_directories: request
+                .additional_directories
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
             session,
             attempt: attempt.map(|(draft_id, token)| StartAttemptWire { draft_id, token }),
         };

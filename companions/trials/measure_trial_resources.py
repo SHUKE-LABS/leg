@@ -160,7 +160,7 @@ def start_tui(
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         visible = " ".join(" ".join(screen.display).split())
-        if "Choose a workspace" in visible:
+        if "Leg can run shell commands" in visible:
             return process, master, int((time.monotonic() - started) * 1000)
         if process.poll() is not None:
             break
@@ -174,7 +174,7 @@ def start_tui(
                 stream.feed(decoder.decode(chunk))
     stop_process(process)
     os.close(master)
-    raise RuntimeError(f"leg-tui did not show its workspace chooser: {screen.display!r}")
+    raise RuntimeError(f"leg-tui did not show its first-run warning: {screen.display!r}")
 
 
 def measure_tui_only(args: argparse.Namespace) -> dict[str, object]:
@@ -206,12 +206,12 @@ def measure_tui_only(args: argparse.Namespace) -> dict[str, object]:
         "rust_target": bundle_info["rust_target"],
         "environment": environment_info(None, None),
         "method": {
-            "startup_ready_event": "first workspace-selection control visible",
+            "startup_ready_event": "first-run warning visible",
             "rss_tool": "companions/trials/sample_process_rss.py via ps process trees",
             "settle_seconds": 10,
             "sample_count": 10,
             "sample_interval_seconds": 1,
-            "tui_process_set": "leg-tui process tree at workspace chooser",
+            "tui_process_set": "leg-tui process tree at first-run warning",
             "bundle_size_method": "normalized .tar.gz archive bytes",
         },
         "TUI": {
@@ -412,14 +412,14 @@ async def measure(args: argparse.Namespace) -> dict[str, object]:
             "rust_target": target,
             "environment": environment_info(args.browser, browser_version),
             "method": {
-                "startup_ready_event": "first workspace-selection control visible",
+                "startup_ready_event": "first TUI first-run warning or Web workspace control visible",
                 "rss_tool": "companions/trials/sample_process_rss.py via ps process trees",
                 "settle_seconds": 10,
                 "sample_count": 10,
                 "sample_interval_seconds": 1,
                 "web_process_set": "leg-web host plus browser process tree; no submitted turn",
                 "browser_baseline_process_set": "same browser engine with about:blank and no host",
-                "tui_process_set": "leg-tui process tree at workspace chooser",
+                "tui_process_set": "leg-tui process tree at first-run warning",
                 "bundle_size_method": "normalized .tar.gz archive bytes; same shared trial materials",
             },
             "TUI": {

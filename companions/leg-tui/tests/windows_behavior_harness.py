@@ -87,8 +87,7 @@ def start_conversation(
         rows=24,
         columns=80,
     )
-    terminal.wait_contains("Path:")
-    terminal.write(str(workspace) + "\r")
+    # Launched from the workspace, a first run opens the warning directly.
     terminal.wait_contains("Leg can run shell commands and modify files")
     terminal.write("\r")
     terminal.wait_contains(harness.COMPOSER_HINT)

@@ -171,8 +171,6 @@ def run_tui_turn(
             rows=24,
             columns=80,
         )
-        terminal.wait_contains("Path:")
-        terminal.write(str(workspace) + "\r")
         terminal.wait_contains("Leg can run shell commands and modify files")
         terminal.write("\r")
         terminal.wait_contains(harness.COMPOSER_HINT)

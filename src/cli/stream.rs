@@ -283,7 +283,10 @@ fn execute_session_exchange_core<T: Transport, W: Write>(
 ) -> Result<()> {
     let session_id = resumed.session_id.clone();
     let turn_index = resumed.next_turn_index;
-    let system_prompt = system_prompt_for_turn(base_system_prompt)?;
+    let system_prompt = crate::message::with_workspace_context(
+        system_prompt_for_turn(base_system_prompt)?,
+        request.workspace_context.as_ref(),
+    );
     let request_content = request.content_blocks();
     let resolved_content = resolve_content(&request_content, Some(&session_id));
     let provider_request_content = match &resolved_content {
@@ -1388,6 +1391,127 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("help example record"))
             .collect::<Vec<Value>>();
         assert_sequence(&examples);
+    }
+
+    /// Each provider call's system prompt and messages.
+    type CapturedCalls = Rc<RefCell<Vec<(Option<String>, Vec<Message>)>>>;
+
+    struct SystemCapturingTransport {
+        replies: RefCell<std::collections::VecDeque<AssistantReply>>,
+        calls: CapturedCalls,
+    }
+
+    impl Transport for SystemCapturingTransport {
+        fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
+            self.send_conversation_with_system_prompt(messages, None)
+                .result
+        }
+
+        fn send_conversation_with_system_prompt(
+            &self,
+            messages: &[Message],
+            system_prompt: Option<&str>,
+        ) -> TransportCall<AssistantReply> {
+            self.calls
+                .borrow_mut()
+                .push((system_prompt.map(str::to_owned), messages.to_vec()));
+            let reply = self
+                .replies
+                .borrow_mut()
+                .pop_front()
+                .expect("test queued enough replies");
+            TransportCall::new(Ok(reply), 1)
+        }
+
+        fn send_conversation_streaming_with_system_prompt(
+            &self,
+            messages: &[Message],
+            system_prompt: Option<&str>,
+            _on_event: &mut dyn FnMut(crate::transport::StreamEvent) -> Result<()>,
+        ) -> TransportCall<AssistantReply> {
+            self.send_conversation_with_system_prompt(messages, system_prompt)
+        }
+    }
+
+    #[test]
+    fn workspace_context_is_a_system_block_on_every_call_and_never_user_text() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let transport = ToolLoop::new(
+            SystemCapturingTransport {
+                replies: RefCell::new(
+                    vec![
+                        crate::tools::tests::tool_use_reply("toolu_1", "echo"),
+                        AssistantReply::new("done"),
+                    ]
+                    .into(),
+                ),
+                calls: Rc::clone(&calls),
+            },
+            crate::tools::tests::echo_registry(Rc::new(Cell::new(0))),
+            None,
+        );
+        let session_write_error = Rc::new(RefCell::new(None));
+        let mut sink = NoopSink;
+        let mut resumed = ResumedSession {
+            session_id: "sess-test".to_string(),
+            conversation: Conversation::new(),
+            prior_turns: 0,
+            next_turn_index: 0,
+            summary: None,
+            history_turn_indices: Vec::new(),
+        };
+        let mut request = request("check both");
+        request.workspace_context = Some(crate::message::WorkspaceContext {
+            directories: vec!["/primary".to_string(), "/extra dir".to_string()],
+        });
+        let mut bytes = Vec::new();
+        let writer = Rc::new(RefCell::new(StreamJsonWriter::new(&mut bytes)));
+        execute_session_exchange_core(
+            &transport,
+            &ExchangeMeta {
+                model: "test-model".to_string(),
+                base_url: "https://provider.test".to_string(),
+            },
+            Provider::Anthropic,
+            &request,
+            &mut sink,
+            &mut resumed,
+            session_write_error,
+            &writer,
+            Some("base prompt"),
+        )
+        .expect("turn succeeds");
+        drop(writer);
+
+        let expected =
+            "Workspace context (non-user):\n{\"directories\":[\"/primary\",\"/extra dir\"]}";
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 2, "initial call plus one tool continuation");
+        for (system_prompt, messages) in calls.iter() {
+            let system_prompt = system_prompt.as_deref().expect("system prompt is sent");
+            assert!(system_prompt.starts_with("base prompt"));
+            assert!(system_prompt.ends_with(expected));
+            assert_eq!(system_prompt.matches("Workspace context").count(), 1);
+            assert_eq!(messages[0].text(), "check both");
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| !message.text().contains("Workspace context"))
+            );
+        }
+        let records = parse_records(&bytes);
+        assert_eq!(records[0]["request"]["body"], "check both");
+        assert_eq!(
+            records[0]["request"]["workspace_context"],
+            json!({"directories": ["/primary", "/extra dir"]})
+        );
+        assert!(
+            !records
+                .last()
+                .unwrap()
+                .to_string()
+                .contains("Workspace context")
+        );
     }
 
     #[test]

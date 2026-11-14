@@ -10,9 +10,9 @@ mod resolve;
 pub mod supervisor;
 
 pub use catalog::{
-    CatalogError, CatalogRunState, CatalogSession, CatalogTurn, CatalogTurnError, RetryIntent,
-    SessionCatalog, SessionCatalogConfig, SessionInterface, TrailOutcome, TrailTool,
-    TrailToolResult, TrailTurn,
+    CatalogError, CatalogRunState, CatalogSession, CatalogTurn, CatalogTurnError,
+    DirectoryAddition, RetryIntent, SessionCatalog, SessionCatalogConfig, SessionInterface,
+    TrailOutcome, TrailTool, TrailToolResult, TrailTurn,
 };
 pub use client::{
     Client, ClientConfig, ClientError, LegSession, StartError, TurnHandle, TurnOutcome,

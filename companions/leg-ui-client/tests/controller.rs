@@ -12,9 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use leg_ui_client::{
-    CatalogError, Client, ClientConfig, DraftBlock, LegSession, ResolveError, SessionCatalog,
-    SessionCatalogConfig, SessionInterface, StartError, StreamEvent, SubmissionClaim,
-    SubmissionResolution, TurnOutcome, TurnRequest,
+    CatalogError, Client, ClientConfig, DirectoryAddition, DraftBlock, LegSession, ResolveError,
+    SessionCatalog, SessionCatalogConfig, SessionInterface, StartError, StreamEvent,
+    SubmissionClaim, SubmissionResolution, TurnOutcome, TurnRequest,
 };
 use serde_json::{Value, json};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -919,6 +919,7 @@ fn shared_catalog_controller_contract(
         assert!(!request.contains("TUI draft survives"));
         assert!(!request.contains("Web draft stays independent"));
         assert!(!request.contains("blue"));
+        assert!(!request.contains("Workspace context (non-user)"));
     }
     let second_turn_request = records[2].body.to_string();
     assert!(second_turn_request.contains("first final answer"));
@@ -987,6 +988,142 @@ fn shared_catalog_controller_contract(
         sessions_dir
             .join(format!("{first_failed_id}.jsonl"))
             .is_file()
+    );
+}
+
+fn workspace_context_block(directories: &[&Path]) -> String {
+    let directories = directories
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    format!(
+        "Workspace context (non-user):\n{}",
+        json!({ "directories": directories })
+    )
+}
+
+fn turn_start_request(events: &[StreamEvent]) -> Value {
+    events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::TurnStart { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("turn start event")
+}
+
+/// Real leg against a captured provider: added directories reach every
+/// provider call of later turns as one system block, tools keep the primary
+/// cwd, and a directory added during an active turn waits for the next one.
+fn workspace_context_controller_contract(scratch: &Path, leg: &Path, supervisor: &Path) {
+    let root = scratch.join("workspace-context");
+    let primary = root.join("primary");
+    fs::create_dir_all(primary.join("extra one")).expect("create first additional directory");
+    fs::create_dir_all(root.join("extra two")).expect("create second additional directory");
+    let primary = fs::canonicalize(&primary).expect("canonical primary");
+    let extra_one = fs::canonicalize(primary.join("extra one")).expect("canonical extra one");
+    let extra_two = fs::canonicalize(root.join("extra two")).expect("canonical extra two");
+    let gate = ReplyGate::new();
+    let provider = MockProvider::start(vec![
+        MockReply::stream(bash_tool_reply("ctx-pwd-one", "pwd", "")),
+        MockReply::stream(text_reply("context turn one")),
+        MockReply::stream(bash_tool_reply("ctx-pwd-two", "pwd", "")).gated(gate.clone()),
+        MockReply::stream(text_reply("context turn two")),
+        MockReply::stream(text_reply("context turn three")),
+    ]);
+    let mut environment = EnvGuard::new();
+    environment.set("ANTHROPIC_BASE_URL", &provider.base_url);
+    let catalog = SessionCatalog::open(SessionCatalogConfig {
+        state_dir: Some(root.join("state")),
+        leg_bin: Some(leg.to_path_buf()),
+        supervisor_bin: Some(supervisor.to_path_buf()),
+    })
+    .expect("open workspace-context catalog");
+    let draft = catalog
+        .create_draft(SessionInterface::Tui, None, Some(primary.as_path()))
+        .expect("create draft");
+    assert_eq!(
+        catalog
+            .add_directory(&draft.id, Path::new("extra one"))
+            .expect("add relative directory"),
+        DirectoryAddition::Added(extra_one.clone())
+    );
+
+    let first_prompt = "first context prompt";
+    let mut first = catalog
+        .start_new(&draft.id, SessionInterface::Tui, first_prompt)
+        .expect("start first context turn");
+    let first_events = collect_catalog_events(&mut first);
+    assert_success(first.wait().expect("finish first context turn"));
+    let session_id = first.session_id().expect("bound session id").to_string();
+    let request = turn_start_request(&first_events);
+    assert_eq!(request["body"], first_prompt);
+    assert_eq!(
+        request["workspace_context"],
+        json!({"directories": [primary.to_string_lossy(), extra_one.to_string_lossy()]})
+    );
+    let bound = catalog.get(&session_id).expect("read bound session");
+    assert_eq!(bound.additional_directories, vec![extra_one.clone()]);
+    let tool_output = bound.turns[0].tools[0]
+        .result
+        .as_ref()
+        .and_then(|result| result.result.as_deref())
+        .unwrap_or("<missing tool output>");
+    assert!(
+        tool_output.contains(primary.to_string_lossy().as_ref())
+            && !tool_output.contains("extra one"),
+        "tool cwd stays primary: {tool_output:?}"
+    );
+
+    let mut second = catalog
+        .start_existing(&session_id, SessionInterface::Tui, "second context prompt")
+        .expect("start second context turn");
+    provider.wait_for_records(3, Duration::from_secs(30));
+    assert_eq!(
+        catalog
+            .add_directory(&session_id, &extra_two)
+            .expect("add a directory while the turn is active"),
+        DirectoryAddition::Added(extra_two.clone())
+    );
+    gate.release();
+    let _ = collect_catalog_events(&mut second);
+    assert_success(second.wait().expect("finish second context turn"));
+
+    let mut third = catalog
+        .start_existing(&session_id, SessionInterface::Tui, "third context prompt")
+        .expect("start third context turn");
+    let third_events = collect_catalog_events(&mut third);
+    assert_success(third.wait().expect("finish third context turn"));
+    assert_eq!(
+        turn_start_request(&third_events)["workspace_context"],
+        json!({"directories": [
+            primary.to_string_lossy(),
+            extra_one.to_string_lossy(),
+            extra_two.to_string_lossy(),
+        ]})
+    );
+
+    let records = provider.finish();
+    assert_eq!(records.len(), 5);
+    let before = workspace_context_block(&[&primary, &extra_one]);
+    let after = workspace_context_block(&[&primary, &extra_one, &extra_two]);
+    for (index, record) in records.iter().enumerate() {
+        let system = record.body["system"].as_str().unwrap_or_default();
+        let expected = if index < 4 { &before } else { &after };
+        assert!(
+            system.ends_with(expected.as_str()),
+            "call {index} system prompt {system:?} lacks {expected:?}"
+        );
+        assert_eq!(system.matches("Workspace context (non-user)").count(), 1);
+        for message in record.body["messages"].as_array().expect("messages") {
+            if message["role"] == "user" {
+                assert!(!message.to_string().contains("Workspace context"));
+            }
+        }
+    }
+    assert_eq!(
+        records[0].body["messages"][0]["content"],
+        json!(first_prompt)
     );
 }
 
@@ -2523,6 +2660,7 @@ fn companion_controller_contract_and_cleanup() {
         &second_cwd,
         sentinel,
     );
+    workspace_context_controller_contract(scratch.path(), &leg, &supervisor);
 
     // Default PATH resolution follows a global npm symlink to the published
     // launcher, then the native package binary. Explicitly selecting that same

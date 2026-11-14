@@ -1107,7 +1107,10 @@ fn execute_exchange_session_core(
     base_system_prompt: Option<&str>,
 ) -> Result<()> {
     let (request, mode) = parse_exchange_request(raw)?;
-    let system_prompt = system_prompt_for_turn(base_system_prompt)?;
+    let system_prompt = crate::message::with_workspace_context(
+        system_prompt_for_turn(base_system_prompt)?,
+        request.workspace_context.as_ref(),
+    );
     let session_id = resumed.session_id.clone();
     let turn_index = resumed.next_turn_index;
     let request_ts_ms = now_ms();
