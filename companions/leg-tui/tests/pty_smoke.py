@@ -556,6 +556,7 @@ def spawn_in_pty(
     env: dict[str, str],
     rows: int = DEFAULT_ROWS,
     columns: int = DEFAULT_COLUMNS,
+    cwd: Path | None = None,
 ) -> tuple[int, int, subprocess.Popen[bytes], list[Any]]:
     master_fd, slave_fd = pty.openpty()
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
@@ -572,6 +573,7 @@ def spawn_in_pty(
             stdout=slave_fd,
             stderr=slave_fd,
             env=env,
+            cwd=cwd,
             close_fds=True,
             preexec_fn=attach_controlling_terminal,
         )
@@ -721,9 +723,9 @@ def start_prompt(
     expected_live_text: str = LIVE_TEXT,
     exercise_keyboard: bool = False,
 ) -> None:
-    read_until(master_fd, child, capture, "Path:")
-    os.write(master_fd, str(workspace).encode() + b"\r")
+    # The TUI was launched from `workspace`; a first run skips the workspace form.
     read_until(master_fd, child, capture, WARNING)
+    assert "Path:" not in capture.text(), capture.text()
     if exercise_keyboard:
         drain_for(master_fd, capture, 0.1, child)
         first_run_help = capture.text()
@@ -898,7 +900,7 @@ def run_smoke(args: argparse.Namespace) -> None:
                 str(Path(args.supervisor_bin).resolve()),
             ]
             master_fd, slave_fd, child, initial_termios = spawn_in_pty(
-                command, env, rows=ROWS, columns=COLUMNS
+                command, env, rows=ROWS, columns=COLUMNS, cwd=workspace
             )
             capture = TerminalCapture()
             try:
@@ -1083,7 +1085,7 @@ def run_smoke(args: argparse.Namespace) -> None:
             negative_env["LEG_UI_STATE_DIR"] = str(root / "negative-state")
             negative_env["LEG_EVENT_LOG"] = str(root / "negative-events.jsonl")
             negative_master, negative_slave, negative_child, negative_initial = spawn_in_pty(
-                command, negative_env, rows=ROWS, columns=COLUMNS
+                command, negative_env, rows=ROWS, columns=COLUMNS, cwd=negative_workspace
             )
             negative_capture = TerminalCapture()
             try:
@@ -1221,11 +1223,9 @@ def launch_conversation(
             "--supervisor-bin",
             str(Path(args.supervisor_bin).resolve()),
         ]
-    master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+    master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env, cwd=workspace)
     capture = TerminalCapture(rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS)
     try:
-        read_until(master_fd, child, capture, "Path:")
-        os.write(master_fd, str(workspace).encode() + b"\r")
         read_until(master_fd, child, capture, WARNING)
         os.write(master_fd, b"\r")
         read_until(master_fd, child, capture, "Idle")
@@ -2597,9 +2597,8 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
                 output,
                 "Sessions · title · workspace · recent · status",
             )
+            # A picker-created session starts in the launch directory.
             os.write(master_fd, b"n")
-            read_until(master_fd, child, output, "Choose a workspace for the new session")
-            os.write(master_fd, str(workspace).encode() + b"\r")
             read_until(master_fd, child, output, WARNING)
             assert "Press Enter to acknowledge" in output.text(), output.text()
             blocked_prompt = "This must not be sent before warning acknowledgement"
@@ -3675,20 +3674,20 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
                 "--supervisor-bin",
                 str(Path(args.supervisor_bin).resolve()),
             ]
-            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
-            read_until_screen_text(
-                master_fd, child, output, "Path:", rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(
+                command, env, cwd=workspace
             )
-            assert "Workspace" in terminal_screen_text(bytes(output), 40, 120)
+            read_until_screen_text(
+                master_fd,
+                child,
+                output,
+                "Leg can run shell commands",
+                rows=DEFAULT_ROWS,
+                columns=DEFAULT_COLUMNS,
+            )
+            assert "Path:" not in terminal_screen_text(bytes(output), 40, 120)
 
             resize_pty(slave_fd, 24, 80)
-            drain_for(master_fd, output, 0.2)
-            workspace_screen = terminal_screen_text(bytes(output), 24, 80)
-            assert "Workspace" in workspace_screen and "Path:" in workspace_screen, (
-                f"workspace selection was not usable at 80x24: {workspace_screen!r}"
-            )
-
-            os.write(master_fd, str(workspace).encode() + b"\r")
             read_until_screen_text(
                 master_fd,
                 child,
@@ -4092,13 +4091,11 @@ def run_color_policy_smoke(args: argparse.Namespace) -> None:
                 env.pop("NO_COLOR", None)
             else:
                 env["NO_COLOR"] = no_color
-            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(
+                command, env, cwd=workspace
+            )
             output = bytearray()
             try:
-                read_until_screen_text(
-                    master_fd, child, output, "Path:", rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS
-                )
-                os.write(master_fd, str(workspace).encode() + b"\r")
                 read_until_screen_text(
                     master_fd,
                     child,

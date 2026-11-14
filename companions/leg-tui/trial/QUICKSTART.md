@@ -57,7 +57,8 @@ bundle_dir=$PWD
 LEG_UI_STATE_DIR="$PWD/.trial-state" ./start-tui.sh
 ```
 
-Select the printed disposable workspace path when prompted. Follow the shared
+The TUI starts in the bundle directory; on the first-run warning, press Esc and
+enter the printed disposable workspace path. Follow the shared
 tasks and safety gates in `docs/ui-experiments.md`. The fixture uses only its
 fake-only key, reports deterministic workspace checks, and makes no paid API
 request.

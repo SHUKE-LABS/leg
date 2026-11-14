@@ -32,10 +32,10 @@ use crossterm::terminal::{
 };
 use editor::{ComposerEditor, normalize_paste};
 use leg_ui_client::{
-    AttachmentRef, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock, DraftBlock,
-    DraftImage, ImageSource, RetryIntent, SessionCatalog, SessionCatalogConfig, SessionInterface,
-    StreamEvent, SubmissionClaim, SubmissionResolution, TrailOutcome, TurnOutcome, TurnStopHandle,
-    draft_fingerprint, draft_images, draft_prompt,
+    AttachmentRef, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock, DirectoryAddition,
+    DraftBlock, DraftImage, ImageSource, RetryIntent, SessionCatalog, SessionCatalogConfig,
+    SessionInterface, StreamEvent, SubmissionClaim, SubmissionResolution, TrailOutcome,
+    TurnOutcome, TurnStopHandle, draft_fingerprint, draft_images, draft_prompt,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -65,6 +65,10 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(34);
 const ACTIVE_CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 const SMALL_TERMINAL_REJECTION: &str = "Send rejected: terminal must be at least 80x24.";
+const ADD_DIR_COMMAND: &str = "/add-dir";
+const ADD_DIR_USAGE: &str =
+    "Usage: /add-dir <path> (relative paths start at the primary workspace)";
+const MAX_STARTUP_ERROR_CHARS: usize = 240;
 static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -136,7 +140,9 @@ fn print_help() {
         "leg-tui — experimental terminal interface for leg\n\n\
          Usage: leg-tui [--leg-bin PATH] [--supervisor-bin PATH]\n\n\
          --version prints the package version and exits.\n\n\
-         Choose an existing workspace, review the first-run warning, then compose a prompt.\n\
+         New sessions use the directory leg-tui was launched from as their workspace.\n\
+         Review the first-run warning, then compose a prompt. `/add-dir <path>` adds a\n\
+         directory to the session's workspace context for later turns.\n\
          Ctrl-S sends. Ctrl-C stops an active turn or exits when idle.\n\
          Leg can run shell commands and modify files as your OS user. The workspace is its working directory, not a sandbox."
     );
@@ -153,10 +159,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     })?;
     let mut app = App::new(catalog);
     app.refresh_sessions();
-    if !app.sessions.is_empty() {
-        app.screen = Screen::SessionPicker;
-        app.status = "Choose an existing session or create a new one".to_string();
-    }
+    app.open_initial_screen(resolve_launch_directory(env::current_dir()));
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let area = terminal.size()?;
     app.set_terminal_size(area.width, area.height);
@@ -217,6 +220,53 @@ fn draw_terminal<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
     terminal.draw(|frame| draw(frame, app))?;
     app.render_counters.draws = app.render_counters.draws.saturating_add(1);
     Ok(())
+}
+
+/// The canonical directory leg-tui was launched from, or a bounded error.
+fn resolve_launch_directory(current: io::Result<PathBuf>) -> Result<PathBuf, String> {
+    let resolved = current
+        .map_err(|error| format!("Could not read the launch directory: {error}"))
+        .and_then(|directory| {
+            fs::canonicalize(&directory).map_err(|error| {
+                format!(
+                    "Could not resolve the launch directory {}: {error}",
+                    directory.display()
+                )
+            })
+        })
+        .and_then(|directory| {
+            if directory.is_dir() {
+                Ok(directory)
+            } else {
+                Err(format!(
+                    "The launch directory {} is not a directory",
+                    directory.display()
+                ))
+            }
+        });
+    resolved.map_err(|error| truncate_to_width(&error, MAX_STARTUP_ERROR_CHARS))
+}
+
+/// The path argument of an exact `/add-dir <path>` command. `None` means the
+/// draft is not the command; `Some(Err)` is a malformed command.
+fn add_dir_argument(draft: &str) -> Option<Result<&str, &'static str>> {
+    let rest = draft.trim().strip_prefix(ADD_DIR_COMMAND)?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let path = rest.trim();
+    if path.is_empty() {
+        return Some(Err(ADD_DIR_USAGE));
+    }
+    if path.chars().any(is_image_marker) {
+        return Some(Err(
+            "/add-dir takes a path only; remove attached images first",
+        ));
+    }
+    if path.chars().any(char::is_control) {
+        return Some(Err("/add-dir takes a single-line path"));
+    }
+    Some(Ok(path))
 }
 
 fn require_interactive_terminal() -> io::Result<()> {
@@ -382,6 +432,8 @@ struct PaletteState {
 
 struct App {
     catalog: SessionCatalog,
+    /// Canonical launch directory; the workspace for newly created sessions.
+    launch_dir: Option<PathBuf>,
     screen: Screen,
     workspace_flow: WorkspaceFlow,
     warning_acknowledged: bool,
@@ -525,6 +577,8 @@ impl RedrawScheduler {
 struct ConversationState {
     state_key: String,
     workspace: Option<PathBuf>,
+    /// Ordered `/add-dir` directories; the primary workspace stays the cwd.
+    additional_directories: Vec<PathBuf>,
     draft_id: Option<String>,
     session_id: Option<String>,
     composer: ComposerEditor,
@@ -625,6 +679,7 @@ impl ConversationState {
         Self {
             state_key: String::new(),
             workspace: None,
+            additional_directories: Vec::new(),
             draft_id: None,
             session_id: None,
             composer: ComposerEditor::default(),
@@ -662,6 +717,7 @@ impl ConversationState {
         let mut state = Self::empty();
         state.state_key = session.id.clone();
         state.workspace = session.cwd.clone();
+        state.additional_directories = session.additional_directories.clone();
         state.draft_id = Some(session.id.clone());
         state.session_id = (!is_draft).then(|| session.id.clone());
         match session.draft_blocks.get(&SessionInterface::Tui) {
@@ -870,6 +926,7 @@ impl App {
         let (turn_tx, turn_rx) = mpsc::channel();
         Self {
             catalog,
+            launch_dir: None,
             screen: Screen::Workspace,
             workspace_flow: WorkspaceFlow::Initial,
             warning_acknowledged: false,
@@ -1281,8 +1338,67 @@ impl App {
         self.status = "Tool row focused · Ctrl-Up/Down move · F4 inspect".to_string();
     }
 
+    /// Opens the session picker when sessions exist; otherwise starts the
+    /// first draft in the launch directory, or asks for a workspace when the
+    /// launch directory could not be resolved.
+    fn open_initial_screen(&mut self, launch: Result<PathBuf, String>) {
+        let launch_error = match launch {
+            Ok(directory) => {
+                self.launch_dir = Some(directory);
+                None
+            }
+            Err(error) => Some(error),
+        };
+        if !self.sessions.is_empty() {
+            self.screen = Screen::SessionPicker;
+            self.status = match launch_error {
+                Some(error) => {
+                    format!("{error}. New sessions use the viewed workspace or ask for one.")
+                }
+                None => "Choose an existing session or create a new one".to_string(),
+            };
+            return;
+        }
+        let Some(launch_dir) = self.launch_dir.clone() else {
+            self.screen = Screen::Workspace;
+            self.set_blocking_status(format!(
+                "{}. Enter an existing workspace path.",
+                launch_error.unwrap_or_default()
+            ));
+            return;
+        };
+        match self
+            .catalog
+            .create_draft(SessionInterface::Tui, None, Some(&launch_dir))
+        {
+            Ok(session) => {
+                let draft_id = session.id.clone();
+                self.adopt_initial_draft(session);
+                // Esc on the warning re-targets this draft instead of
+                // leaving an unused launch-directory draft behind.
+                self.workspace_flow = WorkspaceFlow::ReplaceSession(draft_id);
+            }
+            Err(error) => {
+                self.screen = Screen::Workspace;
+                self.set_blocking_status(format!("Could not create a session draft: {error}"));
+            }
+        }
+    }
+
+    fn adopt_initial_draft(&mut self, session: CatalogSession) {
+        self.workspace = session.cwd.clone();
+        self.additional_directories = session.additional_directories.clone();
+        self.draft_id = Some(session.id.clone());
+        self.session_id = None;
+        self.state_key = session.id;
+        self.workspace_flow = WorkspaceFlow::Initial;
+        self.screen = Screen::Warning;
+        self.status = "Review and acknowledge the first-run warning".to_string();
+        self.refresh_sessions();
+    }
+
     fn create_session(&mut self) {
-        let Some(workspace) = self.workspace.clone() else {
+        let Some(workspace) = self.launch_dir.clone().or_else(|| self.workspace.clone()) else {
             self.workspace_input.clear();
             self.workspace_flow = WorkspaceFlow::NewSession;
             self.screen = Screen::Workspace;
@@ -2536,16 +2652,7 @@ impl App {
         };
         match result {
             Ok(session) => match flow {
-                WorkspaceFlow::Initial => {
-                    self.workspace = session.cwd.clone();
-                    self.draft_id = Some(session.id.clone());
-                    self.session_id = None;
-                    self.state_key = session.id;
-                    self.workspace_flow = WorkspaceFlow::Initial;
-                    self.screen = Screen::Warning;
-                    self.status = "Review and acknowledge the first-run warning".to_string();
-                    self.refresh_sessions();
-                }
+                WorkspaceFlow::Initial => self.adopt_initial_draft(session),
                 WorkspaceFlow::NewSession => self.activate_new_session(session),
                 WorkspaceFlow::ReplaceSession(expected_id) => {
                     debug_assert_eq!(session.id, expected_id);
@@ -3023,6 +3130,18 @@ impl App {
             self.set_blocking_status(SMALL_TERMINAL_REJECTION);
             return;
         }
+        // `/add-dir` is handled locally, and also while a turn runs: the
+        // directory joins later turns only.
+        if let Some(argument) = add_dir_argument(self.composer.text()) {
+            match argument {
+                Ok(path) => {
+                    let path = PathBuf::from(path);
+                    self.add_directory(&path);
+                }
+                Err(message) => self.set_blocking_status(message),
+            }
+            return;
+        }
         if self.turn_status.is_active() {
             self.set_blocking_status("Busy: wait for the active turn");
             return;
@@ -3066,6 +3185,43 @@ impl App {
             return;
         }
         self.start_prompt(prompt, None);
+    }
+
+    fn add_directory(&mut self, input: &Path) {
+        let Some(record_id) = self.current_record_id().map(str::to_owned) else {
+            self.set_blocking_status("Choose a workspace before adding directories");
+            return;
+        };
+        let addition = match self.catalog.add_directory(&record_id, input) {
+            Ok(addition) => addition,
+            Err(error) => {
+                self.set_blocking_status(format!("Could not add directory: {error}"));
+                return;
+            }
+        };
+        self.composer.clear();
+        self.mark_active_draft_edited(true);
+        let status = match addition {
+            DirectoryAddition::Added(directory) => {
+                let status = format!(
+                    "Added directory {}; later turns include it as workspace context.",
+                    directory.display()
+                );
+                self.additional_directories.push(directory);
+                status
+            }
+            DirectoryAddition::AlreadyAdded(directory) => format!(
+                "{} is already in this session's workspace.",
+                directory.display()
+            ),
+        };
+        self.refresh_sessions();
+        match self.persist_draft() {
+            Ok(()) => self.status = status,
+            Err(error) => {
+                self.set_blocking_status(format!("Could not save the current draft: {error}"))
+            }
+        }
     }
 
     fn retry_selected_turn(&mut self) {
@@ -4579,7 +4735,12 @@ fn draw_small_terminal(frame: &mut Frame<'_>, app: &App) {
 fn draw_session_picker(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(94, 90, frame.area());
     let visible = app.visible_session_indices();
-    let height = area.height.saturating_sub(8) as usize;
+    let selected_has_directories = visible
+        .get(app.picker_index)
+        .is_some_and(|index| !app.sessions[*index].additional_directories.is_empty());
+    let height = area
+        .height
+        .saturating_sub(8 + u16::from(selected_has_directories)) as usize;
     let page_rows = (height / 2).max(1);
     let start = app
         .picker_index
@@ -4632,8 +4793,13 @@ fn draw_session_picker(frame: &mut Frame<'_>, app: &App) {
         } else {
             String::new()
         };
+        let additions = match session.additional_directories.len() {
+            0 => String::new(),
+            1 => " +1 dir".to_string(),
+            count => format!(" +{count} dirs"),
+        };
         let second = Line::from(format!(
-            "    {}  ·  {} turns  ·  {}{}",
+            "    {}{additions}  ·  {} turns  ·  {}{}",
             sanitize::terminal_safe_text(&workspace),
             session.turns.len(),
             sanitize::terminal_safe_text(&session.id),
@@ -4649,6 +4815,21 @@ fn draw_session_picker(frame: &mut Frame<'_>, app: &App) {
             first
         });
         lines.push(second);
+        if selected && !session.additional_directories.is_empty() {
+            let directories = session
+                .additional_directories
+                .iter()
+                .map(|directory| {
+                    let missing = if directory.is_dir() { "" } else { " (missing)" };
+                    format!("{}{missing}", directory.display())
+                })
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            lines.push(Line::from(format!(
+                "    also: {}",
+                sanitize::terminal_safe_text(&directories)
+            )));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(
@@ -4821,8 +5002,12 @@ fn draw_conversation(frame: &mut Frame<'_>, app: &mut App) {
         .as_deref()
         .map(|tool| format!(" · tool: {}", truncate_to_width(tool, tool_width)))
         .unwrap_or_default();
+    let additions = match app.additional_directories.len() {
+        0 => String::new(),
+        count => format!(" +{count}"),
+    };
     let header_second = format!(
-        "workspace: {} · catalog: {}{}",
+        "workspace: {}{additions} · catalog: {}{}",
         truncate_to_width(&sanitize::terminal_safe_text(&workspace), workspace_width),
         truncate_to_width(&catalog_summary, catalog_width),
         tool,
@@ -5495,10 +5680,18 @@ fn session_action_status(session: &CatalogSession) -> (String, bool) {
             .cloned()
             .unwrap_or_else(|| "This session is read-only.".to_string()),
         CatalogRunState::Idle => {
-            return (
-                "Session reopened. History browsing did not start an exchange.".to_string(),
-                false,
-            );
+            let status = match session
+                .additional_directories
+                .iter()
+                .find(|directory| !directory.is_dir())
+            {
+                Some(missing) => format!(
+                    "Added directory {} is missing; restore it or /add-dir a replacement. The primary workspace is unchanged.",
+                    missing.display()
+                ),
+                None => "Session reopened. History browsing did not start an exchange.".to_string(),
+            };
+            return (status, false);
         }
     };
     (status, true)
@@ -7098,5 +7291,322 @@ mod image_draft_tests {
         );
         assert!(!turn.retryable());
         assert!(!turn.searchable_text().contains("iVBORw0KGgp"));
+    }
+}
+
+#[cfg(test)]
+mod workspace_directory_tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use leg_ui_client::{SessionCatalog, SessionCatalogConfig, SessionInterface};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::{
+        App, ConversationState, MAX_STARTUP_ERROR_CHARS, Screen, TurnStatus, add_dir_argument,
+        draw_terminal, resolve_launch_directory,
+    };
+
+    struct Root(PathBuf);
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn root(name: &str) -> Root {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "leg-tui-dirs-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture root is created");
+        Root(root)
+    }
+
+    fn directory(root: &Root, name: &str) -> PathBuf {
+        let path = root.0.join(name);
+        std::fs::create_dir_all(&path).expect("fixture directory is created");
+        std::fs::canonicalize(path).expect("fixture directory canonicalizes")
+    }
+
+    fn open_app(root: &Root) -> App {
+        let catalog = SessionCatalog::open(SessionCatalogConfig {
+            state_dir: Some(root.0.join("state")),
+            ..SessionCatalogConfig::default()
+        })
+        .expect("temporary test catalog opens");
+        let mut app = App::new(catalog);
+        app.use_color = false;
+        app.set_terminal_size(80, 24);
+        app.refresh_sessions();
+        app
+    }
+
+    /// An acknowledged app viewing a new draft in `workspace`.
+    fn draft_app(root: &Root, workspace: &Path) -> App {
+        let mut app = open_app(root);
+        app.warning_acknowledged = true;
+        let session = app
+            .catalog
+            .create_draft(SessionInterface::Tui, None, Some(workspace))
+            .expect("draft session is created");
+        app.activate_new_session(session);
+        assert!(app.screen == Screen::Conversation);
+        app
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn submit_draft(app: &mut App, draft: &str) {
+        app.composer.clear();
+        app.handle_paste(draft);
+        app.submit();
+    }
+
+    fn recorded_directories(app: &App) -> Vec<PathBuf> {
+        let id = app.current_record_id().expect("view has a record");
+        app.catalog
+            .get(id)
+            .expect("record loads")
+            .additional_directories
+    }
+
+    fn rendered(app: &mut App, columns: u16, rows: u16) -> String {
+        app.set_terminal_size(columns, rows);
+        let mut terminal =
+            Terminal::new(TestBackend::new(columns, rows)).expect("test terminal opens");
+        draw_terminal(&mut terminal, app).expect("headless draw succeeds");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn empty_catalog_launch_opens_the_warning_with_a_launch_directory_draft() {
+        let root = root("launch");
+        let launch = directory(&root, "launch dir");
+        let mut app = open_app(&root);
+
+        app.open_initial_screen(resolve_launch_directory(Ok(launch.join("."))));
+
+        assert!(app.screen == Screen::Warning);
+        assert!(app.workspace_input.is_empty());
+        assert_eq!(app.launch_dir.as_deref(), Some(launch.as_path()));
+        assert_eq!(app.workspace.as_deref(), Some(launch.as_path()));
+        let sessions = app.catalog.list().expect("catalog lists");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].cwd.as_deref(), Some(launch.as_path()));
+        assert_eq!(app.draft_id.as_deref(), Some(sessions[0].id.as_str()));
+
+        // Choosing another workspace from the warning re-targets the same draft.
+        let other = directory(&root, "other");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.screen == Screen::Workspace);
+        for character in other.display().to_string().chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.screen == Screen::Warning, "{}", app.status);
+        let sessions = app.catalog.list().expect("catalog lists");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].cwd.as_deref(), Some(other.as_path()));
+    }
+
+    #[test]
+    fn unresolved_launch_directory_shows_a_bounded_error_without_a_draft() {
+        let root = root("launch-error");
+        let missing = resolve_launch_directory(Ok(root.0.join("missing")))
+            .expect_err("a missing launch directory is rejected");
+        assert!(missing.starts_with("Could not resolve the launch directory"));
+        let long = resolve_launch_directory(Err(std::io::Error::other("x".repeat(4_000))))
+            .expect_err("current_dir failure is reported");
+        assert!(long.chars().count() <= MAX_STARTUP_ERROR_CHARS);
+
+        let mut app = open_app(&root);
+        app.open_initial_screen(Err(long));
+
+        assert!(app.screen == Screen::Workspace);
+        assert!(app.status_is_blocking());
+        assert!(
+            app.status
+                .starts_with("Could not read the launch directory")
+        );
+        assert!(app.launch_dir.is_none());
+        assert!(app.catalog.list().expect("catalog lists").is_empty());
+    }
+
+    #[test]
+    fn existing_sessions_keep_their_primary_and_new_sessions_use_the_launch_directory() {
+        let root = root("picker");
+        let saved = directory(&root, "saved");
+        let launch = directory(&root, "launch");
+        let mut app = open_app(&root);
+        app.catalog
+            .create_draft(SessionInterface::Tui, None, Some(&saved))
+            .expect("saved draft is created");
+        app.refresh_sessions();
+
+        app.open_initial_screen(Ok(launch.clone()));
+        assert!(app.screen == Screen::SessionPicker);
+        app.handle_key(key(KeyCode::Char('n')));
+
+        let sessions = app.catalog.list().expect("catalog lists");
+        assert_eq!(sessions.len(), 2);
+        let mut primaries = sessions
+            .iter()
+            .filter_map(|session| session.cwd.clone())
+            .collect::<Vec<_>>();
+        primaries.sort();
+        let mut expected = vec![saved, launch.clone()];
+        expected.sort();
+        assert_eq!(primaries, expected);
+        assert_eq!(app.workspace.as_deref(), Some(launch.as_path()));
+    }
+
+    #[test]
+    fn add_dir_persists_ordered_canonical_directories_without_starting_a_turn() {
+        let root = root("add");
+        let workspace = directory(&root, "workspace");
+        let spaced = directory(&root, "workspace/extra dir");
+        let second = directory(&root, "second");
+        let mut app = draft_app(&root, &workspace);
+
+        submit_draft(&mut app, "/add-dir extra dir");
+        assert_eq!(
+            app.status,
+            format!(
+                "Added directory {}; later turns include it as workspace context.",
+                spaced.display()
+            )
+        );
+        assert!(app.composer.text().is_empty());
+
+        submit_draft(&mut app, "/add-dir .");
+        assert_eq!(
+            app.status,
+            format!(
+                "{} is already in this session's workspace.",
+                workspace.display()
+            )
+        );
+        submit_draft(&mut app, &format!("  /add-dir   {}  ", second.display()));
+        submit_draft(&mut app, "/add-dir extra dir/../extra dir");
+        assert!(
+            app.status
+                .ends_with("is already in this session's workspace.")
+        );
+
+        let expected = vec![spaced, second];
+        assert_eq!(app.additional_directories, expected);
+        assert_eq!(recorded_directories(&app), expected);
+        assert!(app.composer.text().is_empty());
+        assert!(app.transcript.is_empty(), "no provider turn was started");
+        assert!(app.turn_status == TurnStatus::Idle);
+
+        let id = app.current_record_id().expect("record").to_string();
+        let reopened = ConversationState::from_catalog(&app.catalog.get(&id).expect("reloads"));
+        assert_eq!(reopened.additional_directories, expected);
+        assert_eq!(reopened.workspace.as_deref(), Some(workspace.as_path()));
+        assert!(
+            reopened.composer.text().is_empty(),
+            "the cleared draft persisted"
+        );
+    }
+
+    #[test]
+    fn rejected_add_dir_keeps_the_draft_and_metadata() {
+        let root = root("reject");
+        let workspace = directory(&root, "workspace");
+        std::fs::write(workspace.join("file.txt"), "not a directory").unwrap();
+        let mut app = draft_app(&root, &workspace);
+
+        for draft in [
+            "/add-dir",
+            "/add-dir   ",
+            "/add-dir missing",
+            "/add-dir file.txt",
+        ] {
+            submit_draft(&mut app, draft);
+            assert!(app.status_is_blocking(), "{draft}: {}", app.status);
+            assert_eq!(app.composer.text(), draft);
+        }
+        assert!(app.status.starts_with("Could not add directory:"));
+        assert!(recorded_directories(&app).is_empty());
+        assert!(app.transcript.is_empty(), "no provider turn was started");
+
+        assert_eq!(add_dir_argument("/add-dirx"), None);
+        assert_eq!(add_dir_argument("please /add-dir x"), None);
+        assert_eq!(add_dir_argument("/add-dir  a b "), Some(Ok("a b")));
+        assert!(matches!(add_dir_argument("/add-dir a\nb"), Some(Err(_))));
+        assert!(matches!(
+            add_dir_argument("/add-dir a\u{F0000}"),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn add_dir_is_accepted_while_a_turn_is_active() {
+        let root = root("busy");
+        let workspace = directory(&root, "workspace");
+        let extra = directory(&root, "workspace/extra");
+        let mut app = draft_app(&root, &workspace);
+        app.turn_status = TurnStatus::Running;
+
+        submit_draft(&mut app, "/add-dir extra");
+        assert!(app.status.starts_with("Added directory"), "{}", app.status);
+        assert_eq!(recorded_directories(&app), vec![extra]);
+
+        submit_draft(&mut app, "next prompt");
+        assert_eq!(app.status, "Busy: wait for the active turn");
+        assert_eq!(app.composer.text(), "next prompt");
+    }
+
+    #[test]
+    fn picker_and_header_show_directory_order_and_a_missing_directory() {
+        let root = root("render");
+        let workspace = directory(&root, "w");
+        let first = directory(&root, "a");
+        let gone = directory(&root, "b");
+        let mut app = draft_app(&root, &workspace);
+        submit_draft(&mut app, &format!("/add-dir {}", first.display()));
+        submit_draft(&mut app, &format!("/add-dir {}", gone.display()));
+        std::fs::remove_dir(&gone).unwrap();
+
+        let header = rendered(&mut app, 80, 24);
+        assert!(header.contains(" +2 · catalog:"), "{header}");
+
+        app.begin_session_picker();
+        let picker = rendered(&mut app, 600, 40);
+        assert!(picker.contains("+2 dirs"), "{picker}");
+        let also = format!("also: {}  ·  {} (missing)", first.display(), gone.display());
+        assert!(picker.contains(&also), "{picker}");
+
+        let id = app.current_record_id().expect("record").to_string();
+        let reopened = ConversationState::from_catalog(&app.catalog.get(&id).expect("reloads"));
+        assert!(!reopened.status_is_blocking());
+        assert!(
+            reopened.status.starts_with(&format!(
+                "Added directory {} is missing; restore it or /add-dir a replacement.",
+                gone.display()
+            )),
+            "{}",
+            reopened.status
+        );
+        assert_eq!(reopened.workspace.as_deref(), Some(workspace.as_path()));
     }
 }
