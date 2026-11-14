@@ -2609,7 +2609,7 @@ def run_workspace_flow_smoke(args: argparse.Namespace) -> None:
         child = None
         output = TerminalCapture()
         try:
-            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env)
+            master_fd, slave_fd, child, initial_termios = spawn_in_pty(command, env, cwd=workspace)
             read_until(
                 master_fd,
                 child,
