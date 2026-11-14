@@ -3725,16 +3725,14 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
             assert "Path:" not in terminal_screen_text(bytes(output), 40, 120)
 
             resize_pty(slave_fd, 24, 80)
-            read_until_screen_text(
-                master_fd,
-                child,
-                output,
-                "Leg can run shell commands",
-                rows=24,
-                columns=80,
-            )
-            drain_for(master_fd, output, 0.2)
-            warning_screen = terminal_screen_text(bytes(output), 24, 80)
+            # The 120x40 frame already shows the warning clipped at 80 columns,
+            # so wait for the complete warning from the 80x24 redraw.
+            deadline = time.monotonic() + 8.0
+            while True:
+                drain_for(master_fd, output, 0.1, child)
+                warning_screen = terminal_screen_text(bytes(output), 24, 80)
+                if screen_contains(warning_screen, WARNING) or time.monotonic() >= deadline:
+                    break
             assert screen_contains(warning_screen, WARNING), (
                 f"first-run warning clipped at 80x24: {warning_screen!r}"
             )
