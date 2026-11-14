@@ -552,6 +552,23 @@ root or end in `/v1`; leg appends the selected endpoint. `LEG_MODEL` is passed
 through unchanged and defaults to `gpt-4.1-mini` for these protocols. OpenAI
 credentials and base URL are independent of the Anthropic settings.
 
+The Responses protocol also accepts two optional settings:
+
+- `OPENAI_RESPONSES_URL` is a full endpoint URL used verbatim for the POST,
+  in place of the URL derived from `OPENAI_BASE_URL`. Chat Completions ignores
+  it.
+- `LEG_OPENAI_FLAVOR` selects the request shape: `api` (default) leaves the
+  request unchanged; `chatgpt` adds `"store": false` for the ChatGPT backend.
+  Only Responses consumes it: Anthropic ignores it, `chatgpt` with
+  `LEG_PROVIDER=openai-chat-completions` is rejected at startup, and so are
+  unknown flavors.
+
+```
+LEG_PROVIDER=openai-responses OPENAI_API_KEY=<token> \
+  OPENAI_RESPONSES_URL=https://chatgpt.com/backend-api/codex/responses \
+  LEG_OPENAI_FLAVOR=chatgpt leg ask "hello"
+```
+
 ### Tool loop
 
 `ask`, `session`, and `exchange` share one tool loop. It runs only when a

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
-use crate::config::LegConfig;
+use crate::config::{LegConfig, OpenAiFlavor};
 use crate::error::{LegError, Result};
 use crate::model::{
     AssistantReply, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, ToolSpec,
@@ -74,7 +74,10 @@ impl<H: HttpClient> OpenAiResponsesClient<H> {
             ("Authorization", auth_value.as_str()),
             ("content-type", "application/json"),
         ];
-        let url = common::endpoint(&self.config.base_url, "responses");
+        let url = match &self.config.openai_responses_url {
+            Some(url) => url.clone(),
+            None => common::endpoint(&self.config.base_url, "responses"),
+        };
 
         let mut decoder = SseDecoder::default();
         let mut assembler = ResponsesAssembler {
@@ -247,6 +250,9 @@ fn build_request_body_with_max_tokens(
         "max_output_tokens": max_output_tokens,
         "stream": true
     });
+    if config.openai_flavor == OpenAiFlavor::ChatGpt {
+        request["store"] = Value::Bool(false);
+    }
     if let Some(ThinkingRequest::Effort(effort)) = config.thinking.request(max_output_tokens) {
         request["reasoning"] = json!({"effort": effort});
     }
@@ -963,6 +969,8 @@ mod tests {
             provider: Provider::OpenAiResponses,
             credential: Credential::Bearer("secret".to_string()),
             base_url: "https://api.openai.com/v1".to_string(),
+            openai_responses_url: None,
+            openai_flavor: crate::config::OpenAiFlavor::Api,
             model: "test-model".to_string(),
             timeout: Duration::from_secs(5),
             stream_idle_timeout: Duration::from_secs(120),
@@ -1147,10 +1155,52 @@ mod tests {
         );
         let body: Value = serde_json::from_str(body).expect("request JSON");
         assert_eq!(body["stream"], true);
+        assert!(body.get("store").is_none());
         assert_eq!(body["instructions"], "be concise");
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["input"][1]["type"], "function_call");
         assert_eq!(body["input"][2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn chatgpt_flavor_posts_to_full_url_override_with_store_disabled() {
+        let response = json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+            "usage":{"input_tokens":1,"output_tokens":1}
+        });
+        let body = [
+            event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_chatgpt"}}),
+            ),
+            event(
+                "response.completed",
+                json!({"type":"response.completed","response":response}),
+            ),
+        ]
+        .join("");
+        let mut config = config();
+        config.base_url = "https://ignored.example/v1".to_string();
+        config.openai_responses_url =
+            Some("https://chatgpt.example/backend-api/codex/responses".to_string());
+        config.openai_flavor = OpenAiFlavor::ChatGpt;
+        let http = FakeHttp {
+            body,
+            request: RefCell::new(None),
+        };
+        let client = OpenAiResponsesClient::with_http(config, http);
+        let reply = client
+            .send_conversation(&[Message::user("hi")])
+            .expect("response parses");
+        assert_eq!(reply.content, [ContentBlock::text("ok")]);
+
+        let request = client.http.request.borrow();
+        let (url, _, body) = request.as_ref().expect("request captured");
+        assert_eq!(url, "https://chatgpt.example/backend-api/codex/responses");
+        let body: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
     }
 
     #[test]

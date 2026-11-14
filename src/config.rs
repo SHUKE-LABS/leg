@@ -7,7 +7,8 @@
 //!
 //! Authentication is modelled as a typed [`Credential`]. Anthropic keeps its
 //! API-key/OAuth precedence, while both OpenAI wire protocols share
-//! `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
+//! `OPENAI_API_KEY` and `OPENAI_BASE_URL`. The Responses protocol may also
+//! take a full `OPENAI_RESPONSES_URL` and a `LEG_OPENAI_FLAVOR` request shape.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -91,6 +92,16 @@ impl Provider {
     }
 }
 
+/// OpenAI Responses request flavor, from `LEG_OPENAI_FLAVOR`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenAiFlavor {
+    /// The public OpenAI API request shape.
+    #[default]
+    Api,
+    /// The ChatGPT backend request shape, which requires `store: false`.
+    ChatGpt,
+}
+
 /// Authentication credential for the selected provider.
 ///
 /// Variants map 1:1 onto the wire-format header the transport emits, including
@@ -116,6 +127,11 @@ pub struct LegConfig {
     pub credential: Credential,
     /// Provider base URL, from `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`.
     pub base_url: String,
+    /// Full Responses endpoint from `OPENAI_RESPONSES_URL`, used verbatim in
+    /// place of the URL derived from `base_url`. Unset or blank means `None`.
+    pub openai_responses_url: Option<String>,
+    /// OpenAI Responses request flavor, from `LEG_OPENAI_FLAVOR`.
+    pub openai_flavor: OpenAiFlavor,
     /// Model id to request. From `LEG_MODEL`, defaulting to a provider-specific
     /// model.
     pub model: String,
@@ -209,6 +225,13 @@ impl LegConfig {
                 DEFAULT_OPENAI_MODEL,
             ),
         };
+        let openai_responses_url = non_empty(lookup("OPENAI_RESPONSES_URL"));
+        let openai_flavor = parse_openai_flavor(non_empty(lookup("LEG_OPENAI_FLAVOR")))?;
+        if openai_flavor == OpenAiFlavor::ChatGpt && provider == Provider::OpenAiChatCompletions {
+            return Err(LegError::Config(
+                "LEG_OPENAI_FLAVOR=chatgpt requires LEG_PROVIDER=openai-responses, got LEG_PROVIDER=openai-chat-completions".to_string(),
+            ));
+        }
         let model = non_empty(lookup("LEG_MODEL")).unwrap_or_else(|| default_model.to_string());
 
         let thinking = ThinkingConfig::resolve(
@@ -370,6 +393,8 @@ impl LegConfig {
             provider,
             credential,
             base_url,
+            openai_responses_url,
+            openai_flavor,
             model,
             timeout: Duration::from_secs(timeout_secs),
             stream_idle_timeout: Duration::from_secs(stream_idle_timeout_secs),
@@ -580,6 +605,16 @@ fn parse_provider(value: Option<String>) -> Result<Provider> {
         Some("openai-responses") => Ok(Provider::OpenAiResponses),
         Some(value) => Err(LegError::Config(format!(
             "LEG_PROVIDER must be one of anthropic, openai-chat-completions, or openai-responses, got {value:?}"
+        ))),
+    }
+}
+
+fn parse_openai_flavor(value: Option<String>) -> Result<OpenAiFlavor> {
+    match value.as_deref() {
+        None | Some("api") => Ok(OpenAiFlavor::Api),
+        Some("chatgpt") => Ok(OpenAiFlavor::ChatGpt),
+        Some(value) => Err(LegError::Config(format!(
+            "LEG_OPENAI_FLAVOR must be one of api or chatgpt, got {value:?}"
         ))),
     }
 }
@@ -894,6 +929,66 @@ mod tests {
         assert_eq!(cfg.provider, Provider::OpenAiResponses);
         assert_eq!(cfg.base_url, DEFAULT_OPENAI_BASE_URL);
         assert_eq!(cfg.model, DEFAULT_OPENAI_MODEL);
+    }
+
+    #[test]
+    fn openai_responses_url_and_flavor_default_and_override() {
+        let cfg = LegConfig::from_lookup(lookup_from(&[
+            ("LEG_PROVIDER", "openai-responses"),
+            ("OPENAI_API_KEY", "openai-secret"),
+            ("OPENAI_RESPONSES_URL", "  "),
+            ("LEG_OPENAI_FLAVOR", ""),
+        ]))
+        .expect("blank values fall back to defaults");
+        assert_eq!(cfg.openai_responses_url, None);
+        assert_eq!(cfg.openai_flavor, OpenAiFlavor::Api);
+
+        let cfg = LegConfig::from_lookup(lookup_from(&[
+            ("LEG_PROVIDER", "openai-responses"),
+            ("OPENAI_API_KEY", "openai-secret"),
+            (
+                "OPENAI_RESPONSES_URL",
+                "https://chatgpt.example/backend-api/codex/responses",
+            ),
+            ("LEG_OPENAI_FLAVOR", "chatgpt"),
+        ]))
+        .expect("Responses overrides load");
+        assert_eq!(
+            cfg.openai_responses_url.as_deref(),
+            Some("https://chatgpt.example/backend-api/codex/responses")
+        );
+        assert_eq!(cfg.openai_flavor, OpenAiFlavor::ChatGpt);
+
+        let cfg = LegConfig::from_lookup(lookup_from(&[
+            ("LEG_PROVIDER", "openai-chat-completions"),
+            ("OPENAI_API_KEY", "openai-secret"),
+            ("LEG_OPENAI_FLAVOR", "api"),
+        ]))
+        .expect("api flavor is valid for Chat Completions");
+        assert_eq!(cfg.openai_flavor, OpenAiFlavor::Api);
+    }
+
+    #[test]
+    fn rejects_invalid_or_mismatched_openai_flavor() {
+        let invalid = LegConfig::from_lookup(lookup_from(&[
+            ("LEG_PROVIDER", "openai-responses"),
+            ("OPENAI_API_KEY", "openai-secret"),
+            ("LEG_OPENAI_FLAVOR", "codex"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(invalid, LegError::Config(_)));
+        assert!(invalid.to_string().contains("LEG_OPENAI_FLAVOR"));
+
+        let mismatched = LegConfig::from_lookup(lookup_from(&[
+            ("LEG_PROVIDER", "openai-chat-completions"),
+            ("OPENAI_API_KEY", "openai-secret"),
+            ("LEG_OPENAI_FLAVOR", "chatgpt"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(mismatched, LegError::Config(_)));
+        let message = mismatched.to_string();
+        assert!(message.contains("LEG_OPENAI_FLAVOR"), "{message}");
+        assert!(message.contains("LEG_PROVIDER"), "{message}");
     }
 
     #[test]

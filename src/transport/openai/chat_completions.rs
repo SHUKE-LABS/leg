@@ -800,6 +800,8 @@ mod tests {
             provider: Provider::OpenAiChatCompletions,
             credential: Credential::Bearer("secret".to_string()),
             base_url: "https://api.openai.com".to_string(),
+            openai_responses_url: None,
+            openai_flavor: crate::config::OpenAiFlavor::Api,
             model: "test-model".to_string(),
             timeout: Duration::from_secs(5),
             stream_idle_timeout: Duration::from_secs(120),
