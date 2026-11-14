@@ -250,11 +250,16 @@ fn resolve_launch_directory(current: io::Result<PathBuf>) -> Result<PathBuf, Str
 /// The path argument of an exact `/add-dir <path>` command. `None` means the
 /// draft is not the command; `Some(Err)` is a malformed command.
 fn add_dir_argument(draft: &str) -> Option<Result<&str, &'static str>> {
-    let rest = draft.trim().strip_prefix(ADD_DIR_COMMAND)?;
+    // Only horizontal padding is trimmed, so line breaks reach the
+    // single-line check below instead of being silently dropped.
+    let horizontal = |character: char| character == ' ' || character == '\t';
+    let rest = draft
+        .trim_matches(horizontal)
+        .strip_prefix(ADD_DIR_COMMAND)?;
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    let path = rest.trim();
+    let path = rest.trim_matches(horizontal);
     if path.is_empty() {
         return Some(Err(ADD_DIR_USAGE));
     }
@@ -7687,11 +7692,14 @@ mod workspace_directory_tests {
         let root = root("reject");
         let workspace = directory(&root, "workspace");
         std::fs::write(workspace.join("file.txt"), "not a directory").unwrap();
+        directory(&root, "workspace/extra");
         let mut app = draft_app(&root, &workspace);
 
         for draft in [
             "/add-dir",
             "/add-dir   ",
+            "/add-dir\nextra",
+            "/add-dir extra\n",
             "/add-dir missing",
             "/add-dir file.txt",
         ] {
@@ -7707,6 +7715,8 @@ mod workspace_directory_tests {
         assert_eq!(add_dir_argument("please /add-dir x"), None);
         assert_eq!(add_dir_argument("/add-dir  a b "), Some(Ok("a b")));
         assert!(matches!(add_dir_argument("/add-dir a\nb"), Some(Err(_))));
+        assert!(matches!(add_dir_argument("/add-dir\na"), Some(Err(_))));
+        assert!(matches!(add_dir_argument("/add-dir a\r\n"), Some(Err(_))));
         assert!(matches!(
             add_dir_argument("/add-dir a\u{F0000}"),
             Some(Err(_))
