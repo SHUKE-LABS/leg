@@ -3726,7 +3726,10 @@ def run_resize_and_non_tty_smoke(args: argparse.Namespace) -> None:
 
             resize_pty(slave_fd, 24, 80)
             # The 120x40 frame already shows the warning clipped at 80 columns,
-            # so wait for the complete warning from the 80x24 redraw.
+            # so wait for the complete warning from the 80x24 redraw. The
+            # warning ignores "x"; the keypress forces a redraw on hosts that
+            # do not report the resize, as the former workspace-form input did.
+            os.write(master_fd, b"x")
             deadline = time.monotonic() + 8.0
             while True:
                 drain_for(master_fd, output, 0.1, child)
