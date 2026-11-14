@@ -176,7 +176,7 @@ def run_tui_turn(
         terminal.wait_contains(harness.COMPOSER_HINT)
         terminal.write("install resolution smoke")
         terminal.wait_contains("install resolution smoke")
-        terminal.write_control("s")
+        terminal.write("\r")
 
         deadline = time.monotonic() + 30.0
         status: dict = {}
