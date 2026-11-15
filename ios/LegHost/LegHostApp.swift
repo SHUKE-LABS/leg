@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 /// The native iOS host for the leg guest.
@@ -15,6 +16,7 @@ struct LegHostApp: App {
         WindowGroup {
             GuestHostScreen(controller: controller)
                 .onAppear { controller.start() }
+                .onOpenURL { url in controller.handleOpenURL(url) }
                 .onChange(of: scenePhase) { phase in
                     switch phase {
                     case .background:
@@ -35,6 +37,7 @@ struct LegHostApp: App {
 struct GuestHostScreen: View {
     @ObservedObject var controller: GuestHostController
     @State private var showingProviderSettings = false
+    @State private var showingShortcutSettings = false
 
     /// The identity of the terminal.
     ///
@@ -92,6 +95,10 @@ struct GuestHostScreen: View {
                               required: false,
                               onDismiss: { showingProviderSettings = false })
         }
+        .sheet(isPresented: $showingShortcutSettings) {
+            ShortcutSetupView(controller: controller,
+                              onDismiss: { showingShortcutSettings = false })
+        }
     }
 
     /// The rows above the terminal of a guest that runs.
@@ -132,6 +139,9 @@ struct GuestHostScreen: View {
             Button("Provider") { showingProviderSettings = true }
                 .font(.caption2.monospaced())
                 .accessibilityIdentifier("provider-settings")
+            Button("Shortcuts") { showingShortcutSettings = true }
+                .font(.caption2.monospaced())
+                .accessibilityIdentifier("shortcut-settings")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
@@ -269,6 +279,8 @@ struct GuestHostScreen: View {
             LabeledContent("Vendored iSH revision", value: HostBundle.ishRevision ?? "unknown")
             Button("Provider settings") { showingProviderSettings = true }
                 .accessibilityIdentifier("provider-settings")
+            Button("Shortcut settings") { showingShortcutSettings = true }
+                .accessibilityIdentifier("shortcut-settings")
             if controller.reusedVerifiedRoot {
                 LabeledContent("Guest root", value: "reused the verified root")
             }
@@ -300,4 +312,9 @@ enum HostBundle {
         }
         return contents.trimmingCharacters(in: .whitespacesAndNewlines)
     }()
+
+    /// The mobile-only Skill staged into the guest's existing Skills v1 root.
+    static let shortcutSkillURL: URL? =
+        Bundle.main.url(forResource: "SKILL", withExtension: "md",
+                        subdirectory: "Skills/shortcuts")
 }

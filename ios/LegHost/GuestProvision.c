@@ -61,6 +61,7 @@ static const char guest_shell_shim[] =
 #define GUEST_ACTIVE_DIR_NAME "root.active"
 #define GUEST_MAX_PATH_FIELD 1024
 #define GUEST_MAX_TEXT_FIELD (64 * 1024)
+#define GUEST_MAX_SHORTCUT_SKILL_BYTES (64 * 1024)
 
 /*
  * The compatibility fields, in the order the manifest check, the marker and
@@ -1434,8 +1435,8 @@ static bool copy_entry(struct archive *in, struct archive *out, uint64_t *size_o
  */
 static bool build_staging_archive(const char *alpine_path, const char *bundle_path,
                                   const struct guest_pins *pins, const struct guest_bundle *bundle,
-                                  const char *archive_path, struct staged_list *files, char *error,
-                                  size_t error_size) {
+                                  const char *shortcut_skill_path, const char *archive_path,
+                                  struct staged_list *files, char *error, size_t error_size) {
     struct archive *out = archive_write_new();
     if (out == NULL) {
         set_error(error, error_size, "cannot create an archive writer");
@@ -1631,6 +1632,61 @@ static bool build_staging_archive(const char *alpine_path, const char *bundle_pa
         goto done;
     }
 
+    /* The mobile Skill is shipped as an ordinary guest file so the existing
+     * Skills v1 discovery rules can activate it without changing desktop
+     * registries or the guest bundle programs. */
+    if (shortcut_skill_path != NULL) {
+        struct stat skill_info;
+        if (lstat(shortcut_skill_path, &skill_info) != 0) {
+            set_error(error, error_size, "cannot stat the Shortcut Skill %s: %s", shortcut_skill_path,
+                      strerror(errno));
+            goto done;
+        }
+        if (!S_ISREG(skill_info.st_mode) || skill_info.st_size < 0 ||
+            (uintmax_t) skill_info.st_size > GUEST_MAX_SHORTCUT_SKILL_BYTES) {
+            set_error(error, error_size, "the Shortcut Skill is not a regular file of at most %d bytes",
+                      GUEST_MAX_SHORTCUT_SKILL_BYTES);
+            goto done;
+        }
+        if (staged_list_find(files, GUEST_SHORTCUT_SKILL_PATH) != NULL) {
+            set_error(error, error_size, "the Alpine root already contains %s", GUEST_SHORTCUT_SKILL_PATH);
+            goto done;
+        }
+
+        char *skill = NULL;
+        size_t skill_length = 0;
+        if (!read_whole_file(shortcut_skill_path, &skill, &skill_length, error, error_size))
+            goto done;
+        if (skill_length > GUEST_MAX_SHORTCUT_SKILL_BYTES) {
+            free(skill);
+            set_error(error, error_size, "the Shortcut Skill is larger than %d bytes",
+                      GUEST_MAX_SHORTCUT_SKILL_BYTES);
+            goto done;
+        }
+        if (!write_entry_header(out, GUEST_SHORTCUT_SKILL_PATH, AE_IFREG, 0644,
+                                (uint64_t) skill_length, NULL, NULL, 0, error, error_size)) {
+            free(skill);
+            goto done;
+        }
+        if (archive_write_data(out, skill, skill_length) < 0) {
+            set_error(error, error_size, "cannot write the Shortcut Skill: %s",
+                      archive_error_string(out));
+            free(skill);
+            goto done;
+        }
+
+        struct staged_file skill_record;
+        memset(&skill_record, 0, sizeof(skill_record));
+        snprintf(skill_record.path, sizeof(skill_record.path), "%s", GUEST_SHORTCUT_SKILL_PATH);
+        skill_record.size = skill_length;
+        sha256_hex(skill, skill_length, skill_record.sha256);
+        free(skill);
+        if (!staged_list_add(files, &skill_record)) {
+            set_error(error, error_size, "out of memory recording the staged files");
+            goto done;
+        }
+    }
+
     /* The marker goes in last: it describes everything staged before it. */
     char *marker = NULL;
     size_t marker_length = 0;
@@ -1731,8 +1787,8 @@ static bool marker_matches_pins(const struct json_value *marker, const struct gu
  * marker has to match the pins.
  */
 static bool verify_root(const char *root, const struct guest_pins *pins,
-                        const struct guest_bundle *bundle, char marker_sha[SHA256_HEX_LEN + 1],
-                        char *error, size_t error_size) {
+                        const struct guest_bundle *bundle, const char *shortcut_skill_path,
+                        char marker_sha[SHA256_HEX_LEN + 1], char *error, size_t error_size) {
     char path[GUEST_PATH_MAX];
 
     snprintf(path, sizeof(path), "%s/meta.db", root);
@@ -1767,6 +1823,22 @@ static bool verify_root(const char *root, const struct guest_pins *pins,
             return false;
         }
         bool matches = marker_matches_pins(marker, pins, error, error_size);
+        if (matches && shortcut_skill_path != NULL) {
+            const struct json_value *record = marker_find_file(marker, GUEST_SHORTCUT_SKILL_PATH);
+            const char *sha = json_as_string(json_member_get(record, "sha256"));
+            if (sha == NULL) {
+                set_error(error, error_size, "the guest root marker has no Shortcut Skill digest");
+                matches = false;
+            } else {
+                char expected[SHA256_HEX_LEN + 1];
+                if (!sha256_of_file(shortcut_skill_path, expected, error, error_size))
+                    matches = false;
+                else if (strcmp(sha, expected) != 0) {
+                    set_error(error, error_size, "the guest root marker records a different Shortcut Skill digest");
+                    matches = false;
+                }
+            }
+        }
         json_free(marker);
         if (!matches)
             return false;
@@ -1780,6 +1852,14 @@ static bool verify_root(const char *root, const struct guest_pins *pins,
             return false;
         }
         if (!verify_file_digest(path, bundle->entries[index].sha256, error, error_size))
+            return false;
+    }
+    if (shortcut_skill_path != NULL) {
+        char expected[SHA256_HEX_LEN + 1];
+        if (!sha256_of_file(shortcut_skill_path, expected, error, error_size))
+            return false;
+        snprintf(path, sizeof(path), "%s/data%s", root, GUEST_SHORTCUT_SKILL_PATH);
+        if (!verify_file_digest(path, expected, error, error_size))
             return false;
     }
     return true;
@@ -1796,6 +1876,7 @@ enum reuse_state { REUSE_ABSENT, REUSE_VALID, REUSE_INVALID };
  */
 static enum reuse_state check_active_root(const char *active, const struct guest_pins *pins,
                                           const struct guest_bundle *bundle,
+                                          const char *shortcut_skill_path,
                                           char marker_sha[SHA256_HEX_LEN + 1], char *error,
                                           size_t error_size) {
     char path[GUEST_PATH_MAX];
@@ -1837,6 +1918,18 @@ static enum reuse_state check_active_root(const char *active, const struct guest
                 break;
             }
         }
+        if (ok && shortcut_skill_path != NULL) {
+            const struct json_value *record = marker_find_file(marker, GUEST_SHORTCUT_SKILL_PATH);
+            const char *sha = json_as_string(json_member_get(record, "sha256"));
+            char expected[SHA256_HEX_LEN + 1];
+            if (sha == NULL || !sha256_of_file(shortcut_skill_path, expected, error, error_size) ||
+                strcmp(sha, expected) != 0) {
+                if (sha != NULL && (error == NULL || error_size == 0 || error[0] == '\0'))
+                    set_error(error, error_size,
+                              "the active root records a different Shortcut Skill digest");
+                ok = false;
+            }
+        }
     }
     json_free(marker);
     if (!ok)
@@ -1857,6 +1950,15 @@ static enum reuse_state check_active_root(const char *active, const struct guest
     sha256_hex(guest_shell_shim, sizeof(guest_shell_shim) - 1, shim_sha);
     if (!verify_file_digest(path, shim_sha, error, error_size))
         return REUSE_INVALID;
+
+    if (shortcut_skill_path != NULL) {
+        char skill_sha[SHA256_HEX_LEN + 1];
+        if (!sha256_of_file(shortcut_skill_path, skill_sha, error, error_size))
+            return REUSE_INVALID;
+        snprintf(path, sizeof(path), "%s/data%s", active, GUEST_SHORTCUT_SKILL_PATH);
+        if (!verify_file_digest(path, skill_sha, error, error_size))
+            return REUSE_INVALID;
+    }
 
     return REUSE_VALID;
 }
@@ -1924,7 +2026,7 @@ int guest_provision(const struct guest_pins *pins, const char *guest_bundle_path
                     const char *alpine_root_path, const char *roots_dir,
                     const struct guest_provision_options *options,
                     struct guest_provision_result *result, char *error, size_t error_size) {
-    struct guest_provision_options defaults = {false};
+    struct guest_provision_options defaults = {false, NULL};
     if (options == NULL)
         options = &defaults;
 
@@ -2021,8 +2123,8 @@ int guest_provision(const struct guest_pins *pins, const char *guest_bundle_path
     /* 5. An existing root is reused when the marker and the four guest
      * programs still verify against the pins. */
     char marker_sha[SHA256_HEX_LEN + 1] = {0};
-    enum reuse_state reuse = check_active_root(active, pins, &bundle, marker_sha, status_message,
-                                               sizeof(status_message));
+    enum reuse_state reuse = check_active_root(active, pins, &bundle, options->shortcut_skill_path,
+                                               marker_sha, status_message, sizeof(status_message));
     if (reuse == REUSE_VALID) {
         guest_bundle_free(&bundle);
         snprintf(result->active_root, sizeof(result->active_root), "%s", active);
@@ -2054,8 +2156,9 @@ int guest_provision(const struct guest_pins *pins, const char *guest_bundle_path
     struct staged_list files;
     memset(&files, 0, sizeof(files));
 
-    if (!build_staging_archive(alpine_root_path, guest_bundle_path, pins, &bundle, staging_archive,
-                               &files, status_message, sizeof(status_message))) {
+    if (!build_staging_archive(alpine_root_path, guest_bundle_path, pins, &bundle,
+                               options->shortcut_skill_path, staging_archive, &files,
+                               status_message, sizeof(status_message))) {
         set_error(error, error_size, "%s", status_message);
         remove_tree(staging_archive);
         staged_list_free(&files);
@@ -2094,8 +2197,8 @@ int guest_provision(const struct guest_pins *pins, const char *guest_bundle_path
 
     /* 7. The staged root has to verify before it is published. */
     char staged_marker_sha[SHA256_HEX_LEN + 1] = {0};
-    if (!verify_root(staging, pins, &bundle, staged_marker_sha, status_message,
-                     sizeof(status_message))) {
+    if (!verify_root(staging, pins, &bundle, options->shortcut_skill_path, staged_marker_sha,
+                     status_message, sizeof(status_message))) {
         set_error(error, error_size, "%s", status_message);
         remove_tree(staging);
         remove_tree(staging_archive);

@@ -13,6 +13,7 @@
 #include "fs/real.h"
 #include "fs/sock.h"
 #include "debug.h"
+#include "IshPlatformShim.h"
 
 #define SOCKET_TYPE_MASK 0xf
 
@@ -225,7 +226,15 @@ static void unix_abstract_release(struct unix_abstract *name) {
 
 const char *sock_tmp_prefix = "/tmp/ishsock";
 
-static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
+/* The native host bridge is the one exception to iSH's in-process Unix
+ * socket namespace. The guest uses this fixed path; the host name is supplied
+ * by the embedding app and is never selected by a request. */
+#define HOST_BRIDGE_GUEST_PATH "/tmp/leg-host-bridge.sock"
+
+static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len,
+                              struct fd *bind_fd, bool *host_bridge) {
+    if (host_bridge != NULL)
+        *host_bridge = false;
     // Make sure we can read things without overflowing buffers
     if (*sockaddr_len < 2)
         return _EINVAL;
@@ -259,6 +268,22 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
             int err;
             if (path_size == 0) {
                 return _ENOENT;
+            } else if (bind_fd == NULL && strcmp(path, HOST_BRIDGE_GUEST_PATH) == 0
+                       && ish_host_bridge_socket() != NULL) {
+                const char *host_name = ish_host_bridge_socket();
+                size_t name_length = strlen(host_name);
+                if (host_name[0] != '/' || name_length == 0
+                    || name_length + 1 > sizeof(((struct sockaddr_un *) sockaddr)->sun_path))
+                    return _ENOENT;
+                struct sockaddr_un *real_addr_un = sockaddr;
+                memcpy(real_addr_un->sun_path, host_name, name_length + 1);
+                *sockaddr_len = offsetof(struct sockaddr_un, sun_path) + name_length + 1;
+#if defined(__APPLE__)
+                ((struct sockaddr *) sockaddr)->sa_len = (uint8_t) *sockaddr_len;
+#endif
+                if (host_bridge != NULL)
+                    *host_bridge = true;
+                return 0;
             } else if (path[0] != '\0') {
                 STRACE(" unix socket %s", path);
                 err = unix_socket_get(path, bind_fd, &socket_id);
@@ -290,9 +315,10 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
     return 0;
 }
 
-static int sockaddr_read(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len) {
+static int sockaddr_read(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len,
+                         bool *host_bridge) {
     struct inode_data *inode = NULL;
-    int err = sockaddr_read_bind(sockaddr_addr, sockaddr, sockaddr_len, NULL);
+    int err = sockaddr_read_bind(sockaddr_addr, sockaddr, sockaddr_len, NULL, host_bridge);
     inode_release_if_exist(inode);
     return err;
 }
@@ -334,7 +360,7 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         return _EBADF;
     struct sockaddr_max_ sockaddr;
     struct inode_data *inode = NULL;
-    int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, sock);
+    int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, sock, NULL);
     if (err < 0)
         return err;
 
@@ -361,7 +387,8 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (sock == NULL)
         return _EBADF;
     struct sockaddr_max_ sockaddr;
-    int err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len);
+    bool host_bridge = false;
+    int err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len, &host_bridge);
     if (err < 0)
         return err;
 
@@ -369,7 +396,7 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (err < 0)
         return errno_map();
 
-    if (sock->socket.domain == AF_LOCAL_) {
+    if (sock->socket.domain == AF_LOCAL_ && !host_bridge) {
         fill_cred(&sock->socket.unix_cred);
         assert(sock->socket.unix_peer == NULL);
         // Send a pointer to ourselves to the other end so they can set up the peer pointers.
@@ -586,7 +613,7 @@ int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, a
         goto error;
     struct sockaddr_max_ sockaddr;
     if (sockaddr_addr) {
-        err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len);
+        err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len, NULL);
         if (err < 0)
             goto error;
     }
@@ -887,7 +914,7 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     // msg_name
     struct sockaddr_max_ msg_name;
     if (msg_fake.msg_name != 0) {
-        int err = sockaddr_read(msg_fake.msg_name, &msg_name, &msg_fake.msg_namelen);
+        int err = sockaddr_read(msg_fake.msg_name, &msg_name, &msg_fake.msg_namelen, NULL);
         if (err < 0)
             return err;
         msg.msg_name = &msg_name;

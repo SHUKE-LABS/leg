@@ -95,6 +95,22 @@ Every item was run on the device of the table above on the day of the table.
 | The uninstall and the install clear the guest data | pass | the sessions of the guest catalog went from one to none over the uninstall and the install, and the root was imported again (a new `root.active`) |
 | A Release build on a clean device stops at the provider boundary | pass | the container of the Release build holds no guest root: the host read the provider configuration first, found no item in the Keychain of the device, and provisioned nothing |
 
+### Shortcut adapter validation for issue #258
+
+The historical run above predates the iOS Shortcut adapter and is not evidence
+for this checklist. A device run for #258 must use the current commit and record
+the following outcomes:
+
+| Item | Expected evidence |
+| --- | --- |
+| Register an existing Shortcut | The Shortcuts settings form saves an exact name and its text, file, or JSON input kind; a case-mismatched name is not accepted as the same registration |
+| Unknown name | A guest `shortcuts.invoke` request receives `denied` / `shortcut_not_registered` before Apple's Shortcuts app opens |
+| Confirmation and JSON result | The host alert names the registered Shortcut and input summary; approving a deterministic JSON-returning Shortcut gives the same structured object back to the guest |
+| Missing input and refusal | The Skill asks for missing input; denying the alert returns `denied` and no Shortcut run occurs |
+| File boundary | The system picker supplies the file, the host copies it to its temporary app-owned directory, the Shortcut receives it, and the temporary copy is removed afterward |
+| Callback outcomes | A normal callback, missing result, cancellation, timeout, unknown Shortcut, and unavailable Shortcuts app produce the documented `ok`, `error`, `cancelled`, or `unavailable` mappings |
+| Foreground/background | The host may foreground Shortcuts for the run; backgrounding the host cancels the pending callback and leaves no pending approval or temporary file |
+
 ### The persistence boundaries on the device
 
 The workspace catalog of the guest lives in the guest root, in the container of

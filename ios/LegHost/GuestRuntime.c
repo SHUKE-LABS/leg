@@ -33,6 +33,7 @@
 #include "kernel/init.h"
 #include "kernel/task.h"
 #include "util/sync.h"
+#include "IshPlatformShim.h"
 
 #define GUEST_OUTPUT_CAPACITY (256 * 1024)
 #define GUEST_CONSOLE_TTYS 64
@@ -268,6 +269,10 @@ int guest_runtime_boot(const char *root_data_dir) {
 
     runtime_booted = true;
     return 0;
+}
+
+int guest_runtime_set_host_bridge_socket(const char *name) {
+    return ish_set_host_bridge_socket(name);
 }
 
 /* ---------------------------------------------------------------- session */

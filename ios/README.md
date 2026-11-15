@@ -203,6 +203,33 @@ so a root staged from another bundle is imported again. The host stages the
 programs under `/usr/local/bin`, `leg-bridge` among them; `leg-web` is not
 part of the guest.
 
+## Shortcuts
+
+The running iOS host implements the `shortcuts.invoke` capability. Open
+**Shortcuts settings**, enter the exact case-sensitive name of an existing
+Shortcut, and choose whether it accepts text, a file, or a JSON object. The
+host stores only this registration metadata. It never discovers, creates,
+edits, enables, schedules, or silently runs personal automations.
+
+The iOS bundle ships `resources/Skills/shortcuts/SKILL.md`. Provisioning stages
+it at `/root/.agents/skills/shortcuts/SKILL.md`, where the existing Skills v1
+discovery rules find it. The Skill calls only `shortcuts.invoke`; it asks for a
+missing name or input, and an unknown name returns `denied` with the stable
+reason `shortcut_not_registered` plus the registration instructions.
+
+Every invocation shows a host confirmation containing the exact name and an
+input summary. The host then opens Apple's public
+`shortcuts://run-shortcut` x-callback URL. Text and JSON inputs are capped at
+32 KiB. Files are selected with the system document picker, copied into an
+app-owned temporary directory, capped at 16 MiB, and removed after the callback;
+the guest never supplies a host path. Inputs and callback results are capped at
+32 KiB; callback waits are capped at 30 seconds.
+The host returns structured `ok`, `denied`, `cancelled`, `unavailable`, or
+`error` statuses and may need to foreground the Shortcuts app. Missing output,
+unknown Shortcut, and an unavailable Shortcuts app map to
+`error/missing_result`, `unavailable/shortcut_not_found`, and
+`unavailable/shortcuts_unavailable` respectively.
+
 The pinned SHA-256 is the `SHA256SUMS` entry the `v0.44.1` release publishes
 for the ios-mobile asset. The build and `ios/tests/run-pinned-inputs.sh` fail
 closed on an archive that does not match it.
@@ -773,7 +800,7 @@ only some of them.
 
 The provisioner is covered by host side fixtures that need neither the
 network nor a simulator: they build their own pinned inputs and exercise the
-valid path, a one byte corruption of each input, every bundle off the
+valid path, the staged mobile Shortcut Skill and its digest-based reuse, a one byte corruption of each input, every bundle off the
 ios-mobile contract (a missing manifest or `leg-bridge`, an extra file, the
 generic bundle, a wrong target, `leg_version`, `bundle_kind` or version
 command, a manifest digest that disagrees with the archive, a malformed,
@@ -828,8 +855,9 @@ root must hold, not code of them.
 
 ## Out of scope
 
-The native Photos, Files and Shortcuts adapters, and App Store metadata are
-later slices of `#255`.
+The native Photos and Files adapters, and App Store metadata, are later slices
+of `#255`. Shortcut creation, editing, enabling, scheduling, private Shortcuts
+database access, and arbitrary automation generation remain out of scope.
 The provider support of this slice is the Anthropic Messages protocol; the
 OpenAI wire variants are covered only as the rejection cases of the fixture.
 The host does not run in the background: iOS decides when the app is

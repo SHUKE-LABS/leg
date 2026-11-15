@@ -27,6 +27,11 @@ typedef void (*guest_exit_notify_callback)(int code, void *context);
  */
 int guest_runtime_boot(const char *root_data_dir);
 
+/* Configures the host endpoint behind the reserved guest bridge socket name.
+ * The path is a private app-temporary Unix socket and is never passed through
+ * the guest environment as a host filesystem path. */
+int guest_runtime_set_host_bridge_socket(const char *name);
+
 /*
  * Runs `program` on a pseudo terminal.
  *

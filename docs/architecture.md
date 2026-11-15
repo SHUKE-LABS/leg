@@ -92,9 +92,11 @@ registry are unchanged.
   dispatch happens.
 - The host owns the transport, the permission prompt, the dispatch, the
   cancellation, and the user confirmation; the bridge reaches it through the
-  `HostAdapter` seam (`src/bridge/adapter.rs`). This slice ships the seam and
-  the one fixed transport the contract names — a Unix socket — and no platform
-  adapter. Without a host the bridge answers `unavailable`.
+  `HostAdapter` seam (`src/bridge/adapter.rs`). The desktop crate ships the
+  seam and the one fixed transport the contract names — a Unix socket. The
+  native iOS host implements `shortcuts.invoke` behind that transport; it does
+  not add a desktop tool or change Skills discovery. Without a host the bridge
+  answers `unavailable`.
 - An approval is bound to the capability and the digest of the input
   (`src/bridge/state.rs`). A capability that needs consent performs no side
   effect until the Skill replays the matching token with a fresh request id,

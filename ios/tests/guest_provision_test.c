@@ -7,7 +7,8 @@
  * checksum failure, a failed import, stale staging cleanup, a reload with no
  * partial state, and a verified reuse of an existing root. The ios-mobile
  * contract cases reject every bundle that differs from the six-file mobile
- * bundle the pins describe, including the generic iSH bundle.
+ * bundle the pins describe, including the generic iSH bundle. The mobile
+ * Shortcut Skill is also staged and checked as part of the valid path.
  */
 
 #include <dirent.h>
@@ -656,12 +657,20 @@ int main(int argc, char **argv) {
 
     char error[1024];
     struct guest_provision_result result;
+    char shortcut_skill_path[1024];
+    snprintf(shortcut_skill_path, sizeof(shortcut_skill_path), "%s/shortcut-SKILL.md", work);
+    write_file(shortcut_skill_path,
+               "---\nname: shortcuts\ndescription: fixture\n---\n\nUse only shortcuts.invoke.\n");
+    struct guest_provision_options shortcut_options = {
+        .simulate_import_failure = false,
+        .shortcut_skill_path = shortcut_skill_path,
+    };
 
     /* --- a valid first run publishes an active root ------------------- */
     char roots[1024];
     snprintf(roots, sizeof(roots), "%s/roots", work);
-    int status = guest_provision(&pins, bundle_path, alpine_path, roots, NULL, &result, error,
-                                 sizeof(error));
+    int status = guest_provision(&pins, bundle_path, alpine_path, roots, &shortcut_options, &result,
+                                 error, sizeof(error));
     CHECK(status == GUEST_PROVISION_OK, "the first run failed: %s", error);
     CHECK(!result.reused, "the first run must not report a reuse");
     CHECK(path_exists(result.active_root), "the active root is missing");
@@ -677,6 +686,8 @@ int main(int argc, char **argv) {
           "the mobile guest must not stage leg-web");
     CHECK(path_exists("roots/root.active/data/etc/leg/guest-bundle.json"),
           "the guest bundle marker is missing");
+    CHECK(path_exists("roots/root.active/data/root/.agents/skills/shortcuts/SKILL.md"),
+          "the mobile Shortcut Skill is missing from the guest");
 
     /* The marker has to record both input digests and every staged file. */
     {
@@ -699,6 +710,8 @@ int main(int argc, char **argv) {
                   "the marker does not record the staged root files");
             CHECK(strstr(marker, "/bin/ash") != NULL,
                   "the marker does not record the staged symlinks");
+            CHECK(strstr(marker, GUEST_SHORTCUT_SKILL_PATH) != NULL,
+                  "the marker does not record the mobile Shortcut Skill");
             free(marker);
         }
     }
@@ -712,14 +725,28 @@ int main(int argc, char **argv) {
 
     /* --- a second run verifies the marker and reuses the root --------- */
     struct guest_provision_result second;
-    status = guest_provision(&pins, bundle_path, alpine_path, roots, NULL, &second, error,
-                              sizeof(error));
+    status = guest_provision(&pins, bundle_path, alpine_path, roots, &shortcut_options, &second,
+                              error, sizeof(error));
     CHECK(status == GUEST_PROVISION_OK, "the second run failed: %s", error);
     CHECK(second.reused, "the second run must reuse the verified root");
     CHECK(strcmp(second.marker_sha256, result.marker_sha256) == 0,
           "the reused root has a different guest bundle marker");
     CHECK(strcmp(second.active_root, result.active_root) == 0,
           "the reused root is at a different path");
+
+    /* Changing the mobile Skill invalidates the active root and stages the
+     * new content instead of reusing stale instructions. */
+    write_file(shortcut_skill_path,
+               "---\nname: shortcuts\ndescription: changed fixture\n---\n\nUse only shortcuts.invoke.\n");
+    struct guest_provision_result changed_skill;
+    status = guest_provision(&pins, bundle_path, alpine_path, roots, &shortcut_options,
+                             &changed_skill, error, sizeof(error));
+    CHECK(status == GUEST_PROVISION_OK, "the run after changing the Skill failed: %s", error);
+    CHECK(!changed_skill.reused, "a changed mobile Skill must not be reused");
+    char *staged_skill = read_file("roots/root.active/data/root/.agents/skills/shortcuts/SKILL.md");
+    CHECK(staged_skill != NULL && strstr(staged_skill, "changed fixture") != NULL,
+          "the changed mobile Skill was not staged");
+    free(staged_skill);
 
     /* --- a corrupted guest bundle fails its own digest check ---------- */
     {

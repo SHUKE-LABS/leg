@@ -129,6 +129,7 @@ for arch in ${ARCHS}; do
         -DLOG_HANDLER_OS_LOG=1
         -DENGINE_ASBESTOS=1
         -I"${ISH_SRC}"
+        -I"${SRCROOT}/LegHost"
         -I"${LIBARCHIVE_SRC}"
         -I"${gen_dir}"
     )

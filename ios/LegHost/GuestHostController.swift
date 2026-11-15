@@ -462,6 +462,13 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The launch controls of this run.
     private var options = HostLaunchOptions.current()
 
+    /// The host-owned list of exact Shortcuts the guest may invoke.
+    let shortcutRegistry = ShortcutRegistrationStore()
+    /// The native adapter behind the fixed capability bridge.
+    private lazy var shortcutsAdapter = ShortcutsAdapter(registry: shortcutRegistry)
+    /// The host endpoint the guest bridge connects to.
+    private var shortcutsBridgeServer: ShortcutsBridgeServer?
+
     /// Whether the run still has to interrupt the session on its own.
     ///
     /// The control is the one of the simulator tests: the run stops the
@@ -582,6 +589,21 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     func clearProviderConfiguration() throws {
         try ProviderConfigurationStore.clear()
         providerWasCleared = true
+    }
+
+    /// Saves one exact Shortcut registration and its declared input kind.
+    func saveShortcutRegistration(name: String, inputKind: ShortcutInputKind) throws {
+        try shortcutRegistry.save(name: name, inputKind: inputKind)
+    }
+
+    /// Removes one exact Shortcut registration.
+    func removeShortcutRegistration(name: String) throws {
+        try shortcutRegistry.remove(name: name)
+    }
+
+    /// Routes an x-callback URL back to the pending native Shortcut request.
+    func handleOpenURL(_ url: URL) {
+        shortcutsAdapter.handleCallback(url)
     }
 
     /// The app went to the background.
@@ -712,6 +734,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 watchExchangeTrail(root: activeRoot)
             }
             try await bootRuntime(root: activeRoot)
+            try startShortcutsBridge()
             state.boots += 1
             watchGuestExit()
 
@@ -759,6 +782,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         guest_runtime_set_output_notify(nil, nil)
         guest_runtime_set_exit_notify(nil, nil)
         exitContext = nil
+        shortcutsAdapter.cancelAll()
+        shortcutsBridgeServer?.stop()
+        shortcutsBridgeServer = nil
 
         // The thread of the output is joined before the next session starts:
         // a late read of the ring of the runtime would show the text of the
@@ -788,6 +814,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // next.
         let guestStopped = await stopGuestSession()
         state.guestTasks = Int(guest_runtime_running_tasks())
+        _ = guest_runtime_set_host_bridge_socket(nil)
 
         guard pumpStopped, guestStopped else {
             let reason = pumpStopped
@@ -881,6 +908,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private func provisionRoot(_ pins: HostPins) async throws -> Provisioned {
         let bundle = try HostPins.embeddedInputURL(named: pins.inputs[GUEST_INPUT_LEG_BUNDLE].filename)
         let alpine = try HostPins.embeddedInputURL(named: pins.inputs[GUEST_INPUT_ALPINE_ROOT].filename)
+        guard let shortcutSkill = HostBundle.shortcutSkillURL else {
+            throw GuestHostError(message: "The mobile Shortcut Skill is missing from the app bundle.")
+        }
         let roots = try Self.rootsDirectory()
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -891,8 +921,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                     bundle.path.withCString { bundlePointer in
                         alpine.path.withCString { alpinePointer in
                             roots.path.withCString { rootsPointer in
-                                guest_provision(pinsPointer, bundlePointer, alpinePointer, rootsPointer,
-                                                nil, &result, &message, message.count)
+                                shortcutSkill.path.withCString { skillPointer in
+                                    var provisionOptions = guest_provision_options(
+                                        simulate_import_failure: false,
+                                        shortcut_skill_path: skillPointer)
+                                    return guest_provision(pinsPointer, bundlePointer, alpinePointer,
+                                                           rootsPointer, &provisionOptions, &result,
+                                                           &message, message.count)
+                                }
                             }
                         }
                     }
@@ -1245,10 +1281,37 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         environment.append("ANTHROPIC_BASE_URL=\(baseURL)")
         environment.append("LEG_MODEL=\(model)")
         environment.append("LEG_CONTEXT_WINDOW_TOKENS=\(window)")
+        // The path is fixed inside the guest. The iSH runtime maps it to the
+        // host's private app-temporary Unix endpoint; no host path is exposed.
+        environment.append("LEG_BRIDGE_HOST_SOCKET=\(ShortcutsAdapter.guestSocketName)")
         if isFixture {
             environment.append(contentsOf: Self.fixtureEnvironment(for: options.fixtureScenario))
         }
         return environment
+    }
+
+    /// Starts the host side of the fixed capability bridge before the guest
+    /// session can issue a request.
+    private func startShortcutsBridge() throws {
+        shortcutsBridgeServer?.stop()
+        let server = ShortcutsBridgeServer { [weak self] request in
+            guard let self else {
+                return .failure(request: request, status: "unavailable",
+                                reason: "host_unreachable",
+                                message: "the iOS host is no longer running",
+                                remediation: "restart the host and retry")
+            }
+            return await self.shortcutsAdapter.handle(request)
+        }
+        try server.start()
+        let status = server.hostSocketName.withCString { pointer in
+            guest_runtime_set_host_bridge_socket(pointer)
+        }
+        guard status == 0 else {
+            server.stop()
+            throw GuestHostError(message: "The iSH capability socket could not be configured.")
+        }
+        shortcutsBridgeServer = server
     }
 
     /// The values that pin a fixture turn down.

@@ -30,6 +30,17 @@ forms cannot be confused.
 This is the only instruction the pinned guest bundle needs that the
 vendored emulator did not implement.
 
+## `fs/sock`: the fixed LegHost capability socket
+
+The iSH Unix socket namespace normally maps every guest socket to another
+socket inside the emulator process. The native `leg-bridge` client needs one
+host-owned endpoint instead. The change reserves `/tmp/leg-host-bridge.sock`
+for the embedding host, maps it to the per-session private socket file the host
+supplies, and skips iSH's in-process peer-pointer handshake for that one
+connected socket. The path is configured by the host, never by a guest
+request, and is cleared when the guest session ends. All other guest Unix
+sockets retain the upstream behavior.
+
 ## `fs/proc`: the `exe` link of a task without an address space
 
 `fs/proc/pid.c` answers the other `/proc/<pid>` entries with a check for a

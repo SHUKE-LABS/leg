@@ -13,11 +13,32 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "platform/platform.h"
+#include "IshPlatformShim.h"
 
 /* The vendored platform layer counts in 10ms ticks. */
 #define TICKS_PER_SECOND 100
+
+static char host_bridge_socket[ISH_HOST_BRIDGE_SOCKET_MAX + 1];
+
+int ish_set_host_bridge_socket(const char *name) {
+    if (name == NULL || name[0] == '\0') {
+        host_bridge_socket[0] = '\0';
+        return 0;
+    }
+    if (name[0] != '/' || strlen(name) >= ISH_HOST_BRIDGE_SOCKET_MAX)
+        return -EINVAL;
+    snprintf(host_bridge_socket, sizeof(host_bridge_socket), "%s", name);
+    return 0;
+}
+
+const char *ish_host_bridge_socket(void) {
+    return host_bridge_socket[0] == '\0' ? NULL : host_bridge_socket;
+}
 
 static uint64_t timeval_ticks(struct timeval tv) {
     return (uint64_t) tv.tv_sec * TICKS_PER_SECOND + (uint64_t) tv.tv_usec / 10000;

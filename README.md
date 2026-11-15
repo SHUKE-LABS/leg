@@ -281,6 +281,13 @@ contract](docs/capability-bridge.md) defines the schemas, the capability
 names, the approval semantics, the limits, the audit summary, and the rule a
 platform adapter has to keep.
 
+The native iOS host implements the `shortcuts.invoke` row. A user registers an
+exact existing Shortcut name and its text, file, or JSON input kind in the
+host's Shortcuts settings. The mobile Skill is shipped inside the iOS guest at
+`/root/.agents/skills/shortcuts/SKILL.md`; it asks for missing input, follows
+the host confirmation, and reports `ok`, `denied`, `cancelled`, `unavailable`,
+or `error`. It cannot create, edit, enable, or silently run automations.
+
 ## Native iOS host
 
 The repository also carries a native iOS host under [`ios/`](ios/README.md):

@@ -6,7 +6,9 @@ native permission, and one answer back. The bridge is a *protocol* boundary,
 not a capability implementation: it validates the request, binds the approval,
 keeps the request id unique, bounds the time, and summarizes the exchange. The
 host owns the transport, the permission prompt, the dispatch, the
-cancellation, and the user confirmation.
+cancellation, and the user confirmation. The iOS host implements the
+`shortcuts.invoke` adapter described below; the desktop bridge and its Skills
+registry remain unchanged.
 
 This document defines the request and answer schemas, the capability names,
 the approval semantics, the size and time limits, the audit summary, and the
@@ -70,10 +72,39 @@ a request id, or carries a disallowed path.
 | `files.read` | needed | `path` (path) |
 | `shortcuts.invoke` | needed | `name` (text), `input` (object, optional) |
 
-The names are the contract the mobile slices implement; this slice runs none
-of them. The *consent* column names the capabilities the host is expected to
-gate behind a user approval. The host owns the consent decision: it may ask
+The names are the contract the mobile slices implement. The iOS host currently
+implements only `shortcuts.invoke`; the other rows remain protocol names, not
+desktop tools. The *consent* column names the capabilities the host is expected
+to gate behind a user approval. The host owns the consent decision: it may ask
 for an approval for any capability, and the bridge honours that too.
+
+### iOS Shortcuts adapter
+
+The iOS host has a Shortcuts settings form where the user registers the exact,
+case-sensitive name of an existing Shortcut and declares one input kind:
+bounded text, a file selected through the system document picker, or a bounded
+JSON object. An unregistered name is rejected before any URL is opened with
+`status=denied` and `reason=shortcut_not_registered`; the remediation tells the
+user to register the exact name. Registration stores only the name and input
+kind, never Shortcut source or an arbitrary URL.
+
+The mobile `shortcuts` Skill is staged at
+`/root/.agents/skills/shortcuts/SKILL.md` during iOS guest provisioning. It
+calls only `shortcuts.invoke`, asks for missing names or input, follows the
+approval token flow, and reports the final status. The host opens Apple's
+public `shortcuts://run-shortcut` x-callback URL with `x-success`, `x-cancel`,
+and `x-error` callbacks. A run is never dispatched without an alert showing the
+registered name and an input summary. The host maps a missing result to
+`error/missing_result`, a cancelled callback to `cancelled/cancelled`, a
+missing Shortcut to `unavailable/shortcut_not_found`, and an unavailable
+Shortcuts app to `unavailable/shortcuts_unavailable`.
+
+File inputs are security-scoped URLs selected by the user, copied into an
+app-owned temporary directory, and deleted after the callback. The host limits
+text and JSON input to 32 KiB, callback results to 32 KiB, files to 16 MiB,
+and callback waits to 30 s.
+The host may need to foreground Apple's Shortcuts app; backgrounding the iOS
+host cancels the pending callback.
 
 A **path** is relative and normalized: no leading `/`, no `..` or `.` segment,
 no empty segment, no backslash, no drive letter, no `~`, no URL scheme, no
@@ -118,10 +149,10 @@ The reasons are grouped by the status they answer with:
 
 | Status | Reasons |
 | --- | --- |
-| `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used` |
+| `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used`, `shortcut_not_registered` |
 | `cancelled` | `cancelled` |
-| `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied` |
-| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large` |
+| `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied`, `shortcut_not_found`, `shortcuts_unavailable` |
+| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large`, `missing_result`, `shortcut_failed`, `invalid_shortcut_url`, `missing_file`, `invalid_file`, `file_too_large`, `file_copy_failed` |
 
 ## Approval semantics
 
@@ -176,6 +207,12 @@ pretending the request failed:
 
 The guest is a Linux guest, so the Unix socket is the transport that matters;
 the last row only names the platforms this slice cannot serve.
+
+On iOS, `LEG_BRIDGE_HOST_SOCKET` is the reserved guest name
+`/tmp/leg-host-bridge.sock`. The iSH host shim maps that name to a private
+per-session app-temporary Unix socket file; the guest cannot select the host
+endpoint. The host accepts one bounded request per connection and waits at
+most 30 s.
 
 ### The envelope
 
