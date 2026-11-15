@@ -380,12 +380,16 @@ Unix socket keeps the upstream mapping.
 
 Start order: bind and listen, register the generation with the hook, install
 the Skill, build the environment, start the session, provision the fake inode
-in the guest's task context, execute the guest program. A failed start
-removes the fake inode and closes the listener. Teardown order: cancel the
-adapters' work, stop accepting and shut the open connections, stop the guest,
-remove the fake inode in a task context, join the workers, unregister the
-generation, then unlink the exact socket and its empty directory and remove
-the generation's staging.
+in the guest's task context, execute the guest program. The hook records the
+fake inode as soon as it exists, so a start that fails after that removes it;
+a failed start also closes the listener. Teardown order: cancel the adapters'
+work, stop accepting and shut the open connections, stop the guest, remove
+the fake inode in a task context, join the workers, unregister the
+generation, then unlink the socket the listener bound (matched by device and
+inode) and its empty directory and remove the generation's staging. The work
+of an adapter is a worker until it returns, even after its request was
+answered; when a worker outlives the 10 s join, the mapping, socket, and
+staging stay and the teardown completes when the last worker ends.
 
 **One exchange per connection.** The listener reads one request line of at
 most 64 KiB within 5 s and writes at most one reply line. The request must be
@@ -424,12 +428,16 @@ successful result:
 A refused row fetches no metadata and reads no asset. `photos.search` skips an
 asset whose metadata is outside the schema bounds.
 
-**Files.** The picked file is reached from the provider's root, one
-component at a time: every directory with `openat(O_DIRECTORY|O_NOFOLLOW)`,
+**Files.** A picked file is read only inside its security-scoped root. A
+file opened in place grants the scope of that file alone, so the live root is
+the picked item: it is opened with `O_NOFOLLOW_ANY` (no link anywhere on its
+path), its descriptor must name the granted path (`F_GETPATH`), and it must be
+a regular file. Below a root that is a granted directory, the file is reached
+one component at a time: every directory with `openat(O_DIRECTORY|O_NOFOLLOW)`,
 every component checked with `fstatat(AT_SYMLINK_NOFOLLOW)`, and the file
 opened with `O_NOFOLLOW` and checked as a regular file by its descriptor. A
-symlinked component or a path outside the root is `denied`/`invalid_selection`
-before a byte is read. `files.export` resolves only `copy_id/name` under the
+link on the way, a path outside the root, or a provider with no root is
+`denied`/`invalid_selection` before a byte is read. `files.export` resolves only `copy_id/name` under the
 managed root the same way; a native path is never accepted.
 
 **Staging and commit.** A transfer is staged under
