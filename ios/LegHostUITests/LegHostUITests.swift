@@ -277,6 +277,28 @@ final class LegHostUITests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
     }
+
+    /// Waits for the guest terminal to show `text`.
+    private func waitForTerminalText(_ text: String, timeout: TimeInterval = 120) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if Self.shows(text, in: app.otherElements["guest-terminal"].debugDescription) {
+                return true
+            }
+            usleep(3_000_000)
+        }
+        return false
+    }
+
+    /// Whether the words of `text` occur in order in the terminal snapshot.
+    private static func shows(_ text: String, in screen: String) -> Bool {
+        var rest = screen[...]
+        for word in text.split(separator: " ", omittingEmptySubsequences: true) {
+            guard let range = rest.range(of: word) else { return false }
+            rest = rest[range.upperBound...]
+        }
+        return true
+    }
 }
 
 /// Drives the LegHost app against the loopback fixture.
