@@ -21,6 +21,26 @@ final class LegHostUITests: XCTestCase {
     /// without the fixture.
     private static let launchArguments = ["-leghost-provider", "anthropic"]
 
+    /// The shell script that drives two real bridge processes in the guest.
+    ///
+    /// The first request obtains the host approval token. The second redeems
+    /// it with the same input and checks the complete deterministic result the
+    /// real iOS host returned. The final sleep keeps the terminal visible so
+    /// the test can read the guest's assertion.
+    private static let shortcutBridgeScript = #"""
+    request='{"version":1,"request_id":"shortcut-e2e-approval","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}}}'
+    first=$(printf '%s\n' "$request" | /usr/local/bin/leg-bridge)
+    token=$(printf '%s\n' "$first" | sed -n 's/.*"approval_token":"\([^"]*\)".*/\1/p')
+    approved='{"version":1,"request_id":"shortcut-e2e-result","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}},"approval_token":"'"$token"'"}'
+    second=$(printf '%s\n' "$approved" | /usr/local/bin/leg-bridge)
+    if printf '%s\n' "$second" | grep -F '"status":"ok"' >/dev/null && printf '%s\n' "$second" | grep -F '"result":{"count":2,"ok":true,"source":"ios-shortcuts-fixture"}' >/dev/null; then
+        printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'
+    else
+        printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"
+    fi
+    sleep 300
+    """#
+
     private var app: XCUIApplication!
 
     override func setUpWithError() throws {
@@ -189,6 +209,32 @@ final class LegHostUITests: XCTestCase {
             .matching(NSPredicate(format: "label CONTAINS %@", "usage: leg-bridge")).firstMatch
         XCTAssertTrue(usage.waitForExistence(timeout: 60), "the terminal does not show the help of leg-bridge")
         attachScreenshot("leg-bridge --help")
+    }
+
+    /// A deterministic JSON callback crosses the complete mobile boundary.
+    ///
+    /// The host starts its real ShortcutsBridgeServer and ShortcutsAdapter in
+    /// a DEBUG-only fixture mode. The guest runs the shipped leg-bridge twice:
+    /// once to obtain approval and once to redeem it. The shell assertion is
+    /// made against the final bridge response, so the object must survive the
+    /// real host adapter, Unix server, iSH socket shim, and guest binary.
+    func testARealShortcutJSONResultCrossesTheHostAndGuestBoundary() {
+        app.terminate()
+        app.launchArguments = ["-leghost-reset"] + Self.launchArguments + [
+            "-leghost-shortcuts-fixture",
+            "-leghost-program", "/bin/sh",
+            "-leghost-program-arg", "-c",
+            "-leghost-program-arg", Self.shortcutBridgeScript,
+        ]
+        app.launch()
+        defer { app.terminate() }
+
+        XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
+                      "the guest terminal is missing")
+        XCTAssertTrue(waitForTerminalText(
+            "SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture",
+            timeout: startTimeout),
+            "the deterministic Shortcut object did not cross the host and guest boundary")
     }
 
     /// The second launch verifies the root and reuses it instead of importing

@@ -97,6 +97,9 @@ struct HostLaunchOptions {
     /// stopped turn is tested on a run that does not wait for the
     /// activation of a simulator.
     var interruptAfterRequest = false
+    /// Whether DEBUG should replace the Shortcuts confirmation and opener with
+    /// the deterministic callback fixture used by the guest bridge UI test.
+    var shortcutsFixture = false
 
     /// The guest program the host runs.
     static let defaultProgram = "/usr/local/bin/leg-tui"
@@ -154,6 +157,8 @@ struct HostLaunchOptions {
                 options.fixtureReset = true
             case "-leghost-interrupt-after-request":
                 options.interruptAfterRequest = true
+            case "-leghost-shortcuts-fixture":
+                options.shortcutsFixture = true
             #endif
             default:
                 break
@@ -465,7 +470,28 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The host-owned list of exact Shortcuts the guest may invoke.
     let shortcutRegistry = ShortcutRegistrationStore()
     /// The native adapter behind the fixed capability bridge.
-    private lazy var shortcutsAdapter = ShortcutsAdapter(registry: shortcutRegistry)
+    private lazy var shortcutsAdapter: ShortcutsAdapter = {
+        #if DEBUG
+        guard options.shortcutsFixture else {
+            return ShortcutsAdapter(registry: shortcutRegistry)
+        }
+        return ShortcutsAdapter(
+            registry: shortcutRegistry,
+            confirmation: { _, _ in true },
+            opener: { [weak self] url in
+                guard let self,
+                      let callback = Self.shortcutsFixtureCallback(from: url) else {
+                    return false
+                }
+                Task { @MainActor [weak self] in
+                    self?.handleOpenURL(callback)
+                }
+                return true
+            })
+        #else
+        return ShortcutsAdapter(registry: shortcutRegistry)
+        #endif
+    }()
     /// The host endpoint the guest bridge connects to.
     private var shortcutsBridgeServer: ShortcutsBridgeServer?
 
@@ -665,6 +691,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         #endif
         do {
             #if DEBUG
+            try configureShortcutsFixtureIfNeeded()
             if providerReset.consume(options.resetProvider) {
                 try ProviderConfigurationStore.clear()
             }
@@ -700,6 +727,43 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             throw error
         }
     }
+
+    #if DEBUG
+    /// The exact registration used by the cross-boundary bridge fixture.
+    private static let shortcutsFixtureName = "LegHost bridge fixture"
+
+    /// The deterministic object returned by the fixture Shortcut callback.
+    private static let shortcutsFixtureResult =
+        "{\"count\":2,\"ok\":true,\"source\":\"ios-shortcuts-fixture\"}"
+
+    /// Seeds the fixture registration without changing the production setup
+    /// flow. The adapter still performs its normal exact-name lookup and
+    /// approval binding for every request.
+    private func configureShortcutsFixtureIfNeeded() throws {
+        guard options.shortcutsFixture,
+              shortcutRegistry.registration(named: Self.shortcutsFixtureName) == nil else {
+            return
+        }
+        try shortcutRegistry.save(name: Self.shortcutsFixtureName, inputKind: .json)
+    }
+
+    /// Converts the public success callback in the opened URL into the fixed
+    /// callback a deterministic test Shortcut would return.
+    private static func shortcutsFixtureCallback(from url: URL) -> URL? {
+        guard let callbackString = URLComponents(url: url,
+                                                 resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "x-success" })?.value,
+              var callback = URLComponents(string: callbackString),
+              callback.host == "success",
+              callback.queryItems?.contains(where: { $0.name == "state" }) == true else {
+            return nil
+        }
+        callback.queryItems = (callback.queryItems ?? [])
+            .filter { $0.name != "result" }
+            + [URLQueryItem(name: "result", value: shortcutsFixtureResult)]
+        return callback.url
+    }
+    #endif
 
     /// Provisions the guest root.
     func provisionGuest() async throws {
