@@ -453,9 +453,9 @@ fn content_type(fields: &Map<String, Value>) -> Result<(), String> {
 }
 
 fn transfer(fields: &Map<String, Value>) -> Result<(), String> {
-    if !fields["size_bytes"]
+    if fields["size_bytes"]
         .as_u64()
-        .is_some_and(|size| size <= MAX_TRANSFER_BYTES)
+        .is_none_or(|size| size > MAX_TRANSFER_BYTES)
     {
         return Err("size_bytes is out of range".to_string());
     }
