@@ -92,9 +92,16 @@ registry are unchanged.
   dispatch happens.
 - The host owns the transport, the permission prompt, the dispatch, the
   cancellation, and the user confirmation; the bridge reaches it through the
-  `HostAdapter` seam (`src/bridge/adapter.rs`). This slice ships the seam and
-  the one fixed transport the contract names — a Unix socket — and no platform
-  adapter. Without a host the bridge answers `unavailable`.
+  `HostAdapter` seam (`src/bridge/adapter.rs`) over the one fixed transport
+  the contract names — a Unix socket. Without a host the bridge answers
+  `unavailable`.
+- The iOS host (`ios/LegHost/BridgeListener.swift`) listens on a private
+  per-generation socket that the vendored iSH maps to the guest endpoint
+  `/run/leghost-bridge.sock`, checks every request again — including the
+  RFC 8785 digest of the input and its own approval ledger — and serves
+  Photos and Files through `PhotosAdapter` and `FilesAdapter`. It installs
+  the bundled `mobile-media-files` Skill into the guest's `~/.agents/skills`
+  before the guest starts.
 - An approval is bound to the capability and the digest of the input
   (`src/bridge/state.rs`). A capability that needs consent performs no side
   effect until the Skill replays the matching token with a fresh request id,

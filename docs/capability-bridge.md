@@ -190,8 +190,8 @@ The reasons are grouped by the status they answer with:
 | --- | --- |
 | `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used`, `invalid_selection`, `duplicate_destination` |
 | `cancelled` | `cancelled` |
-| `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied`, `permission_restricted`, `permission_revoked`, `authorization_failed`, `capability_unsupported` |
-| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large`, `io_failure`, `insufficient_space`, `size_limit` |
+| `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied`, `permission_restricted`, `permission_revoked`, `authorization_failed`, `capability_unsupported`, `picker_unavailable` |
+| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large`, `io_failure`, `insufficient_space`, `size_limit`, `asset_not_found` |
 
 The Photos and Files host answers with these reasons of its own:
 
@@ -207,6 +207,8 @@ The Photos and Files host answers with these reasons of its own:
 | `io_failure` | A read, write, or commit failed. |
 | `size_limit` | The file is larger than 256 MiB. |
 | `capability_unsupported` | The host does not serve the capability. |
+| `asset_not_found` | The asset id names no asset the library still holds. |
+| `picker_unavailable` | The app has no window to show a picker in. |
 
 ## Approval semantics
 
@@ -360,6 +362,98 @@ the work it started.
   own; it may not skip the bridge's.
 - **No second registry.** The bridge is not an agent tool. It adds no tool to
   the desktop registry and changes no Skills contract.
+
+### The iOS host
+
+The LegHost app serves `photos.search`, `photos.export`, `files.import`, and
+`files.export` (`ios/LegHost/BridgeListener.swift`, `PhotosAdapter.swift`,
+`FilesAdapter.swift`).
+
+**The socket.** For every guest generation the host binds an `AF_UNIX`
+listener at a private path, `lb-<random>/s` (directory `0700`, socket `0600`)
+in the app's temporary directory — the Mac's `/tmp` in a simulator, whose
+container path is longer than a Darwin socket path (103 bytes). The guest
+never sees that path. It gets `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`,
+and the vendored iSH maps a `connect()` to that exact fake socket inode onto
+the listener (`ios/vendor/ish/fs/IshBridgeSocketHook.c`). Every other guest
+Unix socket keeps the upstream mapping.
+
+Start order: bind and listen, register the generation with the hook, install
+the Skill, build the environment, start the session, provision the fake inode
+in the guest's task context, execute the guest program. A failed start
+removes the fake inode and closes the listener. Teardown order: cancel the
+adapters' work, stop accepting and shut the open connections, stop the guest,
+remove the fake inode in a task context, join the workers, unregister the
+generation, then unlink the exact socket and its empty directory and remove
+the generation's staging.
+
+**One exchange per connection.** The listener reads one request line of at
+most 64 KiB within 5 s and writes at most one reply line. The request must be
+a version 1 HostRequest with no unknown field, no duplicate name, only I-JSON
+numbers, a `timeout_ms` of 100–30000, and an `input_sha256` equal to the
+digest the host recomputes; anything else is `error`/`host_protocol_violation`
+when the frame names a printable request id and nonce, and the connection is
+closed without a reply otherwise (the bridge reports `host_crashed`). No
+refusal reaches an adapter. Work stops at the request deadline
+(`error`/`timeout`), when the guest closes the connection, and at teardown
+(`cancelled`).
+
+**The host ledger.** The listener keeps its own approvals, in memory, per
+generation: the SHA-256 of the token, the capability, the input digest, the
+issue and expiry seconds, and the state. A preview inserts an unused record;
+a continuation marks it in flight; `ok` or `denied` redeems it; a cancel,
+timeout, or failure removes it. The token is valid while
+`now <= issued_at + 600`, expired records are pruned before every lookup,
+insert, and transition, the ledger holds at most 32 records, and teardown
+discards it. An unknown, expired, used, or mismatched token is `denied` with
+`approval_unknown`, `approval_expired`, `approval_used`, or
+`approval_mismatch`, before the adapter runs.
+
+**Photos.** Both operations authorize first and carry the authorization in a
+successful result:
+
+| Authorization | Status | Reason / result |
+| --- | --- | --- |
+| authorized | `ok` | `authorization: "full"` |
+| limited | `ok` | `authorization: "limited"` |
+| denied after the request | `denied` | `user_refused` |
+| restricted | `unavailable` | `permission_restricted` |
+| granted, then gone at the recheck | `unavailable` | `permission_revoked` |
+| still undetermined, or the API failed | `unavailable` | `authorization_failed` |
+
+A refused row fetches no metadata and reads no asset. `photos.search` skips an
+asset whose metadata is outside the schema bounds.
+
+**Files.** The picked file is reached from the provider's root, one
+component at a time: every directory with `openat(O_DIRECTORY|O_NOFOLLOW)`,
+every component checked with `fstatat(AT_SYMLINK_NOFOLLOW)`, and the file
+opened with `O_NOFOLLOW` and checked as a regular file by its descriptor. A
+symlinked component or a path outside the root is `denied`/`invalid_selection`
+before a byte is read. `files.export` resolves only `copy_id/name` under the
+managed root the same way; a native path is never accepted.
+
+**Staging and commit.** A transfer is staged under
+`Library/Caches/LegHost/BridgeStaging/<generation>/<operation>/`: every byte
+is counted before it is written (over 256 MiB is `error`/`size_limit`), hashed
+as it streams, synced, and checked for size and digest before the commit. The
+commit never replaces: `renameatx_np(RENAME_EXCL)` into the managed root
+(`~/.local/share/leg/bridge/<copy_id>/<name>`), or an exclusively created
+sibling renamed with `RENAME_EXCL` under a coordinated write of a picked
+folder. An existing destination is `denied`/`duplicate_destination` and stays
+unchanged. Any failure removes only the operation's staging; no partial file
+is left where the guest or the user can see it.
+
+| Failure | Status | Reason |
+| --- | --- | --- |
+| picker dismissed, request cancelled | `cancelled` | `cancelled` |
+| security scope lost | `unavailable` | `permission_revoked` |
+| destination exists | `denied` | `duplicate_destination` |
+| no space | `error` | `insufficient_space` |
+| any other read or write failure | `error` | `io_failure` |
+| over 256 MiB | `error` | `size_limit` |
+
+**Redaction.** The host logs no asset bytes, file contents, credentials,
+approval tokens, or native paths; its diagnostics name the step that failed.
 
 ## Duplicate request ids
 

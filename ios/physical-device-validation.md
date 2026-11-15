@@ -177,3 +177,23 @@ suite and on its own.
 - The behaviour of the host when the device is out of space or when the
   pinned runtime files are broken. The faults of the device are induced by the
   controls of the fixture, and they were checked on the device.
+- The capability bridge. The run above predates it; see below.
+
+## The capability bridge on the device
+
+The Photos and Files bridge has not been run on a physical device yet. Its
+simulator and fixture coverage is `BridgeListenerTests`, `PhotosAdapterTests`,
+`FilesAdapterTests`, `GuestSkillInstallerTests`, `BridgeCapabilityUITests`,
+and `SkillRelaunchUITests`. A device run has to record, for the same build:
+
+| Item | Evidence to record |
+| --- | --- |
+| Photos authorization: not determined, full, limited, denied, restricted, revoked | the status and reason of `photos.search` for each state |
+| The longest video | `photos.search` with `duration_desc` returns the same first asset twice |
+| Photos export to the workspace and to the Files picker | the `sha256` of the result matches the file |
+| Files import and export | the round trip keeps size and `sha256`; a second export to the same folder is `duplicate_destination` |
+| A file over 256 MiB | `error`/`size_limit`, no staging left |
+| A symlinked parent or a file outside the picked scope | `denied`/`invalid_selection`, nothing read or staged |
+| A cancelled picker and a stopped session | `cancelled`, the listener closed, no staging left |
+| The Skill | discovered by the agent, kept across a relaunch |
+| The device log | no asset bytes, credentials, approval tokens, or native paths |
