@@ -181,10 +181,17 @@ suite and on its own.
 
 ## The capability bridge on the device
 
-The Photos and Files bridge has not been run on a physical device yet. Its
-simulator and fixture coverage is `BridgeListenerTests`, `PhotosAdapterTests`,
-`FilesAdapterTests`, `GuestSkillInstallerTests`, `BridgeCapabilityUITests`,
-and `SkillRelaunchUITests`. A device run has to record, for the same build:
+The Photos and Files bridge has not been run on a physical device yet. The
+device run is pending in
+[#314](https://github.com/SHUKE-LABS/leg/issues/314): it needs a release
+whose pinned guest carries the bridge capabilities (the pinned `v0.44.1`
+`leg-bridge` predates them) and an operator at the phone. Until then the
+coverage is the simulator and the fixtures: `BridgeListenerTests`,
+`PhotosAdapterTests`, `FilesAdapterTests`, `GuestSkillInstallerTests`,
+`BridgeCapabilityUITests`, and `SkillRelaunchUITests`.
+
+The checklist below is the procedure of that run. It records, for the same
+build:
 
 | Item | Evidence to record |
 | --- | --- |
@@ -193,7 +200,8 @@ and `SkillRelaunchUITests`. A device run has to record, for the same build:
 | Photos export to the workspace and to the Files picker | the `sha256` of the result matches the file |
 | Files import and export | the round trip keeps size and `sha256`; a second export to the same folder is `duplicate_destination` |
 | A file over 256 MiB | `error`/`size_limit`, no staging left |
-| A symlinked parent or a file outside the picked scope | `denied`/`invalid_selection`, nothing read or staged |
+| A file outside the picked scope | `denied`/`invalid_selection`, nothing read or staged |
+| A symlinked parent | waived on the device: an iOS Files provider cannot hold one; fixture-only (`FilesAdapterTests`) |
 | A cancelled picker and a stopped session | `cancelled`, the listener closed, no staging left |
 | The Skill | discovered by the agent, kept across a relaunch |
 | The device log | no asset bytes, credentials, approval tokens, or native paths |
