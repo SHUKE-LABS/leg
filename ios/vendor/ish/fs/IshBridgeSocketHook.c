@@ -13,6 +13,8 @@
 #include "fs/path.h"
 #include "fs/IshBridgeSocketHook.h"
 #include "util/sync.h"
+#define ISH_INTERNAL
+#include "fs/fake.h"
 
 static lock_t hook_lock = LOCK_INITIALIZER;
 
@@ -20,15 +22,16 @@ static struct {
     uint64_t generation;
     bool registered;
     char host_path[ISH_BRIDGE_SOCKET_HOST_PATH_MAX + 1];
-    /* The fake inode the hook created, held so its socket id stays the
-     * same for as long as the endpoint is provisioned. */
+    /* The fake inode the hook created, held from the moment it exists: its
+     * socket id stays the same for as long as the endpoint is provisioned,
+     * and fakefs cannot give its number to another node while the hook
+     * records it. */
     struct inode_data *inode;
-    /* The endpoint the hook made, recorded before the node is made, so a
-     * start that fails after that still removes it. The identity is known
-     * once the node was looked up; until then the record covers a socket at
-     * the endpoint, which is reserved to the host. */
+    /* The identity of the endpoint the hook made. The node, its identity
+     * and the hold come together, so a start that fails after that still
+     * removes it, and the record never covers a node the hook did not
+     * make. */
     bool made;
-    bool made_known;
     qword_t made_dev;
     qword_t made_inode;
     /* The faults the checks of the cleanup inject, ISH_BRIDGE_SOCKET_FAULT_*
@@ -89,15 +92,32 @@ static int endpoint_stat(struct statbuf *stat) {
     return generic_statat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, stat, false);
 }
 
-/* Takes a hold on the inode at the endpoint. */
-static struct inode_data *endpoint_inode(const struct statbuf *stat) {
+/* Makes the endpoint socket, looks it up in the same fakefs transaction, and
+ * takes a hold on its inode. As in generic_open, inodes_lock is held from
+ * before the node exists until the hold does, so no unlink can orphan the
+ * inode and let fakefs give its number to another node in between. */
+static int make_endpoint(struct statbuf *stat, struct inode_data **inode) {
     char path[MAX_PATH];
-    if (path_normalize(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, path, N_SYMLINK_NOFOLLOW) < 0)
-        return NULL;
+    int err = path_normalize(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    if (err < 0)
+        return err;
     struct mount *mount = find_mount_and_trim_path(path);
-    struct inode_data *inode = inode_get(mount, stat->inode);
+    err = _EPERM;
+    lock(&inodes_lock);
+    if (mount->fs == &fakefs)
+        err = fakefs_mknod_stat(mount, path, S_IFSOCK | 0666, 0, stat);
+    if (err == 0)
+        *inode = inode_get_unlocked(mount, stat->inode);
+    unlock(&inodes_lock);
     mount_release(mount);
-    return inode;
+    return err;
+}
+
+/* For the checks of the cleanup: a socket the hook did not make takes the
+ * endpoint. */
+static void put_foreign_endpoint(void) {
+    generic_unlinkat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH);
+    generic_mknodat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, S_IFSOCK | 0666, 0);
 }
 
 void ish_bridge_socket_inject_faults(int faults) {
@@ -122,8 +142,7 @@ static int remove_made_endpoint(void) {
     }
     if (err < 0)
         return ISH_BRIDGE_SOCKET_FS_ERROR;
-    bool ours = S_ISSOCK(stat.mode) &&
-        (!hook.made_known || (stat.dev == hook.made_dev && stat.inode == hook.made_inode));
+    bool ours = S_ISSOCK(stat.mode) && stat.dev == hook.made_dev && stat.inode == hook.made_inode;
     if (ours && generic_unlinkat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH) < 0)
         return ISH_BRIDGE_SOCKET_FS_ERROR;
     hook.made = false;
@@ -142,7 +161,6 @@ int ish_bridge_socket_provision(void) {
      * socket it left at the endpoint is replaced below. */
     release_inode();
     hook.made = false;
-    hook.made_known = false;
 
     int result = ISH_BRIDGE_SOCKET_FS_ERROR;
     int err = generic_mkdirat(AT_PWD, "/run", 0755);
@@ -165,20 +183,18 @@ int ish_bridge_socket_provision(void) {
         goto out;
     }
 
-    /* The endpoint was absent a moment ago, so a socket there from now on
-     * is the one made here. */
+    if (take_fault(ISH_BRIDGE_SOCKET_FAULT_RACE))
+        put_foreign_endpoint();
+    if (make_endpoint(&stat, &hook.inode) < 0)
+        goto out;
     hook.made = true;
-    if (generic_mknodat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, S_IFSOCK | 0666, 0) < 0)
-        goto out;
-    if (take_fault(ISH_BRIDGE_SOCKET_FAULT_LOOKUP) || endpoint_stat(&stat) < 0 || !S_ISSOCK(stat.mode))
-        goto out;
-    hook.made_known = true;
     hook.made_dev = stat.dev;
     hook.made_inode = stat.inode;
-    if (take_fault(ISH_BRIDGE_SOCKET_FAULT_HOLD))
+    if (take_fault(ISH_BRIDGE_SOCKET_FAULT_REPLACE)) {
+        put_foreign_endpoint();
         goto out;
-    hook.inode = endpoint_inode(&stat);
-    if (hook.inode == NULL)
+    }
+    if (take_fault(ISH_BRIDGE_SOCKET_FAULT_HOLD))
         goto out;
     result = ISH_BRIDGE_SOCKET_OK;
 

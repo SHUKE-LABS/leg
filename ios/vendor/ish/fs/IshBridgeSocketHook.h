@@ -62,12 +62,16 @@ struct ish_bridge_socket_state {
 
 /* The faults the checks of the endpoint cleanup inject. */
 enum {
-    /* The next provision fails after it made and looked up the endpoint. */
+    /* The next provision fails after it made the endpoint. */
     ISH_BRIDGE_SOCKET_FAULT_HOLD = 1 << 0,
-    /* The next provision fails its lookup of the endpoint it made. */
-    ISH_BRIDGE_SOCKET_FAULT_LOOKUP = 1 << 1,
+    /* A socket the hook did not make takes the endpoint just before the
+     * next provision makes it, so that provision fails. */
+    ISH_BRIDGE_SOCKET_FAULT_RACE = 1 << 1,
     /* The next cleanup fails its lookup of the endpoint. */
     ISH_BRIDGE_SOCKET_FAULT_CLEANUP_LOOKUP = 1 << 2,
+    /* A socket the hook did not make replaces the endpoint right after the
+     * next provision made it, and that provision fails. */
+    ISH_BRIDGE_SOCKET_FAULT_REPLACE = 1 << 3,
 };
 
 /* Registers `generation` and the listener at `host_path`. */

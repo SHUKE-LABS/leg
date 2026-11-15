@@ -96,12 +96,14 @@ struct HostLaunchOptions {
     /// bridge answers when the host configured no transport.
     var bridgeOff = false
     /// The `ISH_BRIDGE_SOCKET_FAULT_*` bits the hook of the bridge endpoint
-    /// takes in this run: `hold` and `lookup` fail the start after the
-    /// runtime made the endpoint, and `cleanup-lookup` fails the lookup of
-    /// the cleanup that follows.
+    /// takes in this run: `hold` fails the start after the runtime made the
+    /// endpoint, `race` and `replace` put a socket the hook did not make at
+    /// the endpoint before or after it made its own and fail the start, and
+    /// `cleanup-lookup` fails the lookup of the cleanup that follows.
     ///
     /// The control is DEBUG-only: the simulator tests check that a failed
-    /// start removes the endpoint it made, or keeps its record of it.
+    /// start removes the endpoint it made and only that, or keeps its record
+    /// of it.
     var bridgeEndpointFaults: Int32 = 0
     /// Whether the run interrupts the session on its own.
     ///
@@ -125,7 +127,8 @@ struct HostLaunchOptions {
         names.split(separator: ",").reduce(0) { faults, name in
             switch name {
             case "hold": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_HOLD)
-            case "lookup": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_LOOKUP)
+            case "race": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_RACE)
+            case "replace": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_REPLACE)
             case "cleanup-lookup": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_CLEANUP_LOOKUP)
             default: return faults
             }

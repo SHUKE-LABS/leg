@@ -380,9 +380,10 @@ Unix socket keeps the upstream mapping.
 
 Start order: bind and listen, register the generation with the hook, install
 the Skill, build the environment, start the session, provision the fake inode
-in the guest's task context, execute the guest program. The hook records the
-fake inode before it makes it, so a start that fails after that removes it,
-and a cleanup that cannot look the endpoint up keeps the record;
+in the guest's task context, execute the guest program. The hook makes the
+fake inode, records its identity, and holds it in one step, so a start that
+fails after that removes it and never a socket it did not make, and a cleanup
+that cannot look the endpoint up keeps the record;
 a failed start also closes the listener. Teardown order: cancel the adapters'
 work, stop accepting and shut the open connections, stop the guest, remove
 the fake inode in a task context, join the workers, unregister the
