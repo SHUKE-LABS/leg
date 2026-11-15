@@ -426,6 +426,10 @@ struct BridgeOperationContext {
     /// When the request runs out of time.
     let deadline: Date
     let paths: BridgeOperationPaths
+    /// Gives the guest the managed copy `<managed root>/<copy_id>` the
+    /// operation committed: the guest sees a file the host wrote only once
+    /// its fakefs has an entry for it. A throw fails the operation.
+    var publishManagedCopy: (_ copyID: String) throws -> Void = { _ in }
 }
 
 /// A host adapter that serves capabilities.
@@ -598,6 +602,9 @@ final class BridgeListener: @unchecked Sendable {
     /// The variable that tells the guest bridge where the host listens.
     static let environmentVariable = "LEG_BRIDGE_HOST_SOCKET"
 
+    /// The managed root as the guest names it.
+    static let managedGuestPath = "/root/.local/share/leg/bridge"
+
     /// How long the listener waits for the request line of a connection.
     static let frameTimeout: TimeInterval = 5
 
@@ -624,6 +631,7 @@ final class BridgeListener: @unchecked Sendable {
     private let socketParent: URL
     private let stagingRoot: URL
     private let managedRoot: URL
+    private let guestAdopter: (String) -> Bool
     /// The clock of the ledger, in whole Unix seconds.
     var now: () -> Int64 = { Int64(Date().timeIntervalSince1970.rounded(.down)) }
     /// Called with the status of every reply the listener wrote.
@@ -646,7 +654,8 @@ final class BridgeListener: @unchecked Sendable {
          registrar: BridgeEndpointRegistrar,
          socketParent: URL = BridgeListener.defaultSocketParent,
          stagingRoot: URL,
-         managedRoot: URL) {
+         managedRoot: URL,
+         guestAdopter: @escaping (_ guestPath: String) -> Bool = { _ in true }) {
         self.generation = generation
         self.generationID = BridgeValidation.newGeneratedID()
         self.adapters = adapters
@@ -654,6 +663,7 @@ final class BridgeListener: @unchecked Sendable {
         self.socketParent = socketParent
         self.stagingRoot = stagingRoot
         self.managedRoot = managedRoot
+        self.guestAdopter = guestAdopter
     }
 
     deinit {
@@ -962,7 +972,12 @@ final class BridgeListener: @unchecked Sendable {
             paths: BridgeOperationPaths(
                 staging: stagingRoot.appendingPathComponent(generationID, isDirectory: true)
                     .appendingPathComponent(operationID, isDirectory: true),
-                managedRoot: managedRoot))
+                managedRoot: managedRoot),
+            publishManagedCopy: { [guestAdopter] copyID in
+                guard guestAdopter("\(Self.managedGuestPath)/\(copyID)") else {
+                    throw BridgeFailure.error("io_failure", "the guest could not be given the managed copy")
+                }
+            })
 
         // A preview: the adapter says what it would do, and nothing happens.
         if typed.requiresApproval && request.approvalToken == nil {

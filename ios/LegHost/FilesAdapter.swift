@@ -261,7 +261,9 @@ final class FilesAdapter: BridgeCapabilityAdapter {
                 }
                 return try stage(from: source.descriptor, context: context, limit: limit, flag: flag) { transfer in
                     try BridgeCommit.commitToManagedRoot(transfer, managedRoot: context.paths.managedRoot,
-                                                         copyID: copyID, name: name, beforeCommit: beforeCommit)
+                                                         copyID: copyID, name: name,
+                                                         publish: context.publishManagedCopy,
+                                                         beforeCommit: beforeCommit)
                 }
             }
         }
@@ -455,6 +457,7 @@ enum BridgeCommit {
     /// appeared after the preflight makes the commit fail with
     /// `duplicate_destination` and is left as it was.
     static func commitToManagedRoot(_ staged: BridgeStagedFile, managedRoot: URL, copyID: String, name: String,
+                                    publish: (String) throws -> Void,
                                     beforeCommit: ((URL) -> Void)?) throws {
         let root = try BridgeFileSystem.openManagedRoot(managedRoot, create: true)
         defer { close(root) }
@@ -481,6 +484,14 @@ enum BridgeCommit {
         defer { close(staging) }
         try BridgeFileSystem.renameExclusive(staging, staged.url.lastPathComponent, copy, name)
         fsync(copy)
+        do {
+            try publish(copyID)
+        } catch {
+            // A copy the guest cannot see is no copy: it goes with its
+            // directory.
+            unlinkat(copy, name, 0)
+            throw error
+        }
         committed = true
     }
 

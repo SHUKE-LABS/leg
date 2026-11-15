@@ -28,6 +28,14 @@ typedef void (*guest_exit_notify_callback)(int code, void *context);
 int guest_runtime_boot(const char *root_data_dir);
 
 /*
+ * Gives the guest the files the host wrote at and below the guest path
+ * `path` of the booted root (see guest_fakefs_adopt_tree). Any thread may call
+ * it: the fakefs database serializes the writes with the guest. Returns 0, or
+ * a negative errno; -ENODEV when the runtime is not booted.
+ */
+int guest_runtime_adopt_host_tree(const char *path);
+
+/*
  * Runs `program` on a pseudo terminal.
  *
  * `arguments` holds the program name followed by its arguments as one buffer

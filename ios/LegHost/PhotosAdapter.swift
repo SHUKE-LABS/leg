@@ -414,6 +414,7 @@ final class PhotosAdapter: BridgeCapabilityAdapter {
         }
         try Task.checkCancellation()
         let managedRoot = context.paths.managedRoot
+        let publish = context.publishManagedCopy
         let beforeCommit = beforeCommit
         let staged: BridgeStagedFile = try await BridgeIO.run(deadline: context.deadline) { flag in
             let staged = try transfer.finish()
@@ -424,7 +425,7 @@ final class PhotosAdapter: BridgeCapabilityAdapter {
                                                    beforeCommit: beforeCommit)
             } else {
                 try BridgeCommit.commitToManagedRoot(staged, managedRoot: managedRoot, copyID: copyID,
-                                                     name: name, beforeCommit: beforeCommit)
+                                                     name: name, publish: publish, beforeCommit: beforeCommit)
             }
             return staged
         }

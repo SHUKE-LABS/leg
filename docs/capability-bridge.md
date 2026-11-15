@@ -440,8 +440,12 @@ commit never replaces: `renameatx_np(RENAME_EXCL)` into the managed root
 (`~/.local/share/leg/bridge/<copy_id>/<name>`), or an exclusively created
 sibling renamed with `RENAME_EXCL` under a coordinated write of a picked
 folder. An existing destination is `denied`/`duplicate_destination` and stays
-unchanged. Any failure removes only the operation's staging; no partial file
-is left where the guest or the user can see it.
+unchanged. The guest's fakefs hides a file that has no entry in its database,
+so a managed commit then records the copy and its directories there (owned by
+root, the mode of the file on disk); a copy that cannot be recorded is removed
+and the request is `error`/`io_failure`. Any failure removes only the
+operation's staging; no partial file is left where the guest or the user can
+see it.
 
 | Failure | Status | Reason |
 | --- | --- | --- |

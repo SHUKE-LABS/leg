@@ -190,7 +190,10 @@ the Files containment checks, the no-replace commit, and the failure reasons.
 Before the guest starts, the host installs the bundled
 `resources/skills/mobile-media-files` Skill into `data/root/.agents/skills`
 of the active root (see [Skills v1](../docs/skills-v1.md)). A user Skill or a
-changed package at that name is never overwritten.
+changed package at that name is never overwritten. The host writes below
+`data` directly, so it then records the package and its directories in the
+fakefs database (`guest_runtime_adopt_host_tree`); the guest hides a file that
+has no entry there. A failed record shows as `skill=unpublished`.
 
 The state line shows `bridge=off|listening|closed`, the number of replies the
 listener wrote, and what the Skill install did. `-leghost-bridge-off` (Debug

@@ -8,6 +8,7 @@
  */
 
 #include "GuestRuntime.h"
+#include "GuestProvision.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -269,6 +270,21 @@ int guest_runtime_boot(const char *root_data_dir) {
 
     runtime_booted = true;
     return 0;
+}
+
+int guest_runtime_adopt_host_tree(const char *path) {
+    if (!runtime_booted)
+        return -ENODEV;
+    if (!guest_fakefs_path_is_clean(path))
+        return -EINVAL;
+    struct mount *mount = mount_find((char *) path);
+    /* Only the root fakefs holds host-written files; /proc and /dev/pts
+     * do not. */
+    int err = -EINVAL;
+    if (mount->fs == &fakefs && strcmp(mount->point, "") == 0)
+        err = guest_fakefs_adopt_tree(&mount->fakefs, mount->root_fd, path);
+    mount_release(mount);
+    return err;
 }
 
 /* ---------------------------------------------------------------- session */

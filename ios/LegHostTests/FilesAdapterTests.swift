@@ -31,9 +31,20 @@ final class BridgeAdapterScratch {
         try? FileManager.default.removeItem(at: root)
     }
 
+    /// The managed copies the operations gave the guest, by copy id.
+    private(set) var published: [String] = []
+    /// Whether giving the guest a managed copy fails.
+    var publishFails = false
+
     var context: BridgeOperationContext {
         BridgeOperationContext(generation: "g1", operationID: "op1", deadline: Date().addingTimeInterval(30),
-                               paths: BridgeOperationPaths(staging: staging, managedRoot: managedRoot))
+                               paths: BridgeOperationPaths(staging: staging, managedRoot: managedRoot),
+                               publishManagedCopy: { [unowned self] copyID in
+                                   if publishFails {
+                                       throw BridgeFailure.error("io_failure", "the guest could not be given the copy")
+                                   }
+                                   published.append(copyID)
+                               })
     }
 
     @discardableResult
@@ -140,6 +151,19 @@ final class FilesAdapterTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: copy), "report body")
         XCTAssertFalse(scratch.exists(scratch.staging), "the staging directory was left behind")
         XCTAssertEqual(presenter.openScopes, 0, "the security scope was left open")
+        XCTAssertEqual(scratch.published, [copyID], "the guest was not given the copy")
+    }
+
+    func testACopyTheGuestCannotBeGivenIsRemoved() async throws {
+        presenter.importURL = try scratch.write("body", to: scratch.provider.appendingPathComponent("a.txt"))
+        scratch.publishFails = true
+
+        let result = await importFile()
+
+        XCTAssertEqual(result.failure?.status, .error)
+        XCTAssertEqual(result.failure?.reason, "io_failure")
+        XCTAssertTrue(scratch.managedRootIsEmpty, "a copy the guest cannot see was left behind")
+        XCTAssertFalse(scratch.exists(scratch.staging))
     }
 
     func testAnImportThenAnExportRoundTripsTheRelativePath() async throws {

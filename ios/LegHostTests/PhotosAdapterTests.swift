@@ -240,6 +240,7 @@ final class PhotosAdapterTests: XCTestCase {
         XCTAssertEqual(value["sha256"]?.stringValue, BridgeCanonicalJSON.sha256Hex(Data("first video".utf8)))
         XCTAssertEqual(try String(contentsOf: scratch.managedRoot.appendingPathComponent("\(copyID)/IMG_0001.MOV")),
                        "first video")
+        XCTAssertEqual(scratch.published, [copyID], "the guest was not given the copy")
         XCTAssertEqual(library.reads, ["a1"])
         XCTAssertFalse(scratch.exists(scratch.staging))
     }

@@ -1270,7 +1270,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                        "files.import": files, "files.export": files],
             registrar: IshBridgeEndpointRegistrar(),
             stagingRoot: stagingRoot,
-            managedRoot: managedRoot)
+            managedRoot: managedRoot,
+            guestAdopter: { path in path.withCString { guest_runtime_adopt_host_tree($0) } == 0 })
         listener.onReply = { [weak self] _ in
             DispatchQueue.main.async { self?.state.bridgeReplies += 1 }
         }
@@ -1295,6 +1296,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         state.bridge = "closed"
     }
 
+    /// The installed Skill package as the guest names it.
+    private static let skillGuestPath = "/root/.agents/skills/mobile-media-files"
+
     /// Installs the bundled Skill of the capability bridge into the guest.
     ///
     /// A failure does not stop the session: the guest runs without the
@@ -1308,12 +1312,18 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             bundledPackage: resources.appendingPathComponent("skills/mobile-media-files", isDirectory: true),
             activeRoot: URL(fileURLWithPath: activeRoot, isDirectory: true))
         do {
+            let outcome: String
             switch try installer.install() {
-            case .installed: state.skill = "installed"
-            case .updated: state.skill = "updated"
-            case .unchanged: state.skill = "unchanged"
-            case .olderBundled: state.skill = "kept"
+            case .installed: outcome = "installed"
+            case .updated: outcome = "updated"
+            case .unchanged: outcome = "unchanged"
+            case .olderBundled: outcome = "kept"
             }
+            // The guest sees what the host wrote only once its fakefs has an
+            // entry for it. A package a host without the entries installed
+            // gets them now as well.
+            let adopted = Self.skillGuestPath.withCString { guest_runtime_adopt_host_tree($0) }
+            state.skill = adopted == 0 ? outcome : "unpublished"
         } catch let error as GuestSkillInstallError {
             state.skill = error.reason
         } catch {

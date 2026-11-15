@@ -33,6 +33,8 @@ final class BridgeListenerTests: XCTestCase {
         private var _cancelled = 0
         var previewResult: () async throws -> BridgeJSON = { .object(["summary": .string("export one video")]) }
         var performResult: () async throws -> BridgeJSON = { .object(["done": .bool(true)]) }
+        /// The managed copy a perform commits and gives the guest.
+        var publishedCopy: String?
 
         var previews: Int { lock.withLock { _previews } }
         var performs: Int { lock.withLock { _performs } }
@@ -46,6 +48,7 @@ final class BridgeListenerTests: XCTestCase {
         func perform(_ request: BridgeCapabilityRequest, context: BridgeOperationContext) async throws -> BridgeJSON {
             lock.withLock { _performs += 1 }
             do {
+                if let publishedCopy { try context.publishManagedCopy(publishedCopy) }
                 return try await performResult()
             } catch is CancellationError {
                 lock.withLock { _cancelled += 1 }
@@ -65,6 +68,22 @@ final class BridgeListenerTests: XCTestCase {
     private var registrar: FakeRegistrar!
     private var adapter: FixtureAdapter!
     private var listener: BridgeListener!
+    /// The guest paths the listener gave the guest, and whether it can.
+    private let adoptions = Adoptions()
+
+    private final class Adoptions: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _paths: [String] = []
+        var succeeds = true
+        var paths: [String] { lock.withLock { _paths } }
+
+        func adopt(_ path: String) -> Bool {
+            lock.withLock {
+                _paths.append(path)
+                return succeeds
+            }
+        }
+    }
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("bridge-\(UUID().uuidString)")
@@ -87,7 +106,8 @@ final class BridgeListenerTests: XCTestCase {
             uniqueKeysWithValues: BridgeCapabilityRequest.capabilities.map { ($0, adapter as BridgeCapabilityAdapter) })
         return BridgeListener(generation: generation, adapters: adapters, registrar: registrar,
                               stagingRoot: root.appendingPathComponent("staging"),
-                              managedRoot: root.appendingPathComponent("managed"))
+                              managedRoot: root.appendingPathComponent("managed"),
+                              guestAdopter: adoptions.adopt)
     }
 
     // MARK: The guest side
@@ -231,6 +251,18 @@ final class BridgeListenerTests: XCTestCase {
         XCTAssertEqual(adapter.performs, 1)
         wait(for: [replied], timeout: 5)
         XCTAssertEqual(replies, ["ok"])
+    }
+
+    func testAManagedCopyIsGivenToTheGuestByItsGuestPath() throws {
+        adapter.publishedCopy = "c1"
+        let reply = try exchange(frame("photos.search", Self.searchInput, requestID: "r1"))
+        XCTAssertEqual(status(reply), "ok")
+        XCTAssertEqual(adoptions.paths, ["/root/.local/share/leg/bridge/c1"])
+
+        adoptions.succeeds = false
+        let refused = try exchange(frame("photos.search", Self.searchInput, requestID: "r2"))
+        XCTAssertEqual(status(refused), "error")
+        XCTAssertEqual(reason(refused), "io_failure")
     }
 
     func testAnUnknownCapabilityIsUnsupported() throws {
