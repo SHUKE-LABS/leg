@@ -24,8 +24,9 @@ protocol BridgeDocumentPresenter: AnyObject {
     /// Closes the security scope `startAccessing` opened.
     func stopAccessing(_ url: URL)
 
-    /// The directory that proves a picked file is inside its provider's
-    /// scope, or nil when the provider exposes none.
+    /// The security-scoped root a picked file is proven to be inside: the
+    /// picked item itself, or a directory the provider granted above it;
+    /// nil when the provider exposes none.
     func scopeRoot(for url: URL) -> URL?
 }
 
@@ -38,13 +39,14 @@ extension BridgeDocumentPresenter {
         url.stopAccessingSecurityScopedResource()
     }
 
-    /// The volume the picked file lives on.
+    /// The picked item itself.
     ///
-    /// The volume is the one root a provider always exposes; every component
-    /// below it is walked without following a link, so a link anywhere on
-    /// the way to the file is refused.
+    /// A file opened in place grants the security scope of that file and of
+    /// no directory above it, so the item is the root that is proven: it is
+    /// opened with no link anywhere on its path, and its descriptor must be
+    /// the item at the granted path.
     func scopeRoot(for url: URL) -> URL? {
-        (try? url.resourceValues(forKeys: [.volumeURLKey]))?.volume
+        url
     }
 }
 
@@ -549,22 +551,66 @@ struct BridgeOpenedSource {
 
 /// The descriptor-relative file system work of the adapters.
 enum BridgeFileSystem {
-    /// Opens the regular file at `url`, walking every component below
-    /// `root` relative to a descriptor: a parent is checked with
+    /// Opens the regular file at `url` inside the security-scoped `root`.
+    ///
+    /// The root is opened with no link anywhere on its path
+    /// (`O_NOFOLLOW_ANY`), and its descriptor must name the granted path
+    /// (`F_GETPATH`). A file below a granted directory is then walked
+    /// relative to descriptors: a parent is checked with
     /// `fstatat(AT_SYMLINK_NOFOLLOW)` and opened with
     /// `O_DIRECTORY|O_NOFOLLOW`, and the file itself is checked, opened with
     /// `O_NOFOLLOW`, and checked again by its descriptor. A path outside
     /// `root`, a link anywhere on the way, and anything that is not a regular
     /// file are `invalid_selection`.
     static func openContained(_ url: URL, root: URL) throws -> BridgeOpenedSource {
-        guard let components = relativeComponents(of: url, below: root), !components.isEmpty else {
-            throw invalidSelection("the picked file is outside the scope of its provider")
+        let itemIsRoot = aliasFree(url.path) == aliasFree(root.path)
+        var components: [String] = []
+        if !itemIsRoot {
+            guard let below = relativeComponents(of: url, below: root), !below.isEmpty else {
+                throw invalidSelection("the picked file is outside the scope of its provider")
+            }
+            components = below
         }
-        let rootDescriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard rootDescriptor >= 0 else {
-            throw invalidSelection("the scope of the Files provider cannot be opened to prove the file is in it")
+        let rootDescriptor = try openScopeRoot(root)
+        var status = stat()
+        guard fstat(rootDescriptor, &status) == 0 else {
+            close(rootDescriptor)
+            throw invalidSelection("the scope of the Files provider cannot be checked")
+        }
+        if itemIsRoot {
+            guard status.st_mode & S_IFMT == S_IFREG else {
+                close(rootDescriptor)
+                throw invalidSelection("the selection is not a regular file")
+            }
+            _ = fcntl(rootDescriptor, F_SETFL, fcntl(rootDescriptor, F_GETFL) & ~O_NONBLOCK)
+            return BridgeOpenedSource(descriptor: rootDescriptor, size: Int64(status.st_size))
+        }
+        guard status.st_mode & S_IFMT == S_IFDIR else {
+            close(rootDescriptor)
+            throw invalidSelection("the scope of the Files provider is not a directory")
         }
         return try openRegular(below: rootDescriptor, components: components)
+    }
+
+    /// Opens the security-scoped root with no link anywhere on its path and
+    /// proves that the descriptor is the granted path.
+    private static func openScopeRoot(_ root: URL) throws -> Int32 {
+        let path = systemPath(root.path)
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+        guard path.hasPrefix("/"), components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw invalidSelection("the scope of the Files provider is not a plain path")
+        }
+        // O_NONBLOCK: a FIFO at the path must not hold the open.
+        let descriptor = open(path, O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw invalidSelection("the scope of the Files provider cannot be opened without following a link")
+        }
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(descriptor, F_GETPATH, &buffer) == 0, String(cString: buffer) == path else {
+            close(descriptor)
+            throw invalidSelection("the scope of the Files provider is not the granted path")
+        }
+        return descriptor
     }
 
     /// Runs `body` with the managed copy `<managed root>/<copy_id>/<name>`
@@ -737,6 +783,15 @@ enum BridgeFileSystem {
         let rest = Array(components.dropFirst(rootComponents.count))
         guard rest.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
         return rest
+    }
+
+    /// The path through `/private` for a path a provider spelled through the
+    /// `/var` or `/tmp` link of the system, so it opens without a link.
+    private static func systemPath(_ path: String) -> String {
+        for alias in ["/var/", "/tmp/"] where path.hasPrefix(alias) {
+            return "/private" + path
+        }
+        return path
     }
 
     /// The path with the `/private` prefix of the Darwin aliases taken off,

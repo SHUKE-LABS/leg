@@ -227,6 +227,56 @@ final class FilesAdapterTests: XCTestCase {
         assertRefused(await importFile(), .denied, "invalid_selection")
     }
 
+    /// The live picker grants the picked file alone, so the file is its own
+    /// scope root.
+    @MainActor
+    func testThePickedFileIsTheScopeOfTheLivePicker() {
+        let url = URL(fileURLWithPath: "/private/var/mobile/Library/Mobile Documents/a.txt")
+        XCTAssertEqual(LiveDocumentPresenter().scopeRoot(for: url), url)
+    }
+
+    func testAnImportCopiesAFileThatIsItsOwnScope() async throws {
+        let url = try scratch.write("item scope", to: scratch.provider.appendingPathComponent("Docs/item.txt"))
+        presenter.importURL = url
+        presenter.importScopeRoot = url
+
+        let result = await importFile()
+
+        let value = try XCTUnwrap(result.value, "\(String(describing: result.failure))")
+        XCTAssertEqual(value["sha256"]?.stringValue, BridgeCanonicalJSON.sha256Hex(Data("item scope".utf8)))
+    }
+
+    func testAnImportRefusesAFileThatIsItsOwnScopeBehindALink() async throws {
+        try scratch.write("secret", to: scratch.outside.appendingPathComponent("secret.txt"))
+        try FileManager.default.createSymbolicLink(at: scratch.provider.appendingPathComponent("Link"),
+                                                   withDestinationURL: scratch.outside)
+        let url = scratch.provider.appendingPathComponent("Link/secret.txt")
+        presenter.importURL = url
+        presenter.importScopeRoot = url
+
+        assertRefused(await importFile(), .denied, "invalid_selection")
+    }
+
+    func testAnImportRefusesAFileThatIsItsOwnScopeAndALink() async throws {
+        let target = try scratch.write("secret", to: scratch.outside.appendingPathComponent("secret.txt"))
+        let link = scratch.provider.appendingPathComponent("link.txt")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        presenter.importURL = link
+        presenter.importScopeRoot = link
+
+        assertRefused(await importFile(), .denied, "invalid_selection")
+    }
+
+    func testAnImportRefusesAScopeRootBehindALink() async throws {
+        try scratch.write("secret", to: scratch.outside.appendingPathComponent("secret.txt"))
+        let link = scratch.provider.appendingPathComponent("Link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: scratch.outside)
+        presenter.importURL = link.appendingPathComponent("secret.txt")
+        presenter.importScopeRoot = link
+
+        assertRefused(await importFile(), .denied, "invalid_selection")
+    }
+
     func testAnImportRefusesAnUnsafeName() async throws {
         presenter.importURL = try scratch.write("body", to: scratch.provider.appendingPathComponent(" leading.txt"))
 
