@@ -212,3 +212,25 @@ The check of the host walks the files of a task with the walk of the /proc
 while the task lets its files go, and it holds for the exit of a task as
 well: the files of a task that exits are detached under the lock of the
 tasks, so the walk of the /proc sees either the files of the task or none.
+
+## `fs/IshBridgeSocketHook.c`, `fs/sock.c`: the capability bridge endpoint
+
+The LegHost guest reaches the host's capability listener at one fixed path,
+`/run/leghost-bridge.sock`. The listener is a real Unix socket of the app at
+a private host path; upstream rewrites every guest Unix socket path to
+`/tmp/ishsock<pid>.<id>`, so the guest could not reach it.
+
+- `fs/IshBridgeSocketHook.c` and `.h` (new): the host registers one
+  generation and its listener path, then provisions a fake socket inode at
+  the endpoint in the task context of the guest before the program runs, and
+  cleans it up after a failed start or a stop. The hook holds the inode, so
+  its socket id is stable, and removes only the inode it created. A socket an
+  earlier generation left at the endpoint is replaced; anything else there
+  fails the start.
+- `fs/sock.c`: `connect()` to the exact inode the hook provisioned is mapped
+  onto the listener path, and skips the exchange of peer pointers that two
+  iSH sockets make, since the listener is not an iSH socket. `bind()` and
+  every other socket are unchanged.
+
+The hook is in `meson.build`, `iSH.xcodeproj`, and the source list of
+`scripts/build-ish-runtime.sh`.

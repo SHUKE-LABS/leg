@@ -23,6 +23,7 @@
 #include <os/log.h>
 
 #include "fs/devices.h"
+#include "fs/IshBridgeSocketHook.h"
 #include "fs/fd.h"
 #include "fs/path.h"
 #include "fs/proc.h"
@@ -323,11 +324,21 @@ int guest_runtime_start_session(const char *program, const char *arguments,
     tty_set_winsize(tty, (struct winsize_) {.col = 80, .row = 24});
     unlock(&tty->lock);
 
-    /* The kernel copies the argument vector and the environment into the new
-     * process, so both can be released right afterwards. */
-    err = do_execve(program, argument_count, arguments, environment);
-    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] exec %{public}s returned %d", program, err);
+    /* The endpoint of the capability bridge is a file of the guest, so it is
+     * made in the task context of the session, before the program runs. */
+    if (ish_bridge_socket_provision() < 0) {
+        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_ERROR, "[LegHost] the bridge endpoint could not be made");
+        err = GUEST_RUNTIME_BRIDGE_ERROR;
+    } else {
+        /* The kernel copies the argument vector and the environment into the
+         * new process, so both can be released right afterwards. */
+        err = do_execve(program, argument_count, arguments, environment);
+        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] exec %{public}s returned %d", program, err);
+    }
     if (err < 0) {
+        /* The endpoint goes while the task of the session is still the
+         * current task: removing a file of the guest needs one. */
+        ish_bridge_socket_cleanup();
         /* The session could not start, so the task of the session never ran.
          * The kernel lets the task go: the task is marked as gone and its
          * files are detached under the lock of the tasks, so a walk of the
@@ -549,6 +560,18 @@ int guest_runtime_stop_session(void) {
      * the exit of a task of the guest does not end a session that is not
      * there. */
     session_pid = 0;
+
+    /* The endpoint of the capability bridge is removed once no task of the
+     * guest can reach it. Removing a file of the guest needs a task context,
+     * and the init process is the one task that is left. */
+    lock(&pids_lock);
+    struct task *init = pid_get_task(1);
+    unlock(&pids_lock);
+    if (init != NULL) {
+        current = init;
+        ish_bridge_socket_cleanup();
+        current = NULL;
+    }
     return 0;
 }
 

@@ -10,5 +10,6 @@
 #define LEGHOST_TESTS_BRIDGING_HEADER_H
 
 #include "GuestRuntime.h"
+#include "fs/IshBridgeSocketHook.h"
 
 #endif /* LEGHOST_TESTS_BRIDGING_HEADER_H */

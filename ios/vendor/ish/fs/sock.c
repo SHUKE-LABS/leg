@@ -12,6 +12,7 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "fs/sock.h"
+#include "fs/IshBridgeSocketHook.h"
 #include "debug.h"
 
 #define SOCKET_TYPE_MASK 0xf
@@ -225,7 +226,10 @@ static void unix_abstract_release(struct unix_abstract *name) {
 
 const char *sock_tmp_prefix = "/tmp/ishsock";
 
-static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
+// `bridge_endpoint` is set for a connect() only: when it is not NULL and the
+// path names the LegHost capability bridge endpoint, the address is the
+// host's listener rather than an iSH socket, and *bridge_endpoint is set.
+static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd, bool *bridge_endpoint) {
     // Make sure we can read things without overflowing buffers
     if (*sockaddr_len < 2)
         return _EINVAL;
@@ -274,6 +278,15 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
             }
 
             struct sockaddr_un *real_addr_un = sockaddr;
+            if (bridge_endpoint != NULL && path[0] != '\0') {
+                size_t bridge_len = ish_bridge_socket_connect_path(socket_id,
+                        real_addr_un->sun_path, sizeof(real_addr_un->sun_path));
+                if (bridge_len > 0) {
+                    *bridge_endpoint = true;
+                    *sockaddr_len = offsetof(struct sockaddr_un, sun_path) + bridge_len;
+                    break;
+                }
+            }
             size_t path_len = sprintf(real_addr_un->sun_path, "%s%d.%u", sock_tmp_prefix, getpid(), socket_id);
             // The call to real bind will fail if the backing socket already
             // exists from a previous run or something. We already checked that
@@ -292,7 +305,7 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
 
 static int sockaddr_read(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len) {
     struct inode_data *inode = NULL;
-    int err = sockaddr_read_bind(sockaddr_addr, sockaddr, sockaddr_len, NULL);
+    int err = sockaddr_read_bind(sockaddr_addr, sockaddr, sockaddr_len, NULL, NULL);
     inode_release_if_exist(inode);
     return err;
 }
@@ -334,7 +347,7 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         return _EBADF;
     struct sockaddr_max_ sockaddr;
     struct inode_data *inode = NULL;
-    int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, sock);
+    int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, sock, NULL);
     if (err < 0)
         return err;
 
@@ -361,7 +374,8 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (sock == NULL)
         return _EBADF;
     struct sockaddr_max_ sockaddr;
-    int err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len);
+    bool bridge_endpoint = false;
+    int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, NULL, &bridge_endpoint);
     if (err < 0)
         return err;
 
@@ -369,7 +383,9 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (err < 0)
         return errno_map();
 
-    if (sock->socket.domain == AF_LOCAL_) {
+    // The host's listener is not an iSH socket: it does not take part in the
+    // exchange of peer pointers below, and waiting for it would never end.
+    if (sock->socket.domain == AF_LOCAL_ && !bridge_endpoint) {
         fill_cred(&sock->socket.unix_cred);
         assert(sock->socket.unix_peer == NULL);
         // Send a pointer to ourselves to the other end so they can set up the peer pointers.

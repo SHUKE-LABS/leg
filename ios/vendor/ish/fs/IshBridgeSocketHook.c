@@ -1,0 +1,180 @@
+/*
+ * The capability bridge endpoint of the LegHost guest. See
+ * IshBridgeSocketHook.h.
+ */
+
+#include <string.h>
+#include <sys/stat.h>
+
+#include "kernel/errno.h"
+#include "kernel/fs.h"
+#include "kernel/task.h"
+#include "fs/inode.h"
+#include "fs/path.h"
+#include "fs/IshBridgeSocketHook.h"
+#include "util/sync.h"
+
+static lock_t hook_lock = LOCK_INITIALIZER;
+
+static struct {
+    uint64_t generation;
+    bool registered;
+    char host_path[ISH_BRIDGE_SOCKET_HOST_PATH_MAX + 1];
+    /* The fake inode the hook created, held so its socket id stays the
+     * same for as long as the endpoint is provisioned. */
+    struct inode_data *inode;
+} hook;
+
+/* Drops the hold on the fake inode. Called with hook_lock held. */
+static void release_inode(void) {
+    if (hook.inode != NULL) {
+        inode_release(hook.inode);
+        hook.inode = NULL;
+    }
+}
+
+int ish_bridge_socket_register(uint64_t generation, const char *host_path) {
+    if (host_path == NULL)
+        return ISH_BRIDGE_SOCKET_PATH_TOO_LONG;
+    size_t length = strlen(host_path);
+    if (length == 0 || length > ISH_BRIDGE_SOCKET_HOST_PATH_MAX)
+        return ISH_BRIDGE_SOCKET_PATH_TOO_LONG;
+    lock(&hook_lock);
+    if (hook.registered && hook.generation != generation) {
+        unlock(&hook_lock);
+        return ISH_BRIDGE_SOCKET_BUSY;
+    }
+    hook.generation = generation;
+    hook.registered = true;
+    memcpy(hook.host_path, host_path, length + 1);
+    unlock(&hook_lock);
+    return ISH_BRIDGE_SOCKET_OK;
+}
+
+int ish_bridge_socket_unregister(uint64_t generation) {
+    lock(&hook_lock);
+    if (!hook.registered || hook.generation != generation) {
+        unlock(&hook_lock);
+        return ISH_BRIDGE_SOCKET_STALE;
+    }
+    release_inode();
+    hook.registered = false;
+    hook.generation = 0;
+    memset(hook.host_path, 0, sizeof(hook.host_path));
+    unlock(&hook_lock);
+    return ISH_BRIDGE_SOCKET_OK;
+}
+
+/* Looks the endpoint up without following a link at its last component. */
+static int endpoint_stat(struct statbuf *stat) {
+    return generic_statat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, stat, false);
+}
+
+/* Takes a hold on the inode at the endpoint. */
+static struct inode_data *endpoint_inode(const struct statbuf *stat) {
+    char path[MAX_PATH];
+    if (path_normalize(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, path, N_SYMLINK_NOFOLLOW) < 0)
+        return NULL;
+    struct mount *mount = find_mount_and_trim_path(path);
+    struct inode_data *inode = inode_get(mount, stat->inode);
+    mount_release(mount);
+    return inode;
+}
+
+int ish_bridge_socket_provision(void) {
+    if (current == NULL)
+        return ISH_BRIDGE_SOCKET_NO_TASK;
+    lock(&hook_lock);
+    if (!hook.registered) {
+        unlock(&hook_lock);
+        return ISH_BRIDGE_SOCKET_OK;
+    }
+    /* A retry starts from nothing: the hold of an earlier start goes. */
+    release_inode();
+
+    int result = ISH_BRIDGE_SOCKET_FS_ERROR;
+    int err = generic_mkdirat(AT_PWD, "/run", 0755);
+    if (err < 0 && err != _EEXIST)
+        goto out;
+
+    struct statbuf stat;
+    err = endpoint_stat(&stat);
+    if (err == 0) {
+        /* The endpoint is reserved, so a socket there is one an earlier
+         * generation left behind. Anything else is not the host's to
+         * remove. */
+        if (!S_ISSOCK(stat.mode)) {
+            result = ISH_BRIDGE_SOCKET_NOT_SOCKET;
+            goto out;
+        }
+        if (generic_unlinkat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH) < 0)
+            goto out;
+    } else if (err != _ENOENT) {
+        goto out;
+    }
+
+    if (generic_mknodat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH, S_IFSOCK | 0666, 0) < 0)
+        goto out;
+    if (endpoint_stat(&stat) < 0 || !S_ISSOCK(stat.mode))
+        goto out;
+    hook.inode = endpoint_inode(&stat);
+    if (hook.inode == NULL)
+        goto out;
+    result = ISH_BRIDGE_SOCKET_OK;
+
+out:
+    unlock(&hook_lock);
+    return result;
+}
+
+int ish_bridge_socket_cleanup(void) {
+    if (current == NULL)
+        return ISH_BRIDGE_SOCKET_NO_TASK;
+    lock(&hook_lock);
+    int result = ISH_BRIDGE_SOCKET_OK;
+    if (hook.inode != NULL) {
+        /* Only the inode the hook created is removed: a file the guest put
+         * at the endpoint in its place is the guest's. */
+        struct statbuf stat;
+        if (endpoint_stat(&stat) == 0 && S_ISSOCK(stat.mode) && stat.inode == hook.inode->number) {
+            if (generic_unlinkat(AT_PWD, ISH_BRIDGE_SOCKET_GUEST_PATH) < 0)
+                result = ISH_BRIDGE_SOCKET_FS_ERROR;
+        }
+        release_inode();
+    }
+    unlock(&hook_lock);
+    return result;
+}
+
+void ish_bridge_socket_get_state(struct ish_bridge_socket_state *state) {
+    lock(&hook_lock);
+    state->generation = hook.generation;
+    state->registered = hook.registered;
+    state->provisioned = hook.inode != NULL;
+    state->socket_id = 0;
+    if (hook.inode != NULL) {
+        lock(&hook.inode->lock);
+        state->socket_id = hook.inode->socket_id;
+        unlock(&hook.inode->lock);
+    }
+    unlock(&hook_lock);
+}
+
+size_t ish_bridge_socket_connect_path(uint32_t socket_id, char *sun_path, size_t sun_path_size) {
+    if (socket_id == 0)
+        return 0;
+    size_t length = 0;
+    lock(&hook_lock);
+    if (hook.registered && hook.inode != NULL) {
+        lock(&hook.inode->lock);
+        bool ours = hook.inode->socket_id == socket_id;
+        unlock(&hook.inode->lock);
+        size_t path_length = strlen(hook.host_path);
+        if (ours && path_length < sun_path_size) {
+            memcpy(sun_path, hook.host_path, path_length + 1);
+            length = path_length;
+        }
+    }
+    unlock(&hook_lock);
+    return length;
+}
