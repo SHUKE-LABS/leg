@@ -118,9 +118,11 @@ The current Linux checkout cannot produce a truthful device result. On
 `xcodebuild`, `xcrun`, the iOS SDK, and a physical device were unavailable.
 No current-head Shortcut pass is claimed here: the registration, URL/file
 handoff, callback, cancellation, and foreground/background rows above remain
-an operator-run device gate. The host-side focused tests and the CI jobs are
-the evidence available from this environment; a macOS/Xcode device run must
-replace this note before the issue can be closed.
+an operator-run device gate, tracked separately in
+[issue #310](https://github.com/SHUKE-LABS/leg/issues/310). The host-side
+focused tests and the CI jobs are the evidence available from this environment;
+the macOS/Xcode device run belongs to #310 and must replace this note before
+that validation issue can be closed.
 
 ### The persistence boundaries on the device
 
