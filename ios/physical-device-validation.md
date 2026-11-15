@@ -111,6 +111,17 @@ the following outcomes:
 | Callback outcomes | A normal callback, missing result, cancellation, timeout, unknown Shortcut, and unavailable Shortcuts app produce the documented `ok`, `error`, `cancelled`, or `unavailable` mappings |
 | Foreground/background | The host may foreground Shortcuts for the run; backgrounding the host cancels the pending callback and leaves no pending approval or temporary file |
 
+### Current-head follow-up attempt
+
+The current Linux checkout cannot produce a truthful device result. On
+2026-11-16, the follow-up was inspected from the implementation worktree, but
+`xcodebuild`, `xcrun`, the iOS SDK, and a physical device were unavailable.
+No current-head Shortcut pass is claimed here: the registration, URL/file
+handoff, callback, cancellation, and foreground/background rows above remain
+an operator-run device gate. The host-side focused tests and the CI jobs are
+the evidence available from this environment; a macOS/Xcode device run must
+replace this note before the issue can be closed.
+
 ### The persistence boundaries on the device
 
 The workspace catalog of the guest lives in the guest root, in the container of

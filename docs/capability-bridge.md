@@ -92,19 +92,33 @@ The mobile `shortcuts` Skill is staged at
 `/root/.agents/skills/shortcuts/SKILL.md` during iOS guest provisioning. It
 calls only `shortcuts.invoke`, asks for missing names or input, follows the
 approval token flow, and reports the final status. The host opens Apple's
-public `shortcuts://run-shortcut` x-callback URL with `x-success`, `x-cancel`,
-and `x-error` callbacks. A run is never dispatched without an alert showing the
-registered name and an input summary. The host maps a missing result to
-`error/missing_result`, a cancelled callback to `cancelled/cancelled`, a
-missing Shortcut to `unavailable/shortcut_not_found`, and an unavailable
-Shortcuts app to `unavailable/shortcuts_unavailable`.
+public `shortcuts://x-callback-url/run-shortcut` endpoint with `x-success`,
+`x-cancel`, and `x-error` callbacks. Text and JSON use `input=text` and the
+`text` parameter; files use `input=file` and the `file` parameter. A run is
+never dispatched without an alert showing the registered name and an input
+summary. The host maps a missing result to `error/missing_result`, a cancelled
+callback to `cancelled/cancelled`, a missing Shortcut to
+`unavailable/shortcut_not_found`, and an unavailable Shortcuts app to
+`unavailable/shortcuts_unavailable`.
 
-File inputs are security-scoped URLs selected by the user, copied into an
-app-owned temporary directory, and deleted after the callback. The host limits
-text and JSON input to 32 KiB, callback results to 32 KiB, files to 16 MiB,
-and callback waits to 30 s.
+For a file, the user authorizes a Files-provider URL in the system document
+picker. The host retains that security scope only for the run and hands the
+selected URL to Shortcuts through the public `file` parameter; it never sends a
+guest path or an app-private temporary URL to Shortcuts. The scope is released
+when the callback, cancellation, or timeout completes. The host limits text and
+JSON input to 32 KiB, callback results to 32 KiB, files to 16 MiB, and callback
+waits to 30 s.
 The host may need to foreground Apple's Shortcuts app; backgrounding the iOS
 host cancels the pending callback.
+
+There is no private Shortcuts database entitlement and no automatic permission
+grant. The host confirmation is required for every run. Selecting a file is a
+separate user action in the system document picker, and individual Shortcut
+actions may show Apple's own permission prompts. The guest/model can see the
+registered name and bounded input it requested, the approval review (including
+the text/JSON shape or selected file name and size), and the structured result
+or error returned by the Shortcut. It cannot see the host's security-scoped
+URL, Shortcut source, or unregistered automations.
 
 A **path** is relative and normalized: no leading `/`, no `..` or `.` segment,
 no empty segment, no backslash, no drive letter, no `~`, no URL scheme, no

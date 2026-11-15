@@ -219,16 +219,27 @@ reason `shortcut_not_registered` plus the registration instructions.
 
 Every invocation shows a host confirmation containing the exact name and an
 input summary. The host then opens Apple's public
-`shortcuts://run-shortcut` x-callback URL. Text and JSON inputs are capped at
-32 KiB. Files are selected with the system document picker, copied into an
-app-owned temporary directory, capped at 16 MiB, and removed after the callback;
-the guest never supplies a host path. Inputs and callback results are capped at
-32 KiB; callback waits are capped at 30 seconds.
+`shortcuts://x-callback-url/run-shortcut` endpoint. Text and JSON inputs use
+`input=text` and `text`; file inputs use `input=file` and `file`. Text and JSON
+inputs are capped at 32 KiB. Files are selected with the system document
+picker, passed to Shortcuts as the user-authorized security-scoped URL, and
+released after the callback; no guest path or app-private temporary URL is
+ever supplied. Files are capped at 16 MiB. Inputs and callback results are
+capped at 32 KiB; callback waits are capped at 30 seconds.
 The host returns structured `ok`, `denied`, `cancelled`, `unavailable`, or
 `error` statuses and may need to foreground the Shortcuts app. Missing output,
 unknown Shortcut, and an unavailable Shortcuts app map to
 `error/missing_result`, `unavailable/shortcut_not_found`, and
 `unavailable/shortcuts_unavailable` respectively.
+
+The adapter uses no private Shortcuts database entitlement and grants no
+automatic permission. The host confirmation is mandatory for every run; the
+system document picker separately authorizes a selected file, and individual
+Shortcut actions may display Apple's own permission prompts. The guest/model
+sees the registered name and bounded input it requested, the approval review
+(including the input shape or selected file name and size), and the structured
+Shortcut result or error. It never receives the host's security-scoped URL,
+Shortcut source, or unregistered automation list.
 
 The pinned SHA-256 is the `SHA256SUMS` entry the `v0.44.1` release publishes
 for the ios-mobile asset. The build and `ios/tests/run-pinned-inputs.sh` fail
