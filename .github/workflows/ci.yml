@@ -447,6 +447,7 @@ jobs:
     timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
+      LEGHOST_TRACE_RUNTIME: "1"
     steps:
       - uses: actions/checkout@v5
 

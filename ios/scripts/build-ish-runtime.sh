@@ -18,6 +18,9 @@
 # The source list mirrors the `kernel=ish` build in upstream's meson.build.
 
 set -euo pipefail
+if [[ "${LEGHOST_TRACE_RUNTIME:-0}" == 1 ]]; then
+    set -x
+fi
 
 ISH_SRC="${SRCROOT:?SRCROOT is not set}/vendor/ish"
 LIBARCHIVE_SRC="${ISH_SRC}/deps/libarchive"
