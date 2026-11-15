@@ -448,6 +448,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
       LEGHOST_TRACE_RUNTIME: "1"
+      LEGHOST_RUNTIME_TRACE_FILE: ${{ runner.temp }}/ish-runtime-trace.log
     steps:
       - uses: actions/checkout@v5
 
@@ -496,7 +497,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ios-shortcut-bridge-xcresult-${{ github.sha }}
-          path: ${{ runner.temp }}/leghost-shortcut-bridge.xcresult
+          path: |
+            ${{ runner.temp }}/leghost-shortcut-bridge.xcresult
+            ${{ runner.temp }}/ish-runtime-trace.log
           if-no-files-found: warn
           retention-days: 14
 

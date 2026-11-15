@@ -19,6 +19,9 @@
 
 set -euo pipefail
 if [[ "${LEGHOST_TRACE_RUNTIME:-0}" == 1 ]]; then
+    if [[ -n "${LEGHOST_RUNTIME_TRACE_FILE:-}" ]]; then
+        exec 2> >(tee -a "${LEGHOST_RUNTIME_TRACE_FILE}" >&2)
+    fi
     set -x
 fi
 
