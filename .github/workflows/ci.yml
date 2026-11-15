@@ -447,12 +447,20 @@ jobs:
     timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
-      LEGHOST_TRACE_RUNTIME: "1"
     steps:
       - uses: actions/checkout@v5
 
       - name: Report Xcode version
         run: xcodebuild -version
+
+      - name: Configure the ELF linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          llvm_prefix="$(brew --prefix llvm@18)"
+          test -x "${llvm_prefix}/bin/ld.lld"
+          echo "${llvm_prefix}/bin" >>"${GITHUB_PATH}"
+          "${llvm_prefix}/bin/ld.lld" --version
 
       - name: Boot an iPhone simulator
         shell: bash
@@ -479,8 +487,6 @@ jobs:
 
       - name: Run the real Shortcut bridge UI fixture
         shell: bash
-        env:
-          LEGHOST_RUNTIME_TRACE_FILE: ${{ runner.temp }}/ish-runtime-trace.log
         run: |
           set -euo pipefail
           xcodebuild test \
@@ -498,9 +504,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ios-shortcut-bridge-xcresult-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/leghost-shortcut-bridge.xcresult
-            ${{ runner.temp }}/ish-runtime-trace.log
+          path: ${{ runner.temp }}/leghost-shortcut-bridge.xcresult
           if-no-files-found: warn
           retention-days: 14
 
