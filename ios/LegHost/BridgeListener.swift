@@ -636,12 +636,22 @@ final class BridgeListener: @unchecked Sendable {
     var now: () -> Int64 = { Int64(Date().timeIntervalSince1970.rounded(.down)) }
     /// Called with the status of every reply the listener wrote.
     var onReply: ((String) -> Void)?
+    /// How long the teardown waits for the workers before it leaves the rest
+    /// of the teardown to the last worker that ends.
+    var joinTimeout: DispatchTimeInterval = .seconds(10)
+    /// How long a stopped request waits for its adapter before it answers.
+    var cancelGrace: DispatchTimeInterval = .seconds(5)
+    /// Called with the socket path right before the bind, for the tests.
+    var beforeBind: ((String) -> Void)?
 
     private let lock = NSLock()
     private var ledger = BridgeApprovalLedger()
     private var listenFD: Int32 = -1
     private var wakeFDs: [Int32] = [-1, -1]
     private var socketDirectory: URL?
+    /// The device and inode of the socket this listener bound: the teardown
+    /// removes that socket and nothing else.
+    private var boundSocket: (device: dev_t, inode: ino_t)?
     private var registered = false
     private var accepting = false
     private var connections: Set<Int32> = []
@@ -667,8 +677,12 @@ final class BridgeListener: @unchecked Sendable {
     }
 
     deinit {
+        // A connection and the work of an adapter hold the listener, so only
+        // the accept loop can still run here: the wake of beginShutdown ends
+        // it, and the wait is bounded because this may be its own thread.
         beginShutdown()
-        finishShutdown()
+        _ = workers.wait(timeout: .now() + joinTimeout)
+        release()
     }
 
     /// The approvals the listener holds, for the tests.
@@ -726,12 +740,24 @@ final class BridgeListener: @unchecked Sendable {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw BridgeListenerError(message: "the socket could not be made (errno \(errno))") }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+        beforeBind?(path)
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard bound == 0, chmod(path, 0o600) == 0, listen(fd, 8) == 0 else {
+        guard bound == 0 else {
+            let code = errno
+            close(fd)
+            throw BridgeListenerError(message: "the socket could not be bound (errno \(code))")
+        }
+        // The private directory holds nothing else, so the socket at the path
+        // right after the bind is the one this listener made.
+        var owned = stat()
+        if lstat(path, &owned) == 0, owned.st_mode & S_IFMT == S_IFSOCK {
+            boundSocket = (owned.st_dev, owned.st_ino)
+        }
+        guard boundSocket != nil, chmod(path, 0o600) == 0, listen(fd, 8) == 0 else {
             let code = errno
             close(fd)
             throw BridgeListenerError(message: "the socket could not listen (errno \(code))")
@@ -829,10 +855,25 @@ final class BridgeListener: @unchecked Sendable {
     /// The second half of the teardown, after the guest stopped: the workers
     /// are joined, the endpoint mapping is dropped, and the socket, its
     /// directory, and the staging of this generation are removed.
-    func finishShutdown() {
-        if workers.wait(timeout: .now() + .seconds(10)) == .timedOut {
-            NSLog("[LegHost] the bridge workers did not stop")
+    ///
+    /// An adapter that does not stop within `joinTimeout` may still write,
+    /// so the mapping, the socket, and the staging stay until the last
+    /// worker ended, and the teardown finishes then. Returns whether it
+    /// finished now.
+    @discardableResult
+    func finishShutdown() -> Bool {
+        guard workers.wait(timeout: .now() + joinTimeout) == .success else {
+            NSLog("[LegHost] the bridge workers did not stop; the teardown waits for them")
+            workers.notify(queue: .global(qos: .utility)) { [self] in release() }
+            return false
         }
+        release()
+        return true
+    }
+
+    /// Drops the mapping and removes the socket, its directory, and the
+    /// staging of this generation. Runs once no worker is left.
+    private func release() {
         lock.lock()
         defer { lock.unlock() }
         ledger.discardAll()
@@ -849,11 +890,14 @@ final class BridgeListener: @unchecked Sendable {
             wakeFDs[index] = -1
         }
         if let directory = socketDirectory {
-            // Only the socket this listener bound, and the directory it made.
+            // Only the socket this listener bound, and the directory it made
+            // when it is empty.
             var info = stat()
-            if lstat(socketPath, &info) == 0, info.st_mode & S_IFMT == S_IFSOCK {
+            if let owned = boundSocket, lstat(socketPath, &info) == 0, info.st_mode & S_IFMT == S_IFSOCK,
+               info.st_dev == owned.device, info.st_ino == owned.inode {
                 unlink(socketPath)
             }
+            boundSocket = nil
             rmdir(directory.path)
             socketDirectory = nil
         }
@@ -1042,7 +1086,11 @@ final class BridgeListener: @unchecked Sendable {
         }
         let id = nextTask
         nextTask += 1
-        let task = Task {
+        // The work counts as a worker, and holds the listener, until the
+        // adapter returns, also when the request was answered before: the
+        // teardown joins it.
+        workers.enter()
+        let task = Task { [self] in
             do {
                 box.set(.success(try await body()))
             } catch let error as BridgeFailure {
@@ -1053,6 +1101,7 @@ final class BridgeListener: @unchecked Sendable {
                 box.set(.failure(.error("io_failure", "the host failed")))
             }
             done.signal()
+            workers.leave()
         }
         tasks[id] = task
         lock.unlock()
@@ -1072,7 +1121,7 @@ final class BridgeListener: @unchecked Sendable {
             if let stopReason {
                 task.cancel()
                 // The adapter removes what it staged before it returns.
-                _ = done.wait(timeout: .now() + .seconds(5))
+                _ = done.wait(timeout: .now() + cancelGrace)
                 return .failure(stopReason)
             }
         }

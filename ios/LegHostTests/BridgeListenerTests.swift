@@ -57,6 +57,14 @@ final class BridgeListenerTests: XCTestCase {
         }
     }
 
+    /// A gate an adapter that ignores cancellation waits at.
+    private final class Gate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var opened = false
+        var isOpen: Bool { lock.withLock { opened } }
+        func open() { lock.withLock { opened = true } }
+    }
+
     /// Work that runs until it is cancelled.
     private static func forever() async throws -> BridgeJSON {
         while true {
@@ -195,6 +203,29 @@ final class BridgeListenerTests: XCTestCase {
         return fd
     }
 
+    /// Binds a socket of the test at `path`, as another process would.
+    private func bindSocket(at path: String) throws -> Int32 {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &address.sun_path) { raw in
+            let bytes = Array(path.utf8)
+            raw.copyBytes(from: bytes)
+            raw[bytes.count] = 0
+        }
+        let status = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard status == 0 else {
+            close(fd)
+            throw POSIXError(.EADDRINUSE)
+        }
+        return fd
+    }
+
     private func status(_ reply: BridgeJSON?) -> String? { reply?["status"]?.stringValue }
     private func reason(_ reply: BridgeJSON?) -> String? { reply?["error"]?["reason"]?.stringValue }
 
@@ -234,6 +265,66 @@ final class BridgeListenerTests: XCTestCase {
         var info = stat()
         XCTAssertNotEqual(lstat(second.socketPath, &info), 0)
         XCTAssertFalse(registrar.events.contains("unregister 8"))
+    }
+
+    func testASocketThatTakesThePathBeforeTheBindIsNotRemoved() throws {
+        let second = makeListener(generation: 8)
+        var foreign: Int32 = -1
+        second.beforeBind = { path in foreign = (try? self.bindSocket(at: path)) ?? -1 }
+        XCTAssertThrowsError(try second.start())
+        XCTAssertGreaterThanOrEqual(foreign, 0, "the test could not take the path")
+        defer {
+            close(foreign)
+            unlink(second.socketPath)
+            rmdir((second.socketPath as NSString).deletingLastPathComponent)
+        }
+        var info = stat()
+        XCTAssertEqual(lstat(second.socketPath, &info), 0, "the listener removed a socket it did not bind")
+        XCTAssertEqual(info.st_mode & S_IFMT, S_IFSOCK)
+        XCTAssertFalse(registrar.events.contains("register 8"))
+    }
+
+    func testTeardownWaitsForAnAdapterThatDoesNotStop() throws {
+        let token = try preview()
+        let gate = Gate()
+        adapter.performResult = {
+            // Ignores the cancellation.
+            while !gate.isOpen { usleep(10_000) }
+            return .object(["done": .bool(true)])
+        }
+        let staging = root.appendingPathComponent("staging").appendingPathComponent(listener.generationID)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        let path = listener.socketPath
+        let replied = expectation(description: "reply")
+        DispatchQueue.global().async {
+            _ = try? self.exchange(self.frame("photos.export", Self.exportInput, token: token))
+            replied.fulfill()
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while adapter.performs == 0 && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        listener.joinTimeout = .milliseconds(200)
+        listener.cancelGrace = .milliseconds(100)
+        listener.beginShutdown()
+        wait(for: [replied], timeout: 15)
+        // The connection worker has answered and ended by now; only the work
+        // of the adapter is left.
+        Thread.sleep(forTimeInterval: 0.5)
+        XCTAssertFalse(listener.finishShutdown(), "the teardown did not wait for the adapter")
+        var info = stat()
+        XCTAssertEqual(registrar.events.last, "register 7", "the mapping went while the adapter ran")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: staging.path), "the staging went while the adapter ran")
+        XCTAssertEqual(lstat(path, &info), 0)
+
+        gate.open()
+        let released = Date().addingTimeInterval(5)
+        while registrar.events.last != "unregister 7" && Date() < released {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertEqual(registrar.events.last, "unregister 7")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path))
+        XCTAssertNotEqual(lstat(path, &info), 0)
     }
 
     // MARK: Requests
