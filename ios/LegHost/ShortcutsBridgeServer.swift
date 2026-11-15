@@ -165,7 +165,7 @@ final class ShortcutsBridgeServer {
             let remaining = min(Self.maximumWaitMilliseconds,
                                 Int((deadline - now) / 1_000_000))
             var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let result = Darwin.poll(&poller, 1, max(1, remaining))
+            let result = Darwin.poll(&poller, 1, Int32(max(1, remaining)))
             guard result > 0 else { return nil }
             let count = buffer.withUnsafeMutableBytes { storage -> Int in
                 guard let base = storage.baseAddress else { return -1 }
@@ -203,7 +203,7 @@ final class ShortcutsBridgeServer {
                 let remaining = min(Self.maximumWaitMilliseconds,
                                     Int((deadline - now) / 1_000_000))
                 var poller = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-                guard Darwin.poll(&poller, 1, max(1, remaining)) > 0 else {
+                guard Darwin.poll(&poller, 1, Int32(max(1, remaining))) > 0 else {
                     sentAll = false
                     return
                 }

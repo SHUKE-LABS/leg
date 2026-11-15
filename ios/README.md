@@ -207,7 +207,7 @@ part of the guest.
 
 The running iOS host implements the `shortcuts.invoke` capability. Open
 **Shortcuts settings**, enter the exact case-sensitive name of an existing
-Shortcut, and choose whether it accepts text, a file, or a JSON object. The
+Shortcut, and choose whether it accepts text or a JSON object. The
 host stores only this registration metadata. It never discovers, creates,
 edits, enables, schedules, or silently runs personal automations.
 
@@ -220,13 +220,11 @@ reason `shortcut_not_registered` plus the registration instructions.
 Every invocation shows a host confirmation containing the exact name and an
 input summary. The host then opens Apple's public
 `shortcuts://x-callback-url/run-shortcut` endpoint. Text and JSON inputs use
-`input=text` and `text`; file inputs use `input=file` and `file`. Text and JSON
-inputs are capped at 32 KiB. Files are selected with the system document
-picker, validated, copied into an app-owned temporary area, and passed to
-Shortcuts through the public file parameter. The source security scope is
-released after the copy; the temporary copy is deleted after callback,
-cancellation, timeout, or approval expiry. No guest path is ever supplied.
-Files are capped at 16 MiB. Inputs and callback results are capped at 32 KiB;
+`input=text` and `text`. File input is out of scope for this slice because
+Apple's public URL scheme has no documented file parameter; the follow-up is
+tracked in
+[#312](https://github.com/SHUKE-LABS/leg/issues/312). Text and JSON inputs and
+callback results are capped at 32 KiB;
 callback waits are capped at 30 seconds.
 Callback URLs carry a host-generated one-time state value rather than the
 guest's request ID; unknown or stale callback states are ignored.
@@ -237,13 +235,11 @@ unknown Shortcut, and an unavailable Shortcuts app map to
 `unavailable/shortcuts_unavailable` respectively.
 
 The adapter uses no private Shortcuts database entitlement and grants no
-automatic permission. The host confirmation is mandatory for every run; the
-system document picker separately authorizes a selected file, and individual
-Shortcut actions may display Apple's own permission prompts. The guest/model
-sees the registered name and bounded input it requested, the approval review
-(including the input shape or selected file name and size), and the structured
-Shortcut result or error. It never receives the host's security-scoped URL,
-Shortcut source, or unregistered automation list.
+automatic permission. The host confirmation is mandatory for every run, and
+individual Shortcut actions may display Apple's own permission prompts. The
+guest/model sees the registered name and bounded text/JSON input shape it
+requested, the approval review, and the structured Shortcut result or error.
+It never receives Shortcut source or an unregistered automation list.
 
 The pinned SHA-256 is the `SHA256SUMS` entry the `v0.44.1` release publishes
 for the ios-mobile asset. The build and `ios/tests/run-pinned-inputs.sh` fail

@@ -40,6 +40,18 @@ struct ShortcutSetupView: View {
                     Text("Register Shortcut")
                 }
 
+                if registry.loadError != nil {
+                    Section("Registration storage") {
+                        Text(ShortcutRegistrationError.invalidStore.localizedDescription)
+                            .foregroundStyle(.red)
+                            .font(.footnote)
+                            .accessibilityIdentifier("shortcut-store-error")
+                        Text("Registration changes are disabled until the saved value is repaired.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if !error.isEmpty {
                     Text(error)
                         .foregroundStyle(.red)
@@ -65,6 +77,7 @@ struct ShortcutSetupView: View {
                                 Button("Remove", role: .destructive) {
                                     remove(registration)
                                 }
+                                .disabled(registry.loadError != nil)
                                 .accessibilityIdentifier("shortcut-remove-\(registration.name)")
                             }
                         }
@@ -81,7 +94,7 @@ struct ShortcutSetupView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(name.isEmpty)
+                        .disabled(name.isEmpty || registry.loadError != nil)
                         .accessibilityIdentifier("shortcut-save")
                 }
             }
@@ -93,16 +106,16 @@ struct ShortcutSetupView: View {
         do {
             try controller.saveShortcutRegistration(name: name, inputKind: inputKind)
             name = ""
-        } catch {
-            error = error.localizedDescription
+        } catch let caughtError {
+            error = caughtError.localizedDescription
         }
     }
 
     private func remove(_ registration: ShortcutRegistration) {
         do {
             try controller.removeShortcutRegistration(name: registration.name)
-        } catch {
-            error = error.localizedDescription
+        } catch let caughtError {
+            error = caughtError.localizedDescription
         }
     }
 }

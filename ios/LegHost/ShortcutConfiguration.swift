@@ -4,7 +4,6 @@ import Combine
 /// The kinds of input a registered Shortcut is allowed to receive.
 enum ShortcutInputKind: String, CaseIterable, Codable, Identifiable {
     case text
-    case file
     case json
 
     var id: String { rawValue }
@@ -12,7 +11,6 @@ enum ShortcutInputKind: String, CaseIterable, Codable, Identifiable {
     var title: String {
         switch self {
         case .text: return "Text"
-        case .file: return "File"
         case .json: return "JSON"
         }
     }
@@ -20,7 +18,6 @@ enum ShortcutInputKind: String, CaseIterable, Codable, Identifiable {
     var explanation: String {
         switch self {
         case .text: return "A bounded text value supplied by the guest."
-        case .file: return "A file chosen through the system document picker."
         case .json: return "A bounded JSON object supplied by the guest."
         }
     }
@@ -69,11 +66,21 @@ final class ShortcutRegistrationStore: ObservableObject {
     private static let defaultsKey = "leg.shortcuts.registrations.v1"
 
     @Published private(set) var registrations: [ShortcutRegistration]
+    @Published private(set) var loadError: ShortcutRegistrationError?
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.registrations = (try? Self.load(defaults: defaults)) ?? []
+        do {
+            self.registrations = try Self.load(defaults: defaults)
+            self.loadError = nil
+        } catch {
+            // Keep the invalid value intact and make the setup view read-only.
+            // Silently replacing it with an empty list would discard the
+            // user's registrations on the next save.
+            self.registrations = []
+            self.loadError = .invalidStore
+        }
     }
 
     /// Validates one name without consulting persistent state.
@@ -82,7 +89,9 @@ final class ShortcutRegistrationStore: ObservableObject {
         guard name.utf8.count <= maximumNameBytes else {
             throw ShortcutRegistrationError.nameTooLong
         }
-        guard !name.unicodeScalars.contains(where: { $0.properties.isControl }) else {
+        guard !name.unicodeScalars.contains(where: {
+            $0.properties.generalCategory == .control
+        }) else {
             throw ShortcutRegistrationError.controlCharacter
         }
     }
@@ -106,6 +115,7 @@ final class ShortcutRegistrationStore: ObservableObject {
     /// Saves one registration. A name is explicit and exact, so changing its
     /// declared input kind requires removing it and registering it again.
     func save(name: String, inputKind: ShortcutInputKind) throws {
+        guard loadError == nil else { throw ShortcutRegistrationError.invalidStore }
         try Self.validateName(name)
         guard !registrations.contains(where: { $0.name == name }) else {
             throw ShortcutRegistrationError.duplicateName
@@ -117,6 +127,7 @@ final class ShortcutRegistrationStore: ObservableObject {
 
     /// Removes one exact registration.
     func remove(name: String) throws {
+        guard loadError == nil else { throw ShortcutRegistrationError.invalidStore }
         registrations.removeAll { $0.name == name }
         try persist()
     }

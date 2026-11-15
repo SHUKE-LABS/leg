@@ -103,22 +103,21 @@ the following outcomes:
 
 | Item | Expected evidence |
 | --- | --- |
-| Register an existing Shortcut | The Shortcuts settings form saves an exact name and its text, file, or JSON input kind; a case-mismatched name is not accepted as the same registration |
+| Register an existing Shortcut | The Shortcuts settings form saves an exact name and its text or JSON input kind; a case-mismatched name is not accepted as the same registration |
 | Unknown name | A guest `shortcuts.invoke` request receives `denied` / `shortcut_not_registered` before Apple's Shortcuts app opens |
 | Confirmation and JSON result | The host alert names the registered Shortcut and input summary; approving a deterministic JSON-returning Shortcut gives the same structured object back to the guest |
 | Missing input and refusal | The Skill asks for missing input; denying the alert returns `denied` and no Shortcut run occurs |
-| File boundary | The system picker supplies the file, the host copies it to its temporary app-owned directory, the Shortcut receives it, and the temporary copy is removed afterward |
 | Callback outcomes | A normal callback, missing result, cancellation, timeout, unknown Shortcut, and unavailable Shortcuts app produce the documented `ok`, `error`, `cancelled`, or `unavailable` mappings |
-| Foreground/background | The host may foreground Shortcuts for the run; backgrounding the host cancels the pending callback and leaves no pending approval or temporary file |
+| Foreground/background | The host may foreground Shortcuts for the run; backgrounding the host cancels the pending approval or callback |
 
 ### Current-head follow-up attempt
 
 The current Linux checkout cannot produce a truthful device result. On
 2026-11-16, the follow-up was inspected from the implementation worktree, but
 `xcodebuild`, `xcrun`, the iOS SDK, and a physical device were unavailable.
-No current-head Shortcut pass is claimed here: the registration, URL/file
-handoff, callback, cancellation, and foreground/background rows above remain
-an operator-run device gate, tracked separately in
+No current-head Shortcut pass is claimed here: the registration, URL, callback,
+cancellation, and foreground/background rows above remain an operator-run
+device gate, tracked separately in
 [issue #310](https://github.com/SHUKE-LABS/leg/issues/310). The host-side
 focused tests and the CI jobs are the evidence available from this environment;
 the macOS/Xcode device run belongs to #310 and must replace this note before

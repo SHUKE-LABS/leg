@@ -82,8 +82,8 @@ for an approval for any capability, and the bridge honours that too.
 
 The iOS host has a Shortcuts settings form where the user registers the exact,
 case-sensitive name of an existing Shortcut and declares one input kind:
-bounded text, a file selected through the system document picker, or a bounded
-JSON object. An unregistered name is rejected before any URL is opened with
+bounded text or a bounded JSON object. An unregistered name is rejected before
+any URL is opened with
 `status=denied` and `reason=shortcut_not_registered`; the remediation tells the
 user to register the exact name. Registration stores only the name and input
 kind, never Shortcut source or an arbitrary URL.
@@ -94,33 +94,28 @@ calls only `shortcuts.invoke`, asks for missing names or input, follows the
 approval token flow, and reports the final status. The host opens Apple's
 public `shortcuts://x-callback-url/run-shortcut` endpoint with `x-success`,
 `x-cancel`, and `x-error` callbacks. Text and JSON use `input=text` and the
-`text` parameter; files use `input=file` and the `file` parameter. A run is
-never dispatched without an alert showing the registered name and an input
-summary. The host maps a missing result to `error/missing_result`, a cancelled
+`text` parameter. A run is never dispatched without an alert showing the
+registered name and an input summary. The host maps a missing result to
+`error/missing_result`, a cancelled
 callback to `cancelled/cancelled`, a missing Shortcut to
 `unavailable/shortcut_not_found`, and an unavailable Shortcuts app to
 `unavailable/shortcuts_unavailable`.
 Each callback URL carries a host-generated one-time state value, not the
 guest's predictable request id; unknown or stale callback states are ignored.
 
-For a file, the user authorizes a Files-provider URL in the system document
-picker. The host validates it, copies it into an app-owned temporary area, and
-releases the source security scope before handing the copy to Shortcuts through
-the public `file` parameter. The guest never supplies a path. The copy is
-deleted after the callback, cancellation, timeout, or approval expiry. The host
-limits text and JSON input to 32 KiB, callback results to 32 KiB, files to 16
-MiB, and callback waits to 30 s.
+The host limits text and JSON input to 32 KiB, callback results to 32 KiB, and
+callback waits to 30 s. File input is out of scope for this slice because
+Apple's public URL scheme defines no file parameter; the follow-up is tracked
+in [issue #312](https://github.com/SHUKE-LABS/leg/issues/312).
 The host may need to foreground Apple's Shortcuts app; backgrounding the iOS
 host cancels the pending callback.
 
 There is no private Shortcuts database entitlement and no automatic permission
-grant. The host confirmation is required for every run. Selecting a file is a
-separate user action in the system document picker, and individual Shortcut
-actions may show Apple's own permission prompts. The guest/model can see the
-registered name and bounded input it requested, the approval review (including
-the text/JSON shape or selected file name and size), and the structured result
-or error returned by the Shortcut. It cannot see the host's security-scoped
-URL, Shortcut source, or unregistered automations.
+grant. The host confirmation is required for every run, and individual
+Shortcut actions may show Apple's own permission prompts. The guest/model can
+see the registered name and bounded text/JSON shape it requested, the approval
+review, and the structured result or error returned by the Shortcut. It cannot
+see Shortcut source or unregistered automations.
 
 A **path** is relative and normalized: no leading `/`, no `..` or `.` segment,
 no empty segment, no backslash, no drive letter, no `~`, no URL scheme, no
@@ -168,6 +163,7 @@ The reasons are grouped by the status they answer with:
 | `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used`, `shortcut_not_registered` |
 | `cancelled` | `cancelled` |
 | `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied`, `shortcut_not_found`, `shortcuts_unavailable` |
+| `error` | `invalid_request`, `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_field`, `unknown_capability`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large`, `missing_result`, `shortcut_failed`, `invalid_shortcut_url`, `review_too_large`, `response_too_large`, `host_error` |
 
 ## Approval semantics
 

@@ -466,6 +466,53 @@ fn the_guest_reaches_the_capability_through_the_bash_tool() {
     assert!(answer["error"].is_null());
 }
 
+#[cfg(unix)]
+#[test]
+fn the_guest_round_trips_a_structured_shortcut_result() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("shortcut-result");
+    let state_dir = scratch.path.join("state");
+    let result = json!({
+        "ok": true,
+        "count": 2,
+        "source": "deterministic-shortcut",
+    });
+
+    let fixture_result = result.clone();
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), move |_request| {
+        host::Answer::Reply {
+            status: "ok".to_string(),
+            result: fixture_result.clone(),
+        }
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(
+        socket,
+        &state_dir,
+        &request(
+            "shortcut-result-1",
+            "shortcuts.invoke",
+            json!({
+                "name": "Bridge JSON",
+                "input": {"format": "json"},
+            }),
+        ),
+    );
+
+    assert_status(&answer, "ok");
+    assert_eq!(answer["result"], result);
+    assert!(answer["error"].is_null());
+    assert_eq!(fixture.connection_count(), 1);
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["capability"], "shortcuts.invoke");
+    assert_eq!(requests[0]["input"]["name"], "Bridge JSON");
+    assert_eq!(requests[0]["input"]["input"]["format"], "json");
+}
+
 #[test]
 fn a_bad_request_never_reaches_the_host() {
     if !bash_available() {

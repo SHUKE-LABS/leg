@@ -1,6 +1,5 @@
 import Foundation
 import UIKit
-import UniformTypeIdentifiers
 
 /// A bounded JSON value used by the native side of the capability bridge.
 ///
@@ -195,7 +194,6 @@ final class ShortcutsAdapter {
     static let guestSocketName = "/tmp/leg-host-bridge.sock"
     static let maximumInputBytes = 32 * 1024
     static let maximumResultBytes = 32 * 1024
-    static let maximumFileBytes: Int64 = 16 * 1024 * 1024
     // The Rust bridge rejects review values larger than 8 KiB. Keep the
     // human-facing fragment well below that ceiling because JSON encoding
     // escapes quotes, backslashes, and control characters again.
@@ -209,7 +207,6 @@ final class ShortcutsAdapter {
         let name: String
         let inputSHA256: String
         let registration: ShortcutRegistration
-        let selectedFile: URL?
         let expiresAt: Date
         var used = false
     }
@@ -217,9 +214,7 @@ final class ShortcutsAdapter {
     private let registry: ShortcutRegistrationStore
     private let confirmation: (String, String) async -> Bool
     private let opener: (URL) async -> Bool
-    private let filePicker: () async -> URL?
     private let approvalLifetime: TimeInterval
-    private let fileTemporaryDirectory: URL
     private var approvals: [String: Approval] = [:]
     private var callbacks: [String: AsyncStream<ShortcutCallback>.Continuation] = [:]
     private var timeoutTasks: [String: Task<Void, Never>] = [:]
@@ -236,17 +231,11 @@ final class ShortcutsAdapter {
                  }
              }
          },
-         filePicker: @escaping () async -> URL? = {
-             await ShortcutDocumentPicker.pick()
-         },
-         approvalLifetime: TimeInterval = Self.defaultApprovalLifetime,
-         fileTemporaryDirectory: URL = FileManager.default.temporaryDirectory) {
+         approvalLifetime: TimeInterval = ShortcutsAdapter.defaultApprovalLifetime) {
         self.registry = registry
         self.confirmation = confirmation
         self.opener = opener
-        self.filePicker = filePicker
         self.approvalLifetime = approvalLifetime
-        self.fileTemporaryDirectory = fileTemporaryDirectory
     }
 
     /// Handles one host request. The Rust bridge performs the outer protocol
@@ -272,64 +261,23 @@ final class ShortcutsAdapter {
         guard let validation = validate(input: nestedInput, for: registration.inputKind) else {
             return .failure(request: request, status: "error", reason: "invalid_input",
                             message: "the input does not match the registered Shortcut input kind",
-                            remediation: "send the bounded text, file, or JSON input the Shortcut accepts")
+                            remediation: "send the bounded text or JSON input the Shortcut accepts")
         }
         guard let decodedInputSHA256 = Self.inputDigest(for: request.input) else {
             return .failure(request: request, status: "error", reason: "invalid_input",
                             message: "the Shortcut input could not be digested safely",
-                            remediation: "send a smaller text, file, or JSON input")
+                            remediation: "send a smaller text or JSON input")
         }
 
         if request.approvalToken == nil {
-            let selectedFile: URL?
-            if registration.inputKind == .file {
-                let sourceFile = await filePicker()
-                guard let sourceFile else {
-                    return .failure(request: request, status: "cancelled", reason: "cancelled",
-                                    message: "the file selection was cancelled",
-                                    remediation: "choose a file and retry the Shortcut")
-                }
-                defer { sourceFile.stopAccessingSecurityScopedResource() }
-                if Task.isCancelled {
-                    return .failure(request: request, status: "cancelled", reason: "cancelled",
-                                    message: "the file selection was cancelled",
-                                    remediation: "choose a file and retry the Shortcut")
-                }
-                do {
-                    try validateFile(sourceFile)
-                } catch let error as ShortcutFileError {
-                    return .failure(request: request, status: "error", reason: error.reason,
-                                    message: error.message,
-                                    remediation: "choose a smaller regular file and retry")
-                } catch {
-                    return .failure(request: request, status: "error", reason: "file_validation_failed",
-                                    message: "the selected file could not be validated safely",
-                                    remediation: "choose another file and retry")
-                }
-                do {
-                    selectedFile = try copyFile(sourceFile)
-                } catch let error as ShortcutFileError {
-                    return .failure(request: request, status: "error", reason: error.reason,
-                                    message: error.message,
-                                    remediation: "choose a smaller regular file and retry")
-                } catch {
-                    return .failure(request: request, status: "error", reason: "file_copy_failed",
-                                    message: "the selected file could not be copied safely",
-                                    remediation: "check the file permission and retry")
-                }
-            } else {
-                selectedFile = nil
-            }
-            let summary = inputSummary(validation: validation, file: selectedFile)
+            let summary = inputSummary(validation: validation)
             let confirmed = await confirmation(name, summary)
             if Task.isCancelled {
-                cleanupFile(selectedFile)
                 return .failure(request: request, status: "cancelled", reason: "cancelled",
                                 message: "the Shortcut request was cancelled before approval",
                                 remediation: "retry the Shortcut if it is still wanted")
             }
             guard confirmed else {
-                cleanupFile(selectedFile)
                 return .failure(request: request, status: "denied", reason: "user_refused",
                                 message: "the user did not approve running the registered Shortcut",
                                 remediation: "approve the Shortcut run or retry later")
@@ -341,14 +289,12 @@ final class ShortcutsAdapter {
                 "confirmation": .string("The user approved this registered Shortcut run."),
             ])
             guard let reviewData = review.jsonData, reviewData.count <= Self.maximumReviewBytes else {
-                cleanupFile(selectedFile)
                 return .failure(request: request, status: "error", reason: "review_too_large",
                                 message: "the Shortcut confirmation summary is too large",
                                 remediation: "use a smaller Shortcut name or JSON object")
             }
             approvals[token] = Approval(token: token, requestID: request.requestID, name: name,
                                         inputSHA256: decodedInputSHA256, registration: registration,
-                                        selectedFile: selectedFile,
                                         expiresAt: Date().addingTimeInterval(approvalLifetime))
             scheduleApprovalExpiry(token)
             return .approval(request: request, token: token, review: review)
@@ -361,7 +307,6 @@ final class ShortcutsAdapter {
         }
         guard approval.expiresAt > Date() else {
             _ = removeApproval(token)
-            cleanupFile(approval.selectedFile)
             return .failure(request: request, status: "denied", reason: "approval_expired",
                             message: "the Shortcut approval has expired",
                             remediation: "ask for a fresh confirmation")
@@ -377,9 +322,7 @@ final class ShortcutsAdapter {
                             remediation: "send the same name and input that the user approved")
         }
         if Task.isCancelled {
-            if let cancelledApproval = removeApproval(token) {
-                cleanupFile(cancelledApproval.selectedFile)
-            }
+            _ = removeApproval(token)
             return .failure(request: request, status: "cancelled", reason: "cancelled",
                             message: "the Shortcut request was cancelled before dispatch",
                             remediation: "retry the Shortcut if it is still wanted")
@@ -387,13 +330,9 @@ final class ShortcutsAdapter {
 
         approval.used = true
         approvals[token] = approval
-        defer {
-            if let completedApproval = removeApproval(token) {
-                cleanupFile(completedApproval.selectedFile)
-            }
-        }
+        defer { _ = removeApproval(token) }
         return await invoke(request: request, registration: approval.registration,
-                            input: validation, selectedFile: approval.selectedFile)
+                            input: validation)
     }
 
     /// Handles a callback URL registered in the app's Info.plist.
@@ -422,17 +361,12 @@ final class ShortcutsAdapter {
     /// Cancels callbacks when the guest session is torn down or interrupted.
     func cancelAll() {
         ShortcutConfirmation.cancel()
-        ShortcutDocumentPicker.cancel()
         for callbackState in Array(callbacks.keys) {
             finishCallback(callbackState, result: .cancelled)
         }
         timeoutTasks.values.forEach { $0.cancel() }
         timeoutTasks.removeAll()
-        for token in Array(approvals.keys) {
-            if let approval = removeApproval(token) {
-                cleanupFile(approval.selectedFile)
-            }
-        }
+        for token in Array(approvals.keys) { _ = removeApproval(token) }
     }
 
     /// Builds the only URL this adapter can open. The name is supplied by a
@@ -464,27 +398,6 @@ final class ShortcutsAdapter {
         return components.url
     }
 
-    nonisolated static func shortcutURL(name: String,
-                                        file: URL,
-                                        callbackState: String) -> URL? {
-        var components = URLComponents()
-        components.scheme = "shortcuts"
-        components.host = "x-callback-url"
-        components.path = "/run-shortcut"
-        components.queryItems = [
-            URLQueryItem(name: "name", value: name),
-            URLQueryItem(name: "input", value: "file"),
-            URLQueryItem(name: "file", value: file.absoluteString),
-            URLQueryItem(name: "x-success",
-                         value: "\(callbackScheme)://success?state=\(callbackState)"),
-            URLQueryItem(name: "x-cancel",
-                         value: "\(callbackScheme)://cancel?state=\(callbackState)"),
-            URLQueryItem(name: "x-error",
-                         value: "\(callbackScheme)://error?state=\(callbackState)"),
-        ]
-        return components.url
-    }
-
     /// Recomputes the digest from the decoded input instead of trusting the
     /// caller-supplied digest in the host request envelope. The Rust bridge
     /// uses the same sorted compact JSON representation for its digest.
@@ -501,7 +414,6 @@ final class ShortcutsAdapter {
 
     private enum ValidatedInput {
         case text(String)
-        case file
         case json([String: BridgeJSONValue])
     }
 
@@ -510,14 +422,12 @@ final class ShortcutsAdapter {
         switch kind {
         case .text:
             guard let input, input.count == 1, let text = input["text"]?.stringValue,
-                  !text.isEmpty, !text.unicodeScalars.contains(where: { $0.properties.isControl }),
+                  !text.isEmpty,
+                  !text.unicodeScalars.contains(where: {
+                      $0.properties.generalCategory == .control
+                  }),
                   text.utf8.count <= Self.maximumInputBytes else { return nil }
             return .text(text)
-        case .file:
-            // The file is selected by the host's document picker. A guest
-            // path is never accepted as a file input.
-            guard input == nil || input?.isEmpty == true else { return nil }
-            return .file
         case .json:
             guard let input, !input.isEmpty, let data = BridgeJSONValue.object(input).jsonData,
                   data.count <= Self.maximumInputBytes else { return nil }
@@ -525,22 +435,10 @@ final class ShortcutsAdapter {
         }
     }
 
-    private func inputSummary(validation: ValidatedInput, file: URL?) -> String {
+    private func inputSummary(validation: ValidatedInput) -> String {
         switch validation {
         case .text(let text):
             return "text input (\(text.count) characters)"
-        case .file:
-            let name = escapedReviewFragment(file?.lastPathComponent ?? "selected file",
-                                              maximumBytes: Self.maximumReviewSummaryBytes)
-            var size: Int?
-            if let file,
-               let values = try? file.resourceValues(forKeys: [.fileSizeKey]) {
-                size = values.fileSize
-            }
-            if let size {
-                return boundedReviewSummary("file \(name) (\(size) bytes)")
-            }
-            return boundedReviewSummary("file \(name)")
         case .json(let object):
             let prefix = "JSON object with fields: "
             var summary = prefix
@@ -556,36 +454,6 @@ final class ShortcutsAdapter {
             }
             return summary
         }
-    }
-
-    private func validateFile(_ source: URL) throws {
-        let values = try source.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true else { throw ShortcutFileError.notRegular }
-        guard let size = values.fileSize, Int64(size) <= Self.maximumFileBytes else {
-            throw ShortcutFileError.tooLarge
-        }
-    }
-
-    private func copyFile(_ source: URL) throws -> URL {
-        let directory = fileTemporaryDirectory.appendingPathComponent(
-            "LegHost-Shortcuts", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let destination = directory.appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension(source.pathExtension)
-        do {
-            try FileManager.default.copyItem(at: source, to: destination)
-            try validateFile(destination)
-            return destination
-        } catch {
-            try? FileManager.default.removeItem(at: destination)
-            throw error
-        }
-    }
-
-    private func cleanupFile(_ file: URL?) {
-        guard let file else { return }
-        file.stopAccessingSecurityScopedResource()
-        try? FileManager.default.removeItem(at: file)
     }
 
     /// Escapes untrusted JSON keys before putting them into a human-facing
@@ -614,23 +482,9 @@ final class ShortcutsAdapter {
         return escaped
     }
 
-    private func boundedReviewSummary(_ value: String) -> String {
-        guard value.utf8.count > Self.maximumReviewSummaryBytes else { return value }
-        var bounded = ""
-        for scalar in value.unicodeScalars {
-            let token = String(scalar)
-            if bounded.utf8.count + token.utf8.count + "…".utf8.count > Self.maximumReviewSummaryBytes {
-                break
-            }
-            bounded.append(contentsOf: token)
-        }
-        return bounded + "…"
-    }
-
     private func invoke(request: ShortcutBridgeRequest,
                         registration: ShortcutRegistration,
-                        input: ValidatedInput,
-                        selectedFile: URL?) async -> ShortcutBridgeReply {
+                        input: ValidatedInput) async -> ShortcutBridgeReply {
         if Task.isCancelled {
             return .failure(request: request, status: "cancelled", reason: "cancelled",
                             message: "the Shortcut request was cancelled before dispatch",
@@ -650,14 +504,6 @@ final class ShortcutsAdapter {
                                 remediation: "send a smaller JSON object")
             }
             url = Self.shortcutURL(name: registration.name, text: json,
-                                   callbackState: callbackState)
-        case .file:
-            guard let selectedFile else {
-                return .failure(request: request, status: "error", reason: "missing_file",
-                                message: "the host did not receive the selected file",
-                                remediation: "choose a file and retry")
-            }
-            url = Self.shortcutURL(name: registration.name, file: selectedFile,
                                    callbackState: callbackState)
         }
 
@@ -744,8 +590,7 @@ final class ShortcutsAdapter {
     }
 
     private func expireApproval(_ token: String) {
-        guard let approval = removeApproval(token) else { return }
-        cleanupFile(approval.selectedFile)
+        _ = removeApproval(token)
     }
 
     private func registerCallback(callbackState: String,
@@ -779,25 +624,6 @@ final class ShortcutsAdapter {
         guard let continuation = callbacks.removeValue(forKey: callbackState) else { return }
         continuation.yield(result)
         continuation.finish()
-    }
-}
-
-private enum ShortcutFileError: Error {
-    case notRegular
-    case tooLarge
-
-    var reason: String {
-        switch self {
-        case .notRegular: return "invalid_file"
-        case .tooLarge: return "file_too_large"
-        }
-    }
-
-    var message: String {
-        switch self {
-        case .notRegular: return "the selected input is not a regular file"
-        case .tooLarge: return "the selected file is larger than the 16 MiB limit"
-        }
     }
 }
 
@@ -843,87 +669,6 @@ private enum ShortcutConfirmation {
     }
 
     private static func topViewController() -> UIViewController? {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let window = scenes.flatMap(\.windows).first { $0.isKeyWindow }
-        var controller = window?.rootViewController
-        while let presented = controller?.presentedViewController { controller = presented }
-        return controller
-    }
-}
-/// The system file picker used only for a Shortcut's declared file input.
-@MainActor
-private final class ShortcutDocumentPicker: NSObject, UIDocumentPickerDelegate {
-    private static var active: ShortcutDocumentPicker?
-    private var continuation: CheckedContinuation<URL?, Never>?
-    private weak var presentedController: UIDocumentPickerViewController?
-    private var cancelled = false
-
-    static func pick() async -> URL? {
-        let picker = ShortcutDocumentPicker()
-        active?.cancel()
-        active = picker
-        return await withTaskCancellationHandler {
-            await picker.present()
-        } onCancel: {
-            Task { @MainActor in picker.cancel() }
-        }
-    }
-
-    static func cancel() {
-        active?.cancel()
-    }
-
-    private func present() async -> URL? {
-        guard !Task.isCancelled else {
-            Self.active = nil
-            return nil
-        }
-        guard let presenter = ShortcutConfirmation.topViewControllerForPicker() else {
-            Self.active = nil
-            return nil
-        }
-        return await withCheckedContinuation { continuation in
-            self.continuation = continuation
-            guard !self.cancelled else {
-                self.finish(nil)
-                return
-            }
-            let picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.item],
-                                                         asCopy: false)
-            self.presentedController = picker
-            picker.delegate = self
-            presenter.present(picker, animated: true)
-        }
-    }
-
-    func documentPicker(_ controller: UIDocumentPickerViewController,
-                        didPickDocumentsAt urls: [URL]) {
-        finish(urls.first)
-    }
-
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        finish(nil)
-    }
-
-    private func cancel() {
-        cancelled = true
-        finish(nil)
-    }
-
-    private func finish(_ url: URL?) {
-        guard let continuation else { return }
-        self.continuation = nil
-        let controller = presentedController
-        presentedController = nil
-        Self.active = nil
-        controller?.dismiss(animated: true)
-        if let url { _ = url.startAccessingSecurityScopedResource() }
-        continuation.resume(returning: url)
-    }
-}
-
-private extension ShortcutConfirmation {
-    static func topViewControllerForPicker() -> UIViewController? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let window = scenes.flatMap(\.windows).first { $0.isKeyWindow }
         var controller = window?.rootViewController
