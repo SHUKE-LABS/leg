@@ -17,20 +17,28 @@ final class ShortcutsBridgeServer {
                                              qos: .userInitiated)
     private let stateLock = NSLock()
     private let handler: (ShortcutBridgeRequest) async -> ShortcutBridgeReply
+    private let socketDirectory: String
+    private let socketBasename: String
     private let socketPath: String
     private var listener: Int32 = -1
     private var running = false
 
     init(socketName: String = "leg-host-bridge-\(ProcessInfo.processInfo.processIdentifier)",
          handler: @escaping (ShortcutBridgeRequest) async -> ShortcutBridgeReply) {
+        self.socketDirectory = FileManager.default.temporaryDirectory.path
+        self.socketBasename = socketName
         self.socketPath = FileManager.default.temporaryDirectory
             .appendingPathComponent(socketName).path
         self.handler = handler
     }
 
-    /// The private path passed to the iSH socket shim. It is not exposed in
-    /// the guest environment or accepted from a bridge request.
-    var hostSocketName: String { socketPath }
+    /// The private directory in which the endpoint lives. The guest shim
+    /// opens this directory and connects using only `hostSocketBasename`, so
+    /// the Simulator's long container prefix never enters sockaddr_un.
+    var hostSocketDirectory: String { socketDirectory }
+
+    /// The short endpoint basename used inside the private directory.
+    var hostSocketBasename: String { socketBasename }
 
     func start() throws {
         stateLock.lock()
@@ -39,38 +47,19 @@ final class ShortcutsBridgeServer {
         guard !alreadyRunning else { return }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ShortcutsBridgeServerError.socket(errno) }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(socketPath.utf8)
-        let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
-        guard bytes.count + 1 <= pathCapacity else {
-            Darwin.close(fd)
-            throw ShortcutsBridgeServerError.nameTooLong
-        }
-        withUnsafeMutableBytes(of: &address.sun_path) { storage in
-            for (index, byte) in bytes.enumerated() {
-                storage[index] = byte
-            }
-            storage[bytes.count] = 0
-        }
-        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path) ?? 0
-        let length = socklen_t(pathOffset + bytes.count + 1)
-        #if canImport(Darwin)
-        withUnsafeMutableBytes(of: &address) { storage in
-            storage[0] = UInt8(length)
-        }
-        #endif
         removeSocketFile()
-        let result = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(fd, $0, length)
+        let result = socketDirectory.withCString { directory in
+            socketBasename.withCString { basename in
+                guest_runtime_bind_host_bridge_socket(fd, directory, basename)
             }
         }
         guard result == 0 else {
-            let error = errno
             Darwin.close(fd)
             removeSocketFile()
-            throw ShortcutsBridgeServerError.bind(error)
+            if result == -Int32(ENAMETOOLONG) {
+                throw ShortcutsBridgeServerError.nameTooLong
+            }
+            throw ShortcutsBridgeServerError.bind(Int32(-result))
         }
         guard Darwin.listen(fd, 4) == 0 else {
             let error = errno

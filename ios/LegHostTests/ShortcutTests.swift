@@ -624,7 +624,8 @@ final class ShortcutTests: XCTestCase {
                 await adapter.handle(request)
             }
         try server.start()
-        let socketPath = server.hostSocketName
+        let socketDirectory = server.hostSocketDirectory
+        let socketBasename = server.hostSocketBasename
         defer {
             server.stop()
             adapter.cancelAll()
@@ -646,7 +647,7 @@ final class ShortcutTests: XCTestCase {
             timeoutMS: 5_000)
         let firstFrame = try JSONEncoder().encode(first)
         let approvalData = try await Task.detached {
-            try Self.sendBridgeFrame(firstFrame, to: socketPath)
+            try Self.sendBridgeFrame(firstFrame, in: socketDirectory, named: socketBasename)
         }.value
         let approval = try JSONDecoder().decode(ShortcutBridgeReply.self, from: approvalData)
         XCTAssertEqual(approval.status, "approval_required")
@@ -665,7 +666,7 @@ final class ShortcutTests: XCTestCase {
             timeoutMS: 5_000)
         let followUpFrame = try JSONEncoder().encode(followUp)
         let resultData = try await Task.detached {
-            try Self.sendBridgeFrame(followUpFrame, to: socketPath)
+            try Self.sendBridgeFrame(followUpFrame, in: socketDirectory, named: socketBasename)
         }.value
         let result = try JSONDecoder().decode(ShortcutBridgeReply.self, from: resultData)
         XCTAssertEqual(result.status, "ok")
@@ -686,9 +687,32 @@ final class ShortcutTests: XCTestCase {
     }
 
     private nonisolated static func sendBridgeFrame(_ payload: Data,
-                                                    to path: String) throws -> Data {
+                                                    in directory: String,
+                                                    named basename: String) throws -> Data {
         var frame = payload
         frame.append(0x0A)
+
+        let directoryFD = Darwin.open(directory, O_RDONLY)
+        guard directoryFD >= 0 else {
+            throw NSError(domain: "ShortcutTests", code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "could not open the bridge directory"])
+        }
+        defer { Darwin.close(directoryFD) }
+
+        let previousFD = Darwin.open(".", O_RDONLY)
+        guard previousFD >= 0 else {
+            let error = errno
+            throw NSError(domain: "ShortcutTests", code: Int(error),
+                          userInfo: [NSLocalizedDescriptionKey: "could not save the current directory"])
+        }
+        defer {
+            _ = Darwin.fchdir(previousFD)
+            Darwin.close(previousFD)
+        }
+        guard Darwin.fchdir(directoryFD) == 0 else {
+            throw NSError(domain: "ShortcutTests", code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "could not enter the bridge directory"])
+        }
 
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
@@ -699,7 +723,7 @@ final class ShortcutTests: XCTestCase {
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(path.utf8)
+        let bytes = Array(basename.utf8)
         let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
         guard bytes.count + 1 <= pathCapacity else {
             throw NSError(domain: "ShortcutTests", code: 1,

@@ -271,8 +271,13 @@ int guest_runtime_boot(const char *root_data_dir) {
     return 0;
 }
 
-int guest_runtime_set_host_bridge_socket(const char *name) {
-    return ish_set_host_bridge_socket(name);
+int guest_runtime_set_host_bridge_socket(const char *directory, const char *name) {
+    return ish_set_host_bridge_socket(directory, name);
+}
+
+int guest_runtime_bind_host_bridge_socket(int socket_fd, const char *directory,
+                                          const char *name) {
+    return ish_bind_host_bridge_socket(socket_fd, directory, name);
 }
 
 /* ---------------------------------------------------------------- session */

@@ -878,7 +878,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // next.
         let guestStopped = await stopGuestSession()
         state.guestTasks = Int(guest_runtime_running_tasks())
-        _ = guest_runtime_set_host_bridge_socket(nil)
+        _ = guest_runtime_set_host_bridge_socket(nil, nil)
 
         guard pumpStopped, guestStopped else {
             let reason = pumpStopped
@@ -1368,11 +1368,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             return await self.shortcutsAdapter.handle(request)
         }
         try server.start()
-        let status = server.hostSocketName.withCString { pointer in
-            guest_runtime_set_host_bridge_socket(pointer)
+        let status = server.hostSocketDirectory.withCString { directory in
+            server.hostSocketBasename.withCString { basename in
+                guest_runtime_set_host_bridge_socket(directory, basename)
+            }
         }
         guard status == 0 else {
             server.stop()
+            _ = guest_runtime_set_host_bridge_socket(nil, nil)
             throw GuestHostError(message: "The iSH capability socket could not be configured.")
         }
         shortcutsBridgeServer = server

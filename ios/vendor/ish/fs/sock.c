@@ -272,7 +272,7 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
                        && ish_host_bridge_socket() != NULL) {
                 const char *host_name = ish_host_bridge_socket();
                 size_t name_length = strlen(host_name);
-                if (host_name[0] != '/' || name_length == 0
+                if (name_length == 0
                     || name_length + 1 > sizeof(((struct sockaddr_un *) sockaddr)->sun_path))
                     return _ENOENT;
                 struct sockaddr_un *real_addr_un = sockaddr;
@@ -392,7 +392,9 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (err < 0)
         return err;
 
-    err = connect(sock->real_fd, (void *) &sockaddr, sockaddr_len);
+    err = host_bridge
+        ? ish_connect_host_bridge_socket(sock->real_fd, (void *) &sockaddr, sockaddr_len)
+        : connect(sock->real_fd, (void *) &sockaddr, sockaddr_len);
     if (err < 0)
         return errno_map();
 
