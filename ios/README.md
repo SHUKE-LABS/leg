@@ -202,8 +202,9 @@ the hook still records a guest endpoint it made after the listener closed.
 `-leghost-bridge-endpoint-failure <faults>` injects endpoint faults, a comma
 list of `hold` (the start fails after the runtime made the endpoint), `race`
 and `replace` (a socket the runtime did not make takes the endpoint before or
-after it made its own, and the start fails) and `cleanup-lookup` (the cleanup
-cannot look the endpoint up). A listener that cannot start fails the session with
+after it made its own, and the start fails), `cleanup-lookup` (the cleanup
+cannot look the endpoint up) and `cleanup-retry` (such a socket then replaces
+the endpoint and the cleanup runs again). A listener that cannot start fails the session with
 `IOS_BRIDGE_LISTENER_ERROR`.
 
 The `Check bridge wiring` build phase (`scripts/check-bridge-wiring.sh`) fails
@@ -453,8 +454,9 @@ checks `no_host_transport` without a listener, the listener's close after
 a failed start, that a start failing after the endpoint was made leaves no
 endpoint in the guest, that a socket the start did not make, at the endpoint
 before or after it made its own, is not removed, and that a cleanup that
-cannot look the endpoint up keeps its record and the next start replaces the
-socket; `SkillRelaunchUITests` checks the Skill install across a
+cannot look the endpoint up keeps its record, its retry leaves a socket that
+replaced the endpoint, and the next start replaces the socket;
+`SkillRelaunchUITests` checks the Skill install across a
 relaunch.
 
 ```

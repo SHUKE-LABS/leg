@@ -72,12 +72,16 @@ enum {
     /* A socket the hook did not make replaces the endpoint right after the
      * next provision made it, and that provision fails. */
     ISH_BRIDGE_SOCKET_FAULT_REPLACE = 1 << 3,
+    /* After the next cleanup failed and kept its record, a socket the hook
+     * did not make replaces the endpoint, and the cleanup runs again. */
+    ISH_BRIDGE_SOCKET_FAULT_CLEANUP_RETRY = 1 << 4,
 };
 
 /* Registers `generation` and the listener at `host_path`. */
 int ish_bridge_socket_register(uint64_t generation, const char *host_path);
 
-/* Forgets `generation`, its mapping, and its hold on the fake inode. */
+/* Forgets `generation` and its mapping, and drops its hold on the fake inode
+ * unless the endpoint is still recorded. */
 int ish_bridge_socket_unregister(uint64_t generation);
 
 /* Creates the fake socket inode at the guest endpoint for the registered
@@ -89,7 +93,8 @@ int ish_bridge_socket_provision(void);
 /* Removes the fake inode, when the endpoint is still the inode the hook
  * created, and drops the hold on it. The inode goes also when the provision
  * that made it failed afterwards. A lookup or unlink that fails keeps the
- * record and returns ISH_BRIDGE_SOCKET_FS_ERROR. Needs a task context. */
+ * record and the hold and returns ISH_BRIDGE_SOCKET_FS_ERROR. Needs a task
+ * context. */
 int ish_bridge_socket_cleanup(void);
 
 /* For the checks of the endpoint cleanup: injects the

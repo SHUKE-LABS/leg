@@ -228,7 +228,8 @@ a private host path; upstream rewrites every guest Unix socket path to
   its device and inode number, and the hold come together, so a start that
   fails after that still removes it, and the hold keeps fakefs from giving
   that inode number to another node. A cleanup whose lookup or unlink fails
-  keeps the record. A socket an earlier generation left at the endpoint is
+  keeps the record and the hold, past the unregistration, until a cleanup or
+  the next provision ends the record. A socket an earlier generation left at the endpoint is
   replaced; anything else there fails the start.
   `ish_bridge_socket_inject_faults` injects the failures and foreign sockets
   the checks of that cleanup need.

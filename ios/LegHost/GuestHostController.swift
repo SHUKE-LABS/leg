@@ -98,8 +98,10 @@ struct HostLaunchOptions {
     /// The `ISH_BRIDGE_SOCKET_FAULT_*` bits the hook of the bridge endpoint
     /// takes in this run: `hold` fails the start after the runtime made the
     /// endpoint, `race` and `replace` put a socket the hook did not make at
-    /// the endpoint before or after it made its own and fail the start, and
-    /// `cleanup-lookup` fails the lookup of the cleanup that follows.
+    /// the endpoint before or after it made its own and fail the start,
+    /// `cleanup-lookup` fails the lookup of the cleanup that follows, and
+    /// `cleanup-retry` then puts such a socket at the endpoint and runs the
+    /// cleanup again.
     ///
     /// The control is DEBUG-only: the simulator tests check that a failed
     /// start removes the endpoint it made and only that, or keeps its record
@@ -130,6 +132,7 @@ struct HostLaunchOptions {
             case "race": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_RACE)
             case "replace": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_REPLACE)
             case "cleanup-lookup": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_CLEANUP_LOOKUP)
+            case "cleanup-retry": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_CLEANUP_RETRY)
             default: return faults
             }
         }

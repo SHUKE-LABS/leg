@@ -100,6 +100,15 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(waitForOutput("capability_unsupported"), "the next start did not replace the endpoint")
     }
 
+    /// A cleanup that failed keeps its hold with its record, so a socket that
+    /// replaces the endpoint afterwards cannot take the recorded inode number
+    /// and survives the retry.
+    func testACleanupRetryLeavesASocketThatReplacedTheEndpoint() {
+        failTheStart(faults: "hold,cleanup-lookup,cleanup-retry")
+        XCTAssertTrue(waitForState("endpoint=none"), "the retry kept the record of a replaced endpoint")
+        assertTheEndpointIs(gone: false)
+    }
+
     // MARK: Helpers
 
     /// Starts a shell whose start fails with the endpoint `faults`.

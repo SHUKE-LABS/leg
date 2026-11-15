@@ -22,10 +22,10 @@ static struct {
     uint64_t generation;
     bool registered;
     char host_path[ISH_BRIDGE_SOCKET_HOST_PATH_MAX + 1];
-    /* The fake inode the hook created, held from the moment it exists: its
-     * socket id stays the same for as long as the endpoint is provisioned,
-     * and fakefs cannot give its number to another node while the hook
-     * records it. */
+    /* The fake inode the hook created, held from the moment it exists until
+     * its record ends: its socket id stays the same for as long as the
+     * endpoint is provisioned, and fakefs cannot give its number to another
+     * node while the hook records it. */
     struct inode_data *inode;
     /* The identity of the endpoint the hook made. The node, its identity
      * and the hold come together, so a start that fails after that still
@@ -79,7 +79,10 @@ int ish_bridge_socket_unregister(uint64_t generation) {
         unlock(&hook_lock);
         return ISH_BRIDGE_SOCKET_STALE;
     }
-    release_inode();
+    /* The hold of an endpoint still recorded stays until a cleanup or the
+     * next provision ends the record. */
+    if (!hook.made)
+        release_inode();
     hook.registered = false;
     hook.generation = 0;
     memset(hook.host_path, 0, sizeof(hook.host_path));
@@ -203,12 +206,24 @@ out:
     return result;
 }
 
+/* Removes the endpoint the hook made and drops the hold, which stays as long
+ * as the record does. Called with hook_lock held. */
+static int clean_up(void) {
+    int result = remove_made_endpoint();
+    if (!hook.made)
+        release_inode();
+    return result;
+}
+
 int ish_bridge_socket_cleanup(void) {
     if (current == NULL)
         return ISH_BRIDGE_SOCKET_NO_TASK;
     lock(&hook_lock);
-    int result = remove_made_endpoint();
-    release_inode();
+    int result = clean_up();
+    if (result < 0 && take_fault(ISH_BRIDGE_SOCKET_FAULT_CLEANUP_RETRY)) {
+        put_foreign_endpoint();
+        result = clean_up();
+    }
     unlock(&hook_lock);
     return result;
 }
