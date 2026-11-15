@@ -63,6 +63,22 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(waitForOutput("capability_unsupported"), "the retry did not reach its listener")
     }
 
+    /// A start that fails after the runtime made the endpoint removes it: a
+    /// later session without a listener finds no endpoint in the guest.
+    func testAStartThatFailsAfterTheEndpointWasMadeRemovesIt() {
+        app.launchArguments = ["-leghost-reset", "-leghost-bridge-endpoint-failure"] + Self.provider
+            + ["-leghost-program", "/bin/sh"]
+        app.launch()
+        XCTAssertTrue(waitForState("bridge=closed", timeout: startTimeout), "the start did not fail")
+        XCTAssertTrue(waitForState("session=0"))
+
+        app.terminate()
+        launchShell(["-leghost-bridge-off"])
+        XCTAssertTrue(waitForState("bridge=off"))
+        type("test -e /run/leghost-bridge.sock || echo ENDPOINT''_GONE\n")
+        XCTAssertTrue(waitForOutput("ENDPOINT_GONE"), "the failed start left its endpoint in the guest")
+    }
+
     // MARK: Helpers
 
     private func launchShell(_ arguments: [String]) {

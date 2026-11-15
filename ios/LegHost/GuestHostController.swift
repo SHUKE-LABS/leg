@@ -95,6 +95,12 @@ struct HostLaunchOptions {
     /// The control is DEBUG-only: the simulator tests check what the guest
     /// bridge answers when the host configured no transport.
     var bridgeOff = false
+    /// Whether the endpoint of the bridge fails right after the runtime made
+    /// it, so the session does not start.
+    ///
+    /// The control is DEBUG-only: the simulator tests check that a failed
+    /// start removes the endpoint it made.
+    var bridgeEndpointFailure = false
     /// Whether the run interrupts the session on its own.
     ///
     /// The control belongs to the simulator tests: they interrupt the
@@ -161,6 +167,8 @@ struct HostLaunchOptions {
                 options.interruptAfterRequest = true
             case "-leghost-bridge-off":
                 options.bridgeOff = true
+            case "-leghost-bridge-endpoint-failure":
+                options.bridgeEndpointFailure = true
             #endif
             default:
                 break
@@ -1276,6 +1284,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             DispatchQueue.main.async { self?.state.bridgeReplies += 1 }
         }
         try listener.start()
+        if options.bridgeEndpointFailure {
+            ish_bridge_socket_fail_next_hold()
+        }
         bridgeListener = listener
         state.bridge = "listening"
     }

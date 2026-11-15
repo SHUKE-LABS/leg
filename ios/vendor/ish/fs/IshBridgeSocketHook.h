@@ -70,8 +70,13 @@ int ish_bridge_socket_unregister(uint64_t generation);
 int ish_bridge_socket_provision(void);
 
 /* Removes the fake inode, when the endpoint is still the inode the hook
- * created, and drops the hold on it. Needs a task context. */
+ * created, and drops the hold on it. The inode goes also when the provision
+ * that made it failed afterwards. Needs a task context. */
 int ish_bridge_socket_cleanup(void);
+
+/* For the checks of the failed-start cleanup: the next provision fails right
+ * after it made the endpoint, before it takes the hold on it. */
+void ish_bridge_socket_fail_next_hold(void);
 
 /* Copies what the hook holds into `state`. */
 void ish_bridge_socket_get_state(struct ish_bridge_socket_state *state);

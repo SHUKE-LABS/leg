@@ -197,8 +197,10 @@ has no entry there. A failed record shows as `skill=unpublished`.
 
 The state line shows `bridge=off|listening|closed`, the number of replies the
 listener wrote, and what the Skill install did. `-leghost-bridge-off` (Debug
-builds) starts the guest without a listener. A listener that cannot start
-fails the session with `IOS_BRIDGE_LISTENER_ERROR`.
+builds) starts the guest without a listener, and
+`-leghost-bridge-endpoint-failure` fails the start right after the runtime
+made the guest endpoint. A listener that cannot start fails the session with
+`IOS_BRIDGE_LISTENER_ERROR`.
 
 The `Check bridge wiring` build phase (`scripts/check-bridge-wiring.sh`) fails
 the build when a bridge source or test is missing from its target, the
@@ -443,8 +445,9 @@ second launch reusing the verified root instead of importing it again.
 `BridgeCapabilityUITests` sends a request from a guest shell to the listener
 (the pinned 0.44.1 `leg-bridge` predates the Photos and Files capabilities,
 so it uses `files.list` and expects `capability_unsupported` from the host),
-checks `no_host_transport` without a listener and the listener's close after
-a failed start; `SkillRelaunchUITests` checks the Skill install across a
+checks `no_host_transport` without a listener, the listener's close after
+a failed start, and that a start failing after the endpoint was made leaves
+no endpoint in the guest; `SkillRelaunchUITests` checks the Skill install across a
 relaunch.
 
 ```
