@@ -17,6 +17,9 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::canonical_json;
+use super::schema::{self, InputSchema};
+
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -259,8 +262,12 @@ pub struct BridgeRequest {
 
 impl BridgeRequest {
     /// The digest of the request input, used to bind an approval to it.
+    ///
+    /// The digest is taken over the RFC 8785 canonical form of the input, so
+    /// the guest and the host compute the same digest whatever order the
+    /// members arrived in.
     pub fn input_digest(&self) -> String {
-        sha256_hex(self.input.to_string().as_bytes())
+        canonical_json::digest(&self.input)
     }
 }
 
@@ -273,8 +280,11 @@ pub struct Capability {
     pub summary: &'static str,
     /// Whether the capability needs a host approval before it may run.
     pub requires_approval: bool,
-    /// The input fields the capability accepts.
+    /// The input fields the capability accepts, when its input is a flat
+    /// field table.
     pub fields: &'static [Field],
+    /// How the input, and the result the host returns, are checked.
+    pub schema: InputSchema,
 }
 
 /// One accepted input field.
@@ -305,7 +315,7 @@ pub enum FieldKind {
 ///
 /// The names are the contract the mobile slices implement; the bridge itself
 /// runs none of them.
-pub const CAPABILITIES: [Capability; 5] = [
+pub const CAPABILITIES: [Capability; 9] = [
     Capability {
         name: "photos.list",
         summary: "List the photo assets the host exposes.",
@@ -322,6 +332,7 @@ pub const CAPABILITIES: [Capability; 5] = [
                 required: false,
             },
         ],
+        schema: InputSchema::Fields,
     },
     Capability {
         name: "photos.read",
@@ -332,6 +343,7 @@ pub const CAPABILITIES: [Capability; 5] = [
             kind: FieldKind::Text,
             required: true,
         }],
+        schema: InputSchema::Fields,
     },
     Capability {
         name: "files.list",
@@ -349,6 +361,7 @@ pub const CAPABILITIES: [Capability; 5] = [
                 required: false,
             },
         ],
+        schema: InputSchema::Fields,
     },
     Capability {
         name: "files.read",
@@ -359,6 +372,7 @@ pub const CAPABILITIES: [Capability; 5] = [
             kind: FieldKind::Path,
             required: true,
         }],
+        schema: InputSchema::Fields,
     },
     Capability {
         name: "shortcuts.invoke",
@@ -376,6 +390,35 @@ pub const CAPABILITIES: [Capability; 5] = [
                 required: false,
             },
         ],
+        schema: InputSchema::Fields,
+    },
+    Capability {
+        name: "photos.search",
+        summary: "Search the video metadata of the photo library.",
+        requires_approval: false,
+        fields: &[],
+        schema: InputSchema::PhotosSearch,
+    },
+    Capability {
+        name: "photos.export",
+        summary: "Copy one video out of the photo library.",
+        requires_approval: true,
+        fields: &[],
+        schema: InputSchema::PhotosExport,
+    },
+    Capability {
+        name: "files.import",
+        summary: "Copy one file the user picks into the guest workspace.",
+        requires_approval: false,
+        fields: &[],
+        schema: InputSchema::FilesImport,
+    },
+    Capability {
+        name: "files.export",
+        summary: "Copy one imported file to a folder the user picks.",
+        requires_approval: true,
+        fields: &[],
+        schema: InputSchema::FilesExport,
     },
 ];
 
@@ -618,8 +661,11 @@ pub fn validate_request(value: &Value) -> Result<BridgeRequest, BridgeError> {
     })
 }
 
-/// Validates the input object against the capability's field table.
+/// Validates the input object against the capability's schema.
 fn validate_input(capability: &Capability, input: &Value) -> Result<(), BridgeError> {
+    if capability.schema != InputSchema::Fields {
+        return schema::validate_input(capability.schema, input);
+    }
     let Some(fields) = input.as_object() else {
         return Err(BridgeError::new(
             "invalid_input",

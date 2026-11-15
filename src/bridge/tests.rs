@@ -1542,3 +1542,747 @@ fn the_write_over_a_real_socket_is_cancelled() {
     };
     fs::write(&result, answer).expect("write the result");
 }
+
+/// A host that answers in order and lets the test read what it received.
+struct RecordingHost {
+    /// The answers the host gives, in order; the last one repeats.
+    answers: Vec<HostOutcome>,
+    /// The requests the host received.
+    seen: Arc<Mutex<Vec<HostRequest>>>,
+}
+
+impl HostAdapter for RecordingHost {
+    fn dispatch(&mut self, request: &HostRequest, _deadline: Instant) -> HostExchange {
+        self.seen
+            .lock()
+            .expect("the host lock")
+            .push(request.clone());
+        let outcome = if self.answers.len() > 1 {
+            self.answers.remove(0)
+        } else {
+            self.answers
+                .first()
+                .cloned()
+                .unwrap_or(HostOutcome::Cancelled)
+        };
+        HostExchange {
+            outcome,
+            reached: true,
+        }
+    }
+}
+
+/// A bridge over a recording host, and the requests the host received.
+fn recording_bridge(
+    answers: Vec<HostOutcome>,
+    scratch: &Scratch,
+) -> (Bridge, Arc<Mutex<Vec<HostRequest>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    let bridge = Bridge::new(
+        Box::new(RecordingHost {
+            answers,
+            seen: Arc::clone(&seen),
+        }),
+        state,
+        AuditLog::new(None),
+    );
+    (bridge, seen)
+}
+
+/// The approval token the fake hosts issue.
+const TOKEN: &str = "token-0123456789abcdef";
+
+/// A digest the fake hosts return.
+fn checksum() -> String {
+    "ab".repeat(32)
+}
+
+/// The host's request for an approval.
+fn approval_required() -> HostOutcome {
+    HostOutcome::ApprovalRequired {
+        approval_token: TOKEN.to_string(),
+        review: json!({"summary": "copies one video to the guest workspace"}),
+    }
+}
+
+/// A `photos.search` page of `count` videos, longest first.
+fn search_page(count: usize, truncated: bool) -> Value {
+    let assets: Vec<Value> = (0..count)
+        .map(|index| {
+            json!({
+                "asset_id": format!("asset-{index:03}"),
+                "media_type": "video",
+                "duration_ms": 1_000_000 - index as u64,
+                "created_at": "2025-06-01T12:00:00Z",
+                "width": 1920,
+                "height": 1080,
+            })
+        })
+        .collect();
+    json!({"authorization": "full", "assets": assets, "truncated": truncated})
+}
+
+/// The `photos.export` result for `destination`.
+fn photos_export_result(destination: &str) -> Value {
+    let relative_path = if destination == "files_picker" {
+        Value::Null
+    } else {
+        json!("c0ffee/clip.mov")
+    };
+    json!({
+        "authorization": "limited",
+        "copy_id": "c0ffee",
+        "relative_path": relative_path,
+        "name": "clip.mov",
+        "media_type": "video",
+        "size_bytes": 1024,
+        "sha256": checksum(),
+    })
+}
+
+/// The `files.import` result.
+fn files_import_result() -> Value {
+    json!({
+        "copy_id": "c0ffee",
+        "relative_path": "c0ffee/notes.txt",
+        "name": "notes.txt",
+        "content_type": "text/plain",
+        "size_bytes": 12,
+        "sha256": checksum(),
+    })
+}
+
+/// The `files.export` result.
+fn files_export_result() -> Value {
+    json!({
+        "export_id": "e-1",
+        "name": "notes.txt",
+        "content_type": "text/plain",
+        "size_bytes": 12,
+        "sha256": checksum(),
+    })
+}
+
+/// A request line that replays the approval token.
+fn continuation(id: &str, capability: &str, input: Value) -> String {
+    json!({
+        "version": 1,
+        "request_id": id,
+        "capability": capability,
+        "input": input,
+        "approval_token": TOKEN,
+    })
+    .to_string()
+}
+
+/// The reason of a failed answer.
+fn reason(response: &BridgeResponse) -> String {
+    response
+        .error
+        .as_ref()
+        .map(|error| error.reason.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_photos_and_files_capabilities_carry_their_approval_flags() {
+    let flags = [
+        ("photos.search", false),
+        ("photos.export", true),
+        ("files.import", false),
+        ("files.export", true),
+    ];
+    for (name, requires_approval) in flags {
+        let capability = protocol::capability(name).expect("the capability is known");
+        assert_eq!(capability.requires_approval, requires_approval, "{name}");
+    }
+}
+
+#[test]
+fn a_capability_without_an_approval_runs_without_a_token() {
+    let cases = [
+        (
+            "photos.search",
+            json!({"filter": {"media_type": "video"}, "sort": "duration_desc", "limit": 2}),
+            search_page(2, false),
+        ),
+        (
+            "files.import",
+            json!({"destination": "guest_workspace"}),
+            files_import_result(),
+        ),
+    ];
+    for (index, (capability, input, result)) in cases.into_iter().enumerate() {
+        let scratch = scratch(&format!("no-approval-{index}"));
+        let (mut bridge, seen) = recording_bridge(vec![HostOutcome::Ok(result.clone())], &scratch);
+        let response = bridge.handle(&request("r-1", capability, input));
+        assert_eq!(
+            response.status,
+            BridgeStatus::Ok,
+            "{capability}: {response:?}"
+        );
+        assert_eq!(response.result, Some(result));
+        assert!(seen.lock().unwrap()[0].approval_token.is_none());
+    }
+}
+
+#[test]
+fn a_preview_the_host_ran_is_a_protocol_violation() {
+    let cases = [
+        (
+            "photos.export",
+            json!({"asset_id": "A1", "destination": "guest_workspace"}),
+            photos_export_result("guest_workspace"),
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "c0ffee", "relative_path": "c0ffee/notes.txt", "destination": "files_picker"}),
+            files_export_result(),
+        ),
+    ];
+    for (index, (capability, input, result)) in cases.into_iter().enumerate() {
+        let scratch = scratch(&format!("preview-ok-{index}"));
+        let (mut bridge, _) = recording_bridge(vec![HostOutcome::Ok(result)], &scratch);
+        let response = bridge.handle(&request("r-1", capability, input.clone()));
+        assert_eq!(response.status, BridgeStatus::Error, "{capability}");
+        assert_eq!(reason(&response), "host_protocol_violation", "{capability}");
+        assert!(response.result.is_none());
+        assert!(
+            bridge.state().approvals.is_empty(),
+            "a preview the host ran recorded an approval"
+        );
+
+        // A preview the host answers with an approval request is the
+        // contract.
+        let scratch = self::scratch(&format!("preview-approval-{index}"));
+        let (mut bridge, _) = recording_bridge(vec![approval_required()], &scratch);
+        let response = bridge.handle(&request("r-1", capability, input));
+        assert_eq!(
+            response.status,
+            BridgeStatus::ApprovalRequired,
+            "{capability}"
+        );
+    }
+}
+
+#[test]
+fn the_photos_and_files_inputs_are_exact() {
+    let video = json!({"media_type": "video"});
+    let refused: Vec<(&str, Value, &str)> = vec![
+        ("photos.search", json!({"filter": video}), "missing_field"),
+        (
+            "photos.search",
+            json!({"sort": "duration_desc"}),
+            "missing_field",
+        ),
+        (
+            "photos.search",
+            json!({"filter": {}, "sort": "duration_desc"}),
+            "missing_field",
+        ),
+        (
+            "photos.search",
+            json!({"filter": video, "sort": "duration_desc", "page": 1}),
+            "unknown_field",
+        ),
+        (
+            "photos.search",
+            json!({"filter": {"media_type": "video", "album": "x"}, "sort": "duration_desc"}),
+            "unknown_field",
+        ),
+        (
+            "photos.search",
+            json!({"filter": [], "sort": "duration_desc"}),
+            "invalid_input",
+        ),
+        (
+            "photos.search",
+            json!({"filter": {"media_type": "photo"}, "sort": "duration_desc"}),
+            "invalid_input",
+        ),
+        (
+            "photos.search",
+            json!({"filter": video, "sort": "size_desc"}),
+            "invalid_input",
+        ),
+        (
+            "photos.search",
+            json!({"filter": video, "sort": "duration_desc", "limit": 0}),
+            "invalid_input",
+        ),
+        (
+            "photos.search",
+            json!({"filter": video, "sort": "duration_desc", "limit": 101}),
+            "invalid_input",
+        ),
+        (
+            "photos.search",
+            json!({"filter": video, "sort": "duration_desc", "limit": 1.5}),
+            "invalid_input",
+        ),
+        (
+            "photos.search",
+            json!({"filter": {"media_type": "video", "created_after": "yesterday"}, "sort": "created_desc"}),
+            "invalid_input",
+        ),
+        (
+            "photos.search",
+            json!({"filter": {"media_type": "video", "created_after": "2025-01-02T00:00:00Z", "created_before": "2025-01-01T00:00:00Z"}, "sort": "created_desc"}),
+            "invalid_input",
+        ),
+        ("photos.export", json!({"asset_id": "A1"}), "missing_field"),
+        (
+            "photos.export",
+            json!({"asset_id": "", "destination": "guest_workspace"}),
+            "invalid_input",
+        ),
+        (
+            "photos.export",
+            json!({"asset_id": "a".repeat(129), "destination": "guest_workspace"}),
+            "invalid_input",
+        ),
+        (
+            "photos.export",
+            json!({"asset_id": "A\n1", "destination": "guest_workspace"}),
+            "invalid_input",
+        ),
+        (
+            "photos.export",
+            json!({"asset_id": "A1", "destination": "camera_roll"}),
+            "invalid_input",
+        ),
+        (
+            "photos.export",
+            json!({"asset_id": "A1", "destination": "guest_workspace", "filename": "../x.mov"}),
+            "invalid_path",
+        ),
+        (
+            "photos.export",
+            json!({"asset_id": "A1", "destination": "guest_workspace", "filename": ".hidden"}),
+            "invalid_path",
+        ),
+        (
+            "photos.export",
+            json!({"asset_id": "A1", "destination": "guest_workspace", "share": true}),
+            "unknown_field",
+        ),
+        ("files.import", json!({}), "missing_field"),
+        (
+            "files.import",
+            json!({"destination": "files_picker"}),
+            "invalid_input",
+        ),
+        (
+            "files.import",
+            json!({"destination": "guest_workspace", "path": "/etc"}),
+            "unknown_field",
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "C0FFEE", "relative_path": "C0FFEE/a.txt", "destination": "files_picker"}),
+            "invalid_input",
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "c0ffee", "relative_path": "other/a.txt", "destination": "files_picker"}),
+            "invalid_path",
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "c0ffee", "relative_path": "c0ffee/../a.txt", "destination": "files_picker"}),
+            "invalid_path",
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "c0ffee", "relative_path": format!("c0ffee/{}", "a".repeat(129)), "destination": "files_picker"}),
+            "invalid_path",
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "c0ffee", "relative_path": "c0ffee/a.txt", "destination": "guest_workspace"}),
+            "invalid_input",
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "c0ffee", "relative_path": "c0ffee/a.txt", "destination": "files_picker", "filename": "a:b"}),
+            "invalid_path",
+        ),
+    ];
+    for (capability, input, expected) in refused {
+        let line = request("r-1", capability, input.clone());
+        let error = protocol::validate_request(&serde_json::from_str::<Value>(&line).unwrap())
+            .expect_err(&format!("{capability} accepted {input}"));
+        assert_eq!(error.reason, expected, "{capability} {input}: {error:?}");
+    }
+
+    // The bounds are inclusive.
+    let accepted: Vec<(&str, Value)> = vec![
+        (
+            "photos.search",
+            json!({"filter": video, "sort": "duration_desc", "limit": 1}),
+        ),
+        (
+            "photos.search",
+            json!({"filter": video, "sort": "created_desc", "limit": 100}),
+        ),
+        (
+            "photos.search",
+            json!({"filter": {"media_type": "video", "created_after": "2025-01-01T08:00:00+08:00", "created_before": "2025-01-01T00:00:00Z"}, "sort": "created_desc"}),
+        ),
+        (
+            "photos.export",
+            json!({"asset_id": "a".repeat(128), "destination": "files_picker", "filename": "x".repeat(128)}),
+        ),
+        (
+            "files.export",
+            json!({"copy_id": "a".repeat(64), "relative_path": format!("{}/{}", "a".repeat(64), "b".repeat(128)), "destination": "files_picker"}),
+        ),
+    ];
+    for (capability, input) in accepted {
+        let line = request("r-1", capability, input.clone());
+        protocol::validate_request(&serde_json::from_str::<Value>(&line).unwrap())
+            .unwrap_or_else(|error| panic!("{capability} refused {input}: {error:?}"));
+    }
+}
+
+#[test]
+fn an_approval_continues_with_reordered_input_keys() {
+    let scratch = scratch("reordered");
+    let (mut bridge, seen) = recording_bridge(
+        vec![
+            approval_required(),
+            HostOutcome::Ok(photos_export_result("guest_workspace")),
+        ],
+        &scratch,
+    );
+
+    let preview = bridge.handle(
+        r#"{"version":1,"request_id":"r-1","capability":"photos.export","input":{"asset_id":"A1","destination":"guest_workspace"}}"#,
+    );
+    assert_eq!(preview.status, BridgeStatus::ApprovalRequired);
+
+    let response = bridge.handle(&format!(
+        r#"{{"version":1,"request_id":"r-2","capability":"photos.export","input":{{"destination":"guest_workspace","asset_id":"A1"}},"approval_token":"{TOKEN}"}}"#
+    ));
+    assert_eq!(response.status, BridgeStatus::Ok, "{response:?}");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].input_sha256, seen[1].input_sha256);
+    assert_eq!(
+        seen[0].input_sha256,
+        protocol::sha256_hex(br#"{"asset_id":"A1","destination":"guest_workspace"}"#)
+    );
+}
+
+#[test]
+fn the_host_receives_the_canonical_digest_of_the_input() {
+    let scratch = scratch("canonical-digest");
+    let (mut bridge, seen) =
+        recording_bridge(vec![HostOutcome::Ok(search_page(0, false))], &scratch);
+    let response = bridge.handle(
+        r#"{"version":1,"request_id":"r-1","capability":"photos.search","input":{"sort":"duration_desc","filter":{"media_type":"video"},"limit":20}}"#,
+    );
+    assert_eq!(response.status, BridgeStatus::Ok, "{response:?}");
+    assert_eq!(
+        seen.lock().unwrap()[0].input_sha256,
+        "a9a83ee45388e790690d5f5683782ecf738d5f703189c18b139a01f29c8bce4a"
+    );
+}
+
+#[test]
+fn an_approval_refuses_a_changed_value_a_duplicate_key_and_a_bad_number() {
+    let scratch = scratch("approval-refusals");
+    let (mut bridge, seen) = recording_bridge(
+        vec![
+            approval_required(),
+            HostOutcome::Ok(photos_export_result("guest_workspace")),
+        ],
+        &scratch,
+    );
+    let input = json!({"asset_id": "A1", "destination": "guest_workspace"});
+    let preview = bridge.handle(&request("r-1", "photos.export", input));
+    assert_eq!(preview.status, BridgeStatus::ApprovalRequired);
+
+    let changed = bridge.handle(&continuation(
+        "r-2",
+        "photos.export",
+        json!({"asset_id": "A2", "destination": "guest_workspace"}),
+    ));
+    assert_eq!(changed.status, BridgeStatus::Denied);
+    assert_eq!(reason(&changed), "approval_mismatch");
+
+    let duplicate = bridge.handle(&format!(
+        r#"{{"version":1,"request_id":"r-3","capability":"photos.export","input":{{"asset_id":"A2","asset_id":"A1","destination":"guest_workspace"}},"approval_token":"{TOKEN}"}}"#
+    ));
+    assert_eq!(reason(&duplicate), "malformed_request");
+
+    // The second name is `asset_id` once its escape is undone.
+    let escaped_name = format!("{}u0061sset_id", '\\');
+    let escaped = bridge.handle(&format!(
+        r#"{{"version":1,"request_id":"r-4","capability":"photos.export","input":{{"asset_id":"A1","{escaped_name}":"A1","destination":"guest_workspace"}},"approval_token":"{TOKEN}"}}"#
+    ));
+    assert_eq!(reason(&escaped), "malformed_request");
+
+    let number = bridge.handle(
+        r#"{"version":1,"request_id":"r-5","capability":"photos.search","input":{"filter":{"media_type":"video"},"sort":"duration_desc","limit":1e400}}"#,
+    );
+    assert_eq!(reason(&number), "malformed_request");
+
+    // A digest the caller supplies is not a field a request may carry: the
+    // bridge computes it.
+    let supplied = bridge.handle(&format!(
+        r#"{{"version":1,"request_id":"r-6","capability":"photos.export","input":{{"asset_id":"A1","destination":"guest_workspace"}},"input_sha256":"{}","approval_token":"{TOKEN}"}}"#,
+        "0".repeat(64)
+    ));
+    assert_eq!(reason(&supplied), "unknown_field");
+
+    // Only the preview reached the host.
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn an_approval_expires_after_six_hundred_seconds() {
+    use super::state::ApprovalRecord;
+
+    let record = ApprovalRecord {
+        capability: "photos.export".to_string(),
+        input_sha256: "0".repeat(64),
+        token_sha256: "1".repeat(64),
+        issued_at: 1_000,
+        expires_at: 1_600,
+        redeemed: false,
+    };
+    assert!(BridgeState::approval_is_fresh_at(&record, 1_000));
+    assert!(BridgeState::approval_is_fresh_at(&record, 1_600));
+    assert!(!BridgeState::approval_is_fresh_at(&record, 1_601));
+
+    let scratch = scratch("approval-expiry");
+    let (mut bridge, seen) = recording_bridge(
+        vec![
+            approval_required(),
+            HostOutcome::Ok(photos_export_result("guest_workspace")),
+        ],
+        &scratch,
+    );
+    let input = json!({"asset_id": "A1", "destination": "guest_workspace"});
+    bridge.handle(&request("r-1", "photos.export", input.clone()));
+
+    // The approval was issued 601 seconds ago.
+    let mut state = BridgeState::load(&scratch.path).expect("load the bridge state");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(state.approvals.len(), 1);
+    for record in state.approvals.values_mut() {
+        assert_eq!(record.expires_at, record.issued_at + 600);
+        record.issued_at = now - 601;
+        record.expires_at = now - 1;
+    }
+    state.save().expect("save the bridge state");
+
+    let response = bridge.handle(&continuation("r-2", "photos.export", input));
+    assert_eq!(response.status, BridgeStatus::Denied);
+    assert_eq!(reason(&response), "approval_expired");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the expired token reached the host"
+    );
+}
+
+#[test]
+fn an_approval_is_redeemed_by_a_success_or_a_denial() {
+    let outcomes = [
+        HostOutcome::Ok(files_export_result()),
+        HostOutcome::Denied {
+            reason: "user_refused".to_string(),
+            message: "the user refused".to_string(),
+        },
+    ];
+    let input = json!({"copy_id": "c0ffee", "relative_path": "c0ffee/notes.txt", "destination": "files_picker"});
+    for (index, outcome) in outcomes.into_iter().enumerate() {
+        let scratch = scratch(&format!("redeem-{index}"));
+        let (mut bridge, seen) = recording_bridge(vec![approval_required(), outcome], &scratch);
+        bridge.handle(&request("r-1", "files.export", input.clone()));
+        bridge.handle(&continuation("r-2", "files.export", input.clone()));
+
+        let replay = bridge.handle(&continuation("r-3", "files.export", input.clone()));
+        assert_eq!(replay.status, BridgeStatus::Denied);
+        assert_eq!(reason(&replay), "approval_used");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the redeemed token reached the host"
+        );
+    }
+}
+
+#[test]
+fn a_continuation_without_a_decision_invalidates_its_token() {
+    let outcomes = [
+        HostOutcome::Cancelled,
+        HostOutcome::TimedOut,
+        HostOutcome::Failed {
+            reason: "io_failure".to_string(),
+            message: "the copy failed".to_string(),
+        },
+    ];
+    let input = json!({"asset_id": "A1", "destination": "files_picker"});
+    for (index, outcome) in outcomes.into_iter().enumerate() {
+        let scratch = scratch(&format!("invalidate-{index}"));
+        let (mut bridge, seen) = recording_bridge(vec![approval_required(), outcome], &scratch);
+        bridge.handle(&request("r-1", "photos.export", input.clone()));
+        let interrupted = bridge.handle(&continuation("r-2", "photos.export", input.clone()));
+        assert_ne!(interrupted.status, BridgeStatus::Ok);
+
+        let retry = bridge.handle(&continuation("r-3", "photos.export", input.clone()));
+        assert_eq!(retry.status, BridgeStatus::Denied);
+        assert_eq!(reason(&retry), "approval_unknown");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the invalidated token reached the host"
+        );
+    }
+}
+
+#[test]
+fn a_search_page_is_accepted_at_every_size() {
+    let cases = [
+        (1, search_page(1, false)),
+        (1, search_page(1, true)),
+        (1, search_page(0, false)),
+        (100, search_page(100, false)),
+        (100, search_page(100, true)),
+        (20, search_page(7, false)),
+    ];
+    for (index, (limit, page)) in cases.into_iter().enumerate() {
+        let scratch = scratch(&format!("search-page-{index}"));
+        let (mut bridge, _) = recording_bridge(vec![HostOutcome::Ok(page)], &scratch);
+        let response = bridge.handle(&request(
+            "r-1",
+            "photos.search",
+            json!({"filter": {"media_type": "video"}, "sort": "duration_desc", "limit": limit}),
+        ));
+        assert_eq!(
+            response.status,
+            BridgeStatus::Ok,
+            "case {index}: {response:?}"
+        );
+    }
+
+    // Equal durations fall back to the asset id, ascending.
+    let mut page = search_page(2, false);
+    page["assets"][1]["duration_ms"] = page["assets"][0]["duration_ms"].clone();
+    let scratch = scratch("search-page-tie");
+    let (mut bridge, _) = recording_bridge(vec![HostOutcome::Ok(page)], &scratch);
+    let response = bridge.handle(&request(
+        "r-1",
+        "photos.search",
+        json!({"filter": {"media_type": "video"}, "sort": "duration_desc"}),
+    ));
+    assert_eq!(response.status, BridgeStatus::Ok, "{response:?}");
+}
+
+#[test]
+fn a_result_outside_the_schema_is_a_protocol_violation() {
+    let search = json!({"filter": {"media_type": "video", "created_after": "2025-01-01T00:00:00Z"}, "sort": "duration_desc", "limit": 2});
+    let mut cases: Vec<(&str, Value, Value)> = Vec::new();
+
+    let mut extra = search_page(1, false);
+    extra["cursor"] = json!("next");
+    cases.push(("photos.search", search.clone(), extra));
+    cases.push(("photos.search", search.clone(), search_page(3, false)));
+    cases.push(("photos.search", search.clone(), search_page(1, true)));
+    let mut unordered = search_page(2, false);
+    unordered["assets"][1]["duration_ms"] = json!(2_000_000);
+    cases.push(("photos.search", search.clone(), unordered));
+    let mut tie = search_page(2, false);
+    tie["assets"][0]["asset_id"] = json!("z");
+    tie["assets"][1]["duration_ms"] = tie["assets"][0]["duration_ms"].clone();
+    cases.push(("photos.search", search.clone(), tie));
+    let mut early = search_page(1, false);
+    early["assets"][0]["created_at"] = json!("2024-12-31T23:59:59Z");
+    cases.push(("photos.search", search.clone(), early));
+    let mut photo = search_page(1, false);
+    photo["assets"][0]["media_type"] = json!("photo");
+    cases.push(("photos.search", search.clone(), photo));
+    let mut wide = search_page(1, false);
+    wide["assets"][0]["width"] = json!(32_769);
+    cases.push(("photos.search", search.clone(), wide));
+    let mut long = search_page(1, false);
+    long["assets"][0]["duration_ms"] = json!(604_800_001u64);
+    cases.push(("photos.search", search.clone(), long));
+    let mut denied = search_page(1, false);
+    denied["authorization"] = json!("denied");
+    cases.push(("photos.search", search.clone(), denied));
+
+    let to_workspace = json!({"asset_id": "A1", "destination": "guest_workspace"});
+    let to_picker = json!({"asset_id": "A1", "destination": "files_picker"});
+    cases.push((
+        "photos.export",
+        to_workspace.clone(),
+        photos_export_result("files_picker"),
+    ));
+    cases.push((
+        "photos.export",
+        to_picker.clone(),
+        photos_export_result("guest_workspace"),
+    ));
+    let mut path = photos_export_result("guest_workspace");
+    path["relative_path"] = json!("c0ffee/other.mov");
+    cases.push(("photos.export", to_workspace.clone(), path));
+    let mut size = photos_export_result("guest_workspace");
+    size["size_bytes"] = json!(268_435_457u64);
+    cases.push(("photos.export", to_workspace.clone(), size));
+    let mut digest = photos_export_result("guest_workspace");
+    digest["sha256"] = json!("AB".repeat(32));
+    cases.push(("photos.export", to_workspace.clone(), digest));
+
+    let import = json!({"destination": "guest_workspace"});
+    let mut native = files_import_result();
+    native["relative_path"] = json!("/var/mobile/notes.txt");
+    cases.push(("files.import", import.clone(), native));
+    let mut content = files_import_result();
+    content["content_type"] = json!("text/plain; charset=utf-8");
+    cases.push(("files.import", import.clone(), content));
+    let mut id = files_import_result();
+    id["copy_id"] = json!("C0FFEE");
+    id["relative_path"] = json!("C0FFEE/notes.txt");
+    cases.push(("files.import", import.clone(), id));
+
+    let export = json!({"copy_id": "c0ffee", "relative_path": "c0ffee/notes.txt", "destination": "files_picker"});
+    let mut leaked = files_export_result();
+    leaked["path"] = json!("/private/var/mobile/notes.txt");
+    cases.push(("files.export", export.clone(), leaked));
+
+    for (index, (capability, input, result)) in cases.into_iter().enumerate() {
+        let scratch = scratch(&format!("result-schema-{index}"));
+        let approval = protocol::capability(capability).unwrap().requires_approval;
+        let mut answers = Vec::new();
+        if approval {
+            answers.push(approval_required());
+        }
+        answers.push(HostOutcome::Ok(result.clone()));
+        let (mut bridge, _) = recording_bridge(answers, &scratch);
+        let response = if approval {
+            bridge.handle(&request("r-1", capability, input.clone()));
+            bridge.handle(&continuation("r-2", capability, input))
+        } else {
+            bridge.handle(&request("r-1", capability, input))
+        };
+        assert_eq!(
+            response.status,
+            BridgeStatus::Error,
+            "case {index}: {result}"
+        );
+        assert_eq!(
+            reason(&response),
+            "host_protocol_violation",
+            "case {index}: {result}"
+        );
+        assert!(response.result.is_none());
+    }
+}
