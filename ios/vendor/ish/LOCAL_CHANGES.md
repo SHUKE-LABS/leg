@@ -224,12 +224,15 @@ a private host path; upstream rewrites every guest Unix socket path to
   generation and its listener path, then provisions a fake socket inode at
   the endpoint in the task context of the guest before the program runs, and
   cleans it up after a failed start or a stop. The hook holds the inode, so
-  its socket id is stable, and removes only the inode it created: it records
-  the device and inode number of the endpoint as soon as it exists, so a
-  start that fails after that still removes it. A socket an earlier
-  generation left at the endpoint is replaced; anything else there fails the
-  start. `ish_bridge_socket_fail_next_hold` fails the next provision right
-  after the endpoint was made, for the checks of that cleanup.
+  its socket id is stable, and removes only the inode it created. It records
+  the endpoint before it makes the node and its device and inode number once
+  it looked it up, so a start that fails at any point after that still
+  removes it; until the identity is known, the record covers a socket at the
+  endpoint, which is reserved to the host. A cleanup whose lookup or unlink
+  fails keeps the record. A socket an earlier generation left at the
+  endpoint is replaced; anything else there fails the start.
+  `ish_bridge_socket_inject_faults` injects lookup and hold failures for the
+  checks of that cleanup.
 - `fs/sock.c`: `connect()` to the exact inode the hook provisioned is mapped
   onto the listener path, and skips the exchange of peer pointers that two
   iSH sockets make, since the listener is not an iSH socket. `bind()` and

@@ -63,23 +63,54 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(waitForOutput("capability_unsupported"), "the retry did not reach its listener")
     }
 
-    /// A start that fails after the runtime made the endpoint removes it: a
-    /// later session without a listener finds no endpoint in the guest.
+    /// A start that fails after the runtime made and looked up the endpoint
+    /// removes it: a later session without a listener finds no endpoint.
     func testAStartThatFailsAfterTheEndpointWasMadeRemovesIt() {
-        app.launchArguments = ["-leghost-reset", "-leghost-bridge-endpoint-failure"] + Self.provider
+        failTheStart(faults: "hold")
+        XCTAssertTrue(waitForState("endpoint=none"), "the hook kept a record of a removed endpoint")
+        assertTheEndpointIsGone()
+    }
+
+    /// A start whose lookup of the endpoint it just made fails still removes
+    /// the endpoint.
+    func testAStartThatCannotLookUpTheEndpointItMadeRemovesIt() {
+        failTheStart(faults: "lookup")
+        XCTAssertTrue(waitForState("endpoint=none"), "the hook kept a record of a removed endpoint")
+        assertTheEndpointIsGone()
+    }
+
+    /// A cleanup that cannot look the endpoint up keeps the record of it, and
+    /// the next start replaces the socket that was left.
+    func testACleanupThatCannotLookUpTheEndpointKeepsItsRecord() {
+        failTheStart(faults: "hold,cleanup-lookup")
+        XCTAssertTrue(waitForState("endpoint=kept"), "the hook dropped the record of an endpoint it left")
+
+        app.terminate()
+        launchShell([])
+        XCTAssertTrue(waitForState("bridge=listening"))
+        type(Self.request + "\n")
+        XCTAssertTrue(waitForOutput("capability_unsupported"), "the next start did not replace the endpoint")
+    }
+
+    // MARK: Helpers
+
+    /// Starts a shell whose start fails with the endpoint `faults`.
+    private func failTheStart(faults: String) {
+        app.launchArguments = ["-leghost-reset", "-leghost-bridge-endpoint-failure", faults] + Self.provider
             + ["-leghost-program", "/bin/sh"]
         app.launch()
         XCTAssertTrue(waitForState("bridge=closed", timeout: startTimeout), "the start did not fail")
         XCTAssertTrue(waitForState("session=0"))
+    }
 
+    /// Relaunches without a listener and checks the guest has no endpoint.
+    private func assertTheEndpointIsGone() {
         app.terminate()
         launchShell(["-leghost-bridge-off"])
         XCTAssertTrue(waitForState("bridge=off"))
         type("test -e /run/leghost-bridge.sock || echo ENDPOINT''_GONE\n")
         XCTAssertTrue(waitForOutput("ENDPOINT_GONE"), "the failed start left its endpoint in the guest")
     }
-
-    // MARK: Helpers
 
     private func launchShell(_ arguments: [String]) {
         app.launchArguments = arguments + Self.provider + ["-leghost-program", "/bin/sh"]

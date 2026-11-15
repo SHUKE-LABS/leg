@@ -55,6 +55,19 @@ struct ish_bridge_socket_state {
     int registered;
     int provisioned;
     uint32_t socket_id;
+    /* Whether the hook still records an endpoint it made and has not
+     * removed. */
+    int endpoint_recorded;
+};
+
+/* The faults the checks of the endpoint cleanup inject. */
+enum {
+    /* The next provision fails after it made and looked up the endpoint. */
+    ISH_BRIDGE_SOCKET_FAULT_HOLD = 1 << 0,
+    /* The next provision fails its lookup of the endpoint it made. */
+    ISH_BRIDGE_SOCKET_FAULT_LOOKUP = 1 << 1,
+    /* The next cleanup fails its lookup of the endpoint. */
+    ISH_BRIDGE_SOCKET_FAULT_CLEANUP_LOOKUP = 1 << 2,
 };
 
 /* Registers `generation` and the listener at `host_path`. */
@@ -71,12 +84,13 @@ int ish_bridge_socket_provision(void);
 
 /* Removes the fake inode, when the endpoint is still the inode the hook
  * created, and drops the hold on it. The inode goes also when the provision
- * that made it failed afterwards. Needs a task context. */
+ * that made it failed afterwards. A lookup or unlink that fails keeps the
+ * record and returns ISH_BRIDGE_SOCKET_FS_ERROR. Needs a task context. */
 int ish_bridge_socket_cleanup(void);
 
-/* For the checks of the failed-start cleanup: the next provision fails right
- * after it made the endpoint, before it takes the hold on it. */
-void ish_bridge_socket_fail_next_hold(void);
+/* For the checks of the endpoint cleanup: injects the
+ * ISH_BRIDGE_SOCKET_FAULT_* bits in `faults`, each for its next use. */
+void ish_bridge_socket_inject_faults(int faults);
 
 /* Copies what the hook holds into `state`. */
 void ish_bridge_socket_get_state(struct ish_bridge_socket_state *state);

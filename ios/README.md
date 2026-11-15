@@ -196,10 +196,12 @@ fakefs database (`guest_runtime_adopt_host_tree`); the guest hides a file that
 has no entry there. A failed record shows as `skill=unpublished`.
 
 The state line shows `bridge=off|listening|closed`, the number of replies the
-listener wrote, and what the Skill install did. `-leghost-bridge-off` (Debug
-builds) starts the guest without a listener, and
-`-leghost-bridge-endpoint-failure` fails the start right after the runtime
-made the guest endpoint. A listener that cannot start fails the session with
+listener wrote, what the Skill install did, and `endpoint=none|kept`: whether
+the hook still records a guest endpoint it made after the listener closed.
+`-leghost-bridge-off` (Debug builds) starts the guest without a listener, and
+`-leghost-bridge-endpoint-failure <faults>` injects endpoint faults, a comma
+list of `hold` and `lookup` (the start fails after the runtime made the
+endpoint) and `cleanup-lookup` (the cleanup cannot look the endpoint up). A listener that cannot start fails the session with
 `IOS_BRIDGE_LISTENER_ERROR`.
 
 The `Check bridge wiring` build phase (`scripts/check-bridge-wiring.sh`) fails
@@ -446,8 +448,9 @@ second launch reusing the verified root instead of importing it again.
 (the pinned 0.44.1 `leg-bridge` predates the Photos and Files capabilities,
 so it uses `files.list` and expects `capability_unsupported` from the host),
 checks `no_host_transport` without a listener, the listener's close after
-a failed start, and that a start failing after the endpoint was made leaves
-no endpoint in the guest; `SkillRelaunchUITests` checks the Skill install across a
+a failed start, that a start failing after the endpoint was made leaves no
+endpoint in the guest, and that a cleanup that cannot look the endpoint up
+keeps its record and the next start replaces the socket; `SkillRelaunchUITests` checks the Skill install across a
 relaunch.
 
 ```

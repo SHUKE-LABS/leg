@@ -95,12 +95,14 @@ struct HostLaunchOptions {
     /// The control is DEBUG-only: the simulator tests check what the guest
     /// bridge answers when the host configured no transport.
     var bridgeOff = false
-    /// Whether the endpoint of the bridge fails right after the runtime made
-    /// it, so the session does not start.
+    /// The `ISH_BRIDGE_SOCKET_FAULT_*` bits the hook of the bridge endpoint
+    /// takes in this run: `hold` and `lookup` fail the start after the
+    /// runtime made the endpoint, and `cleanup-lookup` fails the lookup of
+    /// the cleanup that follows.
     ///
     /// The control is DEBUG-only: the simulator tests check that a failed
-    /// start removes the endpoint it made.
-    var bridgeEndpointFailure = false
+    /// start removes the endpoint it made, or keeps its record of it.
+    var bridgeEndpointFaults: Int32 = 0
     /// Whether the run interrupts the session on its own.
     ///
     /// The control belongs to the simulator tests: they interrupt the
@@ -117,6 +119,18 @@ struct HostLaunchOptions {
     static let legProgram = "/usr/local/bin/leg"
     /// The supervisor program of the pinned bundle.
     static let supervisorProgram = "/usr/local/bin/leg-ui-supervisor"
+
+    /// The fault bits of a comma-separated list of fault names.
+    static func endpointFaults(_ names: String) -> Int32 {
+        names.split(separator: ",").reduce(0) { faults, name in
+            switch name {
+            case "hold": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_HOLD)
+            case "lookup": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_LOOKUP)
+            case "cleanup-lookup": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_CLEANUP_LOOKUP)
+            default: return faults
+            }
+        }
+    }
 
     /// The options of the current run.
     static func current(arguments: [String] = ProcessInfo.processInfo.arguments) -> HostLaunchOptions {
@@ -168,7 +182,10 @@ struct HostLaunchOptions {
             case "-leghost-bridge-off":
                 options.bridgeOff = true
             case "-leghost-bridge-endpoint-failure":
-                options.bridgeEndpointFailure = true
+                if index + 1 < arguments.count {
+                    options.bridgeEndpointFaults = HostLaunchOptions.endpointFaults(arguments[index + 1])
+                    consumed = 2
+                }
             #endif
             default:
                 break
@@ -214,6 +231,9 @@ struct HostState: Equatable {
     var bridgeReplies = 0
     /// What the install of the bundled Skill did.
     var skill = "none"
+    /// Whether the endpoint hook still records an endpoint it made after the
+    /// listener closed: `none` or `kept`.
+    var endpoint = "none"
 
     /// The state as the tests read it.
     var summary: String {
@@ -222,7 +242,8 @@ struct HostState: Equatable {
             : self.statuses.map(String.init).joined(separator: ",")
         return "provision=\(provisions),boot=\(boots),session=\(sessions),requests=\(requests),"
             + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
-            + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),skill=\(skill)"
+            + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),skill=\(skill),"
+            + "endpoint=\(endpoint)"
     }
 }
 
@@ -1284,8 +1305,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             DispatchQueue.main.async { self?.state.bridgeReplies += 1 }
         }
         try listener.start()
-        if options.bridgeEndpointFailure {
-            ish_bridge_socket_fail_next_hold()
+        if options.bridgeEndpointFaults != 0 {
+            ish_bridge_socket_inject_faults(options.bridgeEndpointFaults)
         }
         bridgeListener = listener
         state.bridge = "listening"
@@ -1304,6 +1325,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 continuation.resume()
             }
         }
+        var hook = ish_bridge_socket_state()
+        ish_bridge_socket_get_state(&hook)
+        state.endpoint = hook.endpoint_recorded != 0 ? "kept" : "none"
         state.bridge = "closed"
     }
 
