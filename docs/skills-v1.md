@@ -243,6 +243,56 @@ Rust tests exercise discovery against copied fixtures and exercise activation,
 resource confinement, refresh, and budget behavior against temporary package
 trees.
 
+## The bundled iOS Skill
+
+LegHost ships one Skill, `mobile-media-files`
+([`ios/resources/skills/mobile-media-files/`](../ios/resources/skills/mobile-media-files/)),
+and installs it into the guest user root before every session, at
+`~/.agents/skills/mobile-media-files/`. Discovery treats it as any other user
+Skill. Its `VERSION` file (one ASCII `major.minor.patch` line) is the bundled
+version.
+
+The installed package carries `.leg-manifest.json`, the installer's proof of
+ownership. It is the RFC 8785 canonical form of exactly these fields:
+
+| Field | Value |
+| --- | --- |
+| `schema` | `leg.skill-install/v1` |
+| `owner` | `leg-ios-bundled` |
+| `package` | `mobile-media-files` |
+| `version` | the bundled SemVer |
+| `digest_algorithm` | `sha256` |
+| `digest` | the package digest, 64 lowercase hex digits |
+
+The package digest is SHA-256 over the ASCII bytes `leg.skill.package/v1`, one
+NUL byte, and then one record per regular file other than the manifest, in the
+order of the UTF-8 bytes of its path. A path is NFC, `/`-separated, and
+relative; an absolute, empty, `.`, `..`, backslash, or NUL path, two paths
+that are equal after normalization, a symbolic link, and any file that is not
+a regular file make the package invalid. A record is the path length (u64,
+big-endian), the path bytes, the permission bits `mode & 0o7777` (u32,
+big-endian), the content length (u64, big-endian), and the content.
+Modification times and owners are not part of it.
+
+| Installed package | Result |
+| --- | --- |
+| None | Installed. |
+| Same digest | No change. |
+| Valid managed package, lower version | Replaced. |
+| Valid managed package, higher version | No change. |
+| Same version, another digest | `install_conflict`; kept as it is. |
+| No manifest, a foreign or invalid manifest, files that no longer match it, or a non-directory | `install_conflict`; kept as it is. |
+
+An install stages the package and a recovery journal under
+`~/.agents/.leg-skill-install/`, syncs both, checks the staged digest, and
+swaps the staged directory into place with one `renameatx_np` (`RENAME_SWAP`
+over a managed package, `RENAME_EXCL` into an empty target). The replaced
+package is removed only after the journal records the new one. On the next
+start, recovery keeps a package that was swapped in, promotes a complete
+staged package over an empty target or a valid managed one, and otherwise
+drops what was staged. Recovery removes only the installer's own directory
+entries; it never deletes the target or anything in the user's workspace.
+
 ## Non-goals
 
 Skills v1 does not add hooks, subagents, plugins, marketplace behavior,
