@@ -31,8 +31,11 @@ final class SkillRelaunchUITests: XCTestCase {
         XCTAssertTrue(waitForOutput("SKILL_FOUND"), "the guest does not see the Skill")
         XCTAssertTrue(waitForOutput("1.0.0"), "the guest sees another version")
 
-        app.typeText("mkdir -p ~/.agents/skills/my-note && echo '# mine' > ~/.agents/skills/my-note/SKILL.md "
-            + "&& echo NOTE''_MADE\n")
+        // A plain mkdir: the root entry of the imported fakefs carries no
+        // directory type, so busybox `mkdir -p` of an absolute path fails at
+        // `/`.
+        app.typeText("cd ~/.agents/skills && mkdir my-note && echo '# mine' > my-note/SKILL.md "
+            + "&& cd && echo NOTE''_MADE\n")
         // The app is not stopped before the guest wrote the marker Skill.
         XCTAssertTrue(waitForOutput("NOTE_MADE"), "the guest did not make the marker Skill")
 
