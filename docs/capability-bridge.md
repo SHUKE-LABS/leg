@@ -100,14 +100,16 @@ summary. The host maps a missing result to `error/missing_result`, a cancelled
 callback to `cancelled/cancelled`, a missing Shortcut to
 `unavailable/shortcut_not_found`, and an unavailable Shortcuts app to
 `unavailable/shortcuts_unavailable`.
+Each callback URL carries a host-generated one-time state value, not the
+guest's predictable request id; unknown or stale callback states are ignored.
 
 For a file, the user authorizes a Files-provider URL in the system document
-picker. The host retains that security scope only for the run and hands the
-selected URL to Shortcuts through the public `file` parameter; it never sends a
-guest path or an app-private temporary URL to Shortcuts. The scope is released
-when the callback, cancellation, or timeout completes. The host limits text and
-JSON input to 32 KiB, callback results to 32 KiB, files to 16 MiB, and callback
-waits to 30 s.
+picker. The host validates it, copies it into an app-owned temporary area, and
+releases the source security scope before handing the copy to Shortcuts through
+the public `file` parameter. The guest never supplies a path. The copy is
+deleted after the callback, cancellation, timeout, or approval expiry. The host
+limits text and JSON input to 32 KiB, callback results to 32 KiB, files to 16
+MiB, and callback waits to 30 s.
 The host may need to foreground Apple's Shortcuts app; backgrounding the iOS
 host cancels the pending callback.
 
@@ -166,7 +168,6 @@ The reasons are grouped by the status they answer with:
 | `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used`, `shortcut_not_registered` |
 | `cancelled` | `cancelled` |
 | `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied`, `shortcut_not_found`, `shortcuts_unavailable` |
-| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large`, `missing_result`, `shortcut_failed`, `invalid_shortcut_url`, `missing_file`, `invalid_file`, `file_too_large`, `file_copy_failed` |
 
 ## Approval semantics
 

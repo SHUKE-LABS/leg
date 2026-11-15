@@ -201,7 +201,7 @@ final class ShortcutsAdapter {
     // escapes quotes, backslashes, and control characters again.
     static let maximumReviewSummaryBytes = 2 * 1024
     static let maximumReviewBytes = 8 * 1024
-    static let approvalLifetime: TimeInterval = 10 * 60
+    static let defaultApprovalLifetime: TimeInterval = 10 * 60
 
     private struct Approval {
         let token: String
@@ -218,9 +218,12 @@ final class ShortcutsAdapter {
     private let confirmation: (String, String) async -> Bool
     private let opener: (URL) async -> Bool
     private let filePicker: () async -> URL?
+    private let approvalLifetime: TimeInterval
+    private let fileTemporaryDirectory: URL
     private var approvals: [String: Approval] = [:]
     private var callbacks: [String: AsyncStream<ShortcutCallback>.Continuation] = [:]
     private var timeoutTasks: [String: Task<Void, Never>] = [:]
+    private var approvalExpiryTasks: [String: Task<Void, Never>] = [:]
 
     init(registry: ShortcutRegistrationStore,
          confirmation: @escaping (String, String) async -> Bool = { name, summary in
@@ -235,11 +238,15 @@ final class ShortcutsAdapter {
          },
          filePicker: @escaping () async -> URL? = {
              await ShortcutDocumentPicker.pick()
-         }) {
+         },
+         approvalLifetime: TimeInterval = Self.defaultApprovalLifetime,
+         fileTemporaryDirectory: URL = FileManager.default.temporaryDirectory) {
         self.registry = registry
         self.confirmation = confirmation
         self.opener = opener
         self.filePicker = filePicker
+        self.approvalLifetime = approvalLifetime
+        self.fileTemporaryDirectory = fileTemporaryDirectory
     }
 
     /// Handles one host request. The Rust bridge performs the outer protocol
@@ -276,30 +283,39 @@ final class ShortcutsAdapter {
         if request.approvalToken == nil {
             let selectedFile: URL?
             if registration.inputKind == .file {
-                selectedFile = await filePicker()
-                guard let selectedFile else {
+                let sourceFile = await filePicker()
+                guard let sourceFile else {
                     return .failure(request: request, status: "cancelled", reason: "cancelled",
                                     message: "the file selection was cancelled",
                                     remediation: "choose a file and retry the Shortcut")
                 }
+                defer { sourceFile.stopAccessingSecurityScopedResource() }
                 if Task.isCancelled {
-                    selectedFile.stopAccessingSecurityScopedResource()
                     return .failure(request: request, status: "cancelled", reason: "cancelled",
                                     message: "the file selection was cancelled",
                                     remediation: "choose a file and retry the Shortcut")
                 }
                 do {
-                    try validateFile(selectedFile)
+                    try validateFile(sourceFile)
                 } catch let error as ShortcutFileError {
-                    selectedFile.stopAccessingSecurityScopedResource()
                     return .failure(request: request, status: "error", reason: error.reason,
                                     message: error.message,
                                     remediation: "choose a smaller regular file and retry")
                 } catch {
-                    selectedFile.stopAccessingSecurityScopedResource()
                     return .failure(request: request, status: "error", reason: "file_validation_failed",
                                     message: "the selected file could not be validated safely",
                                     remediation: "choose another file and retry")
+                }
+                do {
+                    selectedFile = try copyFile(sourceFile)
+                } catch let error as ShortcutFileError {
+                    return .failure(request: request, status: "error", reason: error.reason,
+                                    message: error.message,
+                                    remediation: "choose a smaller regular file and retry")
+                } catch {
+                    return .failure(request: request, status: "error", reason: "file_copy_failed",
+                                    message: "the selected file could not be copied safely",
+                                    remediation: "check the file permission and retry")
                 }
             } else {
                 selectedFile = nil
@@ -307,13 +323,13 @@ final class ShortcutsAdapter {
             let summary = inputSummary(validation: validation, file: selectedFile)
             let confirmed = await confirmation(name, summary)
             if Task.isCancelled {
-                selectedFile?.stopAccessingSecurityScopedResource()
+                cleanupFile(selectedFile)
                 return .failure(request: request, status: "cancelled", reason: "cancelled",
                                 message: "the Shortcut request was cancelled before approval",
                                 remediation: "retry the Shortcut if it is still wanted")
             }
             guard confirmed else {
-                selectedFile?.stopAccessingSecurityScopedResource()
+                cleanupFile(selectedFile)
                 return .failure(request: request, status: "denied", reason: "user_refused",
                                 message: "the user did not approve running the registered Shortcut",
                                 remediation: "approve the Shortcut run or retry later")
@@ -325,7 +341,7 @@ final class ShortcutsAdapter {
                 "confirmation": .string("The user approved this registered Shortcut run."),
             ])
             guard let reviewData = review.jsonData, reviewData.count <= Self.maximumReviewBytes else {
-                selectedFile?.stopAccessingSecurityScopedResource()
+                cleanupFile(selectedFile)
                 return .failure(request: request, status: "error", reason: "review_too_large",
                                 message: "the Shortcut confirmation summary is too large",
                                 remediation: "use a smaller Shortcut name or JSON object")
@@ -333,7 +349,8 @@ final class ShortcutsAdapter {
             approvals[token] = Approval(token: token, requestID: request.requestID, name: name,
                                         inputSHA256: decodedInputSHA256, registration: registration,
                                         selectedFile: selectedFile,
-                                        expiresAt: Date().addingTimeInterval(Self.approvalLifetime))
+                                        expiresAt: Date().addingTimeInterval(approvalLifetime))
+            scheduleApprovalExpiry(token)
             return .approval(request: request, token: token, review: review)
         }
 
@@ -343,8 +360,8 @@ final class ShortcutsAdapter {
                             remediation: "ask the host for a fresh confirmation")
         }
         guard approval.expiresAt > Date() else {
-            approvals.removeValue(forKey: token)
-            approval.selectedFile?.stopAccessingSecurityScopedResource()
+            _ = removeApproval(token)
+            cleanupFile(approval.selectedFile)
             return .failure(request: request, status: "denied", reason: "approval_expired",
                             message: "the Shortcut approval has expired",
                             remediation: "ask for a fresh confirmation")
@@ -360,7 +377,9 @@ final class ShortcutsAdapter {
                             remediation: "send the same name and input that the user approved")
         }
         if Task.isCancelled {
-            approvals.removeValue(forKey: token)?.selectedFile?.stopAccessingSecurityScopedResource()
+            if let cancelledApproval = removeApproval(token) {
+                cleanupFile(cancelledApproval.selectedFile)
+            }
             return .failure(request: request, status: "cancelled", reason: "cancelled",
                             message: "the Shortcut request was cancelled before dispatch",
                             remediation: "retry the Shortcut if it is still wanted")
@@ -369,7 +388,9 @@ final class ShortcutsAdapter {
         approval.used = true
         approvals[token] = approval
         defer {
-            approvals.removeValue(forKey: token)?.selectedFile?.stopAccessingSecurityScopedResource()
+            if let completedApproval = removeApproval(token) {
+                cleanupFile(completedApproval.selectedFile)
+            }
         }
         return await invoke(request: request, registration: approval.registration,
                             input: validation, selectedFile: approval.selectedFile)
@@ -379,8 +400,8 @@ final class ShortcutsAdapter {
     func handleCallback(_ url: URL) {
         guard url.scheme == Self.callbackScheme else { return }
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        guard let requestID = components?.queryItems?.first(where: { $0.name == "request_id" })?.value,
-              callbacks[requestID] != nil else { return }
+        guard let callbackState = components?.queryItems?.first(where: { $0.name == "state" })?.value,
+              callbacks[callbackState] != nil else { return }
         let callback: ShortcutCallback
         switch url.host {
         case "success":
@@ -395,35 +416,36 @@ final class ShortcutsAdapter {
         default:
             callback = .error("unknown callback")
         }
-        finishCallback(requestID, result: callback)
+        finishCallback(callbackState, result: callback)
     }
 
     /// Cancels callbacks when the guest session is torn down or interrupted.
     func cancelAll() {
         ShortcutConfirmation.cancel()
         ShortcutDocumentPicker.cancel()
-        for requestID in Array(callbacks.keys) {
-            finishCallback(requestID, result: .cancelled)
+        for callbackState in Array(callbacks.keys) {
+            finishCallback(callbackState, result: .cancelled)
         }
         timeoutTasks.values.forEach { $0.cancel() }
         timeoutTasks.removeAll()
-        for approval in approvals.values {
-            approval.selectedFile?.stopAccessingSecurityScopedResource()
+        for token in Array(approvals.keys) {
+            if let approval = removeApproval(token) {
+                cleanupFile(approval.selectedFile)
+            }
         }
-        approvals.removeAll()
     }
 
     /// Builds the only URL this adapter can open. The name is supplied by a
     /// registration lookup before this method is called.
     nonisolated static func shortcutURL(name: String,
                                         input: String,
-                                        requestID: String) -> URL? {
-        shortcutURL(name: name, text: input, requestID: requestID)
+                                        callbackState: String) -> URL? {
+        shortcutURL(name: name, text: input, callbackState: callbackState)
     }
 
     nonisolated static func shortcutURL(name: String,
                                         text: String,
-                                        requestID: String) -> URL? {
+                                        callbackState: String) -> URL? {
         var components = URLComponents()
         components.scheme = "shortcuts"
         components.host = "x-callback-url"
@@ -433,18 +455,18 @@ final class ShortcutsAdapter {
             URLQueryItem(name: "input", value: "text"),
             URLQueryItem(name: "text", value: text),
             URLQueryItem(name: "x-success",
-                         value: "\(callbackScheme)://success?request_id=\(requestID)"),
+                         value: "\(callbackScheme)://success?state=\(callbackState)"),
             URLQueryItem(name: "x-cancel",
-                         value: "\(callbackScheme)://cancel?request_id=\(requestID)"),
+                         value: "\(callbackScheme)://cancel?state=\(callbackState)"),
             URLQueryItem(name: "x-error",
-                         value: "\(callbackScheme)://error?request_id=\(requestID)"),
+                         value: "\(callbackScheme)://error?state=\(callbackState)"),
         ]
         return components.url
     }
 
     nonisolated static func shortcutURL(name: String,
                                         file: URL,
-                                        requestID: String) -> URL? {
+                                        callbackState: String) -> URL? {
         var components = URLComponents()
         components.scheme = "shortcuts"
         components.host = "x-callback-url"
@@ -454,11 +476,11 @@ final class ShortcutsAdapter {
             URLQueryItem(name: "input", value: "file"),
             URLQueryItem(name: "file", value: file.absoluteString),
             URLQueryItem(name: "x-success",
-                         value: "\(callbackScheme)://success?request_id=\(requestID)"),
+                         value: "\(callbackScheme)://success?state=\(callbackState)"),
             URLQueryItem(name: "x-cancel",
-                         value: "\(callbackScheme)://cancel?request_id=\(requestID)"),
+                         value: "\(callbackScheme)://cancel?state=\(callbackState)"),
             URLQueryItem(name: "x-error",
-                         value: "\(callbackScheme)://error?request_id=\(requestID)"),
+                         value: "\(callbackScheme)://error?state=\(callbackState)"),
         ]
         return components.url
     }
@@ -544,6 +566,28 @@ final class ShortcutsAdapter {
         }
     }
 
+    private func copyFile(_ source: URL) throws -> URL {
+        let directory = fileTemporaryDirectory.appendingPathComponent(
+            "LegHost-Shortcuts", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory.appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(source.pathExtension)
+        do {
+            try FileManager.default.copyItem(at: source, to: destination)
+            try validateFile(destination)
+            return destination
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    private func cleanupFile(_ file: URL?) {
+        guard let file else { return }
+        file.stopAccessingSecurityScopedResource()
+        try? FileManager.default.removeItem(at: file)
+    }
+
     /// Escapes untrusted JSON keys before putting them into a human-facing
     /// review string. Each escape is appended as a complete token so a byte
     /// bound cannot leave a dangling JSON escape sequence.
@@ -592,11 +636,12 @@ final class ShortcutsAdapter {
                             message: "the Shortcut request was cancelled before dispatch",
                             remediation: "retry the Shortcut if it is still wanted")
         }
+        let callbackState = UUID().uuidString
         let url: URL?
         switch input {
         case .text(let text):
             url = Self.shortcutURL(name: registration.name, text: text,
-                                   requestID: request.requestID)
+                                   callbackState: callbackState)
         case .json(let object):
             guard let data = BridgeJSONValue.object(object).jsonData,
                   let json = String(data: data, encoding: .utf8) else {
@@ -605,7 +650,7 @@ final class ShortcutsAdapter {
                                 remediation: "send a smaller JSON object")
             }
             url = Self.shortcutURL(name: registration.name, text: json,
-                                   requestID: request.requestID)
+                                   callbackState: callbackState)
         case .file:
             guard let selectedFile else {
                 return .failure(request: request, status: "error", reason: "missing_file",
@@ -613,7 +658,7 @@ final class ShortcutsAdapter {
                                 remediation: "choose a file and retry")
             }
             url = Self.shortcutURL(name: registration.name, file: selectedFile,
-                                   requestID: request.requestID)
+                                   callbackState: callbackState)
         }
 
         guard let url else {
@@ -621,22 +666,22 @@ final class ShortcutsAdapter {
                             message: "the registered Shortcut URL could not be built",
                             remediation: "check the registered Shortcut name and input")
         }
-        let callbackStream = registerCallback(requestID: request.requestID,
+        let callbackStream = registerCallback(callbackState: callbackState,
                                                timeoutMS: request.timeoutMS)
         guard await opener(url) else {
-            finishCallback(request.requestID, result: .error("shortcuts_unavailable"))
+            finishCallback(callbackState, result: .error("shortcuts_unavailable"))
             return .failure(request: request, status: "unavailable", reason: "shortcuts_unavailable",
                             message: "the Shortcuts app is not available on this device",
                             remediation: "install or enable Apple's Shortcuts app and retry")
         }
         if Task.isCancelled {
-            finishCallback(request.requestID, result: .cancelled)
+            finishCallback(callbackState, result: .cancelled)
             return .failure(request: request, status: "cancelled", reason: "cancelled",
                             message: "the Shortcut request was cancelled after dispatch",
                             remediation: "check whether the Shortcut completed and retry if needed")
         }
 
-        let callback = await waitForCallback(callbackStream, requestID: request.requestID)
+        let callback = await waitForCallback(callbackStream, callbackState: callbackState)
         switch callback {
         case .cancelled:
             return .failure(request: request, status: "cancelled", reason: "cancelled",
@@ -682,35 +727,56 @@ final class ShortcutsAdapter {
         }
     }
 
-    private func registerCallback(requestID: String,
+    private func scheduleApprovalExpiry(_ token: String) {
+        let nanoseconds = UInt64(max(0, approvalLifetime) * 1_000_000_000)
+        approvalExpiryTasks[token] = Task { [weak self] in
+            if nanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: nanoseconds)
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.expireApproval(token) }
+        }
+    }
+
+    private func removeApproval(_ token: String) -> Approval? {
+        approvalExpiryTasks.removeValue(forKey: token)?.cancel()
+        return approvals.removeValue(forKey: token)
+    }
+
+    private func expireApproval(_ token: String) {
+        guard let approval = removeApproval(token) else { return }
+        cleanupFile(approval.selectedFile)
+    }
+
+    private func registerCallback(callbackState: String,
                                   timeoutMS: Int) -> AsyncStream<ShortcutCallback> {
         let stream = AsyncStream<ShortcutCallback> { continuation in
-            callbacks[requestID] = continuation
+            callbacks[callbackState] = continuation
         }
         let timeout = max(100, min(timeoutMS, 30_000))
-        timeoutTasks[requestID] = Task { [weak self] in
+        timeoutTasks[callbackState] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(timeout) * 1_000_000)
             guard !Task.isCancelled else { return }
-            await MainActor.run { self?.finishCallback(requestID, result: .error("timeout")) }
+            await MainActor.run { self?.finishCallback(callbackState, result: .error("timeout")) }
         }
         return stream
     }
 
     private func waitForCallback(_ stream: AsyncStream<ShortcutCallback>,
-                                 requestID: String) async -> ShortcutCallback {
+                                 callbackState: String) async -> ShortcutCallback {
         await withTaskCancellationHandler {
             var iterator = stream.makeAsyncIterator()
             return await iterator.next() ?? .cancelled
         } onCancel: {
             Task { @MainActor [weak self] in
-                self?.finishCallback(requestID, result: .cancelled)
+                self?.finishCallback(callbackState, result: .cancelled)
             }
         }
     }
 
-    private func finishCallback(_ requestID: String, result: ShortcutCallback) {
-        timeoutTasks.removeValue(forKey: requestID)?.cancel()
-        guard let continuation = callbacks.removeValue(forKey: requestID) else { return }
+    private func finishCallback(_ callbackState: String, result: ShortcutCallback) {
+        timeoutTasks.removeValue(forKey: callbackState)?.cancel()
+        guard let continuation = callbacks.removeValue(forKey: callbackState) else { return }
         continuation.yield(result)
         continuation.finish()
     }

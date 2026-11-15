@@ -222,10 +222,14 @@ input summary. The host then opens Apple's public
 `shortcuts://x-callback-url/run-shortcut` endpoint. Text and JSON inputs use
 `input=text` and `text`; file inputs use `input=file` and `file`. Text and JSON
 inputs are capped at 32 KiB. Files are selected with the system document
-picker, passed to Shortcuts as the user-authorized security-scoped URL, and
-released after the callback; no guest path or app-private temporary URL is
-ever supplied. Files are capped at 16 MiB. Inputs and callback results are
-capped at 32 KiB; callback waits are capped at 30 seconds.
+picker, validated, copied into an app-owned temporary area, and passed to
+Shortcuts through the public file parameter. The source security scope is
+released after the copy; the temporary copy is deleted after callback,
+cancellation, timeout, or approval expiry. No guest path is ever supplied.
+Files are capped at 16 MiB. Inputs and callback results are capped at 32 KiB;
+callback waits are capped at 30 seconds.
+Callback URLs carry a host-generated one-time state value rather than the
+guest's request ID; unknown or stale callback states are ignored.
 The host returns structured `ok`, `denied`, `cancelled`, `unavailable`, or
 `error` statuses and may need to foreground the Shortcuts app. Missing output,
 unknown Shortcut, and an unavailable Shortcuts app map to

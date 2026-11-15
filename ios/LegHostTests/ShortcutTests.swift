@@ -77,7 +77,7 @@ final class ShortcutTests: XCTestCase {
         let url = try XCTUnwrap(ShortcutsAdapter.shortcutURL(
             name: "Morning report",
             input: "{\"format\":\"json\"}",
-            requestID: "shortcut-test-2"))
+            callbackState: "callback-state-2"))
         let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
         let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map {
             ($0.name, $0.value ?? "")
@@ -89,15 +89,15 @@ final class ShortcutTests: XCTestCase {
         XCTAssertEqual(query["name"], "Morning report")
         XCTAssertEqual(query["input"], "text")
         XCTAssertEqual(query["text"], "{\"format\":\"json\"}")
-        XCTAssertEqual(query["x-success"], "legshortcuts://success?request_id=shortcut-test-2")
-        XCTAssertEqual(query["x-cancel"], "legshortcuts://cancel?request_id=shortcut-test-2")
-        XCTAssertEqual(query["x-error"], "legshortcuts://error?request_id=shortcut-test-2")
+        XCTAssertEqual(query["x-success"], "legshortcuts://success?state=callback-state-2")
+        XCTAssertEqual(query["x-cancel"], "legshortcuts://cancel?state=callback-state-2")
+        XCTAssertEqual(query["x-error"], "legshortcuts://error?state=callback-state-2")
     }
 
     func testShortcutURLPassesAUserSelectedFileThroughThePublicFileParameter() throws {
         let file = URL(fileURLWithPath: "/private/var/mobile/Containers/Shared/AppGroup/report.txt")
         let url = try XCTUnwrap(ShortcutsAdapter.shortcutURL(
-            name: "Import report", file: file, requestID: "shortcut-file-1"))
+            name: "Import report", file: file, callbackState: "callback-file-1"))
         let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
         let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map {
             ($0.name, $0.value ?? "")
@@ -127,9 +127,18 @@ final class ShortcutTests: XCTestCase {
             confirmation: { _, _ in true },
             opener: { url in
                 openedURL = url
+                guard let callbackString = URLComponents(url: url,
+                                                         resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "x-success" })?.value,
+                      let callbackURL = URL(string: callbackString),
+                      let callbackState = URLComponents(url: callbackURL,
+                                                       resolvingAgainstBaseURL: false)?
+                        .queryItems?.first(where: { $0.name == "state" })?.value else {
+                    return false
+                }
                 Task { @MainActor in
                     adapter.handleCallback(URL(string:
-                        "legshortcuts://success?request_id=shortcut-file-dispatch-2&result=done")!)
+                        "legshortcuts://success?state=\(callbackState)&result=done")!)
                 }
                 return true
             },
@@ -166,8 +175,129 @@ final class ShortcutTests: XCTestCase {
             ($0.name, $0.value ?? "")
         })
         XCTAssertEqual(query["input"], "file")
-        XCTAssertEqual(query["file"], source.absoluteString)
+        let copied = try XCTUnwrap(URL(string: try XCTUnwrap(query["file"])))
+        XCTAssertNotEqual(copied, source)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copied.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testApprovalExpiryDeletesTheCopiedFile() async throws {
+        let suite = "LegHost.ShortcutTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("shortcut-expiry-\(UUID().uuidString).txt")
+        let privateTemporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("shortcut-expiry-area-\(UUID().uuidString)", isDirectory: true)
+        try Data("expires".utf8).write(to: source)
+        try FileManager.default.createDirectory(at: privateTemporaryDirectory,
+                                                 withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: privateTemporaryDirectory)
+        }
+
+        let store = ShortcutRegistrationStore(defaults: defaults)
+        try store.save(name: "Expiring file", inputKind: .file)
+        let adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in true },
+            filePicker: { source },
+            approvalLifetime: 0.2,
+            fileTemporaryDirectory: privateTemporaryDirectory)
+        let input: [String: BridgeJSONValue] = [
+            "name": .string("Expiring file"),
+            "input": .object([:]),
+        ]
+        let approval = await adapter.handle(ShortcutBridgeRequest(
+            version: 1,
+            requestID: "shortcut-expiry-1",
+            nonce: "nonce-expiry-1",
+            capability: ShortcutsAdapter.capability,
+            input: input,
+            inputSHA256: String(repeating: "4", count: 64),
+            approvalToken: nil,
+            timeoutMS: 5_000))
+        let token = try XCTUnwrap(approval.result?.objectValue?["approval_token"]?.stringValue)
+        let copyDirectory = privateTemporaryDirectory.appendingPathComponent(
+            "LegHost-Shortcuts", isDirectory: true)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(
+            at: copyDirectory, includingPropertiesForKeys: nil).count, 1)
+
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(
+            at: copyDirectory, includingPropertiesForKeys: nil).count, 0)
+        let expired = await adapter.handle(ShortcutBridgeRequest(
+            version: 1,
+            requestID: "shortcut-expiry-2",
+            nonce: "nonce-expiry-2",
+            capability: ShortcutsAdapter.capability,
+            input: input,
+            inputSHA256: String(repeating: "4", count: 64),
+            approvalToken: token,
+            timeoutMS: 5_000))
+        XCTAssertEqual(expired.status, "denied")
+        XCTAssertEqual(expired.error?.reason, "approval_unknown")
+    }
+
+    func testUnknownAndStaleCallbackStatesCannotSettleARequest() async throws {
+        let suite = "LegHost.ShortcutTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = ShortcutRegistrationStore(defaults: defaults)
+        try store.save(name: "Callback state", inputKind: .text)
+        var adapter: ShortcutsAdapter!
+        var openedURL: URL?
+        adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in true },
+            opener: { url in
+                openedURL = url
+                Task { @MainActor in
+                    adapter.handleCallback(URL(string:
+                        "legshortcuts://success?state=forged-state&result=forged")!)
+                }
+                return true
+            })
+        let input: [String: BridgeJSONValue] = [
+            "name": .string("Callback state"),
+            "input": .object(["text": .string("hello")]),
+        ]
+        let first = ShortcutBridgeRequest(
+            version: 1,
+            requestID: "shortcut-state-1",
+            nonce: "nonce-state-1",
+            capability: ShortcutsAdapter.capability,
+            input: input,
+            inputSHA256: String(repeating: "5", count: 64),
+            approvalToken: nil,
+            timeoutMS: 5_000)
+        let approval = await adapter.handle(first)
+        let token = try XCTUnwrap(approval.result?.objectValue?["approval_token"]?.stringValue)
+        let reply = await adapter.handle(ShortcutBridgeRequest(
+            version: 1,
+            requestID: "shortcut-state-2",
+            nonce: "nonce-state-2",
+            capability: ShortcutsAdapter.capability,
+            input: input,
+            inputSHA256: first.inputSHA256,
+            approvalToken: token,
+            timeoutMS: 100))
+        XCTAssertEqual(reply.status, "error")
+        XCTAssertEqual(reply.error?.reason, "timeout")
+
+        let successString = try XCTUnwrap(URLComponents(url: try XCTUnwrap(openedURL),
+                                                        resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "x-success" })?.value)
+        let successURL = try XCTUnwrap(URL(string: successString))
+        let callbackState = try XCTUnwrap(URLComponents(url: successURL,
+                                                        resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "state" })?.value)
+        // The valid state is stale after the timeout and must not settle a new
+        // request or resurrect the completed callback stream.
+        adapter.handleCallback(URL(string:
+            "legshortcuts://success?state=\(callbackState)&result=stale")!)
     }
 
     func testUserRefusalDoesNotDispatchTheShortcut() async throws {
@@ -303,12 +433,12 @@ final class ShortcutTests: XCTestCase {
                                                          resolvingAgainstBaseURL: false)?
                     .queryItems?.first(where: { $0.name == "x-error" })?.value,
                       let callbackURL = URL(string: callbackString),
-                      let requestID = URLComponents(url: callbackURL,
+                      let callbackState = URLComponents(url: callbackURL,
                                                    resolvingAgainstBaseURL: false)?
-                        .queryItems?.first(where: { $0.name == "request_id" })?.value else {
+                        .queryItems?.first(where: { $0.name == "state" })?.value else {
                     return false
                 }
-                let callback = "legshortcuts://error?request_id=\(requestID)&errorMessage=The%20shortcut%20could%20not%20be%20found"
+                let callback = "legshortcuts://error?state=\(callbackState)&errorMessage=The%20shortcut%20could%20not%20be%20found"
                 Task { @MainActor in adapter.handleCallback(URL(string: callback)!) }
                 return true
             })
@@ -379,14 +509,14 @@ final class ShortcutTests: XCTestCase {
                                                          resolvingAgainstBaseURL: false)?
                     .queryItems?.first(where: { $0.name == "x-success" })?.value,
                       let callbackURL = URL(string: callbackString),
-                      let requestID = URLComponents(url: callbackURL,
+                    let callbackState = URLComponents(url: callbackURL,
                                                    resolvingAgainstBaseURL: false)?
-                        .queryItems?.first(where: { $0.name == "request_id" })?.value else {
+                        .queryItems?.first(where: { $0.name == "state" })?.value else {
                     return false
                 }
                 Task { @MainActor in
                     adapter.handleCallback(URL(string:
-                        "legshortcuts://success?request_id=\(requestID)&result=%7B%22ok%22%3Atrue%7D")!)
+                        "legshortcuts://success?state=\(callbackState)&result=%7B%22ok%22%3Atrue%7D")!)
                 }
                 return true
             })
@@ -426,13 +556,13 @@ final class ShortcutTests: XCTestCase {
     }
 
     func testMissingResultAndCancellationMapToStableStatuses() async throws {
-        func requestID(from url: URL, callbackName: String) -> String? {
+        func callbackStateValue(from url: URL, callbackName: String) -> String? {
             guard let callbackString = URLComponents(url: url,
                                                      resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == callbackName })?.value,
                   let callbackURL = URL(string: callbackString) else { return nil }
             return URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-                .queryItems?.first(where: { $0.name == "request_id" })?.value
+                .queryItems?.first(where: { $0.name == "state" })?.value
         }
 
         let suite = "LegHost.ShortcutTests.\(UUID().uuidString)"
@@ -450,12 +580,12 @@ final class ShortcutTests: XCTestCase {
             registry: store,
             confirmation: { _, _ in true },
             opener: { url in
-                guard let requestID = requestID(from: url, callbackName: "x-success") else {
+                guard let callbackState = callbackStateValue(from: url, callbackName: "x-success") else {
                     return false
                 }
                 Task { @MainActor in
                     missingResultAdapter.handleCallback(
-                        URL(string: "legshortcuts://success?request_id=\(requestID)")!)
+                        URL(string: "legshortcuts://success?state=\(callbackState)")!)
                 }
                 return true
             })
@@ -487,12 +617,12 @@ final class ShortcutTests: XCTestCase {
             registry: store,
             confirmation: { _, _ in true },
             opener: { url in
-                guard let requestID = requestID(from: url, callbackName: "x-cancel") else {
+                guard let callbackState = callbackStateValue(from: url, callbackName: "x-cancel") else {
                     return false
                 }
                 Task { @MainActor in
                     cancelledAdapter.handleCallback(
-                        URL(string: "legshortcuts://cancel?request_id=\(requestID)")!)
+                        URL(string: "legshortcuts://cancel?state=\(callbackState)")!)
                 }
                 return true
             })
