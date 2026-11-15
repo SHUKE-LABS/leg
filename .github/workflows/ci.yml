@@ -465,7 +465,7 @@ jobs:
                   if "iPhone" in device.get("name", ""):
                       print(device["udid"])
                       raise SystemExit
-          ')
+          ')"
           if [[ -z "${udid}" ]]; then
             echo "::error::no available iPhone simulator was found"
             exit 1
