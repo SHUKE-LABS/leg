@@ -448,7 +448,6 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
       LEGHOST_TRACE_RUNTIME: "1"
-      LEGHOST_RUNTIME_TRACE_FILE: ${{ runner.temp }}/ish-runtime-trace.log
     steps:
       - uses: actions/checkout@v5
 
@@ -480,6 +479,8 @@ jobs:
 
       - name: Run the real Shortcut bridge UI fixture
         shell: bash
+        env:
+          LEGHOST_RUNTIME_TRACE_FILE: ${{ runner.temp }}/ish-runtime-trace.log
         run: |
           set -euo pipefail
           xcodebuild test \
