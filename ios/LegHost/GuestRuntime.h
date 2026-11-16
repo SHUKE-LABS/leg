@@ -27,17 +27,6 @@ typedef void (*guest_exit_notify_callback)(int code, void *context);
  */
 int guest_runtime_boot(const char *root_data_dir);
 
-/* Configures the host endpoint behind the reserved guest bridge socket name.
- * The directory is private app temporary storage; only its short basename is
- * placed in the native sockaddr, so a long Simulator container path is safe.
- * Neither host path enters the guest environment. */
-int guest_runtime_set_host_bridge_socket(const char *directory, const char *name);
-
-/* Binds one host bridge listener in a private app-temporary directory while
- * keeping the native Unix-socket basename within sockaddr_un.sun_path. */
-int guest_runtime_bind_host_bridge_socket(int socket_fd, const char *directory,
-                                          const char *name);
-
 /*
  * Gives the guest the files the host wrote at and below the guest path
  * `path` of the booted root (see guest_fakefs_adopt_tree). Any thread may call

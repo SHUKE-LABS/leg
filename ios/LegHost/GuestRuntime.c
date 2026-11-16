@@ -35,7 +35,6 @@
 #include "kernel/init.h"
 #include "kernel/task.h"
 #include "util/sync.h"
-#include "IshPlatformShim.h"
 
 #if DEBUG
 extern const char *uname_hostname_override;
@@ -275,15 +274,6 @@ int guest_runtime_boot(const char *root_data_dir) {
 
     runtime_booted = true;
     return 0;
-}
-
-int guest_runtime_set_host_bridge_socket(const char *directory, const char *name) {
-    return ish_set_host_bridge_socket(directory, name);
-}
-
-int guest_runtime_bind_host_bridge_socket(int socket_fd, const char *directory,
-                                          const char *name) {
-    return ish_bind_host_bridge_socket(socket_fd, directory, name);
 }
 
 int guest_runtime_adopt_host_tree(const char *path) {

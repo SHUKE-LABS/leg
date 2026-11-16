@@ -213,11 +213,11 @@ final class LegHostUITests: XCTestCase {
 
     /// A deterministic JSON callback crosses the complete mobile boundary.
     ///
-    /// The host starts its real ShortcutsBridgeServer and ShortcutsAdapter in
-    /// a DEBUG-only fixture mode. The guest runs the shipped leg-bridge twice:
+    /// The host starts its real BridgeListener and ShortcutsAdapter in a
+    /// DEBUG-only fixture mode. The guest runs the shipped leg-bridge twice:
     /// once to obtain approval and once to redeem it. The shell assertion is
     /// made against the final bridge response, so the object must survive the
-    /// real host adapter, Unix server, iSH socket shim, and guest binary.
+    /// real host adapter, unified Unix listener, iSH socket shim, and guest binary.
     func testARealShortcutJSONResultCrossesTheHostAndGuestBoundary() {
         app.terminate()
         app.launchArguments = ["-leghost-reset"] + Self.launchArguments + [

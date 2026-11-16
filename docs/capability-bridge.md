@@ -357,10 +357,11 @@ The guest is a Linux guest, so the Unix socket is the transport that matters;
 the last row only names the platforms this slice cannot serve.
 
 On iOS, `LEG_BRIDGE_HOST_SOCKET` is the reserved guest name
-`/tmp/leg-host-bridge.sock`. The iSH host shim maps that name to a private
-per-session app-temporary Unix socket file; the guest cannot select the host
-endpoint. The host accepts one bounded request per connection and waits at
-most 30 s.
+`/run/leghost-bridge.sock`. The vendored iSH hook maps that fake socket inode
+to a private per-session app-temporary Unix socket file; the guest cannot
+select the host endpoint. The host accepts one bounded request per connection
+and waits at most 30 s. All iOS capabilities use this same listener and its
+approval ledger.
 
 ### The envelope
 
@@ -413,9 +414,10 @@ the work it started.
 
 ### The iOS host
 
-The LegHost app serves `photos.search`, `photos.export`, `files.import`, and
-`files.export` (`ios/LegHost/BridgeListener.swift`, `PhotosAdapter.swift`,
-`FilesAdapter.swift`).
+The LegHost app serves `shortcuts.invoke`, `photos.search`, `photos.export`,
+`files.import`, and `files.export` (`ios/LegHost/BridgeListener.swift`,
+`ShortcutsAdapter.swift`, `PhotosAdapter.swift`, `FilesAdapter.swift`). All
+five capabilities use the same listener and approval ledger.
 
 **The socket.** For every guest generation the host binds an `AF_UNIX`
 listener at a private path, `lb-<random>/s` (directory `0700`, socket `0600`)

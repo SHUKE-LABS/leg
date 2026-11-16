@@ -544,9 +544,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         return ShortcutsAdapter(registry: shortcutRegistry)
         #endif
     }()
-    /// The host endpoint the guest bridge connects to.
-    private var shortcutsBridgeServer: ShortcutsBridgeServer?
-
     /// Whether the run still has to interrupt the session on its own.
     ///
     /// The control is the one of the simulator tests: the run stops the
@@ -852,7 +849,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 watchExchangeTrail(root: activeRoot)
             }
             try await bootRuntime(root: activeRoot)
-            try startShortcutsBridge()
             state.boots += 1
             watchGuestExit()
 
@@ -906,8 +902,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         guest_runtime_set_exit_notify(nil, nil)
         exitContext = nil
         shortcutsAdapter.cancelAll()
-        shortcutsBridgeServer?.stop()
-        shortcutsBridgeServer = nil
 
         // The work of the bridge adapters ends before the guest does: a
         // picker or a copy of the session must not outlive it.
@@ -941,8 +935,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // next.
         let guestStopped = await stopGuestSession()
         state.guestTasks = Int(guest_runtime_running_tasks())
-        _ = guest_runtime_set_host_bridge_socket(nil, nil)
-
         // The guest stopped, and the runtime removed the guest endpoint with
         // it: the mapping, the socket and the staging of the session go now.
         await stopBridge()
@@ -1402,7 +1394,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let listener = BridgeListener(
             generation: UInt64.random(in: 1 ... .max),
             adapters: ["photos.search": photos, "photos.export": photos,
-                       "files.import": files, "files.export": files],
+                       "files.import": files, "files.export": files,
+                       ShortcutsAdapter.capability: shortcutsAdapter],
             registrar: IshBridgeEndpointRegistrar(),
             stagingRoot: stagingRoot,
             managedRoot: managedRoot,
@@ -1516,40 +1509,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         environment.append("ANTHROPIC_BASE_URL=\(baseURL)")
         environment.append("LEG_MODEL=\(model)")
         environment.append("LEG_CONTEXT_WINDOW_TOKENS=\(window)")
-        // The path is fixed inside the guest. The iSH runtime maps it to the
-        // host's private app-temporary Unix endpoint; no host path is exposed.
-        environment.append("LEG_BRIDGE_HOST_SOCKET=\(ShortcutsAdapter.guestSocketName)")
         if isFixture {
             environment.append(contentsOf: Self.fixtureEnvironment(for: options.fixtureScenario))
         }
         return environment
-    }
-
-    /// Starts the host side of the fixed capability bridge before the guest
-    /// session can issue a request.
-    private func startShortcutsBridge() throws {
-        shortcutsBridgeServer?.stop()
-        let server = ShortcutsBridgeServer { [weak self] request in
-            guard let self else {
-                return .failure(request: request, status: "unavailable",
-                                reason: "host_unreachable",
-                                message: "the iOS host is no longer running",
-                                remediation: "restart the host and retry")
-            }
-            return await self.shortcutsAdapter.handle(request)
-        }
-        try server.start()
-        let status = server.hostSocketDirectory.withCString { directory in
-            server.hostSocketBasename.withCString { basename in
-                guest_runtime_set_host_bridge_socket(directory, basename)
-            }
-        }
-        guard status == 0 else {
-            server.stop()
-            _ = guest_runtime_set_host_bridge_socket(nil, nil)
-            throw GuestHostError(message: "The iSH capability socket could not be configured.")
-        }
-        shortcutsBridgeServer = server
     }
 
     /// The values that pin a fixture turn down.

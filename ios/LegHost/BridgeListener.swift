@@ -85,6 +85,12 @@ struct FilesExportInput: Equatable {
     var filename: String?
 }
 
+/// The input of `shortcuts.invoke`.
+struct ShortcutsInvokeInput: Equatable {
+    var name: String
+    var input: BridgeJSON
+}
+
 /// A request the host serves, after its input was checked against the
 /// capability's schema.
 enum BridgeCapabilityRequest: Equatable {
@@ -93,12 +99,17 @@ enum BridgeCapabilityRequest: Equatable {
     /// `files.import`; the only destination is the guest workspace.
     case filesImport
     case filesExport(FilesExportInput)
+    case shortcutsInvoke(ShortcutsInvokeInput)
 
     /// The capabilities the host serves.
-    static let capabilities = ["photos.search", "photos.export", "files.import", "files.export"]
+    static let capabilities = [
+        "photos.search", "photos.export", "files.import", "files.export", "shortcuts.invoke",
+    ]
 
     /// The capabilities that run only after a human approved them.
-    static let approvalCapabilities: Set<String> = ["photos.export", "files.export"]
+    static let approvalCapabilities: Set<String> = [
+        "photos.export", "files.export", "shortcuts.invoke",
+    ]
 
     var capability: String {
         switch self {
@@ -106,6 +117,7 @@ enum BridgeCapabilityRequest: Equatable {
         case .photosExport: return "photos.export"
         case .filesImport: return "files.import"
         case .filesExport: return "files.export"
+        case .shortcutsInvoke: return "shortcuts.invoke"
         }
     }
 
@@ -176,6 +188,17 @@ enum BridgeCapabilityRequest: Equatable {
             }
             let filename = try fields["filename"].map { try basename($0, name: "filename") }
             return .filesExport(FilesExportInput(copyID: copyID, name: name, filename: filename))
+        case "shortcuts.invoke":
+            let fields = try members(input, allowed: ["name", "input"], required: ["name"])
+            guard let name = fields["name"]?.stringValue,
+                  BridgeValidation.isPrintableID(name, maxBytes: 256) else {
+                throw BridgeFailure.invalidInput("name must be printable text of 1 to 256 bytes")
+            }
+            let nestedInput = fields["input"] ?? .object([])
+            guard case .object = nestedInput else {
+                throw BridgeFailure.invalidInput("input must be an object")
+            }
+            return .shortcutsInvoke(ShortcutsInvokeInput(name: name, input: nestedInput))
         default:
             throw BridgeFailure.unavailable("capability_unsupported", "the host does not serve \(capability)")
         }

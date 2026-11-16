@@ -175,14 +175,15 @@ the host's listener.
 
 ## The capability bridge
 
-The host serves `photos.search`, `photos.export`, `files.import`, and
-`files.export` to `leg-bridge` in the guest. Before every session it binds a
-private Unix socket, registers it with the vendored iSH hook, and starts the
-guest with `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`; the hook makes
-that path a socket inode in the guest and maps a `connect()` to it onto the
-listener. The listener answers one request per connection, checks the
-RFC 8785 input digest and its own approval ledger before an adapter runs,
-and is torn down with the session. The
+The host serves `shortcuts.invoke`, `photos.search`, `photos.export`,
+`files.import`, and `files.export` to `leg-bridge` in the guest. Before every
+session it binds a private Unix socket, registers it with the vendored iSH
+hook, and starts the guest with
+`LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`; the hook makes that path a
+socket inode in the guest and maps a `connect()` to it onto the listener. The
+listener routes every capability through this one endpoint, answers one
+request per connection, checks the RFC 8785 input digest and its shared
+approval ledger before an adapter runs, and is torn down with the session. The
 [capability bridge contract](../docs/capability-bridge.md#the-ios-host) has
 the details: the start and teardown order, the Photos authorization matrix,
 the Files containment checks, the no-replace commit, and the failure reasons.

@@ -30,16 +30,18 @@ forms cannot be confused.
 This is the only instruction the pinned guest bundle needs that the
 vendored emulator did not implement.
 
-## `fs/sock`: the fixed LegHost capability socket
+## `fs/sock` and `fs/IshBridgeSocketHook`: the fixed LegHost capability socket
 
 The iSH Unix socket namespace normally maps every guest socket to another
 socket inside the emulator process. The native `leg-bridge` client needs one
-host-owned endpoint instead. The change reserves `/tmp/leg-host-bridge.sock`
-for the embedding host, maps it to the per-session private socket file the host
-supplies, and skips iSH's in-process peer-pointer handshake for that one
-connected socket. The path is configured by the host, never by a guest
-request, and is cleared when the guest session ends. All other guest Unix
-sockets retain the upstream behavior.
+host-owned endpoint instead. The vendored hook provisions the fixed guest path
+`/run/leghost-bridge.sock` in the fake filesystem, records its inode, and maps
+that inode to the per-session private Unix socket path the host supplies. The
+socket skips iSH's in-process peer-pointer handshake because the peer is the
+host listener. The path is registered by the host, never selected by a guest
+request; the hook removes only the endpoint inode it made and retains its
+record if cleanup needs to be retried. All other guest Unix sockets retain the
+upstream behavior.
 
 ## `kernel/uname.c`: bound host names
 

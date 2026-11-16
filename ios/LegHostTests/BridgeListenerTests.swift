@@ -344,6 +344,32 @@ final class BridgeListenerTests: XCTestCase {
         XCTAssertEqual(replies, ["ok"])
     }
 
+    func testShortcutAndMediaShareOneEndpointAndApprovalLedger() throws {
+        let shortcutInput: BridgeJSON = .object([
+            "name": .string("LegHost bridge fixture"),
+            "input": .object(["format": .string("json")]),
+        ])
+        let approval = try exchange(frame("shortcuts.invoke", shortcutInput,
+                                          requestID: "shortcut-preview"))
+        XCTAssertEqual(status(approval), "approval_required")
+        let token = try XCTUnwrap(approval?["result"]?["approval_token"]?.stringValue)
+        XCTAssertEqual(adapter.previews, 1)
+        XCTAssertEqual(adapter.performs, 0)
+
+        // A media request and the Shortcut continuation use the same listener
+        // socket. The listener's one ledger must keep the Shortcut token while
+        // routing the non-approval media capability immediately.
+        let media = try exchange(frame("photos.search", Self.searchInput,
+                                       requestID: "media-search"))
+        XCTAssertEqual(status(media), "ok")
+        let result = try exchange(frame("shortcuts.invoke", shortcutInput, token: token,
+                                        requestID: "shortcut-result"))
+        XCTAssertEqual(status(result), "ok")
+        XCTAssertEqual(adapter.performs, 2)
+        XCTAssertEqual(listener.approvals.records[BridgeApprovalLedger.key(token)]?.state,
+                       .redeemed)
+    }
+
     func testAManagedCopyIsGivenToTheGuestByItsGuestPath() throws {
         adapter.publishedCopy = "c1"
         let reply = try exchange(frame("photos.search", Self.searchInput, requestID: "r1"))

@@ -29,7 +29,6 @@
 		DD11DD11DD11DD11DD110003 /* ProviderSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */; };
 		DD11DD11DD11DD11DD110004 /* ShortcutConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110014 /* ShortcutConfiguration.swift */; };
 		DD11DD11DD11DD11DD110005 /* ShortcutsAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110015 /* ShortcutsAdapter.swift */; };
-		DD11DD11DD11DD11DD110006 /* ShortcutsBridgeServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110016 /* ShortcutsBridgeServer.swift */; };
 		DD11DD11DD11DD11DD110007 /* ShortcutSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110017 /* ShortcutSetupView.swift */; };
 		DD11DD11DD11DD11DD110008 /* Skills in Resources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110018 /* Skills */; };
 		CC11CC11CC11CC11CC110001 /* LegHostUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */; };
@@ -102,7 +101,6 @@
 		DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderSetupView.swift; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110014 /* ShortcutConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutConfiguration.swift; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110015 /* ShortcutsAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutsAdapter.swift; sourceTree = "<group>"; };
-		DD11DD11DD11DD11DD110016 /* ShortcutsBridgeServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutsBridgeServer.swift; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110017 /* ShortcutSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutSetupView.swift; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110018 /* Skills */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Skills; sourceTree = "<group>"; };
 		CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegHostUITests.swift; sourceTree = "<group>"; };
@@ -217,7 +215,6 @@
 				DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */,
 				DD11DD11DD11DD11DD110014 /* ShortcutConfiguration.swift */,
 				DD11DD11DD11DD11DD110015 /* ShortcutsAdapter.swift */,
-				DD11DD11DD11DD11DD110016 /* ShortcutsBridgeServer.swift */,
 				DD11DD11DD11DD11DD110017 /* ShortcutSetupView.swift */,
 				EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */,
 				GG11GG11GG11GG11GG110001 /* BridgeCanonicalJSON.swift */,
@@ -493,7 +490,6 @@
 				DD11DD11DD11DD11DD110003 /* ProviderSetupView.swift in Sources */,
 				DD11DD11DD11DD11DD110004 /* ShortcutConfiguration.swift in Sources */,
 				DD11DD11DD11DD11DD110005 /* ShortcutsAdapter.swift in Sources */,
-				DD11DD11DD11DD11DD110006 /* ShortcutsBridgeServer.swift in Sources */,
 				DD11DD11DD11DD11DD110007 /* ShortcutSetupView.swift in Sources */,
 				EE11EE11EE11EE11EE110013 /* FixtureRequestLedger.swift in Sources */,
 				GG11GG11GG11GG11GG110081 /* BridgeCanonicalJSON.swift in Sources */,
