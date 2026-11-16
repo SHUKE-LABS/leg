@@ -234,10 +234,13 @@ final class LegHostUITests: XCTestCase {
 
         XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
                       "the guest terminal is missing")
-        XCTAssertTrue(waitForTerminalText(
+        let resultVisible = waitForTerminalText(
             "SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture",
-            timeout: startTimeout),
-            "the deterministic Shortcut object did not cross the host and guest boundary")
+            timeout: startTimeout)
+        let state = app.staticTexts["guest-fixture-state"].label
+        XCTAssertTrue(resultVisible,
+                      "the deterministic Shortcut object did not cross the host and guest boundary; "
+                        + "host state: \(state)")
     }
 
     /// The second launch verifies the root and reuses it instead of importing
