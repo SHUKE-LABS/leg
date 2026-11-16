@@ -259,6 +259,9 @@ struct HostState: Equatable {
     var bridge = "off"
     /// The number of replies the bridge listener wrote.
     var bridgeReplies = 0
+    /// The status of the most recent bridge replies, bounded for the screen
+    /// diagnostic so a long-lived session cannot grow it without limit.
+    var bridgeReplyStatuses: [String] = []
     /// What the install of the bundled Skill did.
     var skill = "none"
     /// Whether the endpoint hook still records an endpoint it made after the
@@ -272,7 +275,8 @@ struct HostState: Equatable {
             : self.statuses.map(String.init).joined(separator: ",")
         return "provision=\(provisions),boot=\(boots),session=\(sessions),requests=\(requests),"
             + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
-            + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),skill=\(skill),"
+            + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),"
+            + "reply_statuses=\(bridgeReplyStatuses.joined(separator: ",")),skill=\(skill),"
             + "endpoint=\(endpoint)"
     }
 }
@@ -1419,8 +1423,15 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             stagingRoot: stagingRoot,
             managedRoot: managedRoot,
             guestAdopter: { path in path.withCString { guest_runtime_adopt_host_tree($0) } == 0 })
-        listener.onReply = { [weak self] _ in
-            DispatchQueue.main.async { self?.state.bridgeReplies += 1 }
+        listener.onReply = { [weak self] status in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.state.bridgeReplies += 1
+                self.state.bridgeReplyStatuses.append(status)
+                if self.state.bridgeReplyStatuses.count > 8 {
+                    self.state.bridgeReplyStatuses.removeFirst()
+                }
+            }
         }
         try listener.start()
         if options.bridgeEndpointFaults != 0 {
