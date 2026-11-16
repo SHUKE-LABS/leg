@@ -112,15 +112,19 @@ the following outcomes:
 
 ### Current-head follow-up attempt
 
-The current Linux checkout cannot produce a truthful device result. On
-2026-11-16, the follow-up was inspected from the implementation worktree, but
-`xcodebuild`, `xcrun`, the iOS SDK, and a physical device were unavailable.
-No current-head Shortcut pass is claimed here: the registration, URL, callback,
-cancellation, and foreground/background rows above remain an operator-run
-device gate, tracked separately in
-[issue #310](https://github.com/SHUKE-LABS/leg/issues/310). The host-side
-focused tests and the CI jobs are the evidence available from this environment;
-the macOS/Xcode device run belongs to #310 and must replace this note before
+On 2026-11-16, the exact implementation head
+`e90c7a6ef26d75a728cede5afaebccbaef246b2c` was checked out on the macOS build
+host and the connected iPhone 12 (iOS 27.2) was selected. The one-test provider
+setup smoke was invoked with Xcode 26.1.1, but the build stopped before the test:
+Xcode reported that the Apple account and development provisioning profiles for
+the host and UI-test bundles were unavailable, and exited 65. This is a
+build-host signing failure, not a passing device result; no current-head
+Shortcut pass is claimed here.
+
+The registration, URL, callback, cancellation, and foreground/background rows
+above remain an operator-run device gate, tracked separately in [issue #310](https://github.com/SHUKE-LABS/leg/issues/310).
+The host-side focused tests and the CI jobs are the evidence available from
+this environment; the macOS/Xcode device run must replace this note before
 that validation issue can be closed.
 
 ### The persistence boundaries on the device
