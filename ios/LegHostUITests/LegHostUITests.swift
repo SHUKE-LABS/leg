@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 /// Drives the LegHost app in the simulator.
@@ -37,6 +38,12 @@ final class LegHostUITests: XCTestCase {
         #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; else"#,
         #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; fi; sleep 300"#,
     ].joined(separator: " ")
+
+    /// XCUITest forwards launch arguments through a shell-like boundary. The
+    /// script therefore travels as base64 and is decoded by the host before
+    /// it becomes the guest shell's `-c` argument.
+    private static let shortcutBridgeScriptBase64 =
+        Data(shortcutBridgeScript.utf8).base64EncodedString()
 
     private var app: XCUIApplication!
 
@@ -220,7 +227,7 @@ final class LegHostUITests: XCTestCase {
         app.launchArguments = ["-leghost-reset"] + Self.launchArguments + [
             "-leghost-shortcuts-fixture",
             "-leghost-program", "/bin/sh",
-            "-leghost-program-script", Self.shortcutBridgeScript,
+            "-leghost-program-script-base64", Self.shortcutBridgeScriptBase64,
         ]
         app.launch()
         defer { app.terminate() }

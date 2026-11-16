@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import LegHost
 
@@ -367,6 +368,16 @@ final class GuestHostLifecycleTests: XCTestCase {
         XCTAssertEqual(options.programScript, "printf script")
         XCTAssertEqual(HostLaunchOptions.current(arguments: ["LegHost"]).programArguments, [])
         XCTAssertNil(HostLaunchOptions.current(arguments: ["LegHost", "-leghost-program-script"]).programScript)
+
+        let preservedScript = "request='{\"x\":1}'; printf '%s\\n' \"$request\""
+        let encodedScript = Data(preservedScript.utf8).base64EncodedString()
+        let encodedOptions = HostLaunchOptions.current(arguments: [
+            "LegHost", "-leghost-program-script-base64", encodedScript,
+        ])
+        XCTAssertEqual(encodedOptions.programScript, preservedScript)
+        XCTAssertNil(HostLaunchOptions.current(arguments: [
+            "LegHost", "-leghost-program-script-base64", "not-base64",
+        ]).programScript)
     }
 
     /// A session that could not be released is not retried.

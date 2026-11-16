@@ -170,6 +170,15 @@ struct HostLaunchOptions {
                     options.programScript = arguments[index + 1]
                     consumed = 2
                 }
+            case "-leghost-program-script-base64":
+                if index + 1 < arguments.count {
+                    let encoded = arguments[index + 1]
+                    if let data = Data(base64Encoded: encoded),
+                       let script = String(data: data, encoding: .utf8) {
+                        options.programScript = script
+                    }
+                    consumed = 2
+                }
             case "-leghost-no-provider":
                 options.hasNoProvider = true
             case "-leghost-provider-reset":
