@@ -497,7 +497,8 @@ jobs:
             -derivedDataPath "${RUNNER_TEMP}/leghost-derived-data" \
             -resultBundlePath "${RUNNER_TEMP}/leghost-shortcut-bridge.xcresult" \
             -parallel-testing-enabled NO \
-            -only-testing:LegHostUITests/LegHostUITests/testARealShortcutJSONResultCrossesTheHostAndGuestBoundary
+            -only-testing:LegHostUITests/LegHostUITests/testARealShortcutJSONResultCrossesTheHostAndGuestBoundary \
+            -only-testing:LegHostTests/ShortcutTests
 
       - name: Upload Xcode test result
         if: ${{ always() }}

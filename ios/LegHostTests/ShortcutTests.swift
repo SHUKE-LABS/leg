@@ -80,6 +80,29 @@ final class ShortcutTests: XCTestCase {
         XCTAssertFalse(openerCalled)
     }
 
+    func testUserRefusalDoesNotDispatchTheShortcut() async throws {
+        let (store, _) = try makeStore(name: "Refused shortcut", kind: .text)
+        var openerCalled = false
+        let adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in false },
+            opener: { _ in
+                openerCalled = true
+                return true
+            })
+
+        do {
+            _ = try await adapter.preview(
+                request(name: "Refused shortcut", input: .object(["text": .string("hello")])),
+                context: context())
+            XCTFail("a refused Shortcut was previewed")
+        } catch let error as BridgeFailure {
+            XCTAssertEqual(error, .denied(
+                "user_refused", "the user did not approve running the registered Shortcut"))
+        }
+        XCTAssertFalse(openerCalled)
+    }
+
     func testPreviewIsTheOnlyConfirmationAndPerformUsesTheSameListenerContract() async throws {
         let (store, _) = try makeStore(name: "JSON result", kind: .json)
         var confirmationCount = 0
@@ -134,6 +157,112 @@ final class ShortcutTests: XCTestCase {
         }
     }
 
+    func testCancelCallbackMapsToCancelled() async throws {
+        let (store, _) = try makeStore(name: "Cancelled shortcut", kind: .text)
+        var adapter: ShortcutsAdapter!
+        adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in true },
+            opener: { url in
+                guard let state = Self.callbackState(in: url, callbackName: "x-cancel"),
+                      let callback = URL(string: "legshortcuts://cancel?state=\(state)") else {
+                    return false
+                }
+                Task { @MainActor in
+                    adapter.handleCallback(callback)
+                }
+                return true
+            })
+
+        do {
+            _ = try await adapter.perform(
+                request(name: "Cancelled shortcut", input: .object(["text": .string("hello")])),
+                context: context())
+            XCTFail("a cancelled Shortcut was accepted")
+        } catch let error as BridgeFailure {
+            XCTAssertEqual(error, .cancelled)
+        }
+    }
+
+    func testCallbackDeadlineMapsToTimeout() async throws {
+        let (store, _) = try makeStore(name: "Timed out shortcut", kind: .text)
+        let adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in true },
+            opener: { _ in true })
+
+        do {
+            _ = try await adapter.perform(
+                request(name: "Timed out shortcut", input: .object(["text": .string("hello")])),
+                context: context(timeout: 0.1))
+            XCTFail("a Shortcut without a callback was accepted")
+        } catch let error as BridgeFailure {
+            XCTAssertEqual(error, .error(
+                "timeout", "the Shortcut did not return before the deadline"))
+        }
+    }
+
+    func testShortcutErrorCallbacksMapToStableBridgeFailures() async throws {
+        let cases: [(String, BridgeFailure)] = [
+            ("Shortcut not found", .unavailable(
+                "shortcut_not_found", "the registered Shortcut could not be found")),
+            ("shortcuts_unavailable", .unavailable(
+                "shortcuts_unavailable", "the Shortcuts app is not available on this device")),
+            ("the Shortcut failed", .error(
+                "shortcut_failed", "the Shortcut reported an error")),
+        ]
+
+        for (detail, expected) in cases {
+            let (store, _) = try makeStore(name: "Error callback", kind: .text)
+            var adapter: ShortcutsAdapter!
+            adapter = ShortcutsAdapter(
+                registry: store,
+                confirmation: { _, _ in true },
+                opener: { url in
+                    guard let state = Self.callbackState(in: url, callbackName: "x-error"),
+                          var components = URLComponents(string: "legshortcuts://error") else {
+                        return false
+                    }
+                    components.queryItems = [
+                        URLQueryItem(name: "state", value: state),
+                        URLQueryItem(name: "errorMessage", value: detail),
+                    ]
+                    guard let callback = components.url else { return false }
+                    Task { @MainActor in
+                        adapter.handleCallback(callback)
+                    }
+                    return true
+                })
+
+            do {
+                _ = try await adapter.perform(
+                    request(name: "Error callback", input: .object(["text": .string("hello")])),
+                    context: context())
+                XCTFail("an error callback was accepted: \(detail)")
+            } catch let error as BridgeFailure {
+                XCTAssertEqual(error, expected, "unexpected mapping for \(detail)")
+            }
+        }
+    }
+
+    func testUnavailableShortcutsAppMapsToStableFailure() async throws {
+        let (store, _) = try makeStore(name: "Unavailable shortcut", kind: .text)
+        let adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in true },
+            opener: { _ in false })
+
+        do {
+            _ = try await adapter.perform(
+                request(name: "Unavailable shortcut", input: .object(["text": .string("hello")])),
+                context: context())
+            XCTFail("an unavailable Shortcuts app was accepted")
+        } catch let error as BridgeFailure {
+            XCTAssertEqual(error, .unavailable(
+                "shortcuts_unavailable", "the Shortcuts app is not available on this device"))
+        }
+    }
+
     func testUnknownAndStaleCallbackStatesCannotSettleARequest() async throws {
         let (store, _) = try makeStore(name: "Callback state", kind: .text)
         var adapter: ShortcutsAdapter!
@@ -159,6 +288,120 @@ final class ShortcutTests: XCTestCase {
         adapter.handleCallback(URL(string: "legshortcuts://success?state=\(state)&result=done")!)
         let result = try await task.value
         XCTAssertEqual(result, .object(["kind": .string("text"), "value": .string("done")]))
+    }
+
+    func testCallbackFromCancelledInvocationCannotSettleTheNextInvocation() async throws {
+        let (store, _) = try makeStore(name: "Cancelled then fresh", kind: .text)
+        var adapter: ShortcutsAdapter!
+        var openedURLs: [URL] = []
+        let firstOpened = expectation(description: "the cancelled invocation opened")
+        let secondOpened = expectation(description: "the fresh invocation opened")
+        var secondCompleted = false
+        adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in true },
+            opener: { url in
+                openedURLs.append(url)
+                if openedURLs.count == 1 {
+                    firstOpened.fulfill()
+                } else if openedURLs.count == 2 {
+                    secondOpened.fulfill()
+                }
+                return true
+            })
+
+        let invocation = request(name: "Cancelled then fresh",
+                                 input: .object(["text": .string("hello")]))
+        let firstTask = Task { @MainActor in
+            try await adapter.perform(invocation, context: context(timeout: 1))
+        }
+        await fulfillment(of: [firstOpened], timeout: 1)
+        firstTask.cancel()
+        do {
+            _ = try await firstTask.value
+            XCTFail("the cancelled invocation completed successfully")
+        } catch let error as BridgeFailure {
+            XCTAssertEqual(error, .cancelled)
+        } catch {
+            XCTFail("the cancelled invocation failed with an unexpected error: \(error)")
+        }
+
+        let secondTask = Task { @MainActor in
+            defer { secondCompleted = true }
+            return try await adapter.perform(invocation, context: context(timeout: 1))
+        }
+        await fulfillment(of: [secondOpened], timeout: 1)
+        let firstState = try XCTUnwrap(
+            Self.callbackState(in: openedURLs[0], callbackName: "x-success"))
+        let secondState = try XCTUnwrap(
+            Self.callbackState(in: openedURLs[1], callbackName: "x-success"))
+
+        adapter.handleCallback(try XCTUnwrap(
+            URL(string: "legshortcuts://success?state=\(firstState)&result=stale")))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(secondCompleted, "a cancelled invocation's callback settled the next one")
+
+        adapter.handleCallback(try XCTUnwrap(
+            URL(string: "legshortcuts://success?state=\(secondState)&result=fresh")))
+        let result = try await secondTask.value
+        XCTAssertEqual(result, .object(["kind": .string("text"), "value": .string("fresh")]))
+    }
+
+    func testCallbackFromTimedOutInvocationCannotSettleTheNextInvocation() async throws {
+        let (store, _) = try makeStore(name: "Timed out then fresh", kind: .text)
+        var adapter: ShortcutsAdapter!
+        var openedURLs: [URL] = []
+        let firstOpened = expectation(description: "the timed-out invocation opened")
+        let secondOpened = expectation(description: "the fresh invocation opened")
+        var secondCompleted = false
+        adapter = ShortcutsAdapter(
+            registry: store,
+            confirmation: { _, _ in true },
+            opener: { url in
+                openedURLs.append(url)
+                if openedURLs.count == 1 {
+                    firstOpened.fulfill()
+                } else if openedURLs.count == 2 {
+                    secondOpened.fulfill()
+                }
+                return true
+            })
+
+        let invocation = request(name: "Timed out then fresh",
+                                 input: .object(["text": .string("hello")]))
+        let firstTask = Task { @MainActor in
+            try await adapter.perform(invocation, context: context(timeout: 0.1))
+        }
+        await fulfillment(of: [firstOpened], timeout: 1)
+        do {
+            _ = try await firstTask.value
+            XCTFail("the timed-out invocation completed successfully")
+        } catch let error as BridgeFailure {
+            XCTAssertEqual(error, .error(
+                "timeout", "the Shortcut did not return before the deadline"))
+        } catch {
+            XCTFail("the timed-out invocation failed with an unexpected error: \(error)")
+        }
+
+        let secondTask = Task { @MainActor in
+            defer { secondCompleted = true }
+            return try await adapter.perform(invocation, context: context(timeout: 1))
+        }
+        await fulfillment(of: [secondOpened], timeout: 1)
+        let firstState = try XCTUnwrap(
+            Self.callbackState(in: openedURLs[0], callbackName: "x-success"))
+        let secondState = try XCTUnwrap(
+            Self.callbackState(in: openedURLs[1], callbackName: "x-success"))
+
+        adapter.handleCallback(try XCTUnwrap(
+            URL(string: "legshortcuts://success?state=\(firstState)&result=stale")))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(secondCompleted, "a timed-out invocation's callback settled the next one")
+
+        adapter.handleCallback(try XCTUnwrap(
+            URL(string: "legshortcuts://success?state=\(secondState)&result=fresh")))
+        let result = try await secondTask.value
+        XCTAssertEqual(result, .object(["kind": .string("text"), "value": .string("fresh")]))
     }
 
     func testShortcutURLUsesOnlyThePublicRunEndpointAndCallbacks() throws {
