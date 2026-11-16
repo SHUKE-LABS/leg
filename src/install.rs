@@ -160,6 +160,7 @@ pub(crate) fn install_sources(
 
     // The current user's PATH is read before anything is written, so a
     // registry failure cannot leave a half-finished install behind.
+    let path_already_present = current_path_contains_destination(&destination);
     let path_update = PathUpdate::prepare(&destination, options.no_path)?;
 
     let commit = commit_files(sources, &destination, fault, &mut cleanup)?;
@@ -172,7 +173,7 @@ pub(crate) fn install_sources(
             destination,
             installed,
             path_updated: false,
-            path_already_present: false,
+            path_already_present,
         });
     };
 
@@ -541,6 +542,38 @@ struct PathUpdate {
     already_present: bool,
     /// Whether the merged value differs from the original.
     changed: bool,
+}
+
+/// Whether the current process PATH already contains the destination on Unix.
+///
+/// Windows uses the current-user PATH stored in the registry instead, so this
+/// check is deliberately disabled there to keep that behavior unchanged.
+fn current_path_contains_destination(destination: &Path) -> bool {
+    #[cfg(not(windows))]
+    {
+        return path_contains_destination(std::env::var_os("PATH").as_deref(), destination);
+    }
+    #[cfg(windows)]
+    {
+        let _ = destination;
+        false
+    }
+}
+
+#[cfg(not(windows))]
+/// Whether a controlled PATH value contains a directory resolving to
+/// `destination`.
+fn path_contains_destination(path_value: Option<&std::ffi::OsStr>, destination: &Path) -> bool {
+    let Some(path_value) = path_value else {
+        return false;
+    };
+    let Ok(destination) = fs::canonicalize(destination) else {
+        return false;
+    };
+
+    std::env::split_paths(path_value)
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .any(|entry| fs::canonicalize(entry).is_ok_and(|entry| entry == destination))
 }
 
 impl PathUpdate {
