@@ -41,6 +41,12 @@ connected socket. The path is configured by the host, never by a guest
 request, and is cleared when the guest session ends. All other guest Unix
 sockets retain the upstream behavior.
 
+## `kernel/uname.c`: bound host names
+
+Darwin can return a host nodename longer than iSH's fixed 65-byte guest
+hostname field. The copy into the guest `uname` structure is bounded and
+always NUL-terminated, so a long CI runner name cannot overflow the runtime.
+
 ## `fs/proc`: the `exe` link of a task without an address space
 
 `fs/proc/pid.c` answers the other `/proc/<pid>` entries with a check for a
