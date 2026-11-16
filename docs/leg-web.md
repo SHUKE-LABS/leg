@@ -356,50 +356,50 @@ bash companions/leg-web/tests/theme_browser_e2e.sh
 Same-device Safari to a `leg-web` running in iSH is not a viable default on
 iOS. This result does not gate the MVP (#279).
 
-Tested artifact: `leg-0.49.0-i686-unknown-linux-musl.tar.gz` (manifest
-`leg_version` 0.49.0), SHA-256
-`8709e97d212e707a10a38f20756171fe3583a8af109b1a9fa69957de22ddc975`.
-`scripts/release.sh verify-ish-archive` passed, and so did the inner
-`sha256sum --check SHA256SUMS`. The run used an iPhone 12 (iPhone13,2) on
-iOS 27.2, with the App Store iSH 1.3.2 (494) as the host. iSH downloaded these
-exact bytes and started:
+Observed on the device: an iPhone 12 (iPhone13,2) on iOS 27.2, with the App
+Store iSH 1.3.2 (494) as the host. The run script started `leg-web` in iSH and
+copied its printed one-time URL to the clipboard. Pasting that URL into Safari
+with *Paste and Go* failed with "Safari cannot open the page because it could
+not connect to the server". Back in iSH, the terminal showed a fresh prompt
+because iOS had terminated the backgrounded iSH, `leg-web` included.
+
+Prepared on the build host, not on the device: the script served
+`leg-0.49.0-i686-unknown-linux-musl.tar.gz` (manifest `leg_version` 0.49.0,
+SHA-256 `8709e97d212e707a10a38f20756171fe3583a8af109b1a9fa69957de22ddc975`).
+`scripts/release.sh verify-ish-archive` and the inner
+`sha256sum --check SHA256SUMS` passed there. The script was set to launch:
 
 ```sh
 leg-web --no-open --bind 127.0.0.1:13583 --state-dir ~/leg283/state-a \
   --leg-bin ~/leg283/b/leg --supervisor-bin ~/leg283/b/leg-ui-supervisor
 ```
 
-The run script copied the printed one-time URL to the iSH clipboard. The URL
-exists only after `leg-web` is listening. Pasting that exact URL into Safari
-with *Paste and Go* failed with "Safari cannot open the page because it could
-not connect to the server". Back in iSH, the terminal showed a fresh prompt
-because iOS had terminated the backgrounded iSH, `leg-web` included. No
-listener was left on `127.0.0.1:13583`. With the host gone, the run stopped at
-that step. The bare `127.0.0.1` and `localhost` entries, background and
-relaunch, port collision, and non-loopback bind were not reached on the
-device. The package tests (see Validation) cover loopback binding, the `--bind`
-collision hint, non-loopback rejection, and the Host check. That check answers
-any authority other than `127.0.0.1:<port>`, including `localhost:<port>`,
-with `400 invalid_host`. Keeping iSH alive with its location
-keep-alive (`cat /dev/location`) was not tried: a product cannot require that
-permission, so it would not change this conclusion. The run makes no LAN or
+Not captured on the device: iSH was terminated before the run log was sent, so
+the archive version and SHA-256, the checksum result, the bind and port, and
+the listener state are unrecorded. The remaining cases were never performed:
+the bare `127.0.0.1` and `localhost` entries, background and relaunch, the port
+collision, and the non-loopback bind. The package tests (see Validation) cover
+loopback binding, the `--bind` collision hint, non-loopback rejection, and the
+Host check, outside the device. A retry using iSH's location keep-alive
+(`cat /dev/location`) was cancelled, because a product cannot require that
+permission and the retry would not change the conclusion. No further phone run
+is needed, and the phone was released to xps #310. The run makes no LAN or
 cross-device claim.
 
-The installed LegHost cannot run the generic bundle. It reads its pinned
-inputs from the app bundle, so the generic archive cannot be injected on the
-device. The same provisioner on the build host rejects the archive. Against the
+LegHost today embeds iSH and renders its terminal in a `WKWebView`. It ships
+the `ios-mobile` bundle, which has no `leg-web`, and reads its pinned inputs
+from the app bundle, so the generic archive cannot be injected on the device.
+The same provisioner on the build host rejects the generic archive. Against the
 current pins it fails with `leg_guest_bundle has the digest 8709e97d…, expected
 83da3e66…`. Under `ios-mobile` pins carrying the generic digest it fails with
-`the guest bundle contains an unexpected file: leg-web`. The
-`generic-bundle` fixture in `ios/tests/guest_provision_test.c` asserts the same
-rejection.
+`the guest bundle contains an unexpected file: leg-web`. The `generic-bundle`
+fixture in `ios/tests/guest_provision_test.c` asserts the same rejection.
 
 `leg-web` therefore stays only in the generic iSH artifact. The mobile follow-up
-is for LegHost to ship `leg-web` in its own pinned bundle and open the UI in an
-in-app `WKWebView`, the view it already uses for the terminal. The server and
-the page would then run in one foreground app, with no separate iSH, no Safari,
-and no background termination. That is a new mechanism and needs its own
-ticket.
+belongs to LegHost and needs its own ticket. LegHost would ship `leg-web` in its
+own pinned bundle and open the UI in an in-app `WKWebView`. The server and the
+page would then run in one foreground app, with no separate iSH, no Safari, and
+no background termination.
 
 ## Validation
 
