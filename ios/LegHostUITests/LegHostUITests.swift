@@ -27,19 +27,16 @@ final class LegHostUITests: XCTestCase {
     /// it with the same input and checks the complete deterministic result the
     /// real iOS host returned. The final sleep keeps the terminal visible so
     /// the test can read the guest's assertion.
-    private static let shortcutBridgeScript = #"""
-    request='{"version":1,"request_id":"shortcut-e2e-approval","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}}}'
-    first=$(printf '%s\n' "$request" | /usr/local/bin/leg-bridge)
-    token=$(printf '%s\n' "$first" | sed -n 's/.*"approval_token":"\([^"]*\)".*/\1/p')
-    approved='{"version":1,"request_id":"shortcut-e2e-result","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}},"approval_token":"'"$token"'"}'
-    second=$(printf '%s\n' "$approved" | /usr/local/bin/leg-bridge)
-    if printf '%s\n' "$second" | grep -F '"status":"ok"' >/dev/null && printf '%s\n' "$second" | grep -F '"result":{"count":2,"ok":true,"source":"ios-shortcuts-fixture"}' >/dev/null; then
-        printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'
-    else
-        printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"
-    fi
-    sleep 300
-    """#
+    private static let shortcutBridgeScript = [
+        #"request='{"version":1,"request_id":"shortcut-e2e-approval","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}}}';"#,
+        #"first=$(printf '%s\n' "$request" | /usr/local/bin/leg-bridge);"#,
+        #"token=$(printf '%s\n' "$first" | sed -n 's/.*"approval_token":"\([^"]*\)".*/\1/p');"#,
+        #"approved='{"version":1,"request_id":"shortcut-e2e-result","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}},"approval_token":"'"$token"'"}';"#,
+        #"second=$(printf '%s\n' "$approved" | /usr/local/bin/leg-bridge);"#,
+        #"if printf '%s\n' "$second" | grep -F '"status":"ok"' >/dev/null && printf '%s\n' "$second" | grep -F '"result":{"count":2,"ok":true,"source":"ios-shortcuts-fixture"}' >/dev/null; then"#,
+        #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; else"#,
+        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; fi; sleep 300"#,
+    ].joined(separator: " ")
 
     private var app: XCUIApplication!
 
