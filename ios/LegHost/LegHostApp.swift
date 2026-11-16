@@ -316,5 +316,5 @@ enum HostBundle {
     /// The mobile-only Skill staged into the guest's existing Skills v1 root.
     static let shortcutSkillURL: URL? =
         Bundle.main.url(forResource: "SKILL", withExtension: "md",
-                        subdirectory: "Skills/shortcuts")
+                        subdirectory: "BridgeSkills/shortcuts")
 }

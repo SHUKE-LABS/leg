@@ -255,7 +255,7 @@ Shortcut, and choose whether it accepts text or a JSON object. The
 host stores only this registration metadata. It never discovers, creates,
 edits, enables, schedules, or silently runs personal automations.
 
-The iOS bundle ships `resources/Skills/shortcuts/SKILL.md`. Provisioning stages
+The iOS bundle ships `resources/BridgeSkills/shortcuts/SKILL.md`. Provisioning stages
 it at `/root/.agents/skills/shortcuts/SKILL.md`, where the existing Skills v1
 discovery rules find it. The Skill calls only `shortcuts.invoke`; it asks for a
 missing name or input, and an unknown name returns `denied` with the stable

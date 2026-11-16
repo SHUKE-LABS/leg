@@ -2,7 +2,7 @@
 #
 # Check that the capability bridge is wired into the LegHost build: every
 # source and test file is in the build phase of its target, and the bundled
-# Skill is in the built app.
+# Skills are in the built app.
 #
 # Xcode runs it as the last build phase of the LegHost target. Without
 # TARGET_BUILD_DIR it checks the project only.
@@ -34,6 +34,7 @@ for file in BridgeCanonicalJSON.swift BridgeListener.swift PhotosAdapter.swift F
     expect AA11AA11AA11AA11AA110032 LegHost "${file}" Sources
 done
 expect AA11AA11AA11AA11AA110034 LegHost skills Resources
+expect AA11AA11AA11AA11AA110034 LegHost BridgeSkills Resources
 for file in BridgeCanonicalJSONTests.swift BridgeListenerTests.swift PhotosAdapterTests.swift FilesAdapterTests.swift GuestSkillInstallerTests.swift; do
     expect EE11EE11EE11EE11EE110041 LegHostTests "${file}" Sources
 done
@@ -55,6 +56,13 @@ if [[ -n "${TARGET_BUILD_DIR:-}" && -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" 
             failed=1
         fi
     done < <(cd "${source}" && find . -type f | sed 's|^\./||')
+
+    shortcut_source="${SRCROOT}/resources/BridgeSkills/shortcuts/SKILL.md"
+    shortcut_bundled="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BridgeSkills/shortcuts/SKILL.md"
+    if ! cmp -s "${shortcut_source}" "${shortcut_bundled}"; then
+        echo "error: the app bundle does not carry BridgeSkills/shortcuts/SKILL.md" >&2
+        failed=1
+    fi
 fi
 
 exit "${failed}"
