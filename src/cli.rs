@@ -337,36 +337,51 @@ fn render_json<T: serde::Serialize>(report: &T) -> Result<String> {
 
 /// Prints the summary of a completed `leg install` run.
 fn print_install_report(report: &install::InstallReport) {
-    println!(
+    let stdout = std::io::stdout();
+    write_install_report(report, stdout.lock()).expect("write install report");
+}
+
+/// Writes the summary of a completed `leg install` run.
+fn write_install_report(
+    report: &install::InstallReport,
+    mut output: impl Write,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
         "Installed the native leg binaries into {}:",
         report.destination.display()
-    );
+    )?;
     for file_name in &report.installed {
-        println!("  {file_name}");
+        writeln!(output, "  {file_name}")?;
     }
     if cfg!(windows) {
         if report.path_updated {
-            println!(
+            writeln!(
+                output,
                 "Added {} to the current user's PATH. Open a new shell to use it.",
                 report.destination.display()
-            );
+            )?;
         } else if report.path_already_present {
-            println!(
+            writeln!(
+                output,
                 "{} is already in the current user's PATH. Open a new shell to use it.",
                 report.destination.display()
-            );
+            )?;
         } else {
-            println!(
+            writeln!(
+                output,
                 "The current user's PATH was not changed; add {} to it yourself.",
                 report.destination.display()
-            );
+            )?;
         }
-    } else {
-        println!(
+    } else if !report.path_already_present {
+        writeln!(
+            output,
             "Add {} to your PATH to use them; leg install does not edit shell startup files.",
             report.destination.display()
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// The full `--help` body: the provider environment variables and trail behavior.

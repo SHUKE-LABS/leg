@@ -323,6 +323,48 @@ fn merge_path_value_keeps_an_unchanged_value_untouched() {
     assert!(!merged.changed);
 }
 
+#[cfg(not(windows))]
+#[test]
+fn unix_path_matching_accepts_an_exact_destination_entry() {
+    let scratch = scratch("path-exact");
+    let destination = scratch.path.join("bin");
+    fs::create_dir_all(&destination).expect("create destination");
+    let path_value = std::env::join_paths([destination.clone()]).expect("build a controlled PATH");
+
+    assert!(path_contains_destination(Some(&path_value), &destination));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unix_path_matching_resolves_trailing_slashes_and_symlinks() {
+    let scratch = scratch("path-matching");
+    let destination = scratch.path.join("bin");
+    fs::create_dir_all(&destination).expect("create destination");
+    let symlink = scratch.path.join("bin-link");
+    std::os::unix::fs::symlink(&destination, &symlink).expect("create destination symlink");
+    let missing = scratch.path.join("missing");
+    let trailing = PathBuf::from(format!("{}/", destination.display()));
+
+    let path_value = std::env::join_paths([PathBuf::new(), trailing, symlink, missing])
+        .expect("build a controlled PATH");
+
+    assert!(path_contains_destination(Some(&path_value), &destination));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unix_path_matching_ignores_empty_and_uncanonicalizable_entries() {
+    let scratch = scratch("path-missing");
+    let destination = scratch.path.join("bin");
+    fs::create_dir_all(&destination).expect("create destination");
+    let missing = scratch.path.join("missing");
+    let path_value =
+        std::env::join_paths([PathBuf::new(), missing]).expect("build a controlled PATH");
+
+    assert!(!path_contains_destination(Some(&path_value), &destination));
+    assert!(!path_contains_destination(None, &destination));
+}
+
 #[test]
 fn merge_path_value_preserves_unrelated_entries() {
     let merged = merge_path_value(

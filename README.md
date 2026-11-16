@@ -58,7 +58,8 @@ leg install
 - Windows: `%LOCALAPPDATA%\leg\bin`, added to the current user's PATH. The
   change applies to newly started shells only, so open a new shell afterwards.
 - Unix: `$XDG_BIN_HOME`, or `$HOME/.local/bin` when it is unset. `leg install`
-  never edits shell startup files; add the directory to your PATH yourself.
+  never edits shell startup files; it reminds you to add the directory only
+  when it is not already on your PATH.
 
 `leg install --dest <dir>` picks another directory, and `leg install
 --no-path` leaves the Windows PATH alone. `leg install --help` lists every

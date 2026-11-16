@@ -2915,6 +2915,45 @@ fn install_parses_without_options() {
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn install_report_omits_the_unix_path_hint_when_destination_is_present() {
+    let report = install::InstallReport {
+        destination: PathBuf::from("/tmp/leg-bin"),
+        installed: vec!["leg".to_string()],
+        path_updated: false,
+        path_already_present: true,
+    };
+    let mut output = Vec::new();
+
+    write_install_report(&report, &mut output).expect("render install report");
+
+    let output = String::from_utf8(output).expect("report is UTF-8");
+    assert!(
+        !output.contains("to your PATH"),
+        "unexpected output: {output}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn install_report_keeps_the_unix_path_hint_when_destination_is_absent() {
+    let report = install::InstallReport {
+        destination: PathBuf::from("/tmp/leg-bin"),
+        installed: vec!["leg".to_string()],
+        path_updated: false,
+        path_already_present: false,
+    };
+    let mut output = Vec::new();
+
+    write_install_report(&report, &mut output).expect("render install report");
+
+    let output = String::from_utf8(output).expect("report is UTF-8");
+    assert!(output.contains(
+        "Add /tmp/leg-bin to your PATH to use them; leg install does not edit shell startup files."
+    ));
+}
+
 #[test]
 fn install_parses_the_destination_override_and_path_opt_out() {
     assert_eq!(
