@@ -27,6 +27,10 @@
 		DD11DD11DD11DD11DD110001 /* ProviderConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110011 /* ProviderConfiguration.swift */; };
 		DD11DD11DD11DD11DD110002 /* LoopbackFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */; };
 		DD11DD11DD11DD11DD110003 /* ProviderSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */; };
+		DD11DD11DD11DD11DD110004 /* ShortcutConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110014 /* ShortcutConfiguration.swift */; };
+		DD11DD11DD11DD11DD110005 /* ShortcutsAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110015 /* ShortcutsAdapter.swift */; };
+		DD11DD11DD11DD11DD110007 /* ShortcutSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110017 /* ShortcutSetupView.swift */; };
+		DD11DD11DD11DD11DD110008 /* BridgeSkills in Resources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110018 /* BridgeSkills */; };
 		CC11CC11CC11CC11CC110001 /* LegHostUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */; };
 		CC11CC11CC11CC11CC110002 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CC11CC11CC11CC11CC110011 /* XCTest.framework */; };
 		EE11EE11EE11EE11EE110011 /* HostPreflight.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110001 /* HostPreflight.swift */; };
@@ -35,6 +39,8 @@
 		EE11EE11EE11EE11EE110031 /* GuestHostLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */; };
 		EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */; };
 		FF11FF11FF11FF11FF110002 /* GuestRuntimeKernelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */; };
+		EE11EE11EE11EE11EE110034 /* ShortcutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110024 /* ShortcutTests.swift */; };
+		EE11EE11EE11EE11EE110035 /* BridgeSkills in Resources */ = {isa = PBXBuildFile; fileRef = DD11DD11DD11DD11DD110018 /* BridgeSkills */; };
 		EE11EE11EE11EE11EE110033 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE11CC11CC11CC11CC110011 /* XCTest.framework */; };
 		GG11GG11GG11GG11GG110081 /* BridgeCanonicalJSON.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110001 /* BridgeCanonicalJSON.swift */; };
 		GG11GG11GG11GG11GG110082 /* BridgeListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110002 /* BridgeListener.swift */; };
@@ -93,6 +99,10 @@
 		DD11DD11DD11DD11DD110011 /* ProviderConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderConfiguration.swift; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoopbackFixture.swift; sourceTree = "<group>"; };
 		DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderSetupView.swift; sourceTree = "<group>"; };
+		DD11DD11DD11DD11DD110014 /* ShortcutConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutConfiguration.swift; sourceTree = "<group>"; };
+		DD11DD11DD11DD11DD110015 /* ShortcutsAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutsAdapter.swift; sourceTree = "<group>"; };
+		DD11DD11DD11DD11DD110017 /* ShortcutSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutSetupView.swift; sourceTree = "<group>"; };
+		DD11DD11DD11DD11DD110018 /* BridgeSkills */ = {isa = PBXFileReference; lastKnownFileType = folder; path = BridgeSkills; sourceTree = "<group>"; };
 		CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegHostUITests.swift; sourceTree = "<group>"; };
 		CC11CC11CC11CC11CC110011 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Developer/Library/Frameworks/XCTest.framework; sourceTree = SDKROOT; };
 		CC11CC11CC11CC11CC110012 /* LegHostUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -101,6 +111,7 @@
 		EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureRequestLedger.swift; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestHostLifecycleTests.swift; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostPreflightTests.swift; sourceTree = "<group>"; };
+		EE11EE11EE11EE11EE110024 /* ShortcutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutTests.swift; sourceTree = "<group>"; };
 		FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestRuntimeKernelTests.swift; sourceTree = "<group>"; };
 		FF11FF11FF11FF11FF110003 /* LegHostTests-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "LegHostTests-Bridging-Header.h"; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110023 /* LegHostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -177,6 +188,7 @@
 			children = (
 				EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */,
 				EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */,
+				EE11EE11EE11EE11EE110024 /* ShortcutTests.swift */,
 				FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */,
 				GG11GG11GG11GG11GG110006 /* BridgeCanonicalJSONTests.swift */,
 				GG11GG11GG11GG11GG110007 /* BridgeListenerTests.swift */,
@@ -201,6 +213,9 @@
 				DD11DD11DD11DD11DD110011 /* ProviderConfiguration.swift */,
 				DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */,
 				DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */,
+				DD11DD11DD11DD11DD110014 /* ShortcutConfiguration.swift */,
+				DD11DD11DD11DD11DD110015 /* ShortcutsAdapter.swift */,
+				DD11DD11DD11DD11DD110017 /* ShortcutSetupView.swift */,
 				EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */,
 				GG11GG11GG11GG11GG110001 /* BridgeCanonicalJSON.swift */,
 				GG11GG11GG11GG11GG110002 /* BridgeListener.swift */,
@@ -229,6 +244,7 @@
 			isa = PBXGroup;
 			children = (
 				BB11BB11BB11BB11BB11000C /* PinnedInputs */,
+				DD11DD11DD11DD11DD110018 /* BridgeSkills */,
 				GG11GG11GG11GG11GG11000D /* skills */,
 			);
 			path = resources;
@@ -376,6 +392,7 @@
 				AA11AA11AA11AA11AA110005 /* THIRD_PARTY_NOTICES.md in Resources */,
 				BB11BB11BB11BB11BB110016 /* PinnedInputs.plist in Resources */,
 				BB11BB11BB11BB11BB11001B /* PinnedInputs in Resources */,
+				DD11DD11DD11DD11DD110008 /* BridgeSkills in Resources */,
 				GG11GG11GG11GG11GG11008D /* skills in Resources */,
 				BB11BB11BB11BB11BB110017 /* term.html in Resources */,
 				BB11BB11BB11BB11BB110018 /* term.js in Resources */,
@@ -395,6 +412,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EE11EE11EE11EE11EE110035 /* BridgeSkills in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -470,6 +488,9 @@
 				DD11DD11DD11DD11DD110001 /* ProviderConfiguration.swift in Sources */,
 				DD11DD11DD11DD11DD110002 /* LoopbackFixture.swift in Sources */,
 				DD11DD11DD11DD11DD110003 /* ProviderSetupView.swift in Sources */,
+				DD11DD11DD11DD11DD110004 /* ShortcutConfiguration.swift in Sources */,
+				DD11DD11DD11DD11DD110005 /* ShortcutsAdapter.swift in Sources */,
+				DD11DD11DD11DD11DD110007 /* ShortcutSetupView.swift in Sources */,
 				EE11EE11EE11EE11EE110013 /* FixtureRequestLedger.swift in Sources */,
 				GG11GG11GG11GG11GG110081 /* BridgeCanonicalJSON.swift in Sources */,
 				GG11GG11GG11GG11GG110082 /* BridgeListener.swift in Sources */,
@@ -496,6 +517,7 @@
 				EE11EE11EE11EE11EE110031 /* GuestHostLifecycleTests.swift in Sources */,
 				EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */,
 				FF11FF11FF11FF11FF110002 /* GuestRuntimeKernelTests.swift in Sources */,
+				EE11EE11EE11EE11EE110034 /* ShortcutTests.swift in Sources */,
 				GG11GG11GG11GG11GG110086 /* BridgeCanonicalJSONTests.swift in Sources */,
 				GG11GG11GG11GG11GG110087 /* BridgeListenerTests.swift in Sources */,
 				GG11GG11GG11GG11GG110088 /* PhotosAdapterTests.swift in Sources */,

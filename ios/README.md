@@ -175,14 +175,15 @@ the host's listener.
 
 ## The capability bridge
 
-The host serves `photos.search`, `photos.export`, `files.import`, and
-`files.export` to `leg-bridge` in the guest. Before every session it binds a
-private Unix socket, registers it with the vendored iSH hook, and starts the
-guest with `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`; the hook makes
-that path a socket inode in the guest and maps a `connect()` to it onto the
-listener. The listener answers one request per connection, checks the
-RFC 8785 input digest and its own approval ledger before an adapter runs,
-and is torn down with the session. The
+The host serves `shortcuts.invoke`, `photos.search`, `photos.export`,
+`files.import`, and `files.export` to `leg-bridge` in the guest. Before every
+session it binds a private Unix socket, registers it with the vendored iSH
+hook, and starts the guest with
+`LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`; the hook makes that path a
+socket inode in the guest and maps a `connect()` to it onto the listener. The
+listener routes every capability through this one endpoint, answers one
+request per connection, checks the RFC 8785 input digest and its shared
+approval ledger before an adapter runs, and is torn down with the session. The
 [capability bridge contract](../docs/capability-bridge.md#the-ios-host) has
 the details: the start and teardown order, the Photos authorization matrix,
 the Files containment checks, the no-replace commit, and the failure reasons.
@@ -245,6 +246,44 @@ other file exactly once and nothing else. The pins carry `bundle_kind` and
 so a root staged from another bundle is imported again. The host stages the
 programs under `/usr/local/bin`, `leg-bridge` among them; `leg-web` is not
 part of the guest.
+
+## Shortcuts
+
+The running iOS host implements the `shortcuts.invoke` capability. Open
+**Shortcuts settings**, enter the exact case-sensitive name of an existing
+Shortcut, and choose whether it accepts text or a JSON object. The
+host stores only this registration metadata. It never discovers, creates,
+edits, enables, schedules, or silently runs personal automations.
+
+The iOS bundle ships `resources/BridgeSkills/shortcuts/SKILL.md`. Provisioning stages
+it at `/root/.agents/skills/shortcuts/SKILL.md`, where the existing Skills v1
+discovery rules find it. The Skill calls only `shortcuts.invoke`; it asks for a
+missing name or input, and an unknown name returns `denied` with the stable
+reason `shortcut_not_registered` plus the registration instructions.
+
+Every invocation shows a host confirmation containing the exact name and an
+input summary. The host then opens Apple's public
+`shortcuts://x-callback-url/run-shortcut` endpoint. Text and JSON inputs use
+`input=text` and `text`. File input is out of scope for this slice because
+Apple's public URL scheme has no documented file parameter; the follow-up is
+tracked in
+[#312](https://github.com/SHUKE-LABS/leg/issues/312). Text and JSON inputs and
+callback results are capped at 32 KiB;
+callback waits are capped at 30 seconds.
+Callback URLs carry a host-generated one-time state value rather than the
+guest's request ID; unknown or stale callback states are ignored.
+The host returns structured `ok`, `denied`, `cancelled`, `unavailable`, or
+`error` statuses and may need to foreground the Shortcuts app. Missing output,
+unknown Shortcut, and an unavailable Shortcuts app map to
+`error/missing_result`, `unavailable/shortcut_not_found`, and
+`unavailable/shortcuts_unavailable` respectively.
+
+The adapter uses no private Shortcuts database entitlement and grants no
+automatic permission. The host confirmation is mandatory for every run, and
+individual Shortcut actions may display Apple's own permission prompts. The
+guest/model sees the registered name and bounded text/JSON input shape it
+requested, the approval review, and the structured Shortcut result or error.
+It never receives Shortcut source or an unregistered automation list.
 
 The pinned SHA-256 is the `SHA256SUMS` entry the `v0.44.1` release publishes
 for the ios-mobile asset. The build and `ios/tests/run-pinned-inputs.sh` fail
@@ -827,7 +866,7 @@ only some of them.
 
 The provisioner is covered by host side fixtures that need neither the
 network nor a simulator: they build their own pinned inputs and exercise the
-valid path, a one byte corruption of each input, every bundle off the
+valid path, the staged mobile Shortcut Skill and its digest-based reuse, a one byte corruption of each input, every bundle off the
 ios-mobile contract (a missing manifest or `leg-bridge`, an extra file, the
 generic bundle, a wrong target, `leg_version`, `bundle_kind` or version
 command, a manifest digest that disagrees with the archive, a malformed,
@@ -882,8 +921,11 @@ root must hold, not code of them.
 
 ## Out of scope
 
-The Shortcuts adapter, Photos edits, deletes and shares, and App Store
-metadata are later slices of `#255`.
+The native Photos and Files adapters, and App Store metadata, are later slices
+of `#255`. Shortcut creation, editing, enabling, scheduling, private Shortcuts
+database access, and arbitrary automation generation remain out of scope.
+Photos edits, deletes and shares, and App Store metadata remain later slices of
+`#255`.
 The provider support of this slice is the Anthropic Messages protocol; the
 OpenAI wire variants are covered only as the rejection cases of the fixture.
 The host does not run in the background: iOS decides when the app is

@@ -8,7 +8,8 @@ metadata:
 
 # Mobile media and files
 
-The iOS host serves four capabilities through `leg-bridge`. Each call is one
+This Skill uses the iOS host's four media and file capabilities through
+`leg-bridge`. Each call is one
 JSON line on standard input and one JSON line on standard output:
 
 ```sh

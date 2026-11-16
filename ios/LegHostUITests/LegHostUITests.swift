@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 /// Drives the LegHost app in the simulator.
@@ -20,6 +21,29 @@ final class LegHostUITests: XCTestCase {
     /// provider control gives the run one in memory, without the Keychain and
     /// without the fixture.
     private static let launchArguments = ["-leghost-provider", "anthropic"]
+
+    /// The shell script that drives two real bridge processes in the guest.
+    ///
+    /// The first request obtains the host approval token. The second redeems
+    /// it with the same input and checks the complete deterministic result the
+    /// real iOS host returned. The final sleep keeps the terminal visible so
+    /// the test can read the guest's assertion.
+    private static let shortcutBridgeScript = [
+        #"request='{"version":1,"request_id":"shortcut-e2e-approval","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}}}';"#,
+        #"first=$(printf '%s\n' "$request" | /usr/local/bin/leg-bridge);"#,
+        #"token=$(printf '%s\n' "$first" | sed -n 's/.*"approval_token":"\([^"]*\)".*/\1/p');"#,
+        #"approved='{"version":1,"request_id":"shortcut-e2e-result","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}},"approval_token":"'"$token"'"}';"#,
+        #"second=$(printf '%s\n' "$approved" | /usr/local/bin/leg-bridge);"#,
+        #"if printf '%s\n' "$second" | grep -F '"status":"ok"' >/dev/null && printf '%s\n' "$second" | grep -F '"result":{"count":2,"ok":true,"source":"ios-shortcuts-fixture"}' >/dev/null; then"#,
+        #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; else"#,
+        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; fi; sleep 600"#,
+    ].joined(separator: " ")
+
+    /// XCUITest forwards launch arguments through a shell-like boundary. The
+    /// script therefore travels as base64 and is decoded by the host before
+    /// it becomes the guest shell's `-c` argument.
+    private static let shortcutBridgeScriptBase64 =
+        Data(shortcutBridgeScript.utf8).base64EncodedString()
 
     private var app: XCUIApplication!
 
@@ -191,6 +215,34 @@ final class LegHostUITests: XCTestCase {
         attachScreenshot("leg-bridge --help")
     }
 
+    /// A deterministic JSON callback crosses the complete mobile boundary.
+    ///
+    /// The host starts its real BridgeListener and ShortcutsAdapter in a
+    /// DEBUG-only fixture mode. The guest runs the shipped leg-bridge twice:
+    /// once to obtain approval and once to redeem it. The shell assertion is
+    /// made against the final bridge response, so the object must survive the
+    /// real host adapter, unified Unix listener, iSH socket shim, and guest binary.
+    func testARealShortcutJSONResultCrossesTheHostAndGuestBoundary() {
+        app.terminate()
+        app.launchArguments = ["-leghost-reset"] + Self.launchArguments + [
+            "-leghost-shortcuts-fixture",
+            "-leghost-program", "/bin/sh",
+            "-leghost-program-script-base64", Self.shortcutBridgeScriptBase64,
+        ]
+        app.launch()
+        defer { app.terminate() }
+
+        XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
+                      "the guest terminal is missing")
+        let resultVisible = waitForTerminalText(
+            "SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture",
+            timeout: startTimeout)
+        let state = fixtureStateLabel()
+        XCTAssertTrue(resultVisible,
+                      "the deterministic Shortcut object did not cross the host and guest boundary; "
+                        + "host state: \(state)")
+    }
+
     /// The second launch verifies the root and reuses it instead of importing
     /// it again.
     func testTheSecondLaunchReusesTheVerifiedRoot() {
@@ -230,6 +282,43 @@ final class LegHostUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    /// Waits for the guest terminal to show `text`.
+    private func waitForTerminalText(_ text: String, timeout: TimeInterval = 120) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let screen = app.otherElements["guest-terminal"].debugDescription
+            if Self.shows(text, in: screen) {
+                return true
+            }
+            if Self.shows("SHORTCUT_E2E_MISMATCH", in: screen) {
+                XCTFail("the Shortcut bridge returned an unexpected response: \(screen)")
+                return false
+            }
+            usleep(3_000_000)
+        }
+        return false
+    }
+
+    /// Reads the host counters without allowing a failed UI query to consume
+    /// the rest of the test's failure window.
+    private func fixtureStateLabel(timeout: TimeInterval = 5) -> String {
+        let state = app.staticTexts["guest-fixture-state"]
+        guard state.waitForExistence(timeout: timeout) else {
+            return "<unavailable>"
+        }
+        return state.label
+    }
+
+    /// Whether the words of `text` occur in order in the terminal snapshot.
+    private static func shows(_ text: String, in screen: String) -> Bool {
+        var rest = screen[...]
+        for word in text.split(separator: " ", omittingEmptySubsequences: true) {
+            guard let range = rest.range(of: word) else { return false }
+            rest = rest[range.upperBound...]
+        }
+        return true
     }
 }
 

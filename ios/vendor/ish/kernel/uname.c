@@ -21,7 +21,10 @@ void do_uname(struct uname *uts) {
 
     memset(uts, 0, sizeof(struct uname));
     strcpy(uts->system, "Linux");
-    strcpy(uts->hostname, hostname);
+    /* The host nodename may be longer than iSH's fixed guest field. */
+    size_t hostname_length = strnlen(hostname, sizeof(uts->hostname) - 1);
+    memcpy(uts->hostname, hostname, hostname_length);
+    uts->hostname[hostname_length] = '\0';
     strcpy(uts->release, "4.20.69-ish");
     snprintf(uts->version, sizeof(uts->version), "%s %s %s", uname_version, __DATE__, __TIME__);
     strcpy(uts->arch, "i686");

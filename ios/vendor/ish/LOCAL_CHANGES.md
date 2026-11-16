@@ -30,6 +30,25 @@ forms cannot be confused.
 This is the only instruction the pinned guest bundle needs that the
 vendored emulator did not implement.
 
+## `fs/sock` and `fs/IshBridgeSocketHook`: the fixed LegHost capability socket
+
+The iSH Unix socket namespace normally maps every guest socket to another
+socket inside the emulator process. The native `leg-bridge` client needs one
+host-owned endpoint instead. The vendored hook provisions the fixed guest path
+`/run/leghost-bridge.sock` in the fake filesystem, records its inode, and maps
+that inode to the per-session private Unix socket path the host supplies. The
+socket skips iSH's in-process peer-pointer handshake because the peer is the
+host listener. The path is registered by the host, never selected by a guest
+request; the hook removes only the endpoint inode it made and retains its
+record if cleanup needs to be retried. All other guest Unix sockets retain the
+upstream behavior.
+
+## `kernel/uname.c`: bound host names
+
+Darwin can return a host nodename longer than iSH's fixed 65-byte guest
+hostname field. The copy into the guest `uname` structure is bounded and
+always NUL-terminated, so a long CI runner name cannot overflow the runtime.
+
 ## `fs/proc`: the `exe` link of a task without an address space
 
 `fs/proc/pid.c` answers the other `/proc/<pid>` entries with a check for a

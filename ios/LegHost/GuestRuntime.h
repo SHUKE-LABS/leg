@@ -141,6 +141,10 @@ int guest_runtime_check_cleanup_walk_race(int rounds, int tasks);
  * The result is the number of rounds that ran.
  */
 int guest_runtime_check_exit_walk_race(int rounds, int tasks);
+
+/* The host name copied into the guest uname structure must fit its fixed
+ * field, even when the host supplies a longer name. */
+int guest_runtime_check_uname_hostname_bounds(void);
 #endif
 
 #endif /* LEGHOST_GUEST_RUNTIME_H */

@@ -36,6 +36,10 @@
 #include "kernel/task.h"
 #include "util/sync.h"
 
+#if DEBUG
+extern const char *uname_hostname_override;
+#endif
+
 #define GUEST_OUTPUT_CAPACITY (256 * 1024)
 #define GUEST_CONSOLE_TTYS 64
 
@@ -375,6 +379,23 @@ int guest_runtime_start_session(const char *program, const char *arguments,
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "[LegHost] guest task %d started", pid);
     return 0;
 }
+
+#if DEBUG
+int guest_runtime_check_uname_hostname_bounds(void) {
+    char long_hostname[UNAME_LENGTH + 32];
+    memset(long_hostname, 'x', sizeof(long_hostname) - 1);
+    long_hostname[sizeof(long_hostname) - 1] = '\0';
+
+    const char *previous_hostname = uname_hostname_override;
+    uname_hostname_override = long_hostname;
+    struct uname uts;
+    do_uname(&uts);
+    uname_hostname_override = previous_hostname;
+
+    return uts.hostname[UNAME_LENGTH - 1] == '\0'
+        && memcmp(uts.hostname, long_hostname, UNAME_LENGTH - 1) == 0;
+}
+#endif
 
 int guest_runtime_write_input(const void *data, size_t length) {
     struct tty *tty = session_tty;

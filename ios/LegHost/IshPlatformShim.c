@@ -9,10 +9,11 @@
  */
 
 #include <os/proc.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
-#include <unistd.h>
 
 #include "platform/platform.h"
 

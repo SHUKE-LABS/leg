@@ -80,6 +80,11 @@ struct HostLaunchOptions {
     /// The control is DEBUG-only: the simulator tests start a program of the
     /// pinned bundle with arguments, such as `leg-bridge --help`.
     var programArguments: [String] = []
+    /// A shell command the DEBUG fixture asks the host to run with `/bin/sh`.
+    ///
+    /// The `-c` argument is injected after the app launch arguments have been
+    /// parsed because XCTest drops a bare `-c` from that boundary.
+    var programScript: String?
     /// Whether the run reports the runtime files as missing.
     var runtimeFilesMissing = false
     /// Whether the run reports the runtime files as corrupt.
@@ -114,6 +119,9 @@ struct HostLaunchOptions {
     /// stopped turn is tested on a run that does not wait for the
     /// activation of a simulator.
     var interruptAfterRequest = false
+    /// Whether DEBUG should replace the Shortcuts confirmation and opener with
+    /// the deterministic callback fixture used by the guest bridge UI test.
+    var shortcutsFixture = false
 
     /// The guest program the host runs.
     static let defaultProgram = "/usr/local/bin/leg-tui"
@@ -157,6 +165,20 @@ struct HostLaunchOptions {
                     options.programArguments.append(arguments[index + 1])
                     consumed = 2
                 }
+            case "-leghost-program-script":
+                if index + 1 < arguments.count {
+                    options.programScript = arguments[index + 1]
+                    consumed = 2
+                }
+            case "-leghost-program-script-base64":
+                if index + 1 < arguments.count {
+                    let encoded = arguments[index + 1]
+                    if let data = Data(base64Encoded: encoded),
+                       let script = String(data: data, encoding: .utf8) {
+                        options.programScript = script
+                    }
+                    consumed = 2
+                }
             case "-leghost-no-provider":
                 options.hasNoProvider = true
             case "-leghost-provider-reset":
@@ -185,6 +207,8 @@ struct HostLaunchOptions {
                 options.fixtureReset = true
             case "-leghost-interrupt-after-request":
                 options.interruptAfterRequest = true
+            case "-leghost-shortcuts-fixture":
+                options.shortcutsFixture = true
             case "-leghost-bridge-off":
                 options.bridgeOff = true
             case "-leghost-bridge-endpoint-failure":
@@ -235,6 +259,9 @@ struct HostState: Equatable {
     var bridge = "off"
     /// The number of replies the bridge listener wrote.
     var bridgeReplies = 0
+    /// The status of the most recent bridge replies, bounded for the screen
+    /// diagnostic so a long-lived session cannot grow it without limit.
+    var bridgeReplyStatuses: [String] = []
     /// What the install of the bundled Skill did.
     var skill = "none"
     /// Whether the endpoint hook still records an endpoint it made after the
@@ -248,7 +275,8 @@ struct HostState: Equatable {
             : self.statuses.map(String.init).joined(separator: ",")
         return "provision=\(provisions),boot=\(boots),session=\(sessions),requests=\(requests),"
             + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
-            + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),skill=\(skill),"
+            + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),"
+            + "reply_statuses=\(bridgeReplyStatuses.joined(separator: ",")),skill=\(skill),"
             + "endpoint=\(endpoint)"
     }
 }
@@ -514,6 +542,31 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The launch controls of this run.
     private var options = HostLaunchOptions.current()
 
+    /// The host-owned list of exact Shortcuts the guest may invoke.
+    let shortcutRegistry = ShortcutRegistrationStore()
+    /// The native adapter behind the fixed capability bridge.
+    private lazy var shortcutsAdapter: ShortcutsAdapter = {
+        #if DEBUG
+        guard options.shortcutsFixture else {
+            return ShortcutsAdapter(registry: shortcutRegistry)
+        }
+        return ShortcutsAdapter(
+            registry: shortcutRegistry,
+            confirmation: { _, _ in true },
+            opener: { [weak self] url in
+                guard let self,
+                      let callback = Self.shortcutsFixtureCallback(from: url) else {
+                    return false
+                }
+                Task { @MainActor [weak self] in
+                    self?.handleOpenURL(callback)
+                }
+                return true
+            })
+        #else
+        return ShortcutsAdapter(registry: shortcutRegistry)
+        #endif
+    }()
     /// Whether the run still has to interrupt the session on its own.
     ///
     /// The control is the one of the simulator tests: the run stops the
@@ -638,6 +691,21 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         providerWasCleared = true
     }
 
+    /// Saves one exact Shortcut registration and its declared input kind.
+    func saveShortcutRegistration(name: String, inputKind: ShortcutInputKind) throws {
+        try shortcutRegistry.save(name: name, inputKind: inputKind)
+    }
+
+    /// Removes one exact Shortcut registration.
+    func removeShortcutRegistration(name: String) throws {
+        try shortcutRegistry.remove(name: name)
+    }
+
+    /// Routes an x-callback URL back to the pending native Shortcut request.
+    func handleOpenURL(_ url: URL) {
+        shortcutsAdapter.handleCallback(url)
+    }
+
     /// The app went to the background.
     ///
     /// iOS does not run the guest in the background, so the session stops at
@@ -697,6 +765,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         #endif
         do {
             #if DEBUG
+            try configureShortcutsFixtureIfNeeded()
             if providerReset.consume(options.resetProvider) {
                 try ProviderConfigurationStore.clear()
             }
@@ -732,6 +801,43 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             throw error
         }
     }
+
+    #if DEBUG
+    /// The exact registration used by the cross-boundary bridge fixture.
+    private static let shortcutsFixtureName = "LegHost bridge fixture"
+
+    /// The deterministic object returned by the fixture Shortcut callback.
+    private static let shortcutsFixtureResult =
+        "{\"count\":2,\"ok\":true,\"source\":\"ios-shortcuts-fixture\"}"
+
+    /// Seeds the fixture registration without changing the production setup
+    /// flow. The adapter still performs its normal exact-name lookup and
+    /// approval binding for every request.
+    private func configureShortcutsFixtureIfNeeded() throws {
+        guard options.shortcutsFixture,
+              shortcutRegistry.registration(named: Self.shortcutsFixtureName) == nil else {
+            return
+        }
+        try shortcutRegistry.save(name: Self.shortcutsFixtureName, inputKind: .json)
+    }
+
+    /// Converts the public success callback in the opened URL into the fixed
+    /// callback a deterministic test Shortcut would return.
+    private static func shortcutsFixtureCallback(from url: URL) -> URL? {
+        guard let callbackString = URLComponents(url: url,
+                                                 resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "x-success" })?.value,
+              var callback = URLComponents(string: callbackString),
+              callback.host == "success",
+              callback.queryItems?.contains(where: { $0.name == "state" }) == true else {
+            return nil
+        }
+        callback.queryItems = (callback.queryItems ?? [])
+            .filter { $0.name != "result" }
+            + [URLQueryItem(name: "result", value: shortcutsFixtureResult)]
+        return callback.url
+    }
+    #endif
 
     /// Provisions the guest root.
     func provisionGuest() async throws {
@@ -818,6 +924,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         guest_runtime_set_output_notify(nil, nil)
         guest_runtime_set_exit_notify(nil, nil)
         exitContext = nil
+        shortcutsAdapter.cancelAll()
 
         // The work of the bridge adapters ends before the guest does: a
         // picker or a copy of the session must not outlive it.
@@ -851,7 +958,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // next.
         let guestStopped = await stopGuestSession()
         state.guestTasks = Int(guest_runtime_running_tasks())
-
         // The guest stopped, and the runtime removed the guest endpoint with
         // it: the mapping, the socket and the staging of the session go now.
         await stopBridge()
@@ -948,6 +1054,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private func provisionRoot(_ pins: HostPins) async throws -> Provisioned {
         let bundle = try HostPins.embeddedInputURL(named: pins.inputs[GUEST_INPUT_LEG_BUNDLE].filename)
         let alpine = try HostPins.embeddedInputURL(named: pins.inputs[GUEST_INPUT_ALPINE_ROOT].filename)
+        guard let shortcutSkill = HostBundle.shortcutSkillURL else {
+            throw GuestHostError(message: "The mobile Shortcut Skill is missing from the app bundle.")
+        }
         let roots = try Self.rootsDirectory()
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -958,8 +1067,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                     bundle.path.withCString { bundlePointer in
                         alpine.path.withCString { alpinePointer in
                             roots.path.withCString { rootsPointer in
-                                guest_provision(pinsPointer, bundlePointer, alpinePointer, rootsPointer,
-                                                nil, &result, &message, message.count)
+                                shortcutSkill.path.withCString { skillPointer in
+                                    var provisionOptions = guest_provision_options(
+                                        simulate_import_failure: false,
+                                        shortcut_skill_path: skillPointer)
+                                    return guest_provision(pinsPointer, bundlePointer, alpinePointer,
+                                                           rootsPointer, &provisionOptions, &result,
+                                                           &message, message.count)
+                                }
                             }
                         }
                     }
@@ -1302,13 +1417,21 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let listener = BridgeListener(
             generation: UInt64.random(in: 1 ... .max),
             adapters: ["photos.search": photos, "photos.export": photos,
-                       "files.import": files, "files.export": files],
+                       "files.import": files, "files.export": files,
+                       ShortcutsAdapter.capability: shortcutsAdapter],
             registrar: IshBridgeEndpointRegistrar(),
             stagingRoot: stagingRoot,
             managedRoot: managedRoot,
             guestAdopter: { path in path.withCString { guest_runtime_adopt_host_tree($0) } == 0 })
-        listener.onReply = { [weak self] _ in
-            DispatchQueue.main.async { self?.state.bridgeReplies += 1 }
+        listener.onReply = { [weak self] status in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.state.bridgeReplies += 1
+                self.state.bridgeReplyStatuses.append(status)
+                if self.state.bridgeReplyStatuses.count > 8 {
+                    self.state.bridgeReplyStatuses.removeFirst()
+                }
+            }
         }
         try listener.start()
         if options.bridgeEndpointFaults != 0 {
@@ -1383,6 +1506,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// two programs of the pinned bundle instead. A guest program that is
     /// not the guest TUI takes only the arguments of the launch.
     private func guestArguments(for program: String) -> [String] {
+        #if DEBUG
+        if let script = options.programScript {
+            return [program, "-c", script] + options.programArguments
+        }
+        #endif
         guard program == HostLaunchOptions.defaultProgram else {
             return [program] + options.programArguments
         }

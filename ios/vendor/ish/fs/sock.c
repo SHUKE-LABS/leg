@@ -226,10 +226,16 @@ static void unix_abstract_release(struct unix_abstract *name) {
 
 const char *sock_tmp_prefix = "/tmp/ishsock";
 
-// `bridge_endpoint` is set for a connect() only: when it is not NULL and the
-// path names the LegHost capability bridge endpoint, the address is the
-// host's listener rather than an iSH socket, and *bridge_endpoint is set.
-static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd, bool *bridge_endpoint) {
+/* The native host bridge is the one exception to iSH's in-process Unix
+ * socket namespace. The guest uses this fixed path; the host name is supplied
+ * by the embedding app and is never selected by a request. */
+static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len,
+                              struct fd *bind_fd, bool *bridge_endpoint) {
+    if (bridge_endpoint != NULL)
+        *bridge_endpoint = false;
+    /* `bridge_endpoint` is set for a connect() only: when it is not NULL and
+     * the path names the LegHost capability bridge endpoint, the address is
+     * the host's listener rather than an iSH socket. */
     // Make sure we can read things without overflowing buffers
     if (*sockaddr_len < 2)
         return _EINVAL;
@@ -283,7 +289,16 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
                         real_addr_un->sun_path, sizeof(real_addr_un->sun_path));
                 if (bridge_len > 0) {
                     *bridge_endpoint = true;
-                    *sockaddr_len = offsetof(struct sockaddr_un, sun_path) + bridge_len;
+                    /* The hook copied the terminating NUL as well as the
+                     * path. Darwin uses the native sockaddr length fields
+                     * when it validates an AF_UNIX address, so keep the NUL
+                     * in the length and update sun_len after replacing the
+                     * guest address with the host listener's address. */
+                    *sockaddr_len = offsetof(struct sockaddr_un, sun_path)
+                        + bridge_len + 1;
+#if defined(__APPLE__)
+                    ((struct sockaddr *) sockaddr)->sa_len = (uint8_t) *sockaddr_len;
+#endif
                     break;
                 }
             }
@@ -375,7 +390,8 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         return _EBADF;
     struct sockaddr_max_ sockaddr;
     bool bridge_endpoint = false;
-    int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, NULL, &bridge_endpoint);
+    int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, NULL,
+                                 &bridge_endpoint);
     if (err < 0)
         return err;
 

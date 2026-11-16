@@ -73,6 +73,9 @@ extern const char *const guest_program_names[GUEST_PROGRAM_COUNT];
  */
 #define GUEST_SHELL_SHIM_PATH "/usr/local/bin/bash"
 
+/* The mobile-only Skill is staged into the guest's existing user Skills root. */
+#define GUEST_SHORTCUT_SKILL_PATH "/root/.agents/skills/shortcuts/SKILL.md"
+
 /* The guest bundle archive holds exactly these six files. */
 #define GUEST_BUNDLE_FILE_COUNT 6
 extern const char *const guest_bundle_file_names[GUEST_BUNDLE_FILE_COUNT];
@@ -94,6 +97,8 @@ struct guest_provision_options {
      * importer fails after it has already created the staging root. The
      * provisioner then has to remove every piece of that partial state. */
     bool simulate_import_failure;
+    /* Optional app resource containing the mobile Shortcut Skill. */
+    const char *shortcut_skill_path;
 };
 
 struct guest_provision_result {

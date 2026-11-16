@@ -466,6 +466,74 @@ fn the_guest_reaches_the_capability_through_the_bash_tool() {
     assert!(answer["error"].is_null());
 }
 
+#[cfg(unix)]
+#[test]
+fn the_guest_round_trips_a_structured_shortcut_result() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("shortcut-result");
+    let state_dir = scratch.path.join("state");
+    let result = json!({
+        "ok": true,
+        "count": 2,
+        "source": "deterministic-shortcut",
+    });
+
+    let fixture_result = result.clone();
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), move |request| {
+        if request["approval_token"].is_string() {
+            host::Answer::Reply {
+                status: "ok".to_string(),
+                result: fixture_result.clone(),
+            }
+        } else {
+            host::Answer::Reply {
+                status: "approval_required".to_string(),
+                result: json!({
+                    "approval_token": "token-shortcut-result",
+                    "review": "run the registered Bridge JSON Shortcut",
+                }),
+            }
+        }
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let input = json!({
+        "name": "Bridge JSON",
+        "input": {"format": "json"},
+    });
+    let preview = ask(
+        socket,
+        &state_dir,
+        &request("shortcut-result-preview", "shortcuts.invoke", input.clone()),
+    );
+    assert_status(&preview, "approval_required");
+    let token = preview["result"]["approval_token"]
+        .as_str()
+        .expect("the preview carries an approval token");
+    let approved = json!({
+        "version": 1,
+        "request_id": "shortcut-result-1",
+        "capability": "shortcuts.invoke",
+        "input": input,
+        "approval_token": token,
+    })
+    .to_string();
+    let answer = ask(socket, &state_dir, &approved);
+
+    assert_status(&answer, "ok");
+    assert_eq!(answer["result"], result);
+    assert!(answer["error"].is_null());
+    assert_eq!(fixture.connection_count(), 2);
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["capability"], "shortcuts.invoke");
+    assert_eq!(requests[1]["input"]["name"], "Bridge JSON");
+    assert_eq!(requests[1]["input"]["input"]["format"], "json");
+    assert_eq!(requests[1]["approval_token"], token);
+}
+
 #[test]
 fn a_bad_request_never_reaches_the_host() {
     if !bash_available() {

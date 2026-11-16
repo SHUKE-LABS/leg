@@ -92,9 +92,11 @@ registry are unchanged.
   dispatch happens.
 - The host owns the transport, the permission prompt, the dispatch, the
   cancellation, and the user confirmation; the bridge reaches it through the
-  `HostAdapter` seam (`src/bridge/adapter.rs`) over the one fixed transport
-  the contract names — a Unix socket. Without a host the bridge answers
-  `unavailable`.
+  `HostAdapter` seam (`src/bridge/adapter.rs`). The desktop crate ships the
+  seam and the one fixed transport the contract names — a Unix socket. The
+  native iOS host implements `shortcuts.invoke` behind that transport; it does
+  not add a desktop tool or change Skills discovery. Without a host the bridge
+  answers `unavailable`.
 - The iOS host (`ios/LegHost/BridgeListener.swift`) listens on a private
   per-generation socket that the vendored iSH maps to the guest endpoint
   `/run/leghost-bridge.sock`, checks every request again — including the

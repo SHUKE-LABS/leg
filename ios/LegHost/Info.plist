@@ -20,6 +20,19 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>com.shukelabs.leg.ioshost.shortcuts</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>legshortcuts</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>The guest asks to find videos in your library and to copy one you approve into its workspace or to Files. Nothing in your library is edited, deleted, or shared.</string>
 	<key>UILaunchScreen</key>

@@ -35,4 +35,12 @@ final class GuestRuntimeKernelTests: XCTestCase {
                        "the check of the exit and the walk did not run")
         #endif
     }
+
+    /// A host name longer than the guest's fixed uname field is truncated
+    /// safely instead of overflowing the runtime's stack buffer.
+    func testTheUnameHostnameIsBounded() {
+        #if DEBUG
+        XCTAssertEqual(guest_runtime_check_uname_hostname_bounds(), 1)
+        #endif
+    }
 }
