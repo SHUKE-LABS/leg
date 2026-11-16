@@ -59,6 +59,7 @@
 		497F6D11254E5EA600C82F46 /* real.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C04254E5C0E00C82F46 /* real.c */; };
 		497F6D12254E5EA600C82F46 /* sock.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6BF7254E5C0E00C82F46 /* sock.c */; };
 		497F6D13254E5EA600C82F46 /* sockrestart.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6BFB254E5C0E00C82F46 /* sockrestart.c */; };
+		ABCD1257ABCD1257ABCD0003 /* IshBridgeSocketHook.c in Sources */ = {isa = PBXBuildFile; fileRef = ABCD1257ABCD1257ABCD0001 /* IshBridgeSocketHook.c */; };
 		497F6D14254E5EA600C82F46 /* stat.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6BE3254E5C0D00C82F46 /* stat.c */; };
 		497F6D15254E5EA600C82F46 /* tmp.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6BEB254E5C0D00C82F46 /* tmp.c */; };
 		497F6D16254E5EA600C82F46 /* tty-real.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C05254E5C0E00C82F46 /* tty-real.c */; };
@@ -476,6 +477,8 @@
 		497F6BF9254E5C0E00C82F46 /* dir.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = dir.c; sourceTree = "<group>"; };
 		497F6BFA254E5C0E00C82F46 /* sockrestart.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = sockrestart.h; sourceTree = "<group>"; };
 		497F6BFB254E5C0E00C82F46 /* sockrestart.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = sockrestart.c; sourceTree = "<group>"; };
+		ABCD1257ABCD1257ABCD0001 /* IshBridgeSocketHook.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = IshBridgeSocketHook.c; sourceTree = "<group>"; };
+		ABCD1257ABCD1257ABCD0002 /* IshBridgeSocketHook.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IshBridgeSocketHook.h; sourceTree = "<group>"; };
 		497F6BFC254E5C0E00C82F46 /* pipe.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = pipe.c; sourceTree = "<group>"; };
 		497F6BFD254E5C0E00C82F46 /* inode.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = inode.h; sourceTree = "<group>"; };
 		497F6BFE254E5C0E00C82F46 /* adhoc.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = adhoc.c; sourceTree = "<group>"; };
@@ -1205,6 +1208,8 @@
 				497F6BE1254E5C0D00C82F46 /* sock.h */,
 				497F6BFB254E5C0E00C82F46 /* sockrestart.c */,
 				497F6BFA254E5C0E00C82F46 /* sockrestart.h */,
+				ABCD1257ABCD1257ABCD0001 /* IshBridgeSocketHook.c */,
+				ABCD1257ABCD1257ABCD0002 /* IshBridgeSocketHook.h */,
 				497F6BED254E5C0D00C82F46 /* sqlutil.h */,
 				497F6BE3254E5C0D00C82F46 /* stat.c */,
 				497F6C02254E5C0E00C82F46 /* stat.h */,
@@ -2060,6 +2065,7 @@
 				497F6D11254E5EA600C82F46 /* real.c in Sources */,
 				497F6D12254E5EA600C82F46 /* sock.c in Sources */,
 				497F6D13254E5EA600C82F46 /* sockrestart.c in Sources */,
+				ABCD1257ABCD1257ABCD0003 /* IshBridgeSocketHook.c in Sources */,
 				497F6D14254E5EA600C82F46 /* stat.c in Sources */,
 				497F6D15254E5EA600C82F46 /* tmp.c in Sources */,
 				497F6D16254E5EA600C82F46 /* tty-real.c in Sources */,

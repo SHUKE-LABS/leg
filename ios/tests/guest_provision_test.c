@@ -13,6 +13,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -25,6 +26,7 @@
 #include <archive_entry.h>
 
 #include "GuestProvision.h"
+#include "fs/fake-db.h"
 #include "Sha256.h"
 
 static int failures = 0;
@@ -53,6 +55,76 @@ void ish_vprintk(const char *msg, va_list args) {
 _Noreturn void die(const char *msg, ...) {
     (void) msg;
     abort();
+}
+
+/* ------------------------------------------------------- host-written files */
+
+static inode_t adopted_inode(struct fakefs_db *fs, const char *path) {
+    db_begin_read(fs);
+    inode_t inode = path_get_inode(fs, path);
+    db_commit(fs);
+    return inode;
+}
+
+static uint32_t adopted_mode(struct fakefs_db *fs, const char *path) {
+    struct ish_stat stat = {0};
+    db_begin_read(fs);
+    bool found = path_read_stat(fs, path, &stat, NULL);
+    db_commit(fs);
+    return found ? stat.mode : 0;
+}
+
+/* The host writes files below `data`, and the adoption gives them, and the
+ * directories above them, the entries the guest needs to see them. */
+static void check_host_tree_adoption(const char *active_root) {
+    char db_path[GUEST_PATH_MAX + 16];
+    char data_path[GUEST_PATH_MAX + 16];
+    snprintf(db_path, sizeof(db_path), "%s/meta.db", active_root);
+    snprintf(data_path, sizeof(data_path), "%s/data", active_root);
+    int root_fd = open(data_path, O_RDONLY | O_DIRECTORY);
+    struct fakefs_db fs = {0};
+    if (root_fd < 0 || fake_db_init(&fs, db_path, root_fd) != 0) {
+        CHECK(false, "the database of the active root cannot be opened");
+        return;
+    }
+
+    CHECK(mkdirat(root_fd, "adopt", 0755) == 0 && mkdirat(root_fd, "adopt/a", 0700) == 0 &&
+              mkdirat(root_fd, "adopt/a/skill", 0755) == 0 &&
+              mkdirat(root_fd, "adopt/a/skill/bin", 0755) == 0,
+          "the host directories cannot be made");
+    int file = openat(root_fd, "adopt/a/skill/SKILL.md", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    CHECK(file >= 0 && write(file, "x\n", 2) == 2, "the host file cannot be written");
+    if (file >= 0)
+        close(file);
+    CHECK(symlinkat("/etc/passwd", root_fd, "adopt/a/skill/link") == 0, "the host link cannot be made");
+    CHECK(adopted_inode(&fs, "/adopt") == 0, "a host directory has an entry before the adoption");
+
+    CHECK(guest_fakefs_adopt_tree(&fs, root_fd, "/adopt/a/skill") == 0, "the adoption failed");
+    CHECK(adopted_mode(&fs, "/adopt") == 0040755, "the directory above the tree has no entry");
+    CHECK(adopted_mode(&fs, "/adopt/a") == 0040700, "the directory above keeps no permission bits");
+    CHECK(adopted_mode(&fs, "/adopt/a/skill") == 0040755, "the top of the tree has no entry");
+    CHECK(adopted_mode(&fs, "/adopt/a/skill/bin") == 0040755, "a directory in the tree has no entry");
+    CHECK(adopted_mode(&fs, "/adopt/a/skill/SKILL.md") == 0100644, "a file in the tree has no entry");
+    CHECK(adopted_inode(&fs, "/adopt/a/skill/link") == 0, "a host link was given an entry");
+
+    inode_t inode = adopted_inode(&fs, "/adopt/a/skill/SKILL.md");
+    CHECK(guest_fakefs_adopt_tree(&fs, root_fd, "/adopt/a/skill") == 0, "the second adoption failed");
+    CHECK(adopted_inode(&fs, "/adopt/a/skill/SKILL.md") == inode, "the second adoption replaced an entry");
+
+    CHECK(mkdirat(root_fd, "adopt2", 0755) == 0, "the second host directory cannot be made");
+    CHECK(guest_fakefs_adopt_tree(&fs, root_fd, "/adopt2/missing") == -ENOENT,
+          "a missing path must fail the adoption");
+    CHECK(adopted_inode(&fs, "/adopt2") == 0, "a failed adoption must record nothing");
+    CHECK(guest_fakefs_adopt_tree(&fs, root_fd, "/adopt/a/skill/SKILL.md/x") == -ENOTDIR,
+          "a file above the path must fail the adoption");
+
+    const char *unclean[] = {"adopt", "/", "/adopt/", "//adopt", "/adopt/./a", "/adopt/../etc", "/adopt//a"};
+    for (size_t i = 0; i < sizeof(unclean) / sizeof(unclean[0]); i++)
+        CHECK(guest_fakefs_adopt_tree(&fs, root_fd, unclean[i]) == -EINVAL,
+              "the unclean path %s must be refused", unclean[i]);
+
+    fake_db_deinit(&fs);
+    close(root_fd);
 }
 
 /* ------------------------------------------------------------- fixtures */
@@ -747,6 +819,8 @@ int main(int argc, char **argv) {
     CHECK(staged_skill != NULL && strstr(staged_skill, "changed fixture") != NULL,
           "the changed mobile Skill was not staged");
     free(staged_skill);
+
+    check_host_tree_adoption(result.active_root);
 
     /* --- a corrupted guest bundle fails its own digest check ---------- */
     {

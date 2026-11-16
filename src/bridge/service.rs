@@ -16,11 +16,13 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::adapter::{self, HostAdapter, HostOutcome, HostRequest};
+use super::canonical_json;
 use super::protocol::{
     self, BridgeError, BridgeRequest, BridgeResponse, BridgeStatus, DEFAULT_TIMEOUT_MS,
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_RESULT_BYTES, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS,
     PROTOCOL_VERSION,
 };
+use super::schema;
 use super::state::{AuditEntry, AuditLog, BridgeState, LockError, audit_timestamp};
 
 /// The longest capability name the audit summary records.
@@ -93,8 +95,11 @@ impl Bridge {
             );
         }
 
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
+        // The line is read as a token stream first: a member named twice
+        // would otherwise be read last-wins here and first-wins elsewhere,
+        // and a number a binary64 cannot hold has no canonical digest.
+        let value: Value = match canonical_json::parse(line) {
+            Ok(value) => value.to_value(),
             Err(error) => {
                 return self.answer(
                     "",
@@ -428,11 +433,38 @@ impl Bridge {
         let request_id = request.request_id.clone();
         let capability = request.capability.clone();
         let token = request.approval_token.clone();
+        let requires_approval =
+            protocol::capability(&capability).is_some_and(|entry| entry.requires_approval);
         // The approval the host issued, when it issued one.
         let mut issued: Option<String> = None;
 
         let (status, result, error) = match outcome {
-            HostOutcome::Ok(result) => (BridgeStatus::Ok, Some(result), None),
+            // A capability that needs an approval and carries no token was
+            // dispatched as a preview: the host may only describe what it
+            // would do. A host that ran it anyway broke the protocol.
+            HostOutcome::Ok(_) if requires_approval && token.is_none() => (
+                BridgeStatus::Error,
+                None,
+                Some(BridgeError::new(
+                    "host_protocol_violation",
+                    "the host ran a capability that needs an approval without one",
+                    "the host must answer a preview with an approval request",
+                )),
+            ),
+            HostOutcome::Ok(result) => match protocol::capability(&capability)
+                .map(|entry| schema::validate_result(entry.schema, &request.input, &result))
+            {
+                Some(Err(detail)) => (
+                    BridgeStatus::Error,
+                    None,
+                    Some(BridgeError::new(
+                        "host_protocol_violation",
+                        format!("the host returned a result outside the schema: {detail}"),
+                        "the host must return the result the capability schema names",
+                    )),
+                ),
+                _ => (BridgeStatus::Ok, Some(result), None),
+            },
             HostOutcome::ApprovalRequired {
                 approval_token,
                 review,
@@ -594,14 +626,15 @@ impl Bridge {
             if let Some(issued) = issued {
                 self.state.record_approval(capability, digest, issued);
             }
-            // A redeemed approval cannot be redeemed twice. An answer that
-            // never arrived leaves the approval pending, because the host
-            // decides whether the action happened.
-            if continuation
-                && let Some(token) = token
-                && matches!(status, BridgeStatus::Ok | BridgeStatus::Denied)
-            {
-                self.state.redeem_approval(token);
+            // A redeemed approval cannot be redeemed twice. A continuation
+            // that ended without a decision — cancelled, timed out, or failed
+            // — invalidates its token, as the host does.
+            if continuation && let Some(token) = token {
+                if matches!(status, BridgeStatus::Ok | BridgeStatus::Denied) {
+                    self.state.redeem_approval(token);
+                } else {
+                    self.state.forget_approval(token);
+                }
             }
         } else {
             // The request never reached the host, so its id is free again.

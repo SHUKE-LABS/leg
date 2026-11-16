@@ -33,6 +33,8 @@
 			</array>
 		</dict>
 	</array>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>The guest asks to find videos in your library and to copy one you approve into its workspace or to Files. Nothing in your library is edited, deleted, or shared.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

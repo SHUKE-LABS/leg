@@ -46,10 +46,12 @@ if [[ -n "${DEVELOPER_DIR:-}" && -x "${DEVELOPER_DIR}/Toolchains/XcodeDefault.xc
     CLANG="${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
     AR="${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/bin/ar"
     LIPO="${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/bin/lipo"
+    NM="${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/bin/nm"
 else
     CLANG="$(xcrun --sdk "${PLATFORM_NAME:-iphonesimulator}" clang)"
     AR="$(xcrun --sdk "${PLATFORM_NAME:-iphonesimulator}" ar)"
     LIPO="$(xcrun --sdk "${PLATFORM_NAME:-iphonesimulator}" lipo)"
+    NM="$(xcrun --sdk "${PLATFORM_NAME:-iphonesimulator}" nm)"
 fi
 
 # --- the linker for the i386 vDSO (an ELF object, so ld64 cannot build it)
@@ -104,6 +106,7 @@ fs/real.c fs/fake.c fs/proc.c fs/proc/entry.c fs/proc/ish.c fs/proc/root.c
 fs/proc/pid.c fs/dyndev.c fs/adhoc.c fs/sock.c fs/pipe.c fs/sockrestart.c
 fs/lock.c fs/dev.c fs/mem.c fs/tty.c fs/tty-real.c fs/pty.c fs/tmp.c
 fs/poll.c fs/fake-db.c fs/fake-migrate.c fs/fake-rebuild.c
+fs/IshBridgeSocketHook.c
 util/timer.c util/sync.c util/fifo.c util/fchdir.c
 tools/fakefs.c
 EOF
@@ -202,6 +205,15 @@ for arch in ${ARCHS}; do
     archive="${OBJ_DIR}/libish_runtime-${arch}.a"
     rm -f "${archive}"
     "${AR}" rcs "${archive}" "${objects[@]}"
+    # The app imports the capability bridge endpoint from the runtime; a
+    # library without it would only fail at link time.
+    exported="$("${NM}" -g "${archive}" 2>/dev/null)"
+    for symbol in _ish_bridge_socket_register _ish_bridge_socket_provision _ish_bridge_socket_connect_path; do
+        if ! grep -q " T ${symbol}\$" <<<"${exported}"; then
+            echo "error: ${archive} does not export ${symbol}" >&2
+            exit 1
+        fi
+    done
     archives+=("${archive}")
     echo "built ${archive} from ${#objects[@]} vendored iSH objects"
 

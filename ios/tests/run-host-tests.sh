@@ -78,6 +78,23 @@ compile "${ROOT}/ios/tests/guest_provision_test.c"
 
 "${CC}" -o "${BUILD_DIR}/guest_provision_test" "${objects[@]}" "${LINK_FLAGS[@]}"
 
+# The capability bridge endpoint: the hook must build with the vendored
+# kernel headers, and fs/sock.c must call it for connect().
+"${CC}" "${CFLAGS[@]}" -c "${ISH_SRC}/fs/IshBridgeSocketHook.c" -o "${BUILD_DIR}/bridge_hook.o"
+"${CC}" "${CFLAGS[@]}" -c "${ISH_SRC}/fs/sock.c" -o "${BUILD_DIR}/bridge_sock.o"
+hook_symbols="$(nm -g "${BUILD_DIR}/bridge_hook.o")"
+for symbol in register unregister provision cleanup get_state connect_path; do
+    if ! grep -q " T _\{0,1\}ish_bridge_socket_${symbol}\$" <<<"${hook_symbols}"; then
+        echo "error: the bridge hook does not define ish_bridge_socket_${symbol}" >&2
+        exit 1
+    fi
+done
+if ! grep -q " U _\{0,1\}ish_bridge_socket_connect_path\$" <<<"$(nm "${BUILD_DIR}/bridge_sock.o")"; then
+    echo "error: fs/sock.c does not call ish_bridge_socket_connect_path" >&2
+    exit 1
+fi
+echo "bridge hook symbols checked"
+
 if [[ "${HOST_TEST_BUILD_ONLY:-0}" == "1" ]]; then
     echo "${BUILD_DIR}/guest_provision_test"
     exit 0

@@ -90,6 +90,23 @@ struct HostLaunchOptions {
     var lowStorage = false
     /// Whether the run resets the state of the fixture.
     var fixtureReset = false
+    /// Whether the run starts the session without the capability bridge.
+    ///
+    /// The control is DEBUG-only: the simulator tests check what the guest
+    /// bridge answers when the host configured no transport.
+    var bridgeOff = false
+    /// The `ISH_BRIDGE_SOCKET_FAULT_*` bits the hook of the bridge endpoint
+    /// takes in this run: `hold` fails the start after the runtime made the
+    /// endpoint, `race` and `replace` put a socket the hook did not make at
+    /// the endpoint before or after it made its own and fail the start,
+    /// `cleanup-lookup` fails the lookup of the cleanup that follows, and
+    /// `cleanup-retry` then puts such a socket at the endpoint and runs the
+    /// cleanup again.
+    ///
+    /// The control is DEBUG-only: the simulator tests check that a failed
+    /// start removes the endpoint it made and only that, or keeps its record
+    /// of it.
+    var bridgeEndpointFaults: Int32 = 0
     /// Whether the run interrupts the session on its own.
     ///
     /// The control belongs to the simulator tests: they interrupt the
@@ -109,6 +126,20 @@ struct HostLaunchOptions {
     static let legProgram = "/usr/local/bin/leg"
     /// The supervisor program of the pinned bundle.
     static let supervisorProgram = "/usr/local/bin/leg-ui-supervisor"
+
+    /// The fault bits of a comma-separated list of fault names.
+    static func endpointFaults(_ names: String) -> Int32 {
+        names.split(separator: ",").reduce(0) { faults, name in
+            switch name {
+            case "hold": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_HOLD)
+            case "race": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_RACE)
+            case "replace": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_REPLACE)
+            case "cleanup-lookup": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_CLEANUP_LOOKUP)
+            case "cleanup-retry": return faults | Int32(ISH_BRIDGE_SOCKET_FAULT_CLEANUP_RETRY)
+            default: return faults
+            }
+        }
+    }
 
     /// The options of the current run.
     static func current(arguments: [String] = ProcessInfo.processInfo.arguments) -> HostLaunchOptions {
@@ -159,6 +190,13 @@ struct HostLaunchOptions {
                 options.interruptAfterRequest = true
             case "-leghost-shortcuts-fixture":
                 options.shortcutsFixture = true
+            case "-leghost-bridge-off":
+                options.bridgeOff = true
+            case "-leghost-bridge-endpoint-failure":
+                if index + 1 < arguments.count {
+                    options.bridgeEndpointFaults = HostLaunchOptions.endpointFaults(arguments[index + 1])
+                    consumed = 2
+                }
             #endif
             default:
                 break
@@ -197,6 +235,16 @@ struct HostState: Equatable {
     /// says whether the guest of a session is gone: a guest that was
     /// stopped does not run any more.
     var guestTasks = 0
+    /// The state of the capability bridge listener: `off`, `listening`, or
+    /// `closed`.
+    var bridge = "off"
+    /// The number of replies the bridge listener wrote.
+    var bridgeReplies = 0
+    /// What the install of the bundled Skill did.
+    var skill = "none"
+    /// Whether the endpoint hook still records an endpoint it made after the
+    /// listener closed: `none` or `kept`.
+    var endpoint = "none"
 
     /// The state as the tests read it.
     var summary: String {
@@ -205,7 +253,8 @@ struct HostState: Equatable {
             : self.statuses.map(String.init).joined(separator: ",")
         return "provision=\(provisions),boot=\(boots),session=\(sessions),requests=\(requests),"
             + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
-            + "tasks=\(guestTasks)"
+            + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),skill=\(skill),"
+            + "endpoint=\(endpoint)"
     }
 }
 
@@ -443,6 +492,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// The session is not released then, and no other session starts: a guest
     /// that is still alive would run next to the session that comes next.
     nonisolated static let sessionNotStoppedDiagnostic = "IOS_SESSION_NOT_STOPPED"
+    /// The stable diagnostic the host shows when the capability bridge
+    /// listener or its guest endpoint could not be set up.
+    nonisolated static let bridgeListenerDiagnostic = BridgeListenerError.diagnostic
 
     /// The machine that runs the chain of operations of one session.
     private let lifecycle = GuestHostLifecycle()
@@ -536,6 +588,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private var trailWatcher: DispatchSourceTimer?
     /// The context of the exit callback of the runtime.
     private var exitContext: GuestExitContext?
+    /// The capability bridge listener of the running session.
+    private var bridgeListener: BridgeListener?
 
     /// The environment every guest session gets.
     private static let baseEnvironment = [
@@ -817,6 +871,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// Starts the guest session.
     func startGuestSession() async throws {
         do {
+            try startBridge()
+            installBundledSkill()
             try await startSession()
             state.sessions += 1
             state.guestTasks = Int(guest_runtime_running_tasks())
@@ -824,6 +880,9 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             phase = .running
             detail = reusedVerifiedRoot ? "Guest running (reused root)" : "Guest running"
         } catch {
+            // A start that failed removed the guest endpoint already, in the
+            // task context of the session.
+            await stopBridge()
             publishFailure(error)
             throw error
         }
@@ -849,6 +908,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         shortcutsAdapter.cancelAll()
         shortcutsBridgeServer?.stop()
         shortcutsBridgeServer = nil
+
+        // The work of the bridge adapters ends before the guest does: a
+        // picker or a copy of the session must not outlive it.
+        bridgeListener?.beginShutdown()
 
         // The thread of the output is joined before the next session starts:
         // a late read of the ring of the runtime would show the text of the
@@ -879,6 +942,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let guestStopped = await stopGuestSession()
         state.guestTasks = Int(guest_runtime_running_tasks())
         _ = guest_runtime_set_host_bridge_socket(nil, nil)
+
+        // The guest stopped, and the runtime removed the guest endpoint with
+        // it: the mapping, the socket and the staging of the session go now.
+        await stopBridge()
 
         guard pumpStopped, guestStopped else {
             let reason = pumpStopped
@@ -955,7 +1022,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // well: the guest program never ran, so the terminal is the only
         // place where the run can show what went wrong. The transcript of
         // a fixture run holds it as well.
-        if message.contains(Self.runtimeErrorDiagnostic) {
+        if message.contains(Self.runtimeErrorDiagnostic) || message.contains(Self.bridgeListenerDiagnostic) {
             writeToTerminal("\r\n\(message)\r\n")
         }
         phase = .failed(message)
@@ -1295,7 +1362,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                                                    guestArguments.count, environment)
                     }
                 }
-                if status < 0 {
+                if status == GUEST_RUNTIME_BRIDGE_ERROR {
+                    continuation.resume(throwing: GuestHostError(
+                        message: "\(Self.bridgeListenerDiagnostic): the guest endpoint of the capability "
+                            + "bridge could not be made."))
+                } else if status < 0 {
                     continuation.resume(throwing: GuestHostError(
                         message: "\(Self.runtimeErrorDiagnostic): the guest program could not be "
                             + "started (error \(status))."))
@@ -1303,6 +1374,101 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                     continuation.resume()
                 }
             }
+        }
+    }
+
+    // MARK: - Capability bridge
+
+    /// Starts the capability bridge listener of the session.
+    ///
+    /// The listener binds a fresh private socket and maps the guest endpoint
+    /// onto it before the session starts; the runtime then makes the
+    /// endpoint in the guest, in the task context of the session.
+    private func startBridge() throws {
+        state.bridge = "off"
+        guard !options.bridgeOff else { return }
+        let caches = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true)
+        let stagingRoot = caches.appendingPathComponent("LegHost/BridgeStaging", isDirectory: true)
+        // One generation runs at a time, so the staging of an earlier one is
+        // what a crash left behind.
+        try? FileManager.default.removeItem(at: stagingRoot)
+        try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        let managedRoot = URL(fileURLWithPath: activeRoot, isDirectory: true)
+            .appendingPathComponent("data/root/.local/share/leg/bridge", isDirectory: true)
+        let presenter = LiveDocumentPresenter()
+        let photos = PhotosAdapter(library: LivePhotoLibrary(), presenter: presenter)
+        let files = FilesAdapter(presenter: presenter)
+        let listener = BridgeListener(
+            generation: UInt64.random(in: 1 ... .max),
+            adapters: ["photos.search": photos, "photos.export": photos,
+                       "files.import": files, "files.export": files],
+            registrar: IshBridgeEndpointRegistrar(),
+            stagingRoot: stagingRoot,
+            managedRoot: managedRoot,
+            guestAdopter: { path in path.withCString { guest_runtime_adopt_host_tree($0) } == 0 })
+        listener.onReply = { [weak self] _ in
+            DispatchQueue.main.async { self?.state.bridgeReplies += 1 }
+        }
+        try listener.start()
+        if options.bridgeEndpointFaults != 0 {
+            ish_bridge_socket_inject_faults(options.bridgeEndpointFaults)
+        }
+        bridgeListener = listener
+        state.bridge = "listening"
+    }
+
+    /// Stops the capability bridge listener, after the guest stopped.
+    private func stopBridge() async {
+        guard let listener = bridgeListener else { return }
+        bridgeListener = nil
+        listener.beginShutdown()
+        // The workers are joined off the main actor: a worker that answers
+        // a request may be waiting for it.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                listener.finishShutdown()
+                continuation.resume()
+            }
+        }
+        var hook = ish_bridge_socket_state()
+        ish_bridge_socket_get_state(&hook)
+        state.endpoint = hook.endpoint_recorded != 0 ? "kept" : "none"
+        state.bridge = "closed"
+    }
+
+    /// The installed Skill package as the guest names it.
+    private static let skillGuestPath = "/root/.agents/skills/mobile-media-files"
+
+    /// Installs the bundled Skill of the capability bridge into the guest.
+    ///
+    /// A failure does not stop the session: the guest runs without the
+    /// bundled Skill, and a package the host does not own is left alone.
+    private func installBundledSkill() {
+        guard let resources = Bundle.main.resourceURL else {
+            state.skill = "missing"
+            return
+        }
+        let installer = GuestSkillInstaller(
+            bundledPackage: resources.appendingPathComponent("skills/mobile-media-files", isDirectory: true),
+            activeRoot: URL(fileURLWithPath: activeRoot, isDirectory: true))
+        do {
+            let outcome: String
+            switch try installer.install() {
+            case .installed: outcome = "installed"
+            case .updated: outcome = "updated"
+            case .unchanged: outcome = "unchanged"
+            case .olderBundled: outcome = "kept"
+            }
+            // The guest sees what the host wrote only once its fakefs has an
+            // entry for it. A package a host without the entries installed
+            // gets them now as well.
+            let adopted = Self.skillGuestPath.withCString { guest_runtime_adopt_host_tree($0) }
+            state.skill = adopted == 0 ? outcome : "unpublished"
+        } catch let error as GuestSkillInstallError {
+            state.skill = error.reason
+        } catch {
+            state.skill = "io_failure"
         }
     }
 
@@ -1332,14 +1498,19 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// turn down. Nothing else of the host environment reaches the guest, and
     /// the credential is never written down.
     private func guestEnvironment() -> [String] {
-        guard let configuration else { return Self.baseEnvironment }
+        // The guest names the endpoint inside the guest; the host path of the
+        // listener never reaches it.
+        let bridge = bridgeListener == nil
+            ? []
+            : ["\(BridgeListener.environmentVariable)=\(BridgeListener.guestEndpoint)"]
+        guard let configuration else { return Self.baseEnvironment + bridge }
         let isFixture = options.fixtureScenario != nil
         let baseURL = fixture?.baseURL ?? configuration.baseURL
         let model = isFixture ? ProviderConfigurationStore.fixtureModel : configuration.model
         let window = isFixture
             ? ProviderConfigurationStore.fixtureContextWindowTokens
             : configuration.contextWindowTokens
-        var environment = Self.baseEnvironment
+        var environment = Self.baseEnvironment + bridge
         environment.append("LEG_PROVIDER=\(configuration.provider.rawValue)")
         environment.append("ANTHROPIC_API_KEY=\(configuration.apiKey)")
         environment.append("ANTHROPIC_BASE_URL=\(baseURL)")

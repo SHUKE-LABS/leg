@@ -133,6 +133,7 @@ if get_option('kernel') == 'ish'
         'fs/sock.c',
         'fs/pipe.c',
         'fs/sockrestart.c',
+        'fs/IshBridgeSocketHook.c',
         'fs/lock.c',
 
         'fs/dev.c',

@@ -160,6 +160,10 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
 }
 
 static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ dev) {
+    return fakefs_mknod_stat(mount, path, mode, dev, NULL);
+}
+
+int fakefs_mknod_stat(struct mount *mount, const char *path, mode_t_ mode, dev_t_ dev, struct statbuf *made) {
     struct fakefs_db *fs = &mount->fakefs;
     mode_t_ real_mode = 0666;
     if (S_ISBLK(mode) || S_ISCHR(mode) || S_ISSOCK(mode))
@@ -179,7 +183,20 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     stat.rdev = 0;
     if (S_ISBLK(mode) || S_ISCHR(mode))
         stat.rdev = dev;
-    path_create(fs, path, &stat);
+    inode_t inode = path_create(fs, path, &stat);
+    if (made != NULL) {
+        err = realfs.stat(mount, path, made);
+        if (err < 0) {
+            realfs.unlink(mount, path);
+            db_rollback(fs);
+            return err;
+        }
+        made->inode = inode;
+        made->mode = stat.mode;
+        made->uid = stat.uid;
+        made->gid = stat.gid;
+        made->rdev = stat.rdev;
+    }
     db_commit(fs);
     return err;
 }
