@@ -282,8 +282,13 @@ final class LegHostUITests: XCTestCase {
     private func waitForTerminalText(_ text: String, timeout: TimeInterval = 120) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if Self.shows(text, in: app.otherElements["guest-terminal"].debugDescription) {
+            let screen = app.otherElements["guest-terminal"].debugDescription
+            if Self.shows(text, in: screen) {
                 return true
+            }
+            if Self.shows("SHORTCUT_E2E_MISMATCH", in: screen) {
+                XCTFail("the Shortcut bridge returned an unexpected response: \(screen)")
+                return false
             }
             usleep(3_000_000)
         }

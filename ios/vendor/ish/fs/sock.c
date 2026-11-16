@@ -289,7 +289,16 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
                         real_addr_un->sun_path, sizeof(real_addr_un->sun_path));
                 if (bridge_len > 0) {
                     *bridge_endpoint = true;
-                    *sockaddr_len = offsetof(struct sockaddr_un, sun_path) + bridge_len;
+                    /* The hook copied the terminating NUL as well as the
+                     * path. Darwin uses the native sockaddr length fields
+                     * when it validates an AF_UNIX address, so keep the NUL
+                     * in the length and update sun_len after replacing the
+                     * guest address with the host listener's address. */
+                    *sockaddr_len = offsetof(struct sockaddr_un, sun_path)
+                        + bridge_len + 1;
+#if defined(__APPLE__)
+                    ((struct sockaddr *) sockaddr)->sa_len = (uint8_t) *sockaddr_len;
+#endif
                     break;
                 }
             }
