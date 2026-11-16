@@ -551,7 +551,7 @@ struct PathUpdate {
 fn current_path_contains_destination(destination: &Path) -> bool {
     #[cfg(not(windows))]
     {
-        return path_contains_destination(std::env::var_os("PATH").as_deref(), destination);
+        path_contains_destination(std::env::var_os("PATH").as_deref(), destination)
     }
     #[cfg(windows)]
     {
