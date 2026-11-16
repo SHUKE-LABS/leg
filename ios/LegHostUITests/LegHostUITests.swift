@@ -220,8 +220,7 @@ final class LegHostUITests: XCTestCase {
         app.launchArguments = ["-leghost-reset"] + Self.launchArguments + [
             "-leghost-shortcuts-fixture",
             "-leghost-program", "/bin/sh",
-            "-leghost-program-arg", "-c",
-            "-leghost-program-arg", Self.shortcutBridgeScript,
+            "-leghost-program-script", Self.shortcutBridgeScript,
         ]
         app.launch()
         defer { app.terminate() }

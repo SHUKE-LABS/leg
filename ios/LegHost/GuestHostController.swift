@@ -80,6 +80,11 @@ struct HostLaunchOptions {
     /// The control is DEBUG-only: the simulator tests start a program of the
     /// pinned bundle with arguments, such as `leg-bridge --help`.
     var programArguments: [String] = []
+    /// A shell command the DEBUG fixture asks the host to run with `/bin/sh`.
+    ///
+    /// The `-c` argument is injected after the app launch arguments have been
+    /// parsed because XCTest drops a bare `-c` from that boundary.
+    var programScript: String?
     /// Whether the run reports the runtime files as missing.
     var runtimeFilesMissing = false
     /// Whether the run reports the runtime files as corrupt.
@@ -158,6 +163,11 @@ struct HostLaunchOptions {
             case "-leghost-program-arg":
                 if index + 1 < arguments.count {
                     options.programArguments.append(arguments[index + 1])
+                    consumed = 2
+                }
+            case "-leghost-program-script":
+                if index + 1 < arguments.count {
+                    options.programScript = arguments[index + 1]
                     consumed = 2
                 }
             case "-leghost-no-provider":
@@ -1476,6 +1486,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// two programs of the pinned bundle instead. A guest program that is
     /// not the guest TUI takes only the arguments of the launch.
     private func guestArguments(for program: String) -> [String] {
+        #if DEBUG
+        if let script = options.programScript {
+            return [program, "-c", script] + options.programArguments
+        }
+        #endif
         guard program == HostLaunchOptions.defaultProgram else {
             return [program] + options.programArguments
         }

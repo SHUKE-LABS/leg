@@ -358,12 +358,15 @@ final class GuestHostLifecycleTests: XCTestCase {
             "-leghost-program", "/usr/local/bin/leg-bridge",
             "-leghost-program-arg", "--help",
             "-leghost-program-arg", "-leghost-reset",
+            "-leghost-program-script", "printf script",
             "-leghost-program-arg",
         ])
 
         XCTAssertEqual(options.program, "/usr/local/bin/leg-bridge")
         XCTAssertEqual(options.programArguments, ["--help", "-leghost-reset"])
+        XCTAssertEqual(options.programScript, "printf script")
         XCTAssertEqual(HostLaunchOptions.current(arguments: ["LegHost"]).programArguments, [])
+        XCTAssertNil(HostLaunchOptions.current(arguments: ["LegHost", "-leghost-program-script"]).programScript)
     }
 
     /// A session that could not be released is not retried.
