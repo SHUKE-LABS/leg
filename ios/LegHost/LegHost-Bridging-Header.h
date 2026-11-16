@@ -12,5 +12,6 @@
 #include "GuestProvision.h"
 #include "GuestRuntime.h"
 #include "Sha256.h"
+#include "fs/IshBridgeSocketHook.h"
 
 #endif /* LEGHOST_BRIDGING_HEADER_H */

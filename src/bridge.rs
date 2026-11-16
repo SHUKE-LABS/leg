@@ -24,7 +24,9 @@
 //! capabilities a later mobile slice implements.
 
 pub mod adapter;
+pub mod canonical_json;
 pub mod protocol;
+pub mod schema;
 pub mod service;
 pub mod state;
 

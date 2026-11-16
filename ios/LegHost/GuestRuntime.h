@@ -28,6 +28,14 @@ typedef void (*guest_exit_notify_callback)(int code, void *context);
 int guest_runtime_boot(const char *root_data_dir);
 
 /*
+ * Gives the guest the files the host wrote at and below the guest path
+ * `path` of the booted root (see guest_fakefs_adopt_tree). Any thread may call
+ * it: the fakefs database serializes the writes with the guest. Returns 0, or
+ * a negative errno; -ENODEV when the runtime is not booted.
+ */
+int guest_runtime_adopt_host_tree(const char *path);
+
+/*
  * Runs `program` on a pseudo terminal.
  *
  * `arguments` holds the program name followed by its arguments as one buffer
@@ -36,6 +44,10 @@ int guest_runtime_boot(const char *root_data_dir);
  */
 int guest_runtime_start_session(const char *program, const char *arguments,
                                 size_t argument_count, const char *environment);
+
+/* What guest_runtime_start_session returns when the endpoint of the
+ * capability bridge could not be made in the guest. */
+#define GUEST_RUNTIME_BRIDGE_ERROR (-10001)
 
 /* Registers the callback that is invoked after guest output was queued. */
 void guest_runtime_set_output_notify(guest_output_notify_callback callback, void *context);
@@ -78,6 +90,9 @@ void guest_runtime_kill_guest(void);
 
 /*
  * Stops the guest of the session and waits for it to end.
+ *
+ * Once the guest stopped, the endpoint of the capability bridge is removed
+ * from the guest.
  *
  * Every task of the guest is killed and the waits of the tasks that wait are
  * ended, so a guest that waits for the provider wakes up. The call returns

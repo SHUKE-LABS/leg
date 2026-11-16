@@ -169,6 +169,49 @@ bounded by the table it is read from, and the files of a task that holds
 none are shown as none, so a task that was let go cannot take the emulator
 down. A task that exits detaches its files under the same lock of the tasks,
 so the /proc cannot read the files of a task that is on its way out either.
+The capability bridge endpoint is a vendored change too: `connect()` to the
+fake socket inode the host provisions at `/run/leghost-bridge.sock` reaches
+the host's listener.
+
+## The capability bridge
+
+The host serves `photos.search`, `photos.export`, `files.import`, and
+`files.export` to `leg-bridge` in the guest. Before every session it binds a
+private Unix socket, registers it with the vendored iSH hook, and starts the
+guest with `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`; the hook makes
+that path a socket inode in the guest and maps a `connect()` to it onto the
+listener. The listener answers one request per connection, checks the
+RFC 8785 input digest and its own approval ledger before an adapter runs,
+and is torn down with the session. The
+[capability bridge contract](../docs/capability-bridge.md#the-ios-host) has
+the details: the start and teardown order, the Photos authorization matrix,
+the Files containment checks, the no-replace commit, and the failure reasons.
+
+Before the guest starts, the host installs the bundled
+`resources/skills/mobile-media-files` Skill into `data/root/.agents/skills`
+of the active root (see [Skills v1](../docs/skills-v1.md)). A user Skill or a
+changed package at that name is never overwritten. The host writes below
+`data` directly, so it then records the package and its directories in the
+fakefs database (`guest_runtime_adopt_host_tree`); the guest hides a file that
+has no entry there. A failed record shows as `skill=unpublished`.
+
+The state line shows `bridge=off|listening|closed`, the number of replies the
+listener wrote, what the Skill install did, and `endpoint=none|kept`: whether
+the hook still records a guest endpoint it made after the listener closed.
+`-leghost-bridge-off` (Debug builds) starts the guest without a listener, and
+`-leghost-bridge-endpoint-failure <faults>` injects endpoint faults, a comma
+list of `hold` (the start fails after the runtime made the endpoint), `race`
+and `replace` (a socket the runtime did not make takes the endpoint before or
+after it made its own, and the start fails), `cleanup-lookup` (the cleanup
+cannot look the endpoint up) and `cleanup-retry` (such a socket then replaces
+the endpoint and the cleanup runs again). A listener that cannot start fails the session with
+`IOS_BRIDGE_LISTENER_ERROR`.
+
+The `Check bridge wiring` build phase (`scripts/check-bridge-wiring.sh`) fails
+the build when a bridge source or test is missing from its target, the
+bridging header does not expose the hook, or the app bundle lacks the Skill;
+`scripts/build-ish-runtime.sh` fails when the runtime archive does not export
+the hook.
 
 ## Licensing
 
@@ -404,6 +447,17 @@ ending the guest program without a hardware keyboard, the exit of a helper
 process leaving the session running, `leg-bridge --help` running in the
 imported guest and exiting 0 while an unknown argument exits 2, and the
 second launch reusing the verified root instead of importing it again.
+`BridgeCapabilityUITests` sends a request from a guest shell to the listener
+(the pinned 0.44.1 `leg-bridge` predates the Photos and Files capabilities,
+so it uses `files.list` and expects `capability_unsupported` from the host),
+checks `no_host_transport` without a listener, the listener's close after
+a failed start, that a start failing after the endpoint was made leaves no
+endpoint in the guest, that a socket the start did not make, at the endpoint
+before or after it made its own, is not removed, and that a cleanup that
+cannot look the endpoint up keeps its record, its retry leaves a socket that
+replaced the endpoint, and the next start replaces the socket;
+`SkillRelaunchUITests` checks the Skill install across a
+relaunch.
 
 ```
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
@@ -828,8 +882,8 @@ root must hold, not code of them.
 
 ## Out of scope
 
-The native Photos, Files and Shortcuts adapters, and App Store metadata are
-later slices of `#255`.
+The Shortcuts adapter, Photos edits, deletes and shares, and App Store
+metadata are later slices of `#255`.
 The provider support of this slice is the Anthropic Messages protocol; the
 OpenAI wire variants are covered only as the rejection cases of the fixture.
 The host does not run in the background: iOS decides when the app is

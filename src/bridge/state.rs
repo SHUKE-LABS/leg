@@ -331,9 +331,25 @@ impl BridgeState {
         }
     }
 
+    /// Forgets an approval, so its token is unknown from now on.
+    ///
+    /// A continuation that reached the host but ended without a decision —
+    /// cancelled, timed out, or failed — invalidates its token: the host
+    /// drops the same token, so the caller asks for a fresh approval.
+    pub fn forget_approval(&mut self, approval_token: &str) {
+        self.approvals
+            .remove(&sha256_hex(approval_token.as_bytes()));
+    }
+
     /// Whether an approval is still within its window.
     pub fn approval_is_fresh(record: &ApprovalRecord) -> bool {
-        unix_seconds() <= record.expires_at
+        Self::approval_is_fresh_at(record, unix_seconds())
+    }
+
+    /// Whether an approval is within its window at `now`, in seconds since
+    /// the Unix epoch: the expiry second itself is still inside it.
+    pub fn approval_is_fresh_at(record: &ApprovalRecord, now: u64) -> bool {
+        now <= record.expires_at
     }
 
     /// Inserts a request record and keeps the ledger bounded.

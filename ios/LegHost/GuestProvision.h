@@ -127,4 +127,27 @@ int guest_provision(const struct guest_pins *pins,
 
 const char *guest_provision_status_string(int status);
 
+struct fakefs_db;
+
+/*
+ * Give the guest the files the host wrote into a root.
+ *
+ * The fakefs keeps the owner and the mode of every guest path in its
+ * database and hides a file on disk that has no entry there. The host writes
+ * the bundled Skill and the managed bridge copies straight below `data`, so
+ * every directory and regular file at and below the guest path `path`, and
+ * every directory above it, that has no entry gets one: owned by root, with
+ * the permission bits of the file on disk. A symbolic link or any other kind
+ * of file is left without an entry, so the guest does not see it. A path that
+ * has an entry keeps it.
+ *
+ * `root_fd` is the open `data` directory of the root. Returns 0, or a
+ * negative errno when the path is not clean, too long, or not there.
+ */
+int guest_fakefs_adopt_tree(struct fakefs_db *fs, int root_fd, const char *path);
+
+/* Whether `path` is absolute, below `/`, and has no empty, `.`, or `..`
+ * component, the form the fakefs keys its entries by. */
+bool guest_fakefs_path_is_clean(const char *path);
+
 #endif

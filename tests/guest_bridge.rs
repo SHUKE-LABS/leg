@@ -515,12 +515,103 @@ fn a_bad_request_never_reaches_the_host() {
     assert_status(&malformed, "error");
     assert_reason(&malformed, "malformed_request");
 
+    // A member name the request repeats makes the request ambiguous.
+    let duplicate = ask(
+        socket,
+        &state_dir,
+        r#"{"version":1,"request_id":"r-5","capability":"photos.export","input":{"asset_id":"A2","asset_id":"A1","destination":"guest_workspace"}}"#,
+    );
+    assert_status(&duplicate, "error");
+    assert_reason(&duplicate, "malformed_request");
+
+    let unbounded = ask(
+        socket,
+        &state_dir,
+        &request(
+            "r-6",
+            "photos.search",
+            json!({"filter": {"media_type": "video"}, "sort": "duration_desc", "limit": 101}),
+        ),
+    );
+    assert_status(&unbounded, "error");
+    assert_reason(&unbounded, "invalid_input");
+
     #[cfg(unix)]
     assert_eq!(
         fixture.connection_count(),
         0,
         "a refused request reached the host"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_host_receives_the_canonical_digest_of_the_input() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("canonical-digest");
+    let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "ok".to_string(),
+            result: json!({"authorization": "full", "assets": [], "truncated": false}),
+        }
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(
+        socket,
+        &state_dir,
+        r#"{"version":1,"request_id":"r-1","capability":"photos.search","input":{"sort":"duration_desc","filter":{"media_type":"video"},"limit":20}}"#,
+    );
+    assert_status(&answer, "ok");
+
+    // The digest of `{"filter":{"media_type":"video"},"limit":20,"sort":"duration_desc"}`.
+    let requests = fixture.requests();
+    assert_eq!(
+        requests[0]["input_sha256"],
+        "a9a83ee45388e790690d5f5683782ecf738d5f703189c18b139a01f29c8bce4a"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_preview_the_host_runs_is_answered_error() {
+    if !bash_available() {
+        return;
+    }
+    let scratch = scratch("preview-ran");
+    let state_dir = scratch.path.join("state");
+
+    let fixture = host::Fixture::start(scratch.path.join("host.sock"), |_request| {
+        host::Answer::Reply {
+            status: "ok".to_string(),
+            result: json!({
+                "export_id": "e-1",
+                "name": "notes.txt",
+                "content_type": "text/plain",
+                "size_bytes": 12,
+                "sha256": "ab".repeat(32),
+            }),
+        }
+    });
+    let socket = Some(fixture.path.as_path());
+
+    let answer = ask(
+        socket,
+        &state_dir,
+        &request(
+            "r-1",
+            "files.export",
+            json!({"copy_id": "c0ffee", "relative_path": "c0ffee/notes.txt", "destination": "files_picker"}),
+        ),
+    );
+    assert_status(&answer, "error");
+    assert_reason(&answer, "host_protocol_violation");
+    assert!(answer["result"].is_null());
+    assert_eq!(fixture.connection_count(), 1);
 }
 
 #[test]

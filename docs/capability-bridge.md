@@ -69,16 +69,86 @@ a request id, or carries a disallowed path.
 | `files.list` | not needed | `path` (path, optional), `limit` (count, optional) |
 | `files.read` | needed | `path` (path) |
 | `shortcuts.invoke` | needed | `name` (text), `input` (object, optional) |
+| `photos.search` | not needed | `filter`, `sort`, `limit` — see [Photos and Files](#photos-and-files) |
+| `photos.export` | required | `asset_id`, `destination`, `filename` |
+| `files.import` | not needed | `destination` |
+| `files.export` | required | `copy_id`, `relative_path`, `destination`, `filename` |
 
 The names are the contract the mobile slices implement; this slice runs none
 of them. The *consent* column names the capabilities the host is expected to
 gate behind a user approval. The host owns the consent decision: it may ask
-for an approval for any capability, and the bridge honours that too.
+for an approval for any capability, and the bridge honours that too. For
+`photos.export` and `files.export` the bridge enforces the column as well:
+see [the preview rule](#the-preview-rule).
 
 A **path** is relative and normalized: no leading `/`, no `..` or `.` segment,
 no empty segment, no backslash, no drive letter, no `~`, no URL scheme, no
 control character, and at most 256 bytes. The host maps the relative path into
 its own sandbox; the bridge never resolves it against the guest filesystem.
+
+### Photos and Files
+
+These four capabilities have exact schemas: an input and a result carry exactly
+the fields below. The bridge refuses an input outside its schema before it
+reaches the host (`unknown_field`, `missing_field`, `invalid_input`, or
+`invalid_path` for a file name or a managed path). A host that answers `ok`
+with a result outside its schema broke the protocol: the bridge answers
+`error` with `host_protocol_violation` and withholds the result.
+
+**`photos.search`** finds videos by metadata. It reads no asset.
+
+| Input field | Required | Rule |
+| --- | --- | --- |
+| `filter.media_type` | yes | `"video"` |
+| `filter.created_after` | no | RFC 3339 date-time, inclusive |
+| `filter.created_before` | no | RFC 3339 date-time, inclusive, not before `created_after` |
+| `sort` | yes | `"duration_desc"` or `"created_desc"` |
+| `limit` | no | 1–100, 20 by default |
+
+The result is `{"authorization":"full"|"limited","assets":[…],"truncated":…}`.
+An asset is exactly `asset_id`, `media_type` (`"video"`), `duration_ms`,
+`created_at`, `width`, and `height`. The page holds at most `limit` assets,
+each inside the date filter, in the requested order; equal keys fall back to
+`asset_id`, ascending. Only a full page may be `truncated`.
+
+**`photos.export`** copies one video out of the library.
+
+| Input field | Required | Rule |
+| --- | --- | --- |
+| `asset_id` | yes | an id `photos.search` returned |
+| `destination` | yes | `"guest_workspace"` or `"files_picker"` |
+| `filename` | no | a safe file name |
+
+The result is exactly `authorization`, `copy_id`, `relative_path`, `name`,
+`media_type` (`"video"`), `size_bytes`, and `sha256`. `relative_path` is
+`copy_id/name` for `guest_workspace` and `null` for `files_picker`.
+
+**`files.import`** copies one file the user picks into the guest workspace.
+The input is exactly `{"destination":"guest_workspace"}`. The result is exactly
+`copy_id`, `relative_path` (`copy_id/name`), `name`, `content_type`,
+`size_bytes`, and `sha256`.
+
+**`files.export`** hands one imported copy to the Files picker. The input is
+`copy_id`, `relative_path` exactly as the import returned it,
+`destination` (`"files_picker"`), and an optional `filename`. The result is
+exactly `export_id`, `name`, `content_type`, `size_bytes`, and `sha256`.
+
+| Value | Rule |
+| --- | --- |
+| `asset_id` | printable text, 1–128 bytes |
+| `copy_id`, `export_id` | 1–64 bytes of `a–z`, `0–9`, `-`, starting with a letter or a digit |
+| file name (`filename`, `name`) | 1–128 bytes; no `/`, `\`, `:`, or control character; no leading or trailing space or dot; not `.` or `..` |
+| `relative_path` | `copy_id/name`, at most 256 bytes, under the managed root `~/.local/share/leg/bridge` |
+| `content_type` | lowercase `type/subtype` without parameters, 3–128 bytes |
+| `size_bytes` | at most 268435456 (256 MiB) |
+| `sha256` | 64 lowercase hex digits |
+| date-time | `YYYY-MM-DDTHH:MM:SS[.fraction](Z\|±HH:MM)`, at most 64 bytes |
+| `duration_ms` | at most 604800000 (7 days) |
+| `width`, `height` | 1–32768 |
+
+A name that would need a change to be safe is refused, not changed. The host
+also requires a file name in Unicode NFC; the guest bridge does not check NFC.
+A `relative_path` is never a native host path.
 
 ## The answer
 
@@ -118,10 +188,27 @@ The reasons are grouped by the status they answer with:
 
 | Status | Reasons |
 | --- | --- |
-| `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used` |
+| `denied` | `user_refused`, `approval_unknown`, `approval_mismatch`, `approval_expired`, `approval_used`, `invalid_selection`, `duplicate_destination` |
 | `cancelled` | `cancelled` |
-| `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied` |
-| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large` |
+| `unavailable` | `no_host_transport`, `host_unreachable`, `host_transport_unsupported`, `permission_denied`, `permission_restricted`, `permission_revoked`, `authorization_failed`, `capability_unsupported`, `picker_unavailable` |
+| `error` | `malformed_request`, `request_too_large`, `unsupported_version`, `invalid_request_id`, `unknown_capability`, `unknown_field`, `invalid_input`, `input_too_large`, `missing_field`, `invalid_path`, `invalid_approval_token`, `invalid_timeout`, `duplicate_request_id`, `state_unavailable`, `timeout`, `host_crashed`, `host_protocol_violation`, `transport_error`, `result_too_large`, `io_failure`, `insufficient_space`, `size_limit`, `asset_not_found` |
+
+The Photos and Files host answers with these reasons of its own:
+
+| Reason | Meaning |
+| --- | --- |
+| `user_refused` | The user refused the approval or the Photos permission. |
+| `permission_restricted` | The device restricts the Photos permission. |
+| `permission_revoked` | A permission the host held is gone. |
+| `authorization_failed` | Photos answered no usable authorization. |
+| `invalid_selection` | The picked item cannot be copied: a bad name, not a regular file, or outside the provider's scope. |
+| `duplicate_destination` | The destination already holds the name; nothing was replaced. |
+| `insufficient_space` | The device has no space for the copy. |
+| `io_failure` | A read, write, or commit failed. |
+| `size_limit` | The file is larger than 256 MiB. |
+| `capability_unsupported` | The host does not serve the capability. |
+| `asset_not_found` | The asset id names no asset the library still holds. |
+| `picker_unavailable` | The app has no window to show a picker in. |
 
 ## Approval semantics
 
@@ -148,11 +235,61 @@ The binding is what makes the approval mean something:
 - a token the bridge did not issue is refused (`approval_unknown`);
 - an approval for another capability or for a different input is refused
   (`approval_mismatch`);
-- an approval older than ten minutes is refused (`approval_expired`);
+- an approval is fresh through its 600th second, inclusive; from the 601st
+  it is refused (`approval_expired`);
 - a token that was already redeemed is refused (`approval_used`).
+
+A follow-up the host answers `ok` or `denied` redeems the token. A follow-up
+that ends any other way — `cancelled`, `timeout`, or a failure — invalidates
+it: the binding is removed, the next follow-up with that token is
+`approval_unknown`, and the Skill starts again with a fresh preview. The ledger
+keeps the newest 32 bindings.
 
 The approval token is a host-side credential: keep it out of any channel the
 model can read, or the gate means nothing.
+
+### The preview rule
+
+`photos.export` and `files.export` always need an approval. A request for one
+of them without a token is a **preview**: the host answers it
+`approval_required` and performs nothing. A host that answers a preview `ok`
+broke the protocol: the bridge answers `error` with `host_protocol_violation`,
+withholds the result, and records no approval.
+
+### The input digest
+
+The binding holds `input_sha256`: the lowercase hex SHA-256 of the input in
+the RFC 8785 canonical form (JCS). The bridge computes it — a request that
+carries `input_sha256` is refused with `unknown_field` — and the host computes
+it again from the input it receives. Inputs that differ only in member order or
+number spelling have one digest, so a follow-up may reorder its keys.
+
+The canonical form:
+
+- members sorted by their UTF-16 code units, with no whitespace;
+- strings escape only `"`, `\`, and control characters (`\b`, `\f`,
+  `\n`, `\r`, `\t`, else `\u00xx`);
+- numbers in the shortest ECMAScript form: `1.0` is `1`, `-0` is `0`, `1e21`
+  is `1e+21`, `1e-6` is `0.000001`.
+
+The request line is parsed strictly, and the bridge answers
+`malformed_request` for a line that carries:
+
+- a member name twice in one object, also when an escape spells the repeat
+  (`"a"` and `"\u0061"`);
+- a number a binary64 cannot hold: one that overflows (`1e400`), or a non-zero
+  literal that underflows to zero (`1e-400`);
+- a lone surrogate escape;
+- nesting deeper than 64 levels.
+
+The guest bridge and the host share these vectors:
+
+| Input | Canonical form | SHA-256 |
+| --- | --- | --- |
+| `{"sort":"duration_desc","filter":{"media_type":"video"},"limit":20}` | `{"filter":{"media_type":"video"},"limit":20,"sort":"duration_desc"}` | `a9a83ee45388e790690d5f5683782ecf738d5f703189c18b139a01f29c8bce4a` |
+| `{"destination":"guest_workspace"}` | `{"destination":"guest_workspace"}` | `8045fd38b79820c6825bd8096a324dea1431cfe9e3e17870b1592de88295a750` |
+| `{"\uE000":"bmp","\uD834\uDD1E":"supp"}` | the two members as raw UTF-8, U+1D11E first: its UTF-16 lead unit 0xD834 sorts before 0xE000 | `73e96d65d5acff2a00259e91342ce76055ab13ce7809e00e9920246333341f59` |
+| `{"n":1.0,"small":1e-6,"tiny":1e-7,"huge":1e21,"negzero":-0}` | `{"huge":1e+21,"n":1,"negzero":0,"small":0.000001,"tiny":1e-7}` | `c25482e66991d36fc4ac2b9d6aa6ede849b011530dbed02a79fda81c5974dd24` |
 
 ## The host transport
 
@@ -225,6 +362,112 @@ the work it started.
   own; it may not skip the bridge's.
 - **No second registry.** The bridge is not an agent tool. It adds no tool to
   the desktop registry and changes no Skills contract.
+
+### The iOS host
+
+The LegHost app serves `photos.search`, `photos.export`, `files.import`, and
+`files.export` (`ios/LegHost/BridgeListener.swift`, `PhotosAdapter.swift`,
+`FilesAdapter.swift`).
+
+**The socket.** For every guest generation the host binds an `AF_UNIX`
+listener at a private path, `lb-<random>/s` (directory `0700`, socket `0600`)
+in the app's temporary directory — the Mac's `/tmp` in a simulator, whose
+container path is longer than a Darwin socket path (103 bytes). The guest
+never sees that path. It gets `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`,
+and the vendored iSH maps a `connect()` to that exact fake socket inode onto
+the listener (`ios/vendor/ish/fs/IshBridgeSocketHook.c`). Every other guest
+Unix socket keeps the upstream mapping.
+
+Start order: bind and listen, register the generation with the hook, install
+the Skill, build the environment, start the session, provision the fake inode
+in the guest's task context, execute the guest program. The hook makes the
+fake inode, records its identity, and holds it in one step, so a start that
+fails after that removes it and never a socket it did not make, and a cleanup
+that cannot look the endpoint up keeps the record and the hold;
+a failed start also closes the listener. Teardown order: cancel the adapters'
+work, stop accepting and shut the open connections, stop the guest, remove
+the fake inode in a task context, join the workers, unregister the
+generation, then unlink the socket the listener bound (matched by device and
+inode) and its empty directory and remove the generation's staging. The work
+of an adapter is a worker until it returns, even after its request was
+answered; when a worker outlives the 10 s join, the mapping, socket, and
+staging stay and the teardown completes when the last worker ends.
+
+**One exchange per connection.** The listener reads one request line of at
+most 64 KiB within 5 s and writes at most one reply line. The request must be
+a version 1 HostRequest with no unknown field, no duplicate name, only I-JSON
+numbers, a `timeout_ms` of 100–30000, and an `input_sha256` equal to the
+digest the host recomputes; anything else is `error`/`host_protocol_violation`
+when the frame names a printable request id and nonce, and the connection is
+closed without a reply otherwise (the bridge reports `host_crashed`). No
+refusal reaches an adapter. Work stops at the request deadline
+(`error`/`timeout`), when the guest closes the connection, and at teardown
+(`cancelled`).
+
+**The host ledger.** The listener keeps its own approvals, in memory, per
+generation: the SHA-256 of the token, the capability, the input digest, the
+issue and expiry seconds, and the state. A preview inserts an unused record;
+a continuation marks it in flight; `ok` or `denied` redeems it; a cancel,
+timeout, or failure removes it. The token is valid while
+`now <= issued_at + 600`, expired records are pruned before every lookup,
+insert, and transition, the ledger holds at most 32 records, and teardown
+discards it. An unknown, expired, used, or mismatched token is `denied` with
+`approval_unknown`, `approval_expired`, `approval_used`, or
+`approval_mismatch`, before the adapter runs.
+
+**Photos.** Both operations authorize first and carry the authorization in a
+successful result:
+
+| Authorization | Status | Reason / result |
+| --- | --- | --- |
+| authorized | `ok` | `authorization: "full"` |
+| limited | `ok` | `authorization: "limited"` |
+| denied after the request | `denied` | `user_refused` |
+| restricted | `unavailable` | `permission_restricted` |
+| granted, then gone at the recheck | `unavailable` | `permission_revoked` |
+| still undetermined, or the API failed | `unavailable` | `authorization_failed` |
+
+A refused row fetches no metadata and reads no asset. `photos.search` skips an
+asset whose metadata is outside the schema bounds.
+
+**Files.** A picked file is read only inside its security-scoped root. A
+file opened in place grants the scope of that file alone, so the live root is
+the picked item: it is opened with `O_NOFOLLOW_ANY` (no link anywhere on its
+path), its descriptor must name the granted path (`F_GETPATH`), and it must be
+a regular file. Below a root that is a granted directory, the file is reached
+one component at a time: every directory with `openat(O_DIRECTORY|O_NOFOLLOW)`,
+every component checked with `fstatat(AT_SYMLINK_NOFOLLOW)`, and the file
+opened with `O_NOFOLLOW` and checked as a regular file by its descriptor. A
+link on the way, a path outside the root, or a provider with no root is
+`denied`/`invalid_selection` before a byte is read. `files.export` resolves only `copy_id/name` under the
+managed root the same way; a native path is never accepted.
+
+**Staging and commit.** A transfer is staged under
+`Library/Caches/LegHost/BridgeStaging/<generation>/<operation>/`: every byte
+is counted before it is written (over 256 MiB is `error`/`size_limit`), hashed
+as it streams, synced, and checked for size and digest before the commit. The
+commit never replaces: `renameatx_np(RENAME_EXCL)` into the managed root
+(`~/.local/share/leg/bridge/<copy_id>/<name>`), or an exclusively created
+sibling renamed with `RENAME_EXCL` under a coordinated write of a picked
+folder. An existing destination is `denied`/`duplicate_destination` and stays
+unchanged. The guest's fakefs hides a file that has no entry in its database,
+so a managed commit then records the copy and its directories there (owned by
+root, the mode of the file on disk); a copy that cannot be recorded is removed
+and the request is `error`/`io_failure`. Any failure removes only the
+operation's staging; no partial file is left where the guest or the user can
+see it.
+
+| Failure | Status | Reason |
+| --- | --- | --- |
+| picker dismissed, request cancelled | `cancelled` | `cancelled` |
+| security scope lost | `unavailable` | `permission_revoked` |
+| destination exists | `denied` | `duplicate_destination` |
+| no space | `error` | `insufficient_space` |
+| any other read or write failure | `error` | `io_failure` |
+| over 256 MiB | `error` | `size_limit` |
+
+**Redaction.** The host logs no asset bytes, file contents, credentials,
+approval tokens, or native paths; its diagnostics name the step that failed.
 
 ## Duplicate request ids
 

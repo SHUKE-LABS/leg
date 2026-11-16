@@ -34,6 +34,7 @@
 #include <archive.h>
 #include <archive_entry.h>
 
+#include "fs/fake-db.h"
 #include "tools/fakefs.h"
 
 const char *const guest_program_names[GUEST_PROGRAM_COUNT] = {
@@ -2119,4 +2120,104 @@ int guest_provision(const struct guest_pins *pins, const char *guest_bundle_path
     memcpy(result->marker_sha256, staged_marker_sha, sizeof(staged_marker_sha));
     result->reused = false;
     return GUEST_PROVISION_OK;
+}
+
+/* ------------------------------------------------------- host-written files */
+
+/* Records `path` when it is a directory or a regular file without an entry.
+ * `kind` says what the file on disk is: 'd', 'f', or 0 for anything else. */
+static int adopt_path(struct fakefs_db *fs, int root_fd, const char *path, char *kind) {
+    struct stat st;
+    if (fstatat(root_fd, path + 1, &st, AT_SYMLINK_NOFOLLOW) < 0)
+        return -errno;
+    *kind = S_ISDIR(st.st_mode) ? 'd' : S_ISREG(st.st_mode) ? 'f' : 0;
+    if (*kind == 0 || path_get_inode(fs, path) != 0)
+        return 0;
+    struct ish_stat ish = {
+        .mode = (*kind == 'd' ? 0040000 : 0100000) | (st.st_mode & 0777),
+        .uid = 0,
+        .gid = 0,
+        .rdev = 0,
+    };
+    path_create(fs, path, &ish);
+    return 0;
+}
+
+static int adopt_below(struct fakefs_db *fs, int root_fd, char *path, size_t length) {
+    char kind;
+    int err = adopt_path(fs, root_fd, path, &kind);
+    if (err < 0 || kind != 'd')
+        return err;
+    int dir_fd = openat(root_fd, path + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir_fd < 0)
+        return -errno;
+    DIR *dir = fdopendir(dir_fd);
+    if (dir == NULL) {
+        err = -errno;
+        close(dir_fd);
+        return err;
+    }
+    struct dirent *entry;
+    while (err == 0 && (entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        size_t name_length = strlen(entry->d_name);
+        if (length + 1 + name_length >= GUEST_PATH_MAX) {
+            err = -ENAMETOOLONG;
+            break;
+        }
+        path[length] = '/';
+        memcpy(path + length + 1, entry->d_name, name_length + 1);
+        err = adopt_below(fs, root_fd, path, length + 1 + name_length);
+        path[length] = '\0';
+    }
+    closedir(dir);
+    return err;
+}
+
+bool guest_fakefs_path_is_clean(const char *path) {
+    if (path == NULL || path[0] != '/' || path[1] == '\0')
+        return false;
+    const char *component = path + 1;
+    for (;;) {
+        const char *end = strchr(component, '/');
+        size_t length = end != NULL ? (size_t) (end - component) : strlen(component);
+        if (length == 0 || (length == 1 && component[0] == '.') ||
+            (length == 2 && component[0] == '.' && component[1] == '.'))
+            return false;
+        if (end == NULL)
+            return true;
+        component = end + 1;
+    }
+}
+
+int guest_fakefs_adopt_tree(struct fakefs_db *fs, int root_fd, const char *path) {
+    if (!guest_fakefs_path_is_clean(path))
+        return -EINVAL;
+    size_t length = strlen(path);
+    if (length >= GUEST_PATH_MAX)
+        return -ENAMETOOLONG;
+    char buffer[GUEST_PATH_MAX];
+    memcpy(buffer, path, length + 1);
+
+    int err = 0;
+    db_begin_write(fs);
+    /* The directories above the path, from the top. */
+    for (size_t i = 1; i < length && err == 0; i++) {
+        if (buffer[i] != '/')
+            continue;
+        buffer[i] = '\0';
+        char kind;
+        err = adopt_path(fs, root_fd, buffer, &kind);
+        if (err == 0 && kind != 'd')
+            err = -ENOTDIR;
+        buffer[i] = '/';
+    }
+    if (err == 0)
+        err = adopt_below(fs, root_fd, buffer, length);
+    if (err == 0)
+        db_commit(fs);
+    else
+        db_rollback(fs);
+    return err;
 }

@@ -251,7 +251,7 @@ owns the native permission. A mobile Skill calls it through the existing
 output:
 
 ```
-printf '%s\n' '{"version":1,"request_id":"r-1","capability":"photos.list","input":{"limit":5}}' \
+printf '%s\n' '{"version":1,"request_id":"r-1","capability":"photos.search","input":{"filter":{"media_type":"video"},"sort":"duration_desc","limit":5}}' \
   | leg-bridge
 ```
 
@@ -280,6 +280,13 @@ cancellation, and the user confirmation. The [capability bridge
 contract](docs/capability-bridge.md) defines the schemas, the capability
 names, the approval semantics, the limits, the audit summary, and the rule a
 platform adapter has to keep.
+
+The iOS host serves `photos.search`, `photos.export`, `files.import`, and
+`files.export`. An approval binds the SHA-256 of the RFC 8785 form of the
+input, so a reordered input continues the same approval; the host checks the
+digest and its own token ledger again before it acts. The app installs the
+bundled `mobile-media-files` Skill into the guest's `~/.agents/skills`, so the
+agent finds it like any user Skill.
 
 ## Native iOS host
 

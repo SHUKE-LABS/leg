@@ -36,6 +36,19 @@
 		EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */; };
 		FF11FF11FF11FF11FF110002 /* GuestRuntimeKernelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */; };
 		EE11EE11EE11EE11EE110033 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE11CC11CC11CC11CC110011 /* XCTest.framework */; };
+		GG11GG11GG11GG11GG110081 /* BridgeCanonicalJSON.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110001 /* BridgeCanonicalJSON.swift */; };
+		GG11GG11GG11GG11GG110082 /* BridgeListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110002 /* BridgeListener.swift */; };
+		GG11GG11GG11GG11GG110083 /* PhotosAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110003 /* PhotosAdapter.swift */; };
+		GG11GG11GG11GG11GG110084 /* FilesAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110004 /* FilesAdapter.swift */; };
+		GG11GG11GG11GG11GG110085 /* GuestSkillInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110005 /* GuestSkillInstaller.swift */; };
+		GG11GG11GG11GG11GG110086 /* BridgeCanonicalJSONTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110006 /* BridgeCanonicalJSONTests.swift */; };
+		GG11GG11GG11GG11GG110087 /* BridgeListenerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110007 /* BridgeListenerTests.swift */; };
+		GG11GG11GG11GG11GG110088 /* PhotosAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110008 /* PhotosAdapterTests.swift */; };
+		GG11GG11GG11GG11GG110089 /* FilesAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG110009 /* FilesAdapterTests.swift */; };
+		GG11GG11GG11GG11GG11008A /* GuestSkillInstallerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000A /* GuestSkillInstallerTests.swift */; };
+		GG11GG11GG11GG11GG11008B /* BridgeCapabilityUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000B /* BridgeCapabilityUITests.swift */; };
+		GG11GG11GG11GG11GG11008C /* SkillRelaunchUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000C /* SkillRelaunchUITests.swift */; };
+		GG11GG11GG11GG11GG11008D /* skills in Resources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000D /* skills */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -91,6 +104,19 @@
 		FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestRuntimeKernelTests.swift; sourceTree = "<group>"; };
 		FF11FF11FF11FF11FF110003 /* LegHostTests-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "LegHostTests-Bridging-Header.h"; sourceTree = "<group>"; };
 		EE11EE11EE11EE11EE110023 /* LegHostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LegHostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		GG11GG11GG11GG11GG110001 /* BridgeCanonicalJSON.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCanonicalJSON.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110002 /* BridgeListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeListener.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110003 /* PhotosAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotosAdapter.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110004 /* FilesAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesAdapter.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110005 /* GuestSkillInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestSkillInstaller.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110006 /* BridgeCanonicalJSONTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCanonicalJSONTests.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110007 /* BridgeListenerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeListenerTests.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110008 /* PhotosAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotosAdapterTests.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG110009 /* FilesAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesAdapterTests.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG11000A /* GuestSkillInstallerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestSkillInstallerTests.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG11000B /* BridgeCapabilityUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCapabilityUITests.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG11000C /* SkillRelaunchUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkillRelaunchUITests.swift; sourceTree = "<group>"; };
+		GG11GG11GG11GG11GG11000D /* skills */ = {isa = PBXFileReference; lastKnownFileType = folder; path = skills; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -140,6 +166,8 @@
 			isa = PBXGroup;
 			children = (
 				CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */,
+				GG11GG11GG11GG11GG11000B /* BridgeCapabilityUITests.swift */,
+				GG11GG11GG11GG11GG11000C /* SkillRelaunchUITests.swift */,
 			);
 			path = LegHostUITests;
 			sourceTree = "<group>";
@@ -150,6 +178,11 @@
 				EE11EE11EE11EE11EE110021 /* GuestHostLifecycleTests.swift */,
 				EE11EE11EE11EE11EE110022 /* HostPreflightTests.swift */,
 				FF11FF11FF11FF11FF110001 /* GuestRuntimeKernelTests.swift */,
+				GG11GG11GG11GG11GG110006 /* BridgeCanonicalJSONTests.swift */,
+				GG11GG11GG11GG11GG110007 /* BridgeListenerTests.swift */,
+				GG11GG11GG11GG11GG110008 /* PhotosAdapterTests.swift */,
+				GG11GG11GG11GG11GG110009 /* FilesAdapterTests.swift */,
+				GG11GG11GG11GG11GG11000A /* GuestSkillInstallerTests.swift */,
 				FF11FF11FF11FF11FF110003 /* LegHostTests-Bridging-Header.h */,
 			);
 			path = LegHostTests;
@@ -169,6 +202,11 @@
 				DD11DD11DD11DD11DD110012 /* LoopbackFixture.swift */,
 				DD11DD11DD11DD11DD110013 /* ProviderSetupView.swift */,
 				EE11EE11EE11EE11EE110003 /* FixtureRequestLedger.swift */,
+				GG11GG11GG11GG11GG110001 /* BridgeCanonicalJSON.swift */,
+				GG11GG11GG11GG11GG110002 /* BridgeListener.swift */,
+				GG11GG11GG11GG11GG110003 /* PhotosAdapter.swift */,
+				GG11GG11GG11GG11GG110004 /* FilesAdapter.swift */,
+				GG11GG11GG11GG11GG110005 /* GuestSkillInstaller.swift */,
 				BB11BB11BB11BB11BB110001 /* Sha256.c */,
 				BB11BB11BB11BB11BB110002 /* GuestProvision.c */,
 				BB11BB11BB11BB11BB110003 /* GuestRuntime.c */,
@@ -191,6 +229,7 @@
 			isa = PBXGroup;
 			children = (
 				BB11BB11BB11BB11BB11000C /* PinnedInputs */,
+				GG11GG11GG11GG11GG11000D /* skills */,
 			);
 			path = resources;
 			sourceTree = "<group>";
@@ -236,6 +275,7 @@
 				AA11AA11AA11AA11AA110032 /* Sources */,
 				AA11AA11AA11AA11AA110033 /* Frameworks */,
 				AA11AA11AA11AA11AA110034 /* Resources */,
+				GG11GG11GG11GG11GG110100 /* Check bridge wiring */,
 			);
 			buildRules = (
 			);
@@ -336,6 +376,7 @@
 				AA11AA11AA11AA11AA110005 /* THIRD_PARTY_NOTICES.md in Resources */,
 				BB11BB11BB11BB11BB110016 /* PinnedInputs.plist in Resources */,
 				BB11BB11BB11BB11BB11001B /* PinnedInputs in Resources */,
+				GG11GG11GG11GG11GG11008D /* skills in Resources */,
 				BB11BB11BB11BB11BB110017 /* term.html in Resources */,
 				BB11BB11BB11BB11BB110018 /* term.js in Resources */,
 				BB11BB11BB11BB11BB110019 /* term.css in Resources */,
@@ -395,6 +436,21 @@
 			shellPath = /bin/sh;
 			shellScript = "/bin/bash \"$SRCROOT/scripts/fetch-pinned-inputs.sh\"\n";
 		};
+		GG11GG11GG11GG11GG110100 /* Check bridge wiring */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Check bridge wiring";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/bash \"$SRCROOT/scripts/check-bridge-wiring.sh\"\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -415,6 +471,11 @@
 				DD11DD11DD11DD11DD110002 /* LoopbackFixture.swift in Sources */,
 				DD11DD11DD11DD11DD110003 /* ProviderSetupView.swift in Sources */,
 				EE11EE11EE11EE11EE110013 /* FixtureRequestLedger.swift in Sources */,
+				GG11GG11GG11GG11GG110081 /* BridgeCanonicalJSON.swift in Sources */,
+				GG11GG11GG11GG11GG110082 /* BridgeListener.swift in Sources */,
+				GG11GG11GG11GG11GG110083 /* PhotosAdapter.swift in Sources */,
+				GG11GG11GG11GG11GG110084 /* FilesAdapter.swift in Sources */,
+				GG11GG11GG11GG11GG110085 /* GuestSkillInstaller.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -423,6 +484,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				CC11CC11CC11CC11CC110001 /* LegHostUITests.swift in Sources */,
+				GG11GG11GG11GG11GG11008B /* BridgeCapabilityUITests.swift in Sources */,
+				GG11GG11GG11GG11GG11008C /* SkillRelaunchUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -433,6 +496,11 @@
 				EE11EE11EE11EE11EE110031 /* GuestHostLifecycleTests.swift in Sources */,
 				EE11EE11EE11EE11EE110032 /* HostPreflightTests.swift in Sources */,
 				FF11FF11FF11FF11FF110002 /* GuestRuntimeKernelTests.swift in Sources */,
+				GG11GG11GG11GG11GG110086 /* BridgeCanonicalJSONTests.swift in Sources */,
+				GG11GG11GG11GG11GG110087 /* BridgeListenerTests.swift in Sources */,
+				GG11GG11GG11GG11GG110088 /* PhotosAdapterTests.swift in Sources */,
+				GG11GG11GG11GG11GG110089 /* FilesAdapterTests.swift in Sources */,
+				GG11GG11GG11GG11GG11008A /* GuestSkillInstallerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -639,6 +707,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/LegHost",
+					"$(SRCROOT)/vendor/ish",
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = 1.0;
@@ -667,6 +736,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/LegHost",
+					"$(SRCROOT)/vendor/ish",
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = 1.0;
