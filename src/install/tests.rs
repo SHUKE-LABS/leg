@@ -325,6 +325,17 @@ fn merge_path_value_keeps_an_unchanged_value_untouched() {
 
 #[cfg(not(windows))]
 #[test]
+fn unix_path_matching_accepts_an_exact_destination_entry() {
+    let scratch = scratch("path-exact");
+    let destination = scratch.path.join("bin");
+    fs::create_dir_all(&destination).expect("create destination");
+    let path_value = std::env::join_paths([destination.clone()]).expect("build a controlled PATH");
+
+    assert!(path_contains_destination(Some(&path_value), &destination));
+}
+
+#[cfg(not(windows))]
+#[test]
 fn unix_path_matching_resolves_trailing_slashes_and_symlinks() {
     let scratch = scratch("path-matching");
     let destination = scratch.path.join("bin");
