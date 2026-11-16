@@ -36,7 +36,7 @@ final class LegHostUITests: XCTestCase {
         #"second=$(printf '%s\n' "$approved" | /usr/local/bin/leg-bridge);"#,
         #"if printf '%s\n' "$second" | grep -F '"status":"ok"' >/dev/null && printf '%s\n' "$second" | grep -F '"result":{"count":2,"ok":true,"source":"ios-shortcuts-fixture"}' >/dev/null; then"#,
         #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; else"#,
-        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; fi; sleep 300"#,
+        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; fi; sleep 600"#,
     ].joined(separator: " ")
 
     /// XCUITest forwards launch arguments through a shell-like boundary. The
@@ -237,7 +237,7 @@ final class LegHostUITests: XCTestCase {
         let resultVisible = waitForTerminalText(
             "SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture",
             timeout: startTimeout)
-        let state = app.staticTexts["guest-fixture-state"].label
+        let state = fixtureStateLabel()
         XCTAssertTrue(resultVisible,
                       "the deterministic Shortcut object did not cross the host and guest boundary; "
                         + "host state: \(state)")
@@ -299,6 +299,16 @@ final class LegHostUITests: XCTestCase {
             usleep(3_000_000)
         }
         return false
+    }
+
+    /// Reads the host counters without allowing a failed UI query to consume
+    /// the rest of the test's failure window.
+    private func fixtureStateLabel(timeout: TimeInterval = 5) -> String {
+        let state = app.staticTexts["guest-fixture-state"]
+        guard state.waitForExistence(timeout: timeout) else {
+            return "<unavailable>"
+        }
+        return state.label
     }
 
     /// Whether the words of `text` occur in order in the terminal snapshot.
