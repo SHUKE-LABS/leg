@@ -259,13 +259,18 @@ keyboard as text.
   nothing and show an actionable status.
 - **Handoff.** The guest gets
   `LEG_HOST_ATTACHMENT_DIR=/tmp/leghost-attachments/<generation>`; `leg-tui`
-  writes `.receiver-v1` there, and **Insert** waits for it
-  (`receiver_unavailable` otherwise), so a guest without a receiver never sees
-  a notice. **Insert** moves the file into that directory, records it in the
-  fakefs (`guest_runtime_adopt_host_tree`), and writes one bracketed paste:
-  `leghost-attachment/v1 ` and JSON with the generation, an opaque `ios-<hex>`
-  id, the source, the filename, MIME, byte length, and SHA-256. Image bytes,
-  host paths, and credentials never reach the PTY or the log. `leg-tui`
+  writes `.receiver-v1` there while it runs and removes it on exit, and
+  **Insert** waits for it (`receiver_unavailable` otherwise), so a guest
+  without a receiver never sees a notice. **Insert** copies the file into that
+  directory, records it in the fakefs (`guest_runtime_adopt_host_tree`), and
+  writes one bracketed paste: `leghost-attachment/v1 ` and JSON with the
+  generation, an opaque `ios-<hex>` id, the source, the filename, MIME, byte
+  length, and SHA-256. Every string is `\u`-escaped outside `[A-Za-z0-9._/-]`,
+  so the notice holds nothing a shell expands or runs. Image bytes, host
+  paths, and credentials never reach the PTY or the log. The image stays on
+  the host until the receiver removes the handoff file; one not taken within
+  3 s is retracted with the marker (`receiver_not_responding`), so a receiver
+  that died without cleaning up gets no further notice. `leg-tui`
   resolves the id only in its own generation, checks length and SHA-256,
   removes the handoff file, and stages the image at the cursor through the
   managed catalog; another generation, a missing or changed file, or an open

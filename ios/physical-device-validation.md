@@ -257,6 +257,7 @@ and records, for one build:
 | Rejections | a renamed non-image, a MIME mismatch, a 10 MB+ image, and a fourth large image over 32 MB stage nothing |
 | Cancel | closing either picker leaves the tray and the guest draft unchanged |
 | Ordered turn | text, an inserted image, and text submit as one turn; the provider receives the image SHA-256 |
+| Receiver exit | after quitting `leg-tui` under a shell, **Insert** is `receiver_unavailable` and the image stays in the tray |
 | Unsupported model | a text-only model fails before the request; the draft keeps the image |
 | Cleanup | background, relaunch, and a killed host leave `Library/Application Support/LegHost/attachments` and `data/tmp/leghost-attachments` empty |
 | The device log | no image bytes, Photos or Files paths, credentials, or upload tokens |

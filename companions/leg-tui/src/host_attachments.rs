@@ -11,7 +11,9 @@
 //! them to the catalog's validated staging, and removes the handoff file.
 //!
 //! The receiver is active only when the host names the directory in
-//! `LEG_HOST_ATTACHMENT_DIR`; otherwise every paste stays text.
+//! `LEG_HOST_ATTACHMENT_DIR`; otherwise every paste stays text. Its ready
+//! marker lives as long as the inbox, so the host stops handing images over
+//! once this program is gone.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -108,6 +110,12 @@ impl HostAttachmentInbox {
         if notice.generation == self.generation {
             let _ = fs::remove_file(self.directory.join(&notice.id));
         }
+    }
+}
+
+impl Drop for HostAttachmentInbox {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.directory.join(READY_MARKER));
     }
 }
 
@@ -249,6 +257,15 @@ pub(crate) mod tests {
         );
     }
 
+    /// A label the host escaped so that no shell reads it as code.
+    #[test]
+    fn an_escaped_ios_label_parses_to_the_filename() {
+        let golden = r#"leghost-attachment/v1 {"byte_len":70,"generation":"0123456789abcdef","id":"ios-00112233445566778899aabbccddeeff","label":"\u0024\u0028id\u0029\u0020\u0060x\u0060\u003b\u732b.png","media_type":"image/png","sha256":"497790947d4666760ce38f3c00e852c71fdb66cae849bae8e9ede352719e1581","source":"files"}"#;
+        let notice = parse_notice(golden).unwrap().unwrap();
+        assert_eq!(notice.label, "$(id) `x`;猫.png");
+        assert_eq!(notice_label(&notice), "Files · $(id) `x`;猫.png");
+    }
+
     #[test]
     fn ordinary_text_is_not_a_notice() {
         assert_eq!(parse_notice("hello"), None);
@@ -307,6 +324,11 @@ pub(crate) mod tests {
         let inbox = HostAttachmentInbox::open(directory.clone()).unwrap();
         assert_eq!(inbox.generation, "gen-1");
         assert!(directory.join(READY_MARKER).is_file());
+        drop(inbox);
+        assert!(
+            !directory.join(READY_MARKER).exists(),
+            "a closed receiver no longer announces itself"
+        );
         assert!(HostAttachmentInbox::open(root.join("missing")).is_err());
         assert!(HostAttachmentInbox::open(root.join(".hidden")).is_err());
         fs::remove_dir_all(&root).unwrap();

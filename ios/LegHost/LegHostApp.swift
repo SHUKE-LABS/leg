@@ -142,10 +142,12 @@ struct GuestHostScreen: View {
                     Spacer(minLength: 0)
                     Button("Insert") { controller.insertAttachment(id: attachment.id) }
                         .font(.caption.monospaced())
+                        .disabled(controller.insertingAttachment != nil)
                         .accessibilityIdentifier("attachment-insert")
                     Button("Remove") { controller.removeAttachment(id: attachment.id) }
                         .font(.caption.monospaced())
                         .foregroundStyle(Color.red)
+                        .disabled(controller.insertingAttachment == attachment.id)
                         .accessibilityIdentifier("attachment-remove")
                 }
             }

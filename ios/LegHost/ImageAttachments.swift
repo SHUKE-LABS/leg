@@ -78,7 +78,10 @@ struct ImageAttachmentFailure: Error, Equatable {
         message: "The guest program cannot receive images. Update LegHost to a build whose guest supports images.")
     static let handoffFailed = ImageAttachmentFailure(
         reason: "handoff_failed",
-        message: "The image could not be handed to the guest. Pick it again.")
+        message: "The image could not be handed to the guest. Insert it again.")
+    static let receiverGone = ImageAttachmentFailure(
+        reason: "receiver_not_responding",
+        message: "The guest program did not take the image; it stays here until a program that receives images runs.")
 
     static func tooLarge(_ limits: ImageAttachmentLimits) -> ImageAttachmentFailure {
         ImageAttachmentFailure(
@@ -278,11 +281,6 @@ final class ImageAttachmentStore {
         let attachment = pending.remove(at: index)
         try? FileManager.default.removeItem(at: fileURL(for: attachment))
     }
-
-    /// Drops a staged image whose file was handed to the guest.
-    func release(id: String) {
-        pending.removeAll { $0.id == id }
-    }
 }
 
 // MARK: - The guest handoff
@@ -290,11 +288,16 @@ final class ImageAttachmentStore {
 /// The guest side of the handoff: one directory per session generation that
 /// the guest receiver reads by opaque id.
 ///
-/// The host moves a staged image into the directory, adopts it into the
+/// The host copies a staged image into the directory, adopts it into the
 /// fakefs, and writes a bracketed paste whose text is a notice: a fixed
 /// prefix and JSON with the generation, the id, the source, the filename, the
 /// MIME type, the byte count, and the SHA-256. Image bytes and host paths
-/// never reach the terminal.
+/// never reach the terminal, and the notice is inert where a shell reads it.
+///
+/// The receiver announces itself with a marker it removes when it exits, and
+/// takes a handoff by removing its file. The host keeps its own copy until
+/// then; a handoff not taken in time is retracted with the marker, so a
+/// receiver that died without removing it gets no more notices.
 struct ImageAttachmentHandoff {
     static let environmentVariable = "LEG_HOST_ATTACHMENT_DIR"
     static let guestParent = "/tmp/leghost-attachments"
@@ -333,15 +336,15 @@ struct ImageAttachmentHandoff {
         return values?.isRegularFile == true
     }
 
-    /// Moves the staged file into the directory, makes it visible to the
+    /// Copies the staged file into the directory, makes it visible to the
     /// guest, and returns the bytes of the notice. A failure leaves no
-    /// handoff file.
+    /// handoff file; the staged file stays either way.
     func publish(_ file: URL, attachment: StagedImageAttachment, adopt: (String) -> Bool) throws -> [UInt8] {
         guard attachment.generation == generation else { throw ImageAttachmentFailure.sessionEnded }
         let notice = Self.notice(for: attachment)
         let destination = hostDirectory.appendingPathComponent(attachment.id)
         do {
-            try FileManager.default.moveItem(at: file, to: destination)
+            try FileManager.default.copyItem(at: file, to: destination)
         } catch {
             throw ImageAttachmentFailure.handoffFailed
         }
@@ -357,27 +360,62 @@ struct ImageAttachmentHandoff {
         try? FileManager.default.removeItem(at: hostDirectory.appendingPathComponent(attachment.id))
     }
 
+    /// Whether the receiver removed the handoff file of `attachment`.
+    func isTaken(_ attachment: StagedImageAttachment) -> Bool {
+        !FileManager.default.fileExists(atPath: hostDirectory.appendingPathComponent(attachment.id).path)
+    }
+
+    /// Waits up to `timeout` for the receiver to take `attachment`.
+    @MainActor
+    func waitUntilTaken(_ attachment: StagedImageAttachment, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !isTaken(attachment) {
+            guard Date() < deadline else { return false }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return true
+    }
+
+    /// Withdraws a handoff the receiver did not take, and the marker of that
+    /// receiver: it is no longer reading notices.
+    func retract(_ attachment: StagedImageAttachment) {
+        discard(attachment)
+        try? FileManager.default.removeItem(at: hostDirectory.appendingPathComponent(Self.readyMarker))
+    }
+
     /// Removes the handoffs of the session.
     func clear() {
         try? FileManager.default.removeItem(at: hostParent)
     }
 
-    /// The bracketed paste that announces `attachment`.
+    /// The bracketed paste that announces `attachment`, with sorted keys.
     static func notice(for attachment: StagedImageAttachment) -> [UInt8] {
-        let fields: [String: Any] = [
-            "generation": attachment.generation,
-            "id": attachment.id,
-            "source": attachment.source.rawValue,
-            "label": attachment.filename,
-            "media_type": attachment.mediaType,
-            "byte_len": attachment.byteCount,
-            "sha256": attachment.sha256,
-        ]
-        let json = (try? JSONSerialization.data(withJSONObject: fields,
-                                                options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
-        let text = Array(noticePrefix.utf8) + [UInt8](json)
+        let json = "{\"byte_len\":\(attachment.byteCount)"
+            + ",\"generation\":\(inertJSON(attachment.generation))"
+            + ",\"id\":\(inertJSON(attachment.id))"
+            + ",\"label\":\(inertJSON(attachment.filename))"
+            + ",\"media_type\":\(inertJSON(attachment.mediaType))"
+            + ",\"sha256\":\(inertJSON(attachment.sha256))"
+            + ",\"source\":\(inertJSON(attachment.source.rawValue))}"
+        let text = Array(noticePrefix.utf8) + Array(json.utf8)
         precondition(text.count <= maxNoticeBytes, "the notice outgrew its bound")
         return Array("\u{1b}[200~".utf8) + text + Array("\u{1b}[201~".utf8)
+    }
+
+    /// A JSON string whose literal characters are ASCII letters, digits,
+    /// `.`, `_`, `-`, and `/`; everything else is a `\u` escape. A notice
+    /// that lands in a shell holds no character the shell expands or runs.
+    static func inertJSON(_ value: String) -> String {
+        var json = "\""
+        for unit in value.utf16 {
+            switch unit {
+            case 0x30...0x39, 0x41...0x5A, 0x61...0x7A, 0x2D, 0x2E, 0x2F, 0x5F:
+                json.append(Character(Unicode.Scalar(UInt8(unit))))
+            default:
+                json += String(format: "\\u%04x", UInt32(unit))
+            }
+        }
+        return json + "\""
     }
 }
 

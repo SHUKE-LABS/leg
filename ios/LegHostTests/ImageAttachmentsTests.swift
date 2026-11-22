@@ -158,7 +158,7 @@ final class ImageAttachmentsTests: XCTestCase {
         }
         XCTAssertEqual(adopted.last, "/tmp/leghost-attachments/g1/\(staged.id)")
         XCTAssertEqual(try Data(contentsOf: handoff.hostDirectory.appendingPathComponent(staged.id)), png)
-        XCTAssertEqual(contents(of: generationDirectory(store)), [])
+        XCTAssertEqual(contents(of: generationDirectory(store)), [staged.id], "the host keeps its copy")
 
         let text = try XCTUnwrap(String(bytes: notice, encoding: .utf8))
         let start = "\u{1b}[200~leghost-attachment/v1 "
@@ -180,6 +180,13 @@ final class ImageAttachmentsTests: XCTestCase {
         XCTAssertFalse(text.contains(root.path), "the notice names a host path")
         XCTAssertFalse(text.contains("leghost-attachments"), "the notice names a guest path")
 
+        // A receiver that does not take the handoff gets no more notices.
+        XCTAssertFalse(handoff.isTaken(staged))
+        handoff.retract(staged)
+        XCTAssertTrue(handoff.isTaken(staged))
+        XCTAssertFalse(handoff.isReceiverReady)
+        XCTAssertEqual(contents(of: generationDirectory(store)), [staged.id])
+
         handoff.clear()
         XCTAssertFalse(FileManager.default.fileExists(atPath: handoff.hostParent.path))
     }
@@ -195,6 +202,37 @@ final class ImageAttachmentsTests: XCTestCase {
                        Array("\u{1b}[200~\(golden)\u{1b}[201~".utf8))
     }
 
+    /// A filename a shell would expand or run crosses only as `\u` escapes.
+    func testANoticeHoldsNothingAShellExpands() throws {
+        let hostile = #"$(id) `x`;|&<>*?[]~!"'\猫😀.png"#
+        let attachment = StagedImageAttachment(
+            id: "ios-00112233445566778899aabbccddeeff", generation: "0123456789abcdef", source: .files,
+            filename: hostile, mediaType: "image/png", byteCount: 70, sha256: pngSHA256)
+        let notice = ImageAttachmentHandoff.notice(for: attachment)
+        let pasted = try XCTUnwrap(String(bytes: notice.dropFirst(6).dropLast(6), encoding: .utf8))
+        let inert = CharacterSet(charactersIn: #"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-{}":,\ "#)
+        XCTAssertTrue(pasted.unicodeScalars.allSatisfy { inert.contains($0) }, pasted)
+        XCTAssertEqual(pasted.filter { $0 == " " }.count, 1, "only the prefix ends in a space")
+        let json = Data(pasted.dropFirst("leghost-attachment/v1 ".count).utf8)
+        let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: json) as? [String: Any])
+        XCTAssertEqual(fields["label"] as? String, hostile)
+    }
+
+    /// The image stays on the host until the receiver removes its handoff.
+    @MainActor
+    func testTheHostWaitsForTheReceiverToTakeAHandoff() async throws {
+        let handoff = ImageAttachmentHandoff(generation: "g1", activeRoot: root.appendingPathComponent("active"))
+        try handoff.prepare { _ in true }
+        let store = makeStore()
+        let staged = try store.stage(candidate(png), source: .photos, generation: "g1")
+        _ = try handoff.publish(store.fileURL(for: staged), attachment: staged) { _ in true }
+        let ignored = await handoff.waitUntilTaken(staged, timeout: 0.2)
+        XCTAssertFalse(ignored)
+        try FileManager.default.removeItem(at: handoff.hostDirectory.appendingPathComponent(staged.id))
+        let taken = await handoff.waitUntilTaken(staged, timeout: 0.2)
+        XCTAssertTrue(taken)
+    }
+
     func testAHandoffTheGuestCannotSeeLeavesNoFile() throws {
         let handoff = ImageAttachmentHandoff(generation: "g1", activeRoot: root.appendingPathComponent("active"))
         try handoff.prepare { _ in true }
@@ -204,6 +242,7 @@ final class ImageAttachmentsTests: XCTestCase {
             XCTAssertEqual($0 as? ImageAttachmentFailure, .handoffFailed)
         }
         XCTAssertEqual(contents(of: handoff.hostDirectory), [])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.fileURL(for: staged).path))
 
         let other = ImageAttachmentHandoff(generation: "g2", activeRoot: root.appendingPathComponent("other"))
         let foreign = try store.stage(candidate(png), source: .files, generation: "g1")

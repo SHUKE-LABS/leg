@@ -21,9 +21,9 @@ final class ImageAttachmentUITests: XCTestCase {
         app = nil
     }
 
-    /// Every source stages an image with its preview; one is handed to the
-    /// guest as an opaque notice, the guest reads the same bytes, and the
-    /// others are removed.
+    /// Every source stages an image with its preview. Without a live
+    /// receiver the images stay; one is handed to a receiver as an opaque
+    /// notice, the guest reads the same bytes, and the others are removed.
     func testImagesFromEverySourceReachTheGuestAsOpaqueNotices() {
         launchShell(["-leghost-reset", "-leghost-image-fixture", "png"])
         XCTAssertTrue(waitForState("attachments=0"))
@@ -42,26 +42,35 @@ final class ImageAttachmentUITests: XCTestCase {
         XCTAssertTrue(waitForText("cannot receive images"), "the missing receiver is not reported")
         XCTAssertTrue(waitForState("attachments=3"))
 
+        // A marker no live receiver stands behind: nothing takes the handoff,
+        // so the host retracts it with the marker and keeps the image.
+        GuestKeyboard.focus(app)
+        type(#": > "$LEG_HOST_ATTACHMENT_DIR/.receiver-v1"; echo STA''LE; cat -v"# + "\n")
+        XCTAssertTrue(waitForOutput("STALE"), "the shell did not leave a marker")
+        app.buttons["attachment-insert"].firstMatch.tap()
+        XCTAssertTrue(waitForText("did not take the image"), "the untaken handoff is not reported")
+        XCTAssertTrue(waitForState("attachments=3,handoffs=0"))
+        app.buttons["attachment-insert"].firstMatch.tap()
+        XCTAssertTrue(waitForText("cannot receive images"), "the stale marker still counts as a receiver")
+        app.buttons["guest-key-interrupt"].tap()
+
         app.buttons["attachment-remove"].firstMatch.tap()
         app.buttons["attachment-remove"].firstMatch.tap()
         XCTAssertTrue(waitForState("attachments=1"))
 
-        // The shell announces a receiver and echoes what reaches the terminal.
+        // The shell plays the receiver: it takes the file the notice names,
+        // in its own directory, then shows what reached the terminal.
         GuestKeyboard.focus(app)
-        type(#": > "$LEG_HOST_ATTACHMENT_DIR/.receiver-v1"; echo REA''DY; cat -v"# + "\n")
+        type(#"D=$LEG_HOST_ATTACHMENT_DIR; : > "$D/.receiver-v1"; echo REA''DY; "#
+            + #"until ls "$D" | grep -q ios-; do sleep 0.1; done; f=$(ls "$D" | grep ios-); "#
+            + #"sha256sum "$D/$f" | cut -c1-16 | sed 's/^/SH''A=/'; rm "$D/$f"; cat -v"# + "\n")
         XCTAssertTrue(waitForOutput("READY"), "the shell did not announce the receiver")
         app.buttons["attachment-insert"].firstMatch.tap()
-        XCTAssertTrue(waitForState("handoffs=1"), "the image was not handed over")
-        XCTAssertTrue(waitForState("attachments=0"))
+        XCTAssertTrue(waitForOutput("SHA=497790947d466676"), "the guest does not see the handed-over image")
+        XCTAssertTrue(waitForState("attachments=0,handoffs=1"), "the image was not handed over")
         XCTAssertTrue(waitForOutput("leghost-attachment/v1"), "the notice did not reach the terminal")
         XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Application Support"))
             .firstMatch.exists, "a host path reached the terminal")
-
-        // The guest reads the bytes the notice names, in its own directory.
-        app.buttons["guest-key-interrupt"].tap()
-        GuestKeyboard.focus(app)
-        type(#"sha256sum "$LEG_HOST_ATTACHMENT_DIR"/ios-* | cut -c1-16 | sed 's/^/SH''A=/'"# + "\n")
-        XCTAssertTrue(waitForOutput("SHA=497790947d466676"), "the guest does not see the handed-over image")
     }
 
     /// An image whose bytes do not match its type is refused with an

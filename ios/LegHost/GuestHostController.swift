@@ -541,6 +541,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     @Published private(set) var attachmentStatus = ""
     /// Whether a picker or a paste is reading an image.
     @Published private(set) var isAcquiringAttachment = false
+    /// The image whose handoff waits for the receiver.
+    @Published private(set) var insertingAttachment: String?
 
     /// The stable diagnostic the host shows when the guest runtime cannot run
     /// the guest program.
@@ -1598,6 +1600,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         attachmentHandoff?.clear()
         attachmentHandoff = nil
         isAcquiringAttachment = false
+        insertingAttachment = nil
         publishAttachments(status: "")
     }
 
@@ -1645,13 +1648,14 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     /// Hands a staged image to the guest program, which adds it to its draft
     /// at the cursor.
     ///
-    /// Only the notice crosses the terminal. An image the guest cannot take
-    /// now stays here when the guest has no receiver; any other failure
-    /// removes it, so no handoff file outlives the attempt.
+    /// Only the notice crosses the terminal, and only while a receiver
+    /// announces itself. The image stays here until the receiver takes its
+    /// handoff file; a handoff not taken in time is retracted with the
+    /// receiver marker, and the image waits for a receiver again.
     func insertAttachment(id: String) {
-        guard phase == .running, let store = attachmentStore,
+        guard phase == .running, insertingAttachment == nil, let store = attachmentStore,
               let attachment = store.pending.first(where: { $0.id == id }) else {
-            attachmentStatus = ImageAttachmentFailure.sessionEnded.message
+            if insertingAttachment == nil { attachmentStatus = ImageAttachmentFailure.sessionEnded.message }
             return
         }
         guard let handoff = attachmentHandoff, handoff.isReceiverReady else {
@@ -1661,7 +1665,6 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         do {
             let notice = try handoff.publish(store.fileURL(for: attachment), attachment: attachment,
                                              adopt: Self.adoptGuestTree)
-            store.release(id: id)
             let written = writeGuestInput(notice)
             guard written == notice.count else {
                 // A notice cut short still ends its paste, so the guest
@@ -1670,17 +1673,34 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                 handoff.discard(attachment)
                 throw ImageAttachmentFailure.handoffFailed
             }
-            state.handoffs += 1
-            publishAttachments(status: "Inserted \(attachment.label) into the draft.")
         } catch {
-            store.remove(id: id)
             publishAttachments(status: (error as? ImageAttachmentFailure ?? .handoffFailed).message)
+            return
+        }
+        insertingAttachment = id
+        let timeout = Self.handoffTimeout
+        Task { [weak self] in
+            let taken = await handoff.waitUntilTaken(attachment, timeout: timeout)
+            // A session that ended meanwhile already swept both sides.
+            guard let self, self.attachmentHandoff?.generation == handoff.generation else { return }
+            self.insertingAttachment = nil
+            if taken {
+                store.remove(id: id)
+                self.state.handoffs += 1
+                self.publishAttachments(status: "Handed \(attachment.label) to the guest program.")
+            } else {
+                handoff.retract(attachment)
+                self.publishAttachments(status: ImageAttachmentFailure.receiverGone.message)
+            }
         }
     }
 
+    /// How long the receiver has to take a handoff.
+    private static let handoffTimeout: TimeInterval = 3
+
     /// Removes a staged image and its file.
     func removeAttachment(id: String) {
-        guard let store = attachmentStore,
+        guard insertingAttachment != id, let store = attachmentStore,
               let attachment = store.pending.first(where: { $0.id == id }) else { return }
         store.remove(id: id)
         publishAttachments(status: "Removed \(attachment.label).")
