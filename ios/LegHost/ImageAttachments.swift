@@ -562,6 +562,8 @@ private final class PhotoPickerSession: NSObject, PHPickerViewControllerDelegate
         self.continuation = continuation
         retainedSelf = self
         picker.delegate = self
+        // Closing goes through Cancel, which reports back; a swipe may not.
+        picker.isModalInPresentation = true
         presenter.present(picker, animated: true)
     }
 

@@ -76,7 +76,7 @@ final class ImageAttachmentUITests: XCTestCase {
         XCTAssertFalse(app.buttons["attachment-insert"].exists)
 
         GuestKeyboard.focus(app)
-        type(#"echo COU''NT=$(ls -A "$LEG_HOST_ATTACHMENT_DIR" | wc -l | tr -d ' ')"# + "\n")
+        type(#"test -d "$LEG_HOST_ATTACHMENT_DIR" && echo COU''NT=$(ls -A "$LEG_HOST_ATTACHMENT_DIR" | wc -l | tr -d ' ')"# + "\n")
         XCTAssertTrue(waitForOutput("COUNT=0"), "a refused image reached the guest")
     }
 

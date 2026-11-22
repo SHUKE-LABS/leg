@@ -1625,7 +1625,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             } catch {
                 outcome = .failure(error)
             }
-            guard let self else { return }
+            // A pick that outlived its session leaves the next one alone.
+            guard let self, self.attachmentStore?.generation == generation else { return }
             self.isAcquiringAttachment = false
             do {
                 let candidate = try outcome.get()
@@ -1661,7 +1662,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             let notice = try handoff.publish(store.fileURL(for: attachment), attachment: attachment,
                                              adopt: Self.adoptGuestTree)
             store.release(id: id)
-            guard writeGuestInput(notice) else {
+            let written = writeGuestInput(notice)
+            guard written == notice.count else {
+                // A notice cut short still ends its paste, so the guest
+                // refuses it and takes the keys that follow as keys.
+                if written > Self.pasteStart.count { _ = writeGuestInput(Self.pasteEnd) }
                 handoff.discard(attachment)
                 throw ImageAttachmentFailure.handoffFailed
             }
@@ -1690,16 +1695,19 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     }
 
     /// Makes a tree the host wrote visible to the guest.
-    private static func adoptGuestTree(_ path: String) -> Bool {
+    nonisolated private static func adoptGuestTree(_ path: String) -> Bool {
         path.withCString { guest_runtime_adopt_host_tree($0) } == 0
     }
 
-    /// Writes `bytes` to the guest terminal in full.
+    private static let pasteStart = Array("\u{1b}[200~".utf8)
+    private static let pasteEnd = Array("\u{1b}[201~".utf8)
+
+    /// Writes `bytes` to the guest terminal and returns how many it took.
     ///
     /// The input buffer of the terminal is bounded, so a write the guest has
     /// not read yet is retried for a short while. Nothing of the bytes is
     /// logged.
-    private func writeGuestInput(_ bytes: [UInt8]) -> Bool {
+    private func writeGuestInput(_ bytes: [UInt8]) -> Int {
         var offset = 0
         var attempts = 0
         while offset < bytes.count {
@@ -1712,10 +1720,10 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             }
             attempts += 1
             // -11 is the guest's EAGAIN: the input buffer is full.
-            guard written == 0 || written == -11, attempts < 50 else { return false }
+            guard written == 0 || written == -11, attempts < 50 else { return offset }
             usleep(10_000)
         }
-        return true
+        return offset
     }
 
     // MARK: - Environment

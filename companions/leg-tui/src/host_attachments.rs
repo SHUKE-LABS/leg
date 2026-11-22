@@ -229,6 +229,26 @@ pub(crate) mod tests {
         )
     }
 
+    /// The notice as the iOS host writes it, byte for byte; LegHost asserts
+    /// the same text in `testTheNoticeMatchesTheReceiverContract`.
+    #[test]
+    fn the_ios_host_notice_parses() {
+        let golden = r#"leghost-attachment/v1 {"byte_len":70,"generation":"0123456789abcdef","id":"ios-00112233445566778899aabbccddeeff","label":"IMG_0001.png","media_type":"image/png","sha256":"497790947d4666760ce38f3c00e852c71fdb66cae849bae8e9ede352719e1581","source":"photos"}"#;
+        assert_eq!(
+            parse_notice(golden),
+            Some(Ok(HostNotice {
+                generation: "0123456789abcdef".to_string(),
+                id: "ios-00112233445566778899aabbccddeeff".to_string(),
+                source: "photos",
+                label: "IMG_0001.png".to_string(),
+                media_type: "image/png".to_string(),
+                byte_len: 70,
+                sha256: "497790947d4666760ce38f3c00e852c71fdb66cae849bae8e9ede352719e1581"
+                    .to_string(),
+            }))
+        );
+    }
+
     #[test]
     fn ordinary_text_is_not_a_notice() {
         assert_eq!(parse_notice("hello"), None);

@@ -184,6 +184,17 @@ final class ImageAttachmentsTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: handoff.hostParent.path))
     }
 
+    /// The notice byte for byte; `leg-tui` parses the same text in
+    /// `host_attachments::tests::the_ios_host_notice_parses`.
+    func testTheNoticeMatchesTheReceiverContract() throws {
+        let attachment = StagedImageAttachment(
+            id: "ios-00112233445566778899aabbccddeeff", generation: "0123456789abcdef", source: .photos,
+            filename: "IMG_0001.png", mediaType: "image/png", byteCount: 70, sha256: pngSHA256)
+        let golden = #"leghost-attachment/v1 {"byte_len":70,"generation":"0123456789abcdef","id":"ios-00112233445566778899aabbccddeeff","label":"IMG_0001.png","media_type":"image/png","sha256":"497790947d4666760ce38f3c00e852c71fdb66cae849bae8e9ede352719e1581","source":"photos"}"#
+        XCTAssertEqual(ImageAttachmentHandoff.notice(for: attachment),
+                       Array("\u{1b}[200~\(golden)\u{1b}[201~".utf8))
+    }
+
     func testAHandoffTheGuestCannotSeeLeavesNoFile() throws {
         let handoff = ImageAttachmentHandoff(generation: "g1", activeRoot: root.appendingPathComponent("active"))
         try handoff.prepare { _ in true }
