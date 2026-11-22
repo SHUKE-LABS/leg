@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import WebKit
 
 /// The phases the guest host goes through.
@@ -128,6 +129,12 @@ struct HostLaunchOptions {
     /// Whether DEBUG should replace the Shortcuts confirmation and opener with
     /// the deterministic callback fixture used by the guest bridge UI test.
     var shortcutsFixture = false
+    /// The scenario the image sources answer with instead of Photos, Files
+    /// and the pasteboard.
+    ///
+    /// The control is DEBUG-only: the simulator tests cannot drive the
+    /// system pickers.
+    var imageFixture: FixtureImageAttachmentSources.Scenario?
 
     /// The guest program the host runs.
     static let defaultProgram = "/usr/local/bin/leg-tui"
@@ -215,6 +222,11 @@ struct HostLaunchOptions {
                 options.interruptAfterRequest = true
             case "-leghost-shortcuts-fixture":
                 options.shortcutsFixture = true
+            case "-leghost-image-fixture":
+                if index + 1 < arguments.count {
+                    options.imageFixture = FixtureImageAttachmentSources.Scenario(rawValue: arguments[index + 1])
+                    consumed = 2
+                }
             case "-leghost-bridge-off":
                 options.bridgeOff = true
             case "-leghost-bridge-endpoint-failure":
@@ -280,6 +292,10 @@ struct HostState: Equatable {
     /// The number of stale socket directories the last listener start
     /// removed from the socket root.
     var swept = 0
+    /// The number of images staged and waiting to be inserted.
+    var attachments = 0
+    /// The number of images handed to the guest in this run.
+    var handoffs = 0
 
     /// The state as the tests read it.
     var summary: String {
@@ -290,7 +306,8 @@ struct HostState: Equatable {
             + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
             + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),"
             + "reply_statuses=\(bridgeReplyStatuses.joined(separator: ",")),skill=\(skill),"
-            + "sockets=\(sockets),swept=\(swept),endpoint=\(endpoint)"
+            + "sockets=\(sockets),swept=\(swept),endpoint=\(endpoint),"
+            + "attachments=\(attachments),handoffs=\(handoffs)"
     }
 }
 
@@ -515,6 +532,15 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     @Published private(set) var terminalSize = GuestTerminalSize()
     /// What the host did in this run.
     @Published private(set) var state = HostState()
+    /// The images staged for the running session, in the order they were
+    /// picked.
+    @Published private(set) var attachments: [StagedImageAttachment] = []
+    /// The small previews of the staged images, by id.
+    @Published private(set) var attachmentPreviews: [String: UIImage] = [:]
+    /// What the last image action did, or what to do next.
+    @Published private(set) var attachmentStatus = ""
+    /// Whether a picker or a paste is reading an image.
+    @Published private(set) var isAcquiringAttachment = false
 
     /// The stable diagnostic the host shows when the guest runtime cannot run
     /// the guest program.
@@ -623,6 +649,20 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
     private var exitContext: GuestExitContext?
     /// The capability bridge listener of the running session.
     private var bridgeListener: BridgeListener?
+    /// The staging of the images picked for the running session.
+    private var attachmentStore: ImageAttachmentStore?
+    /// The guest directory the images of the running session are handed
+    /// through; nil when the session has none.
+    private var attachmentHandoff: ImageAttachmentHandoff?
+    /// Where images are read from.
+    private lazy var attachmentSources: ImageAttachmentSources = {
+        #if DEBUG
+        if let scenario = options.imageFixture {
+            return FixtureImageAttachmentSources(scenario: scenario)
+        }
+        #endif
+        return LiveImageAttachmentSources(documents: LiveDocumentPresenter())
+    }()
 
     /// The environment every guest session gets.
     private static let baseEnvironment = [
@@ -905,6 +945,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         do {
             try startBridge()
             installBundledSkill()
+            beginAttachments()
             try await startSession()
             state.sessions += 1
             state.guestTasks = Int(guest_runtime_running_tasks())
@@ -974,6 +1015,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // The guest stopped, and the runtime removed the guest endpoint with
         // it: the mapping, the socket and the staging of the session go now.
         await stopBridge()
+        endAttachments()
 
         guard pumpStopped, guestStopped else {
             let reason = pumpStopped
@@ -1530,6 +1572,152 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         }
     }
 
+    // MARK: - Image attachments
+
+    /// Starts the image staging and the guest handoff directory of a new
+    /// session.
+    ///
+    /// Both sweep what an earlier session, a crash or a termination left
+    /// behind. A handoff directory that cannot be made leaves the session
+    /// without a receiver: the guest gets no variable and images stay here.
+    private func beginAttachments() {
+        let generation = ImageAttachmentStore.newGeneration()
+        if attachmentStore == nil, let root = try? ImageAttachmentStore.defaultRoot() {
+            attachmentStore = ImageAttachmentStore(root: root)
+        }
+        attachmentStore?.begin(generation: generation)
+        let handoff = ImageAttachmentHandoff(generation: generation,
+                                             activeRoot: URL(fileURLWithPath: activeRoot, isDirectory: true))
+        attachmentHandoff = (try? handoff.prepare(adopt: Self.adoptGuestTree)) == nil ? nil : handoff
+        publishAttachments(status: "")
+    }
+
+    /// Removes the staged images and the handoffs of the session that ended.
+    private func endAttachments() {
+        attachmentStore?.end()
+        attachmentHandoff?.clear()
+        attachmentHandoff = nil
+        isAcquiringAttachment = false
+        publishAttachments(status: "")
+    }
+
+    /// Reads one image from `source` and stages it for the running session.
+    ///
+    /// The draft of the guest is not touched: the image waits here with its
+    /// preview until it is inserted or removed. A cancelled or failed read
+    /// stages nothing.
+    func attachImage(from source: ImageAttachmentSource) {
+        guard phase == .running, !isAcquiringAttachment,
+              let store = attachmentStore, let generation = store.generation else {
+            if !isAcquiringAttachment { attachmentStatus = ImageAttachmentFailure.sessionEnded.message }
+            return
+        }
+        isAcquiringAttachment = true
+        let sources = attachmentSources
+        Task { [weak self] in
+            let outcome: Result<ImageAttachmentCandidate, Error>
+            do {
+                switch source {
+                case .photos: outcome = .success(try await sources.pickPhoto())
+                case .files: outcome = .success(try await sources.pickFile())
+                case .pasteboard: outcome = .success(try sources.readPasteboard())
+                }
+            } catch {
+                outcome = .failure(error)
+            }
+            guard let self else { return }
+            self.isAcquiringAttachment = false
+            do {
+                let candidate = try outcome.get()
+                // A session that ended while the picker was up does not
+                // take the image: the store refuses its generation.
+                let staged = try store.stage(candidate, source: source, generation: generation)
+                self.attachmentPreviews[staged.id] = UIImage(data: candidate.data)?
+                    .preparingThumbnail(of: CGSize(width: 64, height: 64))
+                self.publishAttachments(status: "\(staged.label) is ready to insert.")
+            } catch {
+                self.publishAttachments(status: (error as? ImageAttachmentFailure ?? .unreadable).message)
+            }
+        }
+    }
+
+    /// Hands a staged image to the guest program, which adds it to its draft
+    /// at the cursor.
+    ///
+    /// Only the notice crosses the terminal. An image the guest cannot take
+    /// now stays here when the guest has no receiver; any other failure
+    /// removes it, so no handoff file outlives the attempt.
+    func insertAttachment(id: String) {
+        guard phase == .running, let store = attachmentStore,
+              let attachment = store.pending.first(where: { $0.id == id }) else {
+            attachmentStatus = ImageAttachmentFailure.sessionEnded.message
+            return
+        }
+        guard let handoff = attachmentHandoff, handoff.isReceiverReady else {
+            attachmentStatus = ImageAttachmentFailure.receiverUnavailable.message
+            return
+        }
+        do {
+            let notice = try handoff.publish(store.fileURL(for: attachment), attachment: attachment,
+                                             adopt: Self.adoptGuestTree)
+            store.release(id: id)
+            guard writeGuestInput(notice) else {
+                handoff.discard(attachment)
+                throw ImageAttachmentFailure.handoffFailed
+            }
+            state.handoffs += 1
+            publishAttachments(status: "Inserted \(attachment.label) into the draft.")
+        } catch {
+            store.remove(id: id)
+            publishAttachments(status: (error as? ImageAttachmentFailure ?? .handoffFailed).message)
+        }
+    }
+
+    /// Removes a staged image and its file.
+    func removeAttachment(id: String) {
+        guard let store = attachmentStore,
+              let attachment = store.pending.first(where: { $0.id == id }) else { return }
+        store.remove(id: id)
+        publishAttachments(status: "Removed \(attachment.label).")
+    }
+
+    private func publishAttachments(status: String) {
+        let pending = attachmentStore?.pending ?? []
+        attachments = pending
+        attachmentPreviews = attachmentPreviews.filter { id, _ in pending.contains { $0.id == id } }
+        attachmentStatus = status
+        state.attachments = pending.count
+    }
+
+    /// Makes a tree the host wrote visible to the guest.
+    private static func adoptGuestTree(_ path: String) -> Bool {
+        path.withCString { guest_runtime_adopt_host_tree($0) } == 0
+    }
+
+    /// Writes `bytes` to the guest terminal in full.
+    ///
+    /// The input buffer of the terminal is bounded, so a write the guest has
+    /// not read yet is retried for a short while. Nothing of the bytes is
+    /// logged.
+    private func writeGuestInput(_ bytes: [UInt8]) -> Bool {
+        var offset = 0
+        var attempts = 0
+        while offset < bytes.count {
+            let written = bytes[offset...].withUnsafeBytes { raw in
+                guest_runtime_write_input(raw.baseAddress, raw.count)
+            }
+            if written > 0 {
+                offset += Int(written)
+                continue
+            }
+            attempts += 1
+            // -11 is the guest's EAGAIN: the input buffer is full.
+            guard written == 0 || written == -11, attempts < 50 else { return false }
+            usleep(10_000)
+        }
+        return true
+    }
+
     // MARK: - Environment
 
     /// The arguments the guest program runs with.
@@ -1566,14 +1754,16 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         let bridge = bridgeListener == nil
             ? []
             : ["\(BridgeListener.environmentVariable)=\(BridgeListener.guestEndpoint)"]
-        guard let configuration else { return Self.baseEnvironment + bridge }
+        // The guest names the handoff directory by its guest path only.
+        let attachments = attachmentHandoff.map { [$0.environment] } ?? []
+        guard let configuration else { return Self.baseEnvironment + bridge + attachments }
         let isFixture = options.fixtureScenario != nil
         let baseURL = fixture?.baseURL ?? configuration.baseURL
         let model = isFixture ? ProviderConfigurationStore.fixtureModel : configuration.model
         let window = isFixture
             ? ProviderConfigurationStore.fixtureContextWindowTokens
             : configuration.contextWindowTokens
-        var environment = Self.baseEnvironment + bridge
+        var environment = Self.baseEnvironment + bridge + attachments
         environment.append("LEG_PROVIDER=\(configuration.provider.rawValue)")
         environment.append("ANTHROPIC_API_KEY=\(configuration.apiKey)")
         environment.append("ANTHROPIC_BASE_URL=\(baseURL)")

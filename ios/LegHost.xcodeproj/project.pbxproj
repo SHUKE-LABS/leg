@@ -54,6 +54,9 @@
 		GG11GG11GG11GG11GG11008A /* GuestSkillInstallerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000A /* GuestSkillInstallerTests.swift */; };
 		GG11GG11GG11GG11GG11008B /* BridgeCapabilityUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000B /* BridgeCapabilityUITests.swift */; };
 		GG11GG11GG11GG11GG11008C /* SkillRelaunchUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000C /* SkillRelaunchUITests.swift */; };
+		HH11HH11HH11HH11HH110081 /* ImageAttachments.swift in Sources */ = {isa = PBXBuildFile; fileRef = HH11HH11HH11HH11HH110001 /* ImageAttachments.swift */; };
+		HH11HH11HH11HH11HH110082 /* ImageAttachmentsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = HH11HH11HH11HH11HH110002 /* ImageAttachmentsTests.swift */; };
+		HH11HH11HH11HH11HH110083 /* ImageAttachmentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = HH11HH11HH11HH11HH110003 /* ImageAttachmentUITests.swift */; };
 		GG11GG11GG11GG11GG11008D /* skills in Resources */ = {isa = PBXBuildFile; fileRef = GG11GG11GG11GG11GG11000D /* skills */; };
 /* End PBXBuildFile section */
 
@@ -127,6 +130,9 @@
 		GG11GG11GG11GG11GG11000A /* GuestSkillInstallerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestSkillInstallerTests.swift; sourceTree = "<group>"; };
 		GG11GG11GG11GG11GG11000B /* BridgeCapabilityUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCapabilityUITests.swift; sourceTree = "<group>"; };
 		GG11GG11GG11GG11GG11000C /* SkillRelaunchUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkillRelaunchUITests.swift; sourceTree = "<group>"; };
+		HH11HH11HH11HH11HH110001 /* ImageAttachments.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageAttachments.swift; sourceTree = "<group>"; };
+		HH11HH11HH11HH11HH110002 /* ImageAttachmentsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageAttachmentsTests.swift; sourceTree = "<group>"; };
+		HH11HH11HH11HH11HH110003 /* ImageAttachmentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageAttachmentUITests.swift; sourceTree = "<group>"; };
 		GG11GG11GG11GG11GG11000D /* skills */ = {isa = PBXFileReference; lastKnownFileType = folder; path = skills; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -179,6 +185,7 @@
 				CC11CC11CC11CC11CC110010 /* LegHostUITests.swift */,
 				GG11GG11GG11GG11GG11000B /* BridgeCapabilityUITests.swift */,
 				GG11GG11GG11GG11GG11000C /* SkillRelaunchUITests.swift */,
+				HH11HH11HH11HH11HH110003 /* ImageAttachmentUITests.swift */,
 			);
 			path = LegHostUITests;
 			sourceTree = "<group>";
@@ -195,6 +202,7 @@
 				GG11GG11GG11GG11GG110008 /* PhotosAdapterTests.swift */,
 				GG11GG11GG11GG11GG110009 /* FilesAdapterTests.swift */,
 				GG11GG11GG11GG11GG11000A /* GuestSkillInstallerTests.swift */,
+				HH11HH11HH11HH11HH110002 /* ImageAttachmentsTests.swift */,
 				FF11FF11FF11FF11FF110003 /* LegHostTests-Bridging-Header.h */,
 			);
 			path = LegHostTests;
@@ -222,6 +230,7 @@
 				GG11GG11GG11GG11GG110003 /* PhotosAdapter.swift */,
 				GG11GG11GG11GG11GG110004 /* FilesAdapter.swift */,
 				GG11GG11GG11GG11GG110005 /* GuestSkillInstaller.swift */,
+				HH11HH11HH11HH11HH110001 /* ImageAttachments.swift */,
 				BB11BB11BB11BB11BB110001 /* Sha256.c */,
 				BB11BB11BB11BB11BB110002 /* GuestProvision.c */,
 				BB11BB11BB11BB11BB110003 /* GuestRuntime.c */,
@@ -497,6 +506,7 @@
 				GG11GG11GG11GG11GG110083 /* PhotosAdapter.swift in Sources */,
 				GG11GG11GG11GG11GG110084 /* FilesAdapter.swift in Sources */,
 				GG11GG11GG11GG11GG110085 /* GuestSkillInstaller.swift in Sources */,
+				HH11HH11HH11HH11HH110081 /* ImageAttachments.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -507,6 +517,7 @@
 				CC11CC11CC11CC11CC110001 /* LegHostUITests.swift in Sources */,
 				GG11GG11GG11GG11GG11008B /* BridgeCapabilityUITests.swift in Sources */,
 				GG11GG11GG11GG11GG11008C /* SkillRelaunchUITests.swift in Sources */,
+				HH11HH11HH11HH11HH110083 /* ImageAttachmentUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -523,6 +534,7 @@
 				GG11GG11GG11GG11GG110088 /* PhotosAdapterTests.swift in Sources */,
 				GG11GG11GG11GG11GG110089 /* FilesAdapterTests.swift in Sources */,
 				GG11GG11GG11GG11GG11008A /* GuestSkillInstallerTests.swift in Sources */,
+				HH11HH11HH11HH11HH110082 /* ImageAttachmentsTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
