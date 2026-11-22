@@ -275,8 +275,12 @@ capability, and the same input.
 
 The bridge talks to the host over one fixed transport — a Unix socket named
 by `LEG_BRIDGE_HOST_SOCKET` — and answers `unavailable` when the host
-configured none. It adds no tool to the desktop registry and changes no
-Skills contract: the host owns the permission prompt, the dispatch, the
+configured none. On iOS the host binds that socket per session below an
+app-owned socket root, sweeps the stale sockets of a killed host first, and
+tears it down at every stop, failed start, and background (see [the iOS
+host](docs/capability-bridge.md#the-ios-host) for the order and the
+simulator test commands). It adds no tool to the desktop registry and
+changes no Skills contract: the host owns the permission prompt, the dispatch, the
 cancellation, and the user confirmation. The [capability bridge
 contract](docs/capability-bridge.md) defines the schemas, the capability
 names, the approval semantics, the limits, the audit summary, and the rule a
