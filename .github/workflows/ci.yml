@@ -611,7 +611,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ios-bridge-lifecycle-${{ matrix.shard }}-xcresult-${{ github.sha }}
-          path: build/dd/Logs/Test/*.xcresult
+          path: |
+            build/dd/Logs/Test/*.xcresult
+            ~/Library/Logs/DiagnosticReports/LegHost*
           if-no-files-found: warn
           retention-days: 14
 

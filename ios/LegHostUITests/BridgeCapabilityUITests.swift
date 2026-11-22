@@ -255,12 +255,13 @@ final class BridgeCapabilityUITests: XCTestCase {
         return found
     }
 
-    /// Prints the state, the status and the text on the screen to the log
-    /// of the run.
+    /// Prints the element tree, with the state, the status and the terminal
+    /// text, to the log of the run. One snapshot, so a screen that changes
+    /// meanwhile cannot fail the report.
     private func report(_ failure: String) {
-        let labels = app.staticTexts.allElementsBoundByIndex.map(\.label).filter { !$0.isEmpty }
-        print("[BridgeCapabilityUITests] \(failure); app state \(app.state.rawValue); texts:\n"
-            + labels.joined(separator: "\n"))
+        let running = app.state == .runningForeground || app.state == .runningBackground
+        print("[BridgeCapabilityUITests] \(failure); app state \(app.state.rawValue)"
+            + (running ? "\n" + app.debugDescription : "; the app is not running"))
     }
 
     private func waitForStatus(_ text: String, timeout: TimeInterval = 300) -> Bool {
