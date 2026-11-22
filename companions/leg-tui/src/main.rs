@@ -1,5 +1,6 @@
 mod attachments;
 mod editor;
+mod host_attachments;
 mod sanitize;
 mod transcript;
 
@@ -31,6 +32,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use editor::{ComposerEditor, normalize_paste};
+use host_attachments::HostAttachmentInbox;
 use leg_ui_client::{
     AttachmentRef, CatalogRunState, CatalogSession, CatalogTurn, ContentBlock, DirectoryAddition,
     DraftBlock, DraftImage, ImageSource, RetryIntent, SessionCatalog, SessionCatalogConfig,
@@ -158,6 +160,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         ..SessionCatalogConfig::default()
     })?;
     let mut app = App::new(catalog);
+    app.host_attachments = HostAttachmentInbox::from_env();
     app.refresh_sessions();
     app.open_initial_screen(resolve_launch_directory(env::current_dir()));
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -475,6 +478,8 @@ struct App {
     stop_picker_index: usize,
     attachment_chooser: Option<usize>,
     clipboard: Box<dyn ClipboardImageSource>,
+    /// The native host's image handoff, when the host named one.
+    host_attachments: Option<HostAttachmentInbox>,
     quit: bool,
     exit_after_turn: bool,
     render_counters: RenderCounters,
@@ -968,6 +973,7 @@ impl App {
             stop_picker_index: 0,
             attachment_chooser: None,
             clipboard: Box::new(NativeClipboard),
+            host_attachments: None,
             quit: false,
             exit_after_turn: false,
             render_counters: RenderCounters::default(),
@@ -1588,6 +1594,39 @@ impl App {
         }
     }
 
+    /// Attaches an image the native host announced at the composer cursor.
+    /// A notice never becomes prompt text: when the composer cannot take the
+    /// image, its handoff file is discarded and the status says why.
+    fn attach_host_image(&mut self, notice: Result<host_attachments::HostNotice, String>) {
+        let notice = match notice {
+            Ok(notice) => notice,
+            Err(message) => {
+                self.set_blocking_status(message);
+                return;
+            }
+        };
+        let blocked = if self.screen != Screen::Conversation
+            || self.show_help
+            || self.palette.is_some()
+            || self.retry_confirmation.is_some()
+            || self.attachment_chooser.is_some()
+        {
+            Some("Close the open dialog first.".to_string())
+        } else {
+            self.action_disabled_reason(PaletteAction::AttachImage)
+        };
+        let Some(inbox) = self.host_attachments.as_ref() else {
+            return;
+        };
+        if let Some(reason) = blocked {
+            inbox.discard(&notice);
+            self.set_blocking_status(format!("Image not attached: {reason}"));
+            return;
+        }
+        let acquired = inbox.take(&notice);
+        self.attach_acquired_image(acquired);
+    }
+
     fn paste_clipboard_image(&mut self) {
         if self.current_record_id().is_none() {
             self.set_blocking_status("Choose a workspace before attaching an image");
@@ -1629,6 +1668,18 @@ impl App {
                 return;
             }
         };
+        if image
+            .expected_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != staged.attachment.sha256)
+        {
+            let _ = self.catalog.discard_draft_image(&staged.attachment);
+            self.set_blocking_status(format!(
+                "{}: changed during the handoff; attach it again",
+                staged.label
+            ));
+            return;
+        }
         let Some(marker) = self.register_draft_image(staged.clone()) else {
             let _ = self.catalog.discard_draft_image(&staged.attachment);
             self.set_blocking_status("This draft cannot hold more images");
@@ -2899,6 +2950,12 @@ impl App {
     }
 
     fn handle_paste(&mut self, pasted: &str) {
+        if self.host_attachments.is_some()
+            && let Some(notice) = host_attachments::parse_notice(pasted)
+        {
+            self.attach_host_image(notice);
+            return;
+        }
         if let Some(palette) = self.palette.as_mut() {
             palette.query.push_str(&normalize_paste(pasted));
             palette.selected = 0;
@@ -6864,6 +6921,7 @@ mod image_draft_tests {
     use serde_json::json;
 
     use super::attachments::{ClipboardError, ClipboardImageSource};
+    use super::host_attachments::tests::notice_text;
     use super::{
         App, ConversationState, PaletteAction, Screen, SessionCatalog, SessionCatalogConfig,
         TranscriptTurn, TurnStatus, ViewSubmission, draw_terminal,
@@ -7450,6 +7508,175 @@ mod image_draft_tests {
         );
         assert!(!turn.retryable());
         assert!(!turn.searchable_text().contains("iVBORw0KGgp"));
+    }
+
+    /// A host handoff directory with the receiver open on it.
+    fn host_inbox(fixture: &mut Fixture, generation: &str) -> PathBuf {
+        let directory = fixture.root.join("handoff").join(generation);
+        std::fs::create_dir_all(&directory).unwrap();
+        fixture.app.host_attachments =
+            Some(super::HostAttachmentInbox::open(directory.clone()).unwrap());
+        directory
+    }
+
+    fn sha256_of(app: &App, bytes: &[u8]) -> String {
+        let probe = app
+            .catalog
+            .stage_draft_image(bytes, None, "probe", &[])
+            .unwrap();
+        app.catalog.discard_draft_image(&probe.attachment).unwrap();
+        probe.attachment.sha256
+    }
+
+    fn handoff_files(directory: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_host_handoff_builds_an_ordered_text_image_text_draft() {
+        let mut fixture = fixture("host-handoff");
+        let directory = host_inbox(&mut fixture, "gen-a");
+        std::fs::write(directory.join("ios-1"), PNG).unwrap();
+        let sha = sha256_of(&fixture.app, PNG);
+        let app = &mut fixture.app;
+
+        app.handle_paste("before ");
+        app.handle_paste(&notice_text("gen-a", "ios-1", PNG, &sha));
+        assert_eq!(
+            app.status,
+            "Attached Photos · IMG_0001.png · image/png · 11 B"
+        );
+        app.handle_paste(" after");
+
+        let blocks = app.draft_blocks();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], DraftBlock::text("before "));
+        assert_eq!(blocks[2], DraftBlock::text(" after"));
+        let image = draft_images(&blocks).next().unwrap();
+        assert_eq!(image.attachment.sha256, sha);
+        assert_eq!(image.attachment.media_type, "image/png");
+        assert_eq!(image.attachment.byte_len, PNG.len() as u64);
+        assert_eq!(image.label, "Photos · IMG_0001.png");
+        // The handoff is taken once: its file is gone, the catalog owns a copy.
+        assert_eq!(
+            handoff_files(&directory),
+            [super::host_attachments::READY_MARKER]
+        );
+        assert_eq!(staged_count(app), 1);
+
+        // The same bytes attached any other way have the same send identity.
+        std::fs::write(fixture.workspace.join("IMG_0001.png"), PNG).unwrap();
+        let app = &mut fixture.app;
+        let handed_off = draft_fingerprint(&blocks);
+        app.composer.set_text(String::new());
+        app.draft_images.clear();
+        app.handle_paste("before ");
+        attach_file(app, "IMG_0001.png");
+        app.handle_paste(" after");
+        assert_eq!(draft_fingerprint(&app.draft_blocks()), handed_off);
+
+        let screen = rendered(app);
+        let handoff = directory.to_string_lossy().to_string();
+        assert!(!screen.contains(&handoff), "{screen}");
+        assert!(!screen.contains("leghost-attachment"), "{screen}");
+    }
+
+    #[test]
+    fn host_handoffs_that_cannot_attach_leave_no_bytes_and_no_text() {
+        let mut fixture = fixture("host-reject");
+        let directory = host_inbox(&mut fixture, "gen-b");
+        let sha = sha256_of(&fixture.app, PNG);
+        let marker = super::host_attachments::READY_MARKER;
+
+        for (generation, id, contents, digest, expected) in [
+            (
+                "gen-old",
+                "ios-stale",
+                PNG,
+                sha.clone(),
+                "Photos · IMG_0001.png: belongs to an earlier host session; attach it again",
+            ),
+            (
+                "gen-b",
+                "ios-changed",
+                PNG,
+                "0".repeat(64),
+                "Photos · IMG_0001.png: changed during the handoff; attach it again",
+            ),
+            (
+                "gen-b",
+                "ios-text",
+                b"plain text".as_slice(),
+                sha.clone(),
+                "Photos · IMG_0001.png: not a supported JPEG, PNG, GIF, or WebP image",
+            ),
+            (
+                "gen-b",
+                "ios-jpeg",
+                JPEG,
+                sha.clone(),
+                "Photos · IMG_0001.png: named as image/png but the bytes are image/jpeg",
+            ),
+        ] {
+            std::fs::write(directory.join(id), contents).unwrap();
+            let app = &mut fixture.app;
+            app.handle_paste(&notice_text(generation, id, contents, &digest));
+            assert_eq!(app.status, expected);
+            assert!(app.status_is_blocking());
+            if generation == "gen-b" {
+                assert!(!directory.join(id).exists(), "{id} is consumed");
+            } else {
+                std::fs::remove_file(directory.join(id)).unwrap();
+            }
+        }
+        let app = &mut fixture.app;
+        app.handle_paste(&notice_text("gen-b", "ios-missing", PNG, &sha));
+        assert_eq!(
+            app.status,
+            "Photos · IMG_0001.png: is no longer available; attach it again"
+        );
+        app.handle_paste("leghost-attachment/v1 {broken");
+        assert_eq!(
+            app.status,
+            "The host sent an image notice this program cannot read"
+        );
+
+        // An open dialog does not take the image; its handoff is discarded.
+        std::fs::write(directory.join("ios-palette"), PNG).unwrap();
+        let app = &mut fixture.app;
+        app.palette = Some(super::PaletteState {
+            query: String::new(),
+            selected: 0,
+            notice: None,
+        });
+        app.handle_paste(&notice_text("gen-b", "ios-palette", PNG, &sha));
+        assert_eq!(
+            app.status,
+            "Image not attached: Close the open dialog first."
+        );
+        assert_eq!(app.palette.as_ref().unwrap().query, "");
+        app.palette = None;
+
+        assert_eq!(handoff_files(&directory), [marker]);
+        assert_eq!(staged_count(app), 0);
+        assert!(app.draft_blocks().iter().all(|block| match block {
+            DraftBlock::Text { text } => !text.contains("leghost"),
+            DraftBlock::Image(_) => false,
+        }));
+    }
+
+    #[test]
+    fn without_a_host_receiver_a_notice_paste_stays_text() {
+        let mut fixture = fixture("host-none");
+        let app = &mut fixture.app;
+        let text = notice_text("gen-c", "ios-1", PNG, &"a".repeat(64));
+        app.handle_paste(&text);
+        assert_eq!(app.draft_blocks(), [DraftBlock::text(text)]);
     }
 }
 
