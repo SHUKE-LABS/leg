@@ -786,10 +786,8 @@ offers the composer. The simulator test
 1. types `/tmp` and presses Enter to select the workspace,
 2. presses Enter to acknowledge the first-run warning, when it is shown,
 3. types `IOS_FIXTURE_TURN`,
-4. presses the send control (`ctrl-s`) the host offers above the terminal.
-
-The send control is on the screen because the software keyboard cannot send
-the key the guest TUI submits the composer with.
+4. presses the send control (`send`, Enter) the host offers above the
+   terminal.
 
 The host names the two programs of the pinned bundle to the guest program
 (`--leg-bin` and `--supervisor-bin`). The guest program would otherwise find

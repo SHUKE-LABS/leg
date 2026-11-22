@@ -42,8 +42,8 @@ enum GuestTerminalKey {
     static let left = "\u{1b}[D"
     /// The interrupt.
     static let interrupt = "\u{3}"
-    /// The send. The guest TUI submits the composer with it.
-    static let submit = "\u{13}"
+    /// The send: the guest TUI submits the composer with Enter.
+    static let submit = "\r"
 }
 
 /// The terminal the guest output is written to.
@@ -618,8 +618,8 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     /// Whether the run is a fixture run.
     ///
-    /// A fixture run offers the send control on the screen: the software
-    /// keyboard cannot send the key the guest TUI submits the composer with.
+    /// A fixture run offers the send control on the screen, so a test sends
+    /// the composer with one tap.
     var isFixtureRun: Bool { options.fixtureScenario != nil }
     /// The provider configuration this run uses.
     private var configuration: ProviderConfiguration?
