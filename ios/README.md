@@ -177,8 +177,10 @@ the host's listener.
 
 The host serves `shortcuts.invoke`, `photos.search`, `photos.export`,
 `files.import`, and `files.export` to `leg-bridge` in the guest. Before every
-session it binds a private Unix socket, registers it with the vendored iSH
-hook, and starts the guest with
+session it sweeps the stale endpoints of a killed host out of its app-owned
+socket root (`tmp/lb` of the app, `/tmp/leghost-bridge-<uid>` in a
+simulator), binds a fresh private Unix socket there, registers it with the
+vendored iSH hook, and starts the guest with
 `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`; the hook makes that path a
 socket inode in the guest and maps a `connect()` to it onto the listener. The
 listener routes every capability through this one endpoint, answers one
@@ -197,16 +199,33 @@ fakefs database (`guest_runtime_adopt_host_tree`); the guest hides a file that
 has no entry there. A failed record shows as `skill=unpublished`.
 
 The state line shows `bridge=off|listening|closed`, the number of replies the
-listener wrote, what the Skill install did, and `endpoint=none|kept`: whether
-the hook still records a guest endpoint it made after the listener closed.
-`-leghost-bridge-off` (Debug builds) starts the guest without a listener, and
+listener wrote, what the Skill install did, `sockets=<n>` (the socket
+directories in the root after the last start or teardown), `swept=<n>` (the
+stale ones the last start removed), and `endpoint=none|kept`: whether the
+hook still records a guest endpoint it made after the listener closed.
+`-leghost-bridge-off` (Debug builds) starts the guest without a listener,
+`-leghost-bridge-listener-failure` makes the listener setup fail, and
 `-leghost-bridge-endpoint-failure <faults>` injects endpoint faults, a comma
 list of `hold` (the start fails after the runtime made the endpoint), `race`
 and `replace` (a socket the runtime did not make takes the endpoint before or
 after it made its own, and the start fails), `cleanup-lookup` (the cleanup
 cannot look the endpoint up) and `cleanup-retry` (such a socket then replaces
-the endpoint and the cleanup runs again). A listener that cannot start fails the session with
-`IOS_BRIDGE_LISTENER_ERROR`.
+the endpoint and the cleanup runs again). A listener that cannot start fails
+the session with `IOS_BRIDGE_LISTENER_ERROR` before the guest program runs.
+
+A normal stop, a failed start, and the background all tear the listener down
+and leave `sockets=0` and `endpoint=none`; the next launch gets a fresh
+endpoint on the same root, so the workspace and the trail stay. A
+killed host leaves a stale socket that the next start sweeps. On a booted
+simulator, `ios/tests/run-lifecycle-tests.sh` runs `BridgeListenerTests` with
+the other host tests, and the bridge UI tests run with:
+
+```bash
+xcodebuild test -project ios/LegHost.xcodeproj -scheme LegHost \
+  -sdk iphonesimulator -destination "platform=iOS Simulator,id=<udid>" \
+  -parallel-testing-enabled NO \
+  -only-testing:LegHostUITests/BridgeCapabilityUITests
+```
 
 The `Check bridge wiring` build phase (`scripts/check-bridge-wiring.sh`) fails
 the build when a bridge source or test is missing from its target, the
@@ -859,7 +878,9 @@ accessibility server of a simulator wedges when a long run of the tests
 drives the app again and again, and the test that follows the wedge fails
 with an accessibility timeout instead of an assertion, so every test starts
 from a simulator that was booted for it. Pass the names of the tests to run
-only some of them.
+only some of them. The script runs the build of `xcodebuild build-for-testing`
+in `build/dd`; `--class LegHostUITests/BridgeCapabilityUITests <test ...>`
+runs bridge tests the same way, as the `ios-bridge-lifecycle` CI job does.
 
 
 ## Host fixtures

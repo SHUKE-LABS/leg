@@ -358,8 +358,8 @@ the last row only names the platforms this slice cannot serve.
 
 On iOS, `LEG_BRIDGE_HOST_SOCKET` is the reserved guest name
 `/run/leghost-bridge.sock`. The vendored iSH hook maps that fake socket inode
-to a private per-session app-temporary Unix socket file; the guest cannot
-select the host endpoint. The host accepts one bounded request per connection
+to a private per-session Unix socket below the app-owned socket root; the
+guest cannot select the host endpoint. The host accepts one bounded request per connection
 and waits at most 30 s. All iOS capabilities use this same listener and its
 approval ledger.
 
@@ -420,17 +420,31 @@ The LegHost app serves `shortcuts.invoke`, `photos.search`, `photos.export`,
 five capabilities use the same listener and approval ledger.
 
 **The socket.** For every guest generation the host binds an `AF_UNIX`
-listener at a private path, `lb-<random>/s` (directory `0700`, socket `0600`)
-in the app's temporary directory — the Mac's `/tmp` in a simulator, whose
-container path is longer than a Darwin socket path (103 bytes). The guest
-never sees that path. It gets `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`,
+listener at a private path, `<socket root>/lb-<12 hex>/s` (directory `0700`,
+socket `0600`). The socket root is app-owned and short enough for a Darwin
+socket path (103 bytes): `/var/mobile/.../tmp/lb` on a device (the app's
+temporary directory, named without `/private`), and `/tmp/leghost-bridge-<uid>`
+in a simulator, whose container path is too long. The root must be a real
+directory of the app's user; the host makes it `0700`, and a symbolic link,
+a file, another owner, or a root too long for the socket path fails the start
+with `IOS_BRIDGE_LISTENER_ERROR` before anything is bound or mapped.
+
+Before it binds, the listener sweeps the root of what a killed or crashed
+host left behind. It looks only at `lb-*` directories of the app's user that
+hold nothing but their socket `s`: one goes when a non-blocking `connect()` to
+its socket is refused (no listener), its socket matched by device and inode
+before the unlink, and an empty one goes once it is older than 60 s. A live
+endpoint, a symbolic link, another name, or a directory with anything else
+stays. The guest never sees the host path. It gets `LEG_BRIDGE_HOST_SOCKET=/run/leghost-bridge.sock`,
 and the vendored iSH maps a `connect()` to that exact fake socket inode onto
 the listener (`ios/vendor/ish/fs/IshBridgeSocketHook.c`). Every other guest
 Unix socket keeps the upstream mapping.
 
-Start order: bind and listen, register the generation with the hook, install
-the Skill, build the environment, start the session, provision the fake inode
-in the guest's task context, execute the guest program. The hook makes the
+Start order: prepare and sweep the socket root, bind and listen, register the
+generation with the hook, install the Skill, build the environment (only now
+with `LEG_BRIDGE_HOST_SOCKET`), start the session, provision the fake inode in
+the guest's task context, execute the guest program. A setup failure before
+the session is `IOS_BRIDGE_LISTENER_ERROR`, and the guest program never runs. The hook makes the
 fake inode, records its identity, and holds it in one step, so a start that
 fails after that removes it and never a socket it did not make, and a cleanup
 that cannot look the endpoint up keeps the record and the hold;
@@ -442,6 +456,14 @@ inode) and its empty directory and remove the generation's staging. The work
 of an adapter is a worker until it returns, even after its request was
 answered; when a worker outlives the 10 s join, the mapping, socket, and
 staging stay and the teardown completes when the last worker ends.
+
+The same teardown runs for every boundary: a normal stop, a failed start, and
+the background, which iOS ends the session at (the trail of the stopped turn
+is persisted first). The retry or the next launch starts a new generation
+with a fresh endpoint on the same verified root, so the workspace and the
+session trail of the guest stay. A host that was killed runs no teardown: its
+socket is stale (the kernel closed the listener), its staging is removed with
+the staging root at the next start, and its socket directory by the sweep.
 
 **One exchange per connection.** The listener reads one request line of at
 most 64 KiB within 5 s and writes at most one reply line. The request must be
@@ -518,6 +540,24 @@ see it.
 
 **Redaction.** The host logs no asset bytes, file contents, credentials,
 approval tokens, or native paths; its diagnostics name the step that failed.
+
+**Verification.** On a booted simulator:
+
+```bash
+ios/tests/run-lifecycle-tests.sh            # LegHostTests, incl. BridgeListenerTests
+xcodebuild test -project ios/LegHost.xcodeproj -scheme LegHost \
+  -sdk iphonesimulator -destination "platform=iOS Simulator,id=<udid>" \
+  -parallel-testing-enabled NO \
+  -only-testing:LegHostUITests/BridgeCapabilityUITests
+cargo test --all-targets                    # guest bridge, incl. tests/guest_bridge.rs
+```
+
+`BridgeListenerTests` covers the socket root, the sweep, the start and
+teardown order, and the host-side protocol limits; `BridgeCapabilityUITests`
+drives the real `/usr/local/bin/leg-bridge` across a listener failure, the
+guest refusals, the background, and a relaunch after a kill. The
+`ios-bridge-lifecycle` CI job runs both, the UI tests on a freshly booted
+simulator each through `ios/tests/run-fixture-tests.sh --class`.
 
 ## Duplicate request ids
 

@@ -10,6 +10,9 @@ final class BridgeCapabilityUITests: XCTestCase {
     private let startTimeout: TimeInterval = 300
     private static let provider = ["-leghost-provider", "anthropic"]
     private static let request = #"printf '%s\n' '{"version":1,"request_id":"r-1","capability":"files.list","input":{}}' | /usr/local/bin/leg-bridge"#
+    /// Reduces an answer of the bridge to `REASON=<reason>`; the echo of the
+    /// command line does not contain the marker.
+    private static let reasonFilter = #" | sed -n 's/.*"reason":"\([a-z_]*\)".*/REAS''ON=\1/p'"#
 
     private var app: XCUIApplication!
 
@@ -46,6 +49,82 @@ final class BridgeCapabilityUITests: XCTestCase {
         type(Self.request + "\n")
         XCTAssertTrue(waitForOutput("no_host_transport"), "the guest found a transport")
         XCTAssertTrue(waitForState("replies=0"))
+    }
+
+    /// A listener that cannot start fails the session before the guest
+    /// program starts, and maps no guest endpoint.
+    func testAListenerThatCannotStartStartsNoGuest() {
+        app.launchArguments = ["-leghost-reset", "-leghost-bridge-listener-failure"] + Self.provider
+            + ["-leghost-program", "/bin/sh"]
+        app.launch()
+        XCTAssertTrue(waitForStatus("IOS_BRIDGE_LISTENER_ERROR"), "the listener failure is not reported")
+        XCTAssertTrue(waitForState("session=0"), "the guest started without a listener")
+        XCTAssertTrue(waitForState("bridge=off"))
+        XCTAssertTrue(waitForState("endpoint=none"))
+    }
+
+    /// The real guest bridge refuses what it cannot send before it connects,
+    /// and uses a request id once: the duplicate opens no host connection.
+    func testTheGuestRefusesBadRequestsWithoutReachingTheHost() {
+        launchShell(["-leghost-reset"])
+        XCTAssertTrue(waitForState("bridge=listening"))
+        type(Self.request + "\n")
+        XCTAssertTrue(waitForOutput("capability_unsupported"), "the host did not answer the guest")
+        XCTAssertTrue(waitForState("replies=1,"))
+
+        // Each refusal prints its reason alone on a line, so the check does
+        // not depend on where the terminal wraps the answer.
+        type(Self.request + Self.reasonFilter + "\n")
+        XCTAssertTrue(waitForOutput("REASON=duplicate_request_id"), "the guest sent a request id twice")
+        type(#"printf 'not json\n' | /usr/local/bin/leg-bridge"# + Self.reasonFilter + "\n")
+        XCTAssertTrue(waitForOutput("REASON=malformed_request"))
+        type(#"printf '%s\n' '{"version":2,"request_id":"r-2","capability":"files.list","input":{}}' | /usr/local/bin/leg-bridge"#
+            + Self.reasonFilter + "\n")
+        XCTAssertTrue(waitForOutput("REASON=unsupported_version"))
+        type("/usr/local/bin/leg-bridge-missing </dev/null; echo BRIDGE''_EXIT=$?\n")
+        XCTAssertTrue(waitForOutput("BRIDGE_EXIT=127"), "a missing bridge did not fail as a missing command")
+        XCTAssertTrue(waitForState("replies=1,"), "a refused request reached the host")
+    }
+
+    /// The background stops the session and closes its endpoint; the next
+    /// launch opens a fresh one.
+    func testTheBackgroundClosesTheEndpointAndTheNextLaunchOpensAFreshOne() {
+        launchShell(["-leghost-reset"])
+        XCTAssertTrue(waitForState("bridge=listening"))
+        XCTAssertTrue(waitForState("sockets=1,"))
+
+        // The app needs a moment to leave the foreground before it is
+        // activated again.
+        XCUIDevice.shared.press(.home)
+        sleep(5)
+        app.activate()
+        XCTAssertTrue(app.staticTexts["guest-interrupted"].waitForExistence(timeout: startTimeout),
+                      "the session was not interrupted")
+        XCTAssertTrue(waitForState("bridge=closed"))
+        XCTAssertTrue(waitForState("sockets=0,"), "the interrupted session left its socket")
+        XCTAssertTrue(waitForState("endpoint=none"), "the interrupted session left its guest endpoint")
+
+        app.terminate()
+        launchShell([])
+        XCTAssertTrue(waitForState("bridge=listening"))
+        XCTAssertTrue(waitForState("sockets=1,"))
+        type(Self.request + "\n")
+        XCTAssertTrue(waitForOutput("capability_unsupported"), "the next launch did not reach its listener")
+    }
+
+    /// A host that is killed cannot tear its listener down; the next launch
+    /// still ends up with exactly its own fresh endpoint.
+    func testARelaunchAfterAKillLeavesOnlyTheFreshEndpoint() {
+        launchShell(["-leghost-reset"])
+        XCTAssertTrue(waitForState("bridge=listening"))
+        XCTAssertTrue(waitForState("sockets=1,"))
+
+        app.terminate()
+        launchShell([])
+        XCTAssertTrue(waitForState("bridge=listening"))
+        XCTAssertTrue(waitForState("sockets=1,"), "the endpoint of the killed host is still there")
+        type(Self.request + "\n")
+        XCTAssertTrue(waitForOutput("capability_unsupported"), "the relaunch did not reach its listener")
     }
 
     /// A start that fails closes the listener it opened.
@@ -149,16 +228,44 @@ final class BridgeCapabilityUITests: XCTestCase {
 
     /// Waits for the terminal to show `text` as output.
     private func waitForOutput(_ text: String, timeout: TimeInterval = 60) -> Bool {
-        app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch
+        let found = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch
             .waitForExistence(timeout: timeout)
+        if !found {
+            report("no output \"\(text)\"")
+        }
+        return found
+    }
+
+    /// Prints the element tree, with the state, the status and the terminal
+    /// text, to the log of the run. One snapshot, so a screen that changes
+    /// meanwhile cannot fail the report.
+    private func report(_ failure: String) {
+        let running = app.state == .runningForeground || app.state == .runningBackground
+        print("[BridgeCapabilityUITests] \(failure); app state \(app.state.rawValue)"
+            + (running ? "\n" + app.debugDescription : "; the app is not running"))
+    }
+
+    private func waitForStatus(_ text: String, timeout: TimeInterval = 300) -> Bool {
+        let detail = app.staticTexts["guest-status-detail"]
+        guard detail.waitForExistence(timeout: timeout) else { return false }
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", text), object: detail)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 
     private func waitForState(_ text: String, timeout: TimeInterval = 120) -> Bool {
         let state = app.staticTexts["guest-fixture-state"]
-        guard state.waitForExistence(timeout: timeout) else { return false }
+        guard state.waitForExistence(timeout: timeout) else {
+            report("no state")
+            return false
+        }
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label CONTAINS %@", text), object: state)
-        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+        guard XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed else {
+            report("no state \"\(text)\"")
+            return false
+        }
+        return true
     }
 
     private func attachScreenshot(_ name: String) {

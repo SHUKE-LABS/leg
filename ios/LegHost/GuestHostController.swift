@@ -112,6 +112,12 @@ struct HostLaunchOptions {
     /// start removes the endpoint it made and only that, or keeps its record
     /// of it.
     var bridgeEndpointFaults: Int32 = 0
+    /// Whether the listener of the capability bridge fails its setup.
+    ///
+    /// The control is DEBUG-only: the simulator tests check that a listener
+    /// that cannot start fails the session with `IOS_BRIDGE_LISTENER_ERROR`
+    /// before the guest program starts.
+    var bridgeListenerFailure = false
     /// Whether the run interrupts the session on its own.
     ///
     /// The control belongs to the simulator tests: they interrupt the
@@ -216,6 +222,8 @@ struct HostLaunchOptions {
                     options.bridgeEndpointFaults = HostLaunchOptions.endpointFaults(arguments[index + 1])
                     consumed = 2
                 }
+            case "-leghost-bridge-listener-failure":
+                options.bridgeListenerFailure = true
             #endif
             default:
                 break
@@ -267,6 +275,11 @@ struct HostState: Equatable {
     /// Whether the endpoint hook still records an endpoint it made after the
     /// listener closed: `none` or `kept`.
     var endpoint = "none"
+    /// The number of socket directories in the socket root of the bridge.
+    var sockets = 0
+    /// The number of stale socket directories the last listener start
+    /// removed from the socket root.
+    var swept = 0
 
     /// The state as the tests read it.
     var summary: String {
@@ -277,7 +290,7 @@ struct HostState: Equatable {
             + "statuses=\(statuses),validation=\(validation),listener=\(listeners),trail=\(trail),"
             + "tasks=\(guestTasks),bridge=\(bridge),replies=\(bridgeReplies),"
             + "reply_statuses=\(bridgeReplyStatuses.joined(separator: ",")),skill=\(skill),"
-            + "endpoint=\(endpoint)"
+            + "sockets=\(sockets),swept=\(swept),endpoint=\(endpoint)"
     }
 }
 
@@ -1396,12 +1409,26 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
 
     /// Starts the capability bridge listener of the session.
     ///
-    /// The listener binds a fresh private socket and maps the guest endpoint
-    /// onto it before the session starts; the runtime then makes the
-    /// endpoint in the guest, in the task context of the session.
+    /// The listener sweeps the stale endpoints of an earlier process out of
+    /// the socket root, binds a fresh private socket, and maps the guest
+    /// endpoint onto it before the session starts; the runtime then makes
+    /// the endpoint in the guest, in the task context of the session. Any
+    /// failure here is an `IOS_BRIDGE_LISTENER_ERROR`, and the guest program
+    /// does not start.
     private func startBridge() throws {
         state.bridge = "off"
         guard !options.bridgeOff else { return }
+        do {
+            try startListener()
+        } catch let error as BridgeListenerError {
+            throw error
+        } catch {
+            throw BridgeListenerError(message: "the bridge staging could not be made")
+        }
+        state.sockets = BridgeListener.socketDirectories(in: BridgeListener.defaultSocketParent).count
+    }
+
+    private func startListener() throws {
         let caches = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
                                                  appropriateFor: nil, create: true)
         let stagingRoot = caches.appendingPathComponent("LegHost/BridgeStaging", isDirectory: true)
@@ -1409,6 +1436,11 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         // what a crash left behind.
         try? FileManager.default.removeItem(at: stagingRoot)
         try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        // The injected failure is a socket root too long for a socket path,
+        // which the listener refuses before it makes anything.
+        let socketParent = options.bridgeListenerFailure
+            ? BridgeListener.defaultSocketParent.appendingPathComponent(String(repeating: "x", count: 104))
+            : BridgeListener.defaultSocketParent
         let managedRoot = URL(fileURLWithPath: activeRoot, isDirectory: true)
             .appendingPathComponent("data/root/.local/share/leg/bridge", isDirectory: true)
         let presenter = LiveDocumentPresenter()
@@ -1420,6 +1452,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
                        "files.import": files, "files.export": files,
                        ShortcutsAdapter.capability: shortcutsAdapter],
             registrar: IshBridgeEndpointRegistrar(),
+            socketParent: socketParent,
             stagingRoot: stagingRoot,
             managedRoot: managedRoot,
             guestAdopter: { path in path.withCString { guest_runtime_adopt_host_tree($0) } == 0 })
@@ -1438,6 +1471,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
             ish_bridge_socket_inject_faults(options.bridgeEndpointFaults)
         }
         bridgeListener = listener
+        state.swept = listener.sweptEndpoints.count
         state.bridge = "listening"
     }
 
@@ -1457,6 +1491,7 @@ final class GuestHostController: NSObject, ObservableObject, WKScriptMessageHand
         var hook = ish_bridge_socket_state()
         ish_bridge_socket_get_state(&hook)
         state.endpoint = hook.endpoint_recorded != 0 ? "kept" : "none"
+        state.sockets = BridgeListener.socketDirectories(in: BridgeListener.defaultSocketParent).count
         state.bridge = "closed"
     }
 

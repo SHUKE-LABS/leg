@@ -109,10 +109,12 @@ final class BridgeListenerTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func makeListener(generation: UInt64) -> BridgeListener {
+    private func makeListener(generation: UInt64,
+                              socketParent: URL = BridgeListener.defaultSocketParent) -> BridgeListener {
         let adapters: [String: BridgeCapabilityAdapter] = Dictionary(
             uniqueKeysWithValues: BridgeCapabilityRequest.capabilities.map { ($0, adapter as BridgeCapabilityAdapter) })
         return BridgeListener(generation: generation, adapters: adapters, registrar: registrar,
+                              socketParent: socketParent,
                               stagingRoot: root.appendingPathComponent("staging"),
                               managedRoot: root.appendingPathComponent("managed"),
                               guestAdopter: adoptions.adopt)
@@ -282,6 +284,155 @@ final class BridgeListenerTests: XCTestCase {
         XCTAssertEqual(lstat(second.socketPath, &info), 0, "the listener removed a socket it did not bind")
         XCTAssertEqual(info.st_mode & S_IFMT, S_IFSOCK)
         XCTAssertFalse(registrar.events.contains("register 8"))
+    }
+
+    // MARK: The socket root
+
+    /// A socket root of the test's own, next to the default one, so a path
+    /// below it fits a Darwin socket path. The test makes it.
+    private func makeSocketRoot() -> URL {
+        let path = BridgeListener.defaultSocketParent.deletingLastPathComponent()
+            .appendingPathComponent("lbt-" + String(BridgeValidation.newGeneratedID().prefix(8)), isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: path) }
+        return path
+    }
+
+    private func assertListenerError(_ body: @autoclosure () throws -> Void, file: StaticString = #filePath,
+                                     line: UInt = #line) {
+        XCTAssertThrowsError(try body(), file: file, line: line) { error in
+            XCTAssertTrue((error as? BridgeListenerError)?.errorDescription?.hasPrefix("IOS_BRIDGE_LISTENER_ERROR") == true,
+                          "\(error)", file: file, line: line)
+        }
+    }
+
+    func testTheListenerBindsBelowThePrivateSocketRoot() throws {
+        let socketRoot = BridgeListener.defaultSocketParent.path
+        #if targetEnvironment(simulator)
+        XCTAssertEqual(socketRoot, "/tmp/leghost-bridge-\(geteuid())")
+        #else
+        XCTAssertTrue(socketRoot.hasSuffix("/tmp/lb"), socketRoot)
+        XCTAssertFalse(socketRoot.hasPrefix("/private/"), socketRoot)
+        #endif
+        let longest = socketRoot.utf8.count + 1 + BridgeListener.socketDirectoryPrefix.utf8.count
+            + BridgeListener.socketDirectoryIDLength + 2
+        XCTAssertLessThanOrEqual(longest, Int(ISH_BRIDGE_SOCKET_HOST_PATH_MAX))
+
+        let directory = (listener.socketPath as NSString).deletingLastPathComponent
+        XCTAssertEqual((directory as NSString).deletingLastPathComponent, socketRoot)
+        XCTAssertTrue((directory as NSString).lastPathComponent.hasPrefix(BridgeListener.socketDirectoryPrefix))
+        XCTAssertEqual((listener.socketPath as NSString).lastPathComponent, "s")
+
+        var info = stat()
+        XCTAssertEqual(lstat(socketRoot, &info), 0)
+        XCTAssertEqual(info.st_mode & S_IFMT, S_IFDIR)
+        XCTAssertEqual(info.st_mode & 0o777, 0o700)
+        XCTAssertEqual(info.st_uid, geteuid())
+        XCTAssertEqual(lstat(directory, &info), 0)
+        XCTAssertEqual(info.st_mode & S_IFMT, S_IFDIR)
+        XCTAssertEqual(info.st_mode & 0o777, 0o700)
+        XCTAssertEqual(lstat(listener.socketPath, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o777, 0o600)
+    }
+
+    func testTheStartRemovesOnlyStaleEndpointsFromTheSocketRoot() throws {
+        let socketRoot = makeSocketRoot()
+        // A listener of another generation that is still up.
+        let live = makeListener(generation: 8, socketParent: socketRoot)
+        try live.start()
+        defer {
+            live.beginShutdown()
+            live.finishShutdown()
+        }
+        func entry(_ name: String) -> String { socketRoot.appendingPathComponent(name).path }
+        func exists(_ name: String) -> Bool {
+            var info = stat()
+            return lstat(entry(name), &info) == 0
+        }
+
+        // What a killed host leaves: a socket nothing listens on any more.
+        XCTAssertEqual(mkdir(entry("lb-stale"), 0o700), 0)
+        close(try bindSocket(at: entry("lb-stale") + "/s"))
+        // An empty directory past the grace, and one that may be a listener
+        // between its mkdir and its bind.
+        XCTAssertEqual(mkdir(entry("lb-old"), 0o700), 0)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)],
+                                              ofItemAtPath: entry("lb-old"))
+        XCTAssertEqual(mkdir(entry("lb-young"), 0o700), 0)
+        // Entries the sweep does not own: another name, a file, a symbolic
+        // link, a directory with more than its socket, and a non-socket.
+        XCTAssertEqual(mkdir(entry("other"), 0o700), 0)
+        close(try bindSocket(at: entry("other") + "/s"))
+        XCTAssertTrue(FileManager.default.createFile(atPath: entry("lb-file"), contents: Data()))
+        XCTAssertEqual(symlink(entry("other"), entry("lb-link")), 0)
+        XCTAssertEqual(mkdir(entry("lb-extra"), 0o700), 0)
+        close(try bindSocket(at: entry("lb-extra") + "/s"))
+        XCTAssertTrue(FileManager.default.createFile(atPath: entry("lb-extra") + "/note", contents: Data()))
+        XCTAssertEqual(mkdir(entry("lb-plain"), 0o700), 0)
+        XCTAssertTrue(FileManager.default.createFile(atPath: entry("lb-plain") + "/s", contents: Data()))
+
+        let next = makeListener(generation: 9, socketParent: socketRoot)
+        try next.start()
+        defer {
+            next.beginShutdown()
+            next.finishShutdown()
+        }
+        XCTAssertEqual(next.sweptEndpoints, ["lb-old", "lb-stale"])
+        XCTAssertFalse(exists("lb-stale"))
+        XCTAssertFalse(exists("lb-old"))
+        for kept in ["lb-young", "other/s", "lb-file", "lb-link", "lb-extra/s", "lb-plain/s"] {
+            XCTAssertTrue(exists(kept), "the sweep removed \(kept)")
+        }
+        XCTAssertEqual(try status(exchange(frame("photos.search", Self.searchInput), on: live)), "ok",
+                       "the sweep broke a live endpoint")
+        XCTAssertEqual(try status(exchange(frame("photos.search", Self.searchInput), on: next)), "ok")
+    }
+
+    func testASocketRootTheAppDoesNotOwnFailsTheStart() throws {
+        // A symbolic link at the root, even to a private directory.
+        let target = makeSocketRoot()
+        try BridgeListener.prepareSocketRoot(target)
+        let link = makeSocketRoot()
+        XCTAssertEqual(symlink(target.path, link.path), 0)
+        assertListenerError(try makeListener(generation: 8, socketParent: link).start())
+        XCTAssertTrue(BridgeListener.socketDirectories(in: target).isEmpty)
+
+        // A file at the root.
+        let file = makeSocketRoot()
+        XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data()))
+        assertListenerError(try makeListener(generation: 9, socketParent: file).start())
+
+        // A root too long for a socket path is refused before it is made.
+        let long = makeSocketRoot().appendingPathComponent(String(repeating: "x", count: 104))
+        assertListenerError(try makeListener(generation: 10, socketParent: long).start())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: long.path))
+
+        XCTAssertEqual(registrar.events, ["register 7"], "a failed start mapped the guest endpoint")
+    }
+
+    func testALooseSocketRootOfTheAppIsMadePrivate() throws {
+        let socketRoot = makeSocketRoot()
+        XCTAssertEqual(mkdir(socketRoot.path, 0o700), 0)
+        XCTAssertEqual(chmod(socketRoot.path, 0o755), 0)
+        try BridgeListener.prepareSocketRoot(socketRoot)
+        var info = stat()
+        XCTAssertEqual(lstat(socketRoot.path, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o777, 0o700)
+    }
+
+    func testAConnectionDuringTheTeardownIsClosedWithoutAReply() throws {
+        let current = try XCTUnwrap(listener)
+        let path = current.socketPath
+        current.beginShutdown()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { current.finishShutdown() }
+        // The guest bridge reports a connection closed without a reply as
+        // `host_crashed`.
+        XCTAssertNil(try? exchange(frame("photos.search", Self.searchInput), on: current))
+        XCTAssertEqual(adapter.performs, 0)
+        let deadline = Date().addingTimeInterval(5)
+        while registrar.events.last != "unregister 7" && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertThrowsError(try connect(to: path))
     }
 
     func testTeardownWaitsForAnAdapterThatDoesNotStop() throws {
