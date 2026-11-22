@@ -344,6 +344,9 @@ final class ImageAttachmentsTests: XCTestCase {
 
         XCTAssertEqual(LoopbackFixture.imageSHA256, pngSHA256)
         XCTAssertEqual(problems([before, image(png), after]), [])
+        let restored: [String: Any] = ["type": "text", "text": "IOS_IMAGE_BEFORE  IOS_IMAGE_AFTER"]
+        XCTAssertEqual(problems([before, image(png), after, restored]), [])
+        XCTAssertEqual(problems([before, image(png), after, before]), ["image-order"])
         XCTAssertEqual(problems([image(png), before, after]), ["image-order"])
         XCTAssertEqual(problems([before, image(png), image(png), after]), ["image-order"])
         XCTAssertEqual(problems([before, after]), ["image-order"])

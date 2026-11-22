@@ -369,13 +369,20 @@ final class LoopbackFixture {
     /// The reasons the last message is not the image turn: exactly text, one
     /// `image/png` block whose decoded bytes are the fixture image, and text.
     ///
-    /// The image is decoded and hashed in memory only; the reasons name the
-    /// part that did not match.
+    /// The v0.50.3 `leg` restores the draft prompt (both text blocks joined)
+    /// as a trailing text block when no block equals it
+    /// (`model::content_with_prompt`); that one block is accepted, nothing
+    /// else. The image is decoded and hashed in memory only; the reasons name
+    /// the part that did not match.
     static func imageTurnProblems(_ object: [String: Any]) -> [String] {
         guard let message = (object["messages"] as? [[String: Any]])?.last,
               (message["role"] as? String) == "user",
-              let blocks = message["content"] as? [[String: Any]]
+              var blocks = message["content"] as? [[String: Any]]
         else { return ["image-turn"] }
+        let text = { (index: Int) in blocks[index]["text"] as? String ?? "" }
+        if blocks.count == 4, (blocks[3]["type"] as? String) == "text", text(3) == text(0) + text(2) {
+            blocks.removeLast()
+        }
         guard blocks.map({ $0["type"] as? String ?? "" }) == ["text", "image", "text"] else {
             return ["image-order"]
         }
