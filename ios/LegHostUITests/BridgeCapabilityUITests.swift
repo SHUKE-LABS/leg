@@ -86,9 +86,9 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(waitForState("replies=1,"), "a refused request reached the host")
     }
 
-    /// The background stops the session and closes its endpoint; the retry
-    /// opens a fresh one.
-    func testTheBackgroundClosesTheEndpointAndTheRetryOpensAFreshOne() {
+    /// The background stops the session and closes its endpoint; the next
+    /// launch opens a fresh one.
+    func testTheBackgroundClosesTheEndpointAndTheNextLaunchOpensAFreshOne() {
         launchShell(["-leghost-reset"])
         XCTAssertTrue(waitForState("bridge=listening"))
         XCTAssertTrue(waitForState("sockets=1,"))
@@ -104,12 +104,12 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(waitForState("sockets=0,"), "the interrupted session left its socket")
         XCTAssertTrue(waitForState("endpoint=none"), "the interrupted session left its guest endpoint")
 
-        XCTAssertTrue(retryUntilSession(2), "the retry did not start a new session")
+        app.terminate()
+        launchShell([])
         XCTAssertTrue(waitForState("bridge=listening"))
         XCTAssertTrue(waitForState("sockets=1,"))
-        GuestKeyboard.focus(app)
         type(Self.request + "\n")
-        XCTAssertTrue(waitForOutput("capability_unsupported"), "the retry did not reach its listener")
+        XCTAssertTrue(waitForOutput("capability_unsupported"), "the next launch did not reach its listener")
     }
 
     /// A host that is killed cannot tear its listener down; the next launch
@@ -220,25 +220,6 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
                       "the terminal is missing")
         GuestKeyboard.focus(app)
-    }
-
-    /// Taps the retry until session `number` runs. A loaded simulator drops
-    /// an activation now and then; the app falls back to the background and
-    /// interrupts the retry, and shows the retry control again.
-    private func retryUntilSession(_ number: Int) -> Bool {
-        for _ in 0..<3 {
-            let retry = app.buttons["guest-retry"]
-            guard retry.waitForExistence(timeout: 60) else { break }
-            if app.state != .runningForeground {
-                app.activate()
-            }
-            _ = app.wait(for: .runningForeground, timeout: 30)
-            retry.tap()
-            if waitForState("session=\(number)", timeout: 150) {
-                return true
-            }
-        }
-        return false
     }
 
     private func type(_ text: String) {

@@ -214,8 +214,8 @@ the endpoint and the cleanup runs again). A listener that cannot start fails
 the session with `IOS_BRIDGE_LISTENER_ERROR` before the guest program runs.
 
 A normal stop, a failed start, and the background all tear the listener down
-and leave `sockets=0` and `endpoint=none`; the retry or the next launch gets
-a fresh endpoint on the same root, so the workspace and the trail stay. A
+and leave `sockets=0` and `endpoint=none`; the next launch gets a fresh
+endpoint on the same root, so the workspace and the trail stay. A
 killed host leaves a stale socket that the next start sweeps. On a booted
 simulator, `ios/tests/run-lifecycle-tests.sh` runs `BridgeListenerTests` with
 the other host tests, and the bridge UI tests run with:

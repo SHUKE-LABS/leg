@@ -527,7 +527,7 @@ jobs:
               testTheGuestRefusesBadRequestsWithoutReachingTheHost
           - shard: ui-lifecycle
             tests: >-
-              testTheBackgroundClosesTheEndpointAndTheRetryOpensAFreshOne
+              testTheBackgroundClosesTheEndpointAndTheNextLaunchOpensAFreshOne
               testARelaunchAfterAKillLeavesOnlyTheFreshEndpoint
               testAFailedStartClosesTheListener
               testAStartThatFailsAfterTheEndpointWasMadeRemovesIt
