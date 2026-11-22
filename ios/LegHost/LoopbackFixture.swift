@@ -22,6 +22,9 @@ final class LoopbackFixture {
         /// The fixture holds the answer back, so a turn stays running long
         /// enough for the host to be interrupted in the middle of it.
         case delayed
+        /// One turn of text, the inserted fixture image and text, answered
+        /// with the final text and no tool round.
+        case image
     }
 
     /// The text the fixture streams in the first answer.
@@ -36,6 +39,13 @@ final class LoopbackFixture {
     static let providerErrorType = "api_error"
     /// The message the provider error carries.
     static let providerErrorMessage = "IOS_FIXTURE_PROVIDER_ERROR"
+    /// The text the image turn carries before the image.
+    static let imageTextBefore = "IOS_IMAGE_BEFORE"
+    /// The text the image turn carries after the image.
+    static let imageTextAfter = "IOS_IMAGE_AFTER"
+    /// The SHA-256 of the image the image turn carries: the PNG of
+    /// `FixtureImageAttachmentSources`.
+    static let imageSHA256 = "497790947d4666760ce38f3c00e852c71fdb66cae849bae8e9ede352719e1581"
 
     /// What the fixture observed.
     ///
@@ -110,6 +120,7 @@ final class LoopbackFixture {
         case .providerError: return 1
         case .unreachable: return 0
         case .delayed: return 2
+        case .image: return 1
         }
     }
 
@@ -278,6 +289,13 @@ final class LoopbackFixture {
             queue.asyncAfter(deadline: .now() + Self.delayedAnswerDelay) { [weak self] in
                 self?.answerTurn(number: number, on: connection)
             }
+        case .image:
+            guard number == 1 else {
+                reject("unexpected request \(number)", on: connection)
+                return
+            }
+            record(status: 200)
+            answer(status: 200, on: connection, body: finalAnswer())
         }
     }
 
@@ -340,8 +358,39 @@ final class LoopbackFixture {
         if (object["stream"] as? Bool) != true {
             problems.append("stream")
         }
-        if number == 2 && !carriesToolResult(object) {
+        if scenario == .image {
+            problems.append(contentsOf: Self.imageTurnProblems(object))
+        } else if number == 2 && !carriesToolResult(object) {
             problems.append("tool-result")
+        }
+        return problems
+    }
+
+    /// The reasons the last message is not the image turn: exactly text, one
+    /// `image/png` block whose decoded bytes are the fixture image, and text.
+    ///
+    /// The image is decoded and hashed in memory only; the reasons name the
+    /// part that did not match.
+    static func imageTurnProblems(_ object: [String: Any]) -> [String] {
+        guard let message = (object["messages"] as? [[String: Any]])?.last,
+              (message["role"] as? String) == "user",
+              let blocks = message["content"] as? [[String: Any]]
+        else { return ["image-turn"] }
+        guard blocks.map({ $0["type"] as? String ?? "" }) == ["text", "image", "text"] else {
+            return ["image-order"]
+        }
+        var problems: [String] = []
+        if !((blocks[0]["text"] as? String) ?? "").contains(Self.imageTextBefore)
+            || !((blocks[2]["text"] as? String) ?? "").contains(Self.imageTextAfter) {
+            problems.append("image-text")
+        }
+        let source = blocks[1]["source"] as? [String: Any] ?? [:]
+        if (source["type"] as? String) != "base64" || (source["media_type"] as? String) != "image/png" {
+            problems.append("image-type")
+        }
+        let bytes = (source["data"] as? String).flatMap { Data(base64Encoded: $0) }
+        if bytes.map(BridgeCanonicalJSON.sha256Hex) != Self.imageSHA256 {
+            problems.append("image-digest")
         }
         return problems
     }

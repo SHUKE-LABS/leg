@@ -326,6 +326,34 @@ final class ImageAttachmentsTests: XCTestCase {
         }
     }
 
+    // MARK: The loopback image turn
+
+    /// The image scenario of the loopback fixture accepts only text, the
+    /// fixture PNG as one `image/png` block, and text, in that order.
+    func testTheLoopbackImageTurnAcceptsOnlyTheOrderedFixtureImage() {
+        let before: [String: Any] = ["type": "text", "text": "IOS_IMAGE_BEFORE "]
+        let after: [String: Any] = ["type": "text", "text": " IOS_IMAGE_AFTER"]
+        func image(_ data: Data, type: String = "image/png") -> [String: Any] {
+            let source = ["type": "base64", "media_type": type, "data": data.base64EncodedString()]
+            return ["type": "image", "source": source]
+        }
+        func problems(_ content: [[String: Any]], role: String = "user") -> [String] {
+            let message: [String: Any] = ["role": role, "content": content]
+            return LoopbackFixture.imageTurnProblems(["messages": [message]])
+        }
+
+        XCTAssertEqual(LoopbackFixture.imageSHA256, pngSHA256)
+        XCTAssertEqual(problems([before, image(png), after]), [])
+        XCTAssertEqual(problems([image(png), before, after]), ["image-order"])
+        XCTAssertEqual(problems([before, image(png), image(png), after]), ["image-order"])
+        XCTAssertEqual(problems([before, after]), ["image-order"])
+        XCTAssertEqual(problems([after, image(png), before]), ["image-text"])
+        XCTAssertEqual(problems([before, image(png, type: "image/jpeg"), after]), ["image-type"])
+        XCTAssertEqual(problems([before, image(png + Data([0])), after]), ["image-digest"])
+        XCTAssertEqual(problems([before, image(png), after], role: "assistant"), ["image-turn"])
+        XCTAssertEqual(LoopbackFixture.imageTurnProblems([:]), ["image-turn"])
+    }
+
     // MARK: Helpers
 
     private func makeStore(limits: ImageAttachmentLimits = .shared) -> ImageAttachmentStore {

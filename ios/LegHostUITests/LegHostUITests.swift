@@ -930,60 +930,11 @@ final class LegHostFixtureUITests: XCTestCase {
         app.launch()
     }
 
-    /// Drives one turn in the guest program.
-    ///
-    /// The guest program opens the picker of the sessions when the catalog of
-    /// the guest holds a session, and it asks for a workspace when the run
-    /// starts without one. A new session is made in the picker, so the guest
-    /// asks for the workspace of that session. The guest program shows the
-    /// first-run warning then, unless a previous run already acknowledged it,
-    /// and it offers the composer after it. The test fills in the workspace,
-    /// acknowledges the warning and sends the prompt with the send control.
-    ///
-    /// The screen of the guest is read in one loop, so the terminal is read
-    /// once per round and not once per screen that is waited for: the
-    /// terminal of the guest holds a thousand elements, and reading them all
-    /// made the accessibility server of the simulator give up in the middle
-    /// of a long run.
-    ///
-    /// The screen of the session that came before is still on the terminal
-    /// when a session starts, so the loop waits for the screen the guest
-    /// opens with before it looks for the composer.
+    /// Drives one turn in the guest program: the composer is opened (see
+    /// `GuestScreen.openComposer`) and the prompt is sent with the send
+    /// control.
     private func driveOneTurn() {
-        let terminal = app.otherElements["guest-terminal"]
-        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
-
-        let deadline = Date().addingTimeInterval(180)
-        var created = false
-        var asked = false
-        var warned = false
-        var composer = false
-        while !composer && Date() < deadline {
-            let text = terminalText()
-            if !asked {
-                if !created && Self.shows("Enter reopen", in: text) {
-                    // A new session is made in the picker of the sessions,
-                    // and the guest asks for the workspace of that session.
-                    focusGuest()
-                    app.typeText("n")
-                    created = true
-                } else if Self.shows("Enter a path and press Enter to select it.", in: text) {
-                    focusGuest()
-                    app.typeText("/tmp")
-                    app.typeText("\n")
-                    asked = true
-                }
-            } else if !warned && Self.shows("Press Enter to acknowledge and open the composer.", in: text) {
-                focusGuest()
-                app.typeText("\n")
-                warned = true
-            } else if Self.shows("catalog: ", in: text) {
-                composer = true
-            }
-            if !composer { usleep(3_000_000) }
-        }
-        XCTAssertTrue(asked, "the guest program did not ask for a workspace")
-        XCTAssertTrue(composer, "the composer did not appear")
+        GuestScreen.openComposer(app)
 
         focusGuest()
         app.typeText(prompt)
@@ -1023,7 +974,7 @@ final class LegHostFixtureUITests: XCTestCase {
     private func waitForTerminalText(_ text: String, timeout: TimeInterval = 120) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if Self.shows(text, in: terminalText()) { return true }
+            if GuestScreen.shows(text, in: GuestScreen.text(app)) { return true }
             // The screen is read through the accessibility tree, and the tree
             // of a simulator is read one snapshot at a time. The wait is
             // polled every third second, so a long wait does not keep the
@@ -1067,33 +1018,9 @@ final class LegHostFixtureUITests: XCTestCase {
         return false
     }
 
-    /// The text of the guest terminal.
-    ///
-    /// The terminal is read as one snapshot of its own tree. The guest
-    /// program draws while the terminal is read, so the elements of the tree
-    /// are resolved one by one against a tree that changes under the reader,
-    /// and the read fails on a screen that moves. The snapshot of the
-    /// terminal holds the labels of the terminal as one string.
-    private func terminalText() -> String {
-        app.otherElements["guest-terminal"].debugDescription
-    }
-
     /// Whether the terminal shows `text` right now.
     private func terminalShows(_ text: String) -> Bool {
-        Self.shows(text, in: terminalText())
-    }
-
-    /// Whether `text` shows up in `screen`.
-    ///
-    /// The words of `text` have to show up in order, but not next to each
-    /// other: the terminal draws the words of a line as they are written.
-    private static func shows(_ text: String, in screen: String) -> Bool {
-        var rest = screen[...]
-        for word in text.split(separator: " ", omittingEmptySubsequences: true) {
-            guard let range = rest.range(of: word) else { return false }
-            rest = rest[range.upperBound...]
-        }
-        return true
+        GuestScreen.shows(text, in: GuestScreen.text(app))
     }
 }
 
@@ -1125,5 +1052,88 @@ enum GuestKeyboard {
     /// give up in the middle of a long run.
     private static func hasFocus(_ app: XCUIApplication) -> Bool {
         app.textFields["guest-input"].debugDescription.contains("Focused")
+    }
+}
+
+/// The screen of the guest program, read through the accessibility tree.
+enum GuestScreen {
+    /// The text of the guest terminal.
+    ///
+    /// The terminal is read as one snapshot of its own tree. The guest
+    /// program draws while the terminal is read, so the elements of the tree
+    /// are resolved one by one against a tree that changes under the reader,
+    /// and the read fails on a screen that moves. The snapshot of the
+    /// terminal holds the labels of the terminal as one string.
+    static func text(_ app: XCUIApplication) -> String {
+        app.otherElements["guest-terminal"].debugDescription
+    }
+
+    /// Whether `text` shows up in `screen`.
+    ///
+    /// The words of `text` have to show up in order, but not next to each
+    /// other: the terminal draws the words of a line as they are written.
+    static func shows(_ text: String, in screen: String) -> Bool {
+        var rest = screen[...]
+        for word in text.split(separator: " ", omittingEmptySubsequences: true) {
+            guard let range = rest.range(of: word) else { return false }
+            rest = rest[range.upperBound...]
+        }
+        return true
+    }
+
+    /// Opens the composer of the guest TUI.
+    ///
+    /// The guest program opens the picker of the sessions when the catalog of
+    /// the guest holds a session, and it asks for a workspace when the run
+    /// starts without one. A new session is made in the picker, so the guest
+    /// asks for the workspace of that session. The guest program shows the
+    /// first-run warning then, unless a previous run already acknowledged it,
+    /// and it offers the composer after it. The helper fills in the workspace
+    /// and acknowledges the warning.
+    ///
+    /// The screen of the guest is read in one loop, so the terminal is read
+    /// once per round and not once per screen that is waited for: the
+    /// terminal of the guest holds a thousand elements, and reading them all
+    /// made the accessibility server of the simulator give up in the middle
+    /// of a long run.
+    ///
+    /// The screen of the session that came before is still on the terminal
+    /// when a session starts, so the loop waits for the screen the guest
+    /// opens with before it looks for the composer.
+    static func openComposer(_ app: XCUIApplication) {
+        let terminal = app.otherElements["guest-terminal"]
+        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
+
+        let deadline = Date().addingTimeInterval(180)
+        var created = false
+        var asked = false
+        var warned = false
+        var composer = false
+        while !composer && Date() < deadline {
+            let screen = text(app)
+            if !asked {
+                if !created && shows("Enter reopen", in: screen) {
+                    // A new session is made in the picker of the sessions,
+                    // and the guest asks for the workspace of that session.
+                    GuestKeyboard.focus(app)
+                    app.typeText("n")
+                    created = true
+                } else if shows("Enter a path and press Enter to select it.", in: screen) {
+                    GuestKeyboard.focus(app)
+                    app.typeText("/tmp")
+                    app.typeText("\n")
+                    asked = true
+                }
+            } else if !warned && shows("Press Enter to acknowledge and open the composer.", in: screen) {
+                GuestKeyboard.focus(app)
+                app.typeText("\n")
+                warned = true
+            } else if shows("catalog: ", in: screen) {
+                composer = true
+            }
+            if !composer { usleep(3_000_000) }
+        }
+        XCTAssertTrue(asked, "the guest program did not ask for a workspace")
+        XCTAssertTrue(composer, "the composer did not appear")
     }
 }

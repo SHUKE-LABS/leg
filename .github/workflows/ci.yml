@@ -542,6 +542,7 @@ jobs:
             tests: >-
               testImagesFromEverySourceReachTheGuestAsOpaqueNotices
               testARejectedImageStagesNothing
+              testAnInsertedImageReachesTheProviderAsOneOrderedTurn
     name: ios-bridge-lifecycle (${{ matrix.shard }})
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
