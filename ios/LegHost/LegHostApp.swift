@@ -107,7 +107,76 @@ struct GuestHostScreen: View {
             statusBar
             stateRow
             controlRow
+            attachmentRow
         }
+    }
+
+    /// The images the user picks for the guest draft.
+    ///
+    /// Each staged image shows its preview, its source marker and safe
+    /// filename, its type and its size, and can be inserted into the draft
+    /// at the cursor or removed. Text still pastes through the keyboard.
+    private var attachmentRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                attachmentButton("Photo", source: .photos, identifier: "attach-photos")
+                attachmentButton("File", source: .files, identifier: "attach-files")
+                attachmentButton("Paste image", source: .pasteboard, identifier: "attach-pasteboard")
+                Spacer(minLength: 0)
+            }
+            ForEach(controller.attachments) { attachment in
+                HStack(spacing: 6) {
+                    if let preview = controller.attachmentPreviews[attachment.id] {
+                        Image(uiImage: preview)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 28, height: 28)
+                            .clipped()
+                            .accessibilityHidden(true)
+                    }
+                    Text("\(attachment.label) · \(attachment.mediaType) · \(attachment.sizeText)")
+                        .font(.caption2.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .accessibilityIdentifier("attachment-preview")
+                    Spacer(minLength: 0)
+                    Button("Insert") { controller.insertAttachment(id: attachment.id) }
+                        .font(.caption.monospaced())
+                        .disabled(controller.insertingAttachment != nil)
+                        .accessibilityIdentifier("attachment-insert")
+                    Button("Remove") { controller.removeAttachment(id: attachment.id) }
+                        .font(.caption.monospaced())
+                        .foregroundStyle(Color.red)
+                        .disabled(controller.insertingAttachment == attachment.id)
+                        .accessibilityIdentifier("attachment-remove")
+                }
+            }
+            if !controller.attachmentStatus.isEmpty {
+                Text(controller.attachmentStatus)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("attachment-status")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 4)
+    }
+
+    private func attachmentButton(_ label: String, source: ImageAttachmentSource,
+                                  identifier: String) -> some View {
+        Button {
+            controller.attachImage(from: source)
+        } label: {
+            Text(label)
+                .font(.caption.monospaced())
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(Color.white.opacity(0.12))
+                .foregroundStyle(Color.white)
+        }
+        .buttonStyle(.plain)
+        .disabled(controller.isAcquiringAttachment)
+        .accessibilityIdentifier(identifier)
     }
 
     /// Whether the terminal is on the screen in this phase.

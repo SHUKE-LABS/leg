@@ -51,6 +51,8 @@ pub(crate) struct AcquiredImage {
     pub bytes: Vec<u8>,
     pub declared_media_type: Option<&'static str>,
     pub label: String,
+    /// The digest a host announced; staged bytes must match it.
+    pub expected_sha256: Option<String>,
 }
 
 /// Reads one local image file with a bounded read. The size limit is checked
@@ -79,6 +81,7 @@ pub(crate) fn read_image_file(path: &Path) -> Result<AcquiredImage, String> {
         bytes,
         declared_media_type: declared_media_type(path),
         label,
+        expected_sha256: None,
     })
 }
 
@@ -126,6 +129,7 @@ pub(crate) fn clipboard_image(
         bytes,
         declared_media_type: None,
         label: CLIPBOARD_IMAGE_LABEL.to_string(),
+        expected_sha256: None,
     })
 }
 

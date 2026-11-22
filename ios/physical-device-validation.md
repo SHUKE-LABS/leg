@@ -237,3 +237,27 @@ build:
 | A cancelled picker and a stopped session | `cancelled`, the listener closed, no staging left |
 | The Skill | discovered by the agent, kept across a relaunch |
 | The device log | no asset bytes, credentials, approval tokens, or native paths |
+
+## Image attachments on the device
+
+The image attachment path ([#291](https://github.com/SHUKE-LABS/leg/issues/291))
+has not been run on a physical device yet. The pinned `v0.44.1` guest has no
+receiver, so the device run waits for the re-pin in
+[#319](https://github.com/SHUKE-LABS/leg/issues/319). Until then the coverage
+is the simulator and the fixtures: `ImageAttachmentsTests` with the host
+tests, `ImageAttachmentUITests`, and the `leg-tui` receiver tests. The run
+uses the device command of [The tests on the device](#the-tests-on-the-device)
+and records, for one build:
+
+| Item | Evidence to record |
+| --- | --- |
+| Photos picker | a JPEG, a PNG, and a HEIC (sent as JPEG) each show a preview, `Photos · <name>`, MIME, and size; denied and limited library access do not block the picker |
+| Files picker | a PNG from On My iPhone and from iCloud Drive stages; a file whose provider revoked access is `permission_revoked` |
+| Clipboard | a copied image stages as `Clipboard · pasted-image.<ext>`; denying the paste prompt is `paste_denied`; text paste still types text |
+| Rejections | a renamed non-image, a MIME mismatch, a 10 MB+ image, and a fourth large image over 32 MB stage nothing |
+| Cancel | closing either picker leaves the tray and the guest draft unchanged |
+| Ordered turn | text, an inserted image, and text submit as one turn; the provider receives the image SHA-256 |
+| Receiver exit | after quitting `leg-tui` under a shell, **Insert** is `receiver_unavailable` and the image stays in the tray |
+| Unsupported model | a text-only model fails before the request; the draft keeps the image |
+| Cleanup | background, relaunch, and a killed host leave `Library/Application Support/LegHost/attachments` and `data/tmp/leghost-attachments` empty |
+| The device log | no image bytes, Photos or Files paths, credentials, or upload tokens |

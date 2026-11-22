@@ -233,6 +233,79 @@ bridging header does not expose the hook, or the app bundle lacks the Skill;
 `scripts/build-ish-runtime.sh` fails when the runtime archive does not export
 the hook.
 
+## Image attachments
+
+While a guest runs, the row under the on-screen keys attaches an image to the
+guest draft from **Photo** (the system Photos picker), **File** (the Files
+picker), or **Paste image** (`UIPasteboard`). Text still pastes through the
+keyboard as text.
+
+- **Permissions.** The Photos picker runs out of process and returns only the
+  picked image, so it needs no library access: a denied or limited library
+  does not block it. A picked file is read only inside the security scope its
+  provider grants; a scope that is no longer granted is `permission_revoked`
+  ("pick it again"). iOS asks before LegHost reads another app's clipboard; a
+  denied paste is `paste_denied` and names the Settings switch.
+- **Formats and limits.** JPEG, PNG, GIF, and WebP, proven by magic bytes; a
+  declared type that disagrees is `media_type_mismatch`. The picker converts
+  HEIC and other photo formats to JPEG. One image is at most 10 MB
+  base64-encoded (7.5 MB raw) and the waiting images at most 32 MB, the limits
+  the guest draft enforces too.
+- **Staging.** An accepted image is written to
+  `Library/Application Support/LegHost/attachments/<generation>/<id>` through
+  a partial file renamed into place, then listed with a preview, source marker
+  and safe filename, MIME, size, **Insert**, and **Remove**. Cancel,
+  permission, unreadable, invalid, overflow, and `staging_unavailable` stage
+  nothing and show an actionable status.
+- **Handoff.** The guest gets
+  `LEG_HOST_ATTACHMENT_DIR=/tmp/leghost-attachments/<generation>`; `leg-tui`
+  writes `.receiver-v1` there while it runs and removes it on exit, and
+  **Insert** waits for it (`receiver_unavailable` otherwise), so a guest
+  without a receiver never sees a notice. **Insert** copies the file into that
+  directory, records it in the fakefs (`guest_runtime_adopt_host_tree`), and
+  writes one bracketed paste: `leghost-attachment/v1 ` and JSON with the
+  generation, an opaque `ios-<hex>` id, the source, the filename, MIME, byte
+  length, and SHA-256. Every string is `\u`-escaped outside `[A-Za-z0-9._/-]`,
+  so the notice holds nothing a shell expands or runs. Image bytes, host
+  paths, and credentials never reach the PTY or the log. The image stays on
+  the host until the receiver removes the handoff file; one not taken within
+  3 s is retracted with the marker (`receiver_not_responding`), so a receiver
+  that died without cleaning up gets no further notice. `leg-tui`
+  resolves the id only in its own generation, checks length and SHA-256,
+  removes the handoff file, and stages the image at the cursor through the
+  managed catalog; another generation, a missing or changed file, or an open
+  dialog is refused with a status and leaves no bytes.
+- **Turns.** From there the draft follows the
+  [companion client](../docs/companion-client.md) rules: one request identity
+  per unchanged draft, so reconnect, resume, resend, and replay reuse the
+  attachment SHA-256. A known text-only model fails before any provider call;
+  an unknown model's image rejection is non-retryable `image_input_unsupported`
+  naming the provider and model, and the draft keeps the image for removal or
+  a model switch.
+- **Cleanup.** Each session start sweeps both directories under a new
+  generation; a stop, a failed start, and the background remove them, and the
+  next start removes what a crash or termination left. A picker that returns
+  after its session ended is `session_ended`. The catalog cleanup removes the
+  images of a deleted guest session.
+
+The pinned `v0.44.1` guest predates the receiver, so **Insert** reports
+`receiver_unavailable` until the pin moves
+([#319](https://github.com/SHUKE-LABS/leg/issues/319)). The state line shows
+`attachments=<n>` (images waiting) and `handoffs=<n>`.
+`-leghost-image-fixture <scenario>` (Debug builds) replaces all three sources
+with `png`, `jpeg`, `mismatch`, `unsupported`, `oversized`, `cancel`,
+`denied`, `revoked`, or `unreadable`. `ImageAttachmentsTests` runs with the
+host tests; the UI tests and the device run:
+
+```bash
+bash ios/tests/run-fixture-tests.sh
+bash ios/tests/run-fixture-tests.sh --class LegHostUITests/ImageAttachmentUITests \
+  testImagesFromEverySourceReachTheGuestAsOpaqueNotices testARejectedImageStagesNothing
+bash ios/tests/run-host-tests.sh
+xcodebuild test -project ios/LegHost.xcodeproj -scheme LegHost \
+  -destination 'platform=iOS,id=<device-udid>' -derivedDataPath build/dd-device
+```
+
 ## Licensing
 
 Everything in this directory is GPLv3 (see `LICENSE`) because it embeds and

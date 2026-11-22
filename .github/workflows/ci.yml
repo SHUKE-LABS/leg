@@ -537,6 +537,11 @@ jobs:
               testAStartWhoseEndpointWasReplacedLeavesTheReplacement
               testACleanupThatCannotLookUpTheEndpointKeepsItsRecord
               testACleanupRetryLeavesASocketThatReplacedTheEndpoint
+          - shard: ui-attachments
+            class: ImageAttachmentUITests
+            tests: >-
+              testImagesFromEverySourceReachTheGuestAsOpaqueNotices
+              testARejectedImageStagesNothing
     name: ios-bridge-lifecycle (${{ matrix.shard }})
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
@@ -600,11 +605,12 @@ jobs:
         shell: bash
         env:
           TESTS: ${{ matrix.tests }}
+          TEST_CLASS: ${{ matrix.class || 'BridgeCapabilityUITests' }}
         run: |
           set -euo pipefail
           read -r -a tests <<<"${TESTS}"
           ios/tests/run-fixture-tests.sh --udid "${SIMULATOR_UDID}" \
-            --class LegHostUITests/BridgeCapabilityUITests "${tests[@]}"
+            --class "LegHostUITests/${TEST_CLASS}" "${tests[@]}"
 
       - name: Upload Xcode test results
         if: ${{ always() }}

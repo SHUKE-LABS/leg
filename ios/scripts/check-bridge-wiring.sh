@@ -30,15 +30,17 @@ expect() {
     fi
 }
 
-for file in BridgeCanonicalJSON.swift BridgeListener.swift PhotosAdapter.swift FilesAdapter.swift GuestSkillInstaller.swift; do
+for file in BridgeCanonicalJSON.swift BridgeListener.swift PhotosAdapter.swift FilesAdapter.swift GuestSkillInstaller.swift \
+    ImageAttachments.swift; do
     expect AA11AA11AA11AA11AA110032 LegHost "${file}" Sources
 done
 expect AA11AA11AA11AA11AA110034 LegHost skills Resources
 expect AA11AA11AA11AA11AA110034 LegHost BridgeSkills Resources
-for file in BridgeCanonicalJSONTests.swift BridgeListenerTests.swift PhotosAdapterTests.swift FilesAdapterTests.swift GuestSkillInstallerTests.swift; do
+for file in BridgeCanonicalJSONTests.swift BridgeListenerTests.swift PhotosAdapterTests.swift FilesAdapterTests.swift \
+    GuestSkillInstallerTests.swift ImageAttachmentsTests.swift; do
     expect EE11EE11EE11EE11EE110041 LegHostTests "${file}" Sources
 done
-for file in BridgeCapabilityUITests.swift SkillRelaunchUITests.swift; do
+for file in BridgeCapabilityUITests.swift SkillRelaunchUITests.swift ImageAttachmentUITests.swift; do
     expect CC11CC11CC11CC11CC110042 LegHostUITests "${file}" Sources
 done
 
