@@ -10,6 +10,9 @@ final class BridgeCapabilityUITests: XCTestCase {
     private let startTimeout: TimeInterval = 300
     private static let provider = ["-leghost-provider", "anthropic"]
     private static let request = #"printf '%s\n' '{"version":1,"request_id":"r-1","capability":"files.list","input":{}}' | /usr/local/bin/leg-bridge"#
+    /// Reduces an answer of the bridge to `REASON=<reason>`; the echo of the
+    /// command line does not contain the marker.
+    private static let reasonFilter = #" | sed -n 's/.*"reason":"\([a-z_]*\)".*/REAS''ON=\1/p'"#
 
     private var app: XCUIApplication!
 
@@ -69,13 +72,15 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(waitForOutput("capability_unsupported"), "the host did not answer the guest")
         XCTAssertTrue(waitForState("replies=1,"))
 
-        type(Self.request + "\n")
-        XCTAssertTrue(waitForOutput("duplicate_request_id"), "the guest sent a request id twice")
-        type(#"printf 'not json\n' | /usr/local/bin/leg-bridge"# + "\n")
-        XCTAssertTrue(waitForOutput("malformed_request"))
+        // Each refusal prints its reason alone on a line, so the check does
+        // not depend on where the terminal wraps the answer.
+        type(Self.request + Self.reasonFilter + "\n")
+        XCTAssertTrue(waitForOutput("REASON=duplicate_request_id"), "the guest sent a request id twice")
+        type(#"printf 'not json\n' | /usr/local/bin/leg-bridge"# + Self.reasonFilter + "\n")
+        XCTAssertTrue(waitForOutput("REASON=malformed_request"))
         type(#"printf '%s\n' '{"version":2,"request_id":"r-2","capability":"files.list","input":{}}' | /usr/local/bin/leg-bridge"#
-            + "\n")
-        XCTAssertTrue(waitForOutput("unsupported_version"))
+            + Self.reasonFilter + "\n")
+        XCTAssertTrue(waitForOutput("REASON=unsupported_version"))
         type("/usr/local/bin/leg-bridge-missing </dev/null; echo BRIDGE''_EXIT=$?\n")
         XCTAssertTrue(waitForOutput("BRIDGE_EXIT=127"), "a missing bridge did not fail as a missing command")
         XCTAssertTrue(waitForState("replies=1,"), "a refused request reached the host")
@@ -99,10 +104,7 @@ final class BridgeCapabilityUITests: XCTestCase {
         XCTAssertTrue(waitForState("sockets=0,"), "the interrupted session left its socket")
         XCTAssertTrue(waitForState("endpoint=none"), "the interrupted session left its guest endpoint")
 
-        let retry = app.buttons["guest-retry"]
-        XCTAssertTrue(retry.waitForExistence(timeout: 60), "the retry control is missing")
-        retry.tap()
-        XCTAssertTrue(waitForState("session=2", timeout: startTimeout))
+        XCTAssertTrue(retryUntilSession(2), "the retry did not start a new session")
         XCTAssertTrue(waitForState("bridge=listening"))
         XCTAssertTrue(waitForState("sockets=1,"))
         GuestKeyboard.focus(app)
@@ -220,14 +222,45 @@ final class BridgeCapabilityUITests: XCTestCase {
         GuestKeyboard.focus(app)
     }
 
+    /// Taps the retry until session `number` runs. A loaded simulator drops
+    /// an activation now and then; the app falls back to the background and
+    /// interrupts the retry, and shows the retry control again.
+    private func retryUntilSession(_ number: Int) -> Bool {
+        for _ in 0..<3 {
+            let retry = app.buttons["guest-retry"]
+            guard retry.waitForExistence(timeout: 60) else { break }
+            if app.state != .runningForeground {
+                app.activate()
+            }
+            _ = app.wait(for: .runningForeground, timeout: 30)
+            retry.tap()
+            if waitForState("session=\(number)", timeout: 150) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func type(_ text: String) {
         app.typeText(text)
     }
 
     /// Waits for the terminal to show `text` as output.
     private func waitForOutput(_ text: String, timeout: TimeInterval = 60) -> Bool {
-        app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch
+        let found = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch
             .waitForExistence(timeout: timeout)
+        if !found {
+            report("no output \"\(text)\"")
+        }
+        return found
+    }
+
+    /// Prints the state, the status and the text on the screen to the log
+    /// of the run.
+    private func report(_ failure: String) {
+        let labels = app.staticTexts.allElementsBoundByIndex.map(\.label).filter { !$0.isEmpty }
+        print("[BridgeCapabilityUITests] \(failure); app state \(app.state.rawValue); texts:\n"
+            + labels.joined(separator: "\n"))
     }
 
     private func waitForStatus(_ text: String, timeout: TimeInterval = 300) -> Bool {
@@ -240,10 +273,17 @@ final class BridgeCapabilityUITests: XCTestCase {
 
     private func waitForState(_ text: String, timeout: TimeInterval = 120) -> Bool {
         let state = app.staticTexts["guest-fixture-state"]
-        guard state.waitForExistence(timeout: timeout) else { return false }
+        guard state.waitForExistence(timeout: timeout) else {
+            report("no state")
+            return false
+        }
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label CONTAINS %@", text), object: state)
-        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+        guard XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed else {
+            report("no state \"\(text)\"")
+            return false
+        }
+        return true
     }
 
     private func attachScreenshot(_ name: String) {

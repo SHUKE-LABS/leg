@@ -606,6 +606,15 @@ jobs:
           ios/tests/run-fixture-tests.sh --udid "${SIMULATOR_UDID}" \
             --class LegHostUITests/BridgeCapabilityUITests "${tests[@]}"
 
+      - name: Upload Xcode test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-bridge-lifecycle-${{ matrix.shard }}-xcresult-${{ github.sha }}
+          path: build/dd/Logs/Test/*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
+
   cross:
     runs-on: ubuntu-latest
     strategy:
