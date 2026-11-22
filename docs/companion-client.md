@@ -424,7 +424,9 @@ Palette actions add images to the draft at the cursor. **Attach image file**
 asks for a path; **Paste image from clipboard** reads the host clipboard
 through PowerShell on Windows, `osascript` on macOS, or `wl-paste`/`xclip` on
 Linux. Without a supported clipboard tool, the status says to attach a local
-file instead or use Web/iOS. A bracketed paste always stays text. The composer
+file instead or use Web/iOS. A bracketed paste stays text, except the image
+notice of the [iOS host](../ios/README.md#image-attachments) when it set
+`LEG_HOST_ATTACHMENT_DIR`. The composer
 shows each image as `[image N]`, and a panel above it lists the filename or
 `clipboard image`, MIME, and size. **Remove draft image** opens a chooser;
 Enter or Delete removes the selected image. Invalid bytes, a MIME mismatch,
