@@ -631,23 +631,43 @@ final class BridgeListener: @unchecked Sendable {
     /// How long the listener waits for the request line of a connection.
     static let frameTimeout: TimeInterval = 5
 
-    /// The directory the private socket directories are made in.
+    /// The socket root: the app-owned directory the private socket
+    /// directories are made in.
     ///
-    /// A Darwin socket path holds 103 bytes. The temporary directory of an
-    /// app on a device fits; the one of a simulator app is far longer, so
-    /// the simulator uses the shared temporary directory of the Mac.
+    /// A Darwin socket path holds 103 bytes. On a device the root is `lb` in
+    /// the temporary directory of the app, named through `/var` rather than
+    /// `/private/var` to keep it short. The container of a simulator app is
+    /// far longer, so the simulator uses `/tmp/leghost-bridge-<uid>`, a
+    /// directory only the user that runs the simulator can enter.
     static var defaultSocketParent: URL {
         #if targetEnvironment(simulator)
-        return URL(fileURLWithPath: "/tmp", isDirectory: true)
+        return URL(fileURLWithPath: "/tmp/leghost-bridge-\(geteuid())", isDirectory: true)
         #else
-        return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        var temporary = NSTemporaryDirectory()
+        if temporary.hasPrefix("/private/var/") {
+            temporary.removeFirst("/private".count)
+        }
+        return URL(fileURLWithPath: temporary, isDirectory: true).appendingPathComponent("lb", isDirectory: true)
         #endif
     }
+
+    /// The name prefix of the private socket directory of a generation.
+    static let socketDirectoryPrefix = "lb-"
+
+    /// The random part of a socket directory name, in hex digits.
+    static let socketDirectoryIDLength = 12
+
+    /// How old an empty socket directory must be before the sweep removes
+    /// it: a listener of another process may be between its `mkdir` and its
+    /// `bind`.
+    static let emptySocketDirectoryGrace: TimeInterval = 60
 
     let generation: UInt64
     /// The id of this generation in the staging paths.
     let generationID: String
     private(set) var socketPath = ""
+    /// The stale socket directories the start removed from the socket root.
+    private(set) var sweptEndpoints: [String] = []
 
     private let adapters: [String: BridgeCapabilityAdapter]
     private let registrar: BridgeEndpointRegistrar
@@ -717,11 +737,22 @@ final class BridgeListener: @unchecked Sendable {
 
     // MARK: Start and stop
 
-    /// Binds and listens on a fresh private socket and maps the guest
-    /// endpoint onto it.
+    /// Prepares the socket root, removes the stale endpoints an earlier host
+    /// process left in it, binds and listens on a fresh private socket, and
+    /// maps the guest endpoint onto it.
     func start() throws {
+        // A root too long for a socket path fails before anything is made.
+        let longest = socketParent.path.utf8.count + 1 + Self.socketDirectoryPrefix.utf8.count
+            + Self.socketDirectoryIDLength + 2
+        guard longest <= Int(ISH_BRIDGE_SOCKET_HOST_PATH_MAX) else {
+            throw BridgeListenerError(message: "the socket root is too long for a Darwin socket path")
+        }
+        try Self.prepareSocketRoot(socketParent)
+        sweptEndpoints = Self.sweepStaleEndpoints(in: socketParent)
         let directory = socketParent.appendingPathComponent(
-            "lb-" + String(BridgeValidation.newGeneratedID().prefix(12)), isDirectory: true)
+            Self.socketDirectoryPrefix
+                + String(BridgeValidation.newGeneratedID().prefix(Self.socketDirectoryIDLength)),
+            isDirectory: true)
         guard mkdir(directory.path, 0o700) == 0 else {
             throw BridgeListenerError(message: "the socket directory could not be made (errno \(errno))")
         }
@@ -743,23 +774,127 @@ final class BridgeListener: @unchecked Sendable {
         }
     }
 
-    private func bindAndListen(path: String) throws {
+    // MARK: The socket root
+
+    /// Makes the socket root, or checks the one that is there: it must be a
+    /// real directory of this user, which only this user can enter. Anything
+    /// else at the root fails the start.
+    static func prepareSocketRoot(_ root: URL) throws {
+        let path = root.path
+        if mkdir(path, 0o700) != 0 {
+            let code = errno
+            guard code == EEXIST else {
+                throw BridgeListenerError(message: "the socket root could not be made (errno \(code))")
+            }
+        }
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR, info.st_uid == geteuid() else {
+            throw BridgeListenerError(message: "the socket root is not a directory the app owns")
+        }
+        guard info.st_mode & 0o777 == 0o700 || chmod(path, 0o700) == 0 else {
+            throw BridgeListenerError(message: "the socket root could not be made private (errno \(errno))")
+        }
+    }
+
+    /// The socket directories in `root`, by name.
+    static func socketDirectories(in root: URL) -> [String] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+        return names.filter { $0.hasPrefix(socketDirectoryPrefix) }.sorted()
+    }
+
+    /// Removes what the listeners of an earlier host process left in `root`
+    /// and returns the names it removed.
+    ///
+    /// Only an `lb-*` directory of this user that holds nothing but its
+    /// socket `s` is looked at. It goes when that socket is a socket of this
+    /// user that no listener accepts on any more, or when the directory is
+    /// empty and older than the grace. A live endpoint, an entry of another
+    /// user, a symbolic link, and anything else stay.
+    @discardableResult
+    static func sweepStaleEndpoints(in root: URL, now: Date = Date()) -> [String] {
+        var removed: [String] = []
+        for name in socketDirectories(in: root) {
+            let directory = root.appendingPathComponent(name, isDirectory: true).path
+            var info = stat()
+            guard lstat(directory, &info) == 0, info.st_mode & S_IFMT == S_IFDIR, info.st_uid == geteuid(),
+                  let contents = try? FileManager.default.contentsOfDirectory(atPath: directory) else {
+                continue
+            }
+            if contents.isEmpty {
+                let age = now.timeIntervalSince1970 - TimeInterval(info.st_mtimespec.tv_sec)
+                guard age >= emptySocketDirectoryGrace else { continue }
+            } else {
+                guard contents == ["s"], removeStaleSocket(at: directory + "/s") else { continue }
+            }
+            if rmdir(directory) == 0 {
+                removed.append(name)
+            }
+        }
+        return removed
+    }
+
+    /// Unlinks the socket at `path` when it is a socket of this user whose
+    /// listener is gone: a connect to it is refused. The socket that goes is
+    /// the one that was checked, matched by device and inode.
+    private static func removeStaleSocket(at path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFSOCK, info.st_uid == geteuid(),
+              connectStatus(path) == ECONNREFUSED else {
+            return false
+        }
+        var again = stat()
+        guard lstat(path, &again) == 0, again.st_dev == info.st_dev, again.st_ino == info.st_ino else {
+            return false
+        }
+        return unlink(path) == 0
+    }
+
+    /// Connects to the socket at `path` without waiting; 0 or the errno.
+    ///
+    /// A live listener takes the connection as one that sends no request,
+    /// and closes it without a reply.
+    private static func connectStatus(_ path: String) -> Int32 {
+        guard var address = socketAddress(path) else { return ENAMETOOLONG }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return errno }
+        defer { close(fd) }
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        var on: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+        let status = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return status == 0 ? 0 : errno
+    }
+
+    /// The address of the socket at `path`, when the path fits one.
+    private static func socketAddress(_ path: String) -> sockaddr_un? {
         var address = sockaddr_un()
         let capacity = MemoryLayout.size(ofValue: address.sun_path)
         let bytes = Array(path.utf8)
-        guard bytes.count < capacity, bytes.count <= Int(ISH_BRIDGE_SOCKET_HOST_PATH_MAX) else {
-            throw BridgeListenerError(message: "the socket path is longer than a Darwin socket path")
-        }
-        var info = stat()
-        guard lstat(path, &info) != 0, errno == ENOENT else {
-            throw BridgeListenerError(message: "the socket path is already taken")
-        }
+        guard bytes.count < capacity, bytes.count <= Int(ISH_BRIDGE_SOCKET_HOST_PATH_MAX) else { return nil }
         address.sun_family = sa_family_t(AF_UNIX)
         withUnsafeMutableBytes(of: &address.sun_path) { raw in
             raw.copyBytes(from: bytes)
             raw[bytes.count] = 0
         }
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        return address
+    }
+
+    // MARK: The socket
+
+    private func bindAndListen(path: String) throws {
+        guard var address = Self.socketAddress(path) else {
+            throw BridgeListenerError(message: "the socket path is longer than a Darwin socket path")
+        }
+        var info = stat()
+        guard lstat(path, &info) != 0, errno == ENOENT else {
+            throw BridgeListenerError(message: "the socket path is already taken")
+        }
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw BridgeListenerError(message: "the socket could not be made (errno \(errno))") }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
