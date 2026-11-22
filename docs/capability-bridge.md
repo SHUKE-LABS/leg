@@ -555,7 +555,9 @@ cargo test --all-targets                    # guest bridge, incl. tests/guest_br
 `BridgeListenerTests` covers the socket root, the sweep, the start and
 teardown order, and the host-side protocol limits; `BridgeCapabilityUITests`
 drives the real `/usr/local/bin/leg-bridge` across a listener failure, the
-guest refusals, the background, and a relaunch after a kill.
+guest refusals, the background, and a relaunch after a kill. The
+`ios-bridge-lifecycle` CI job runs both, the UI tests on a freshly booted
+simulator each through `ios/tests/run-fixture-tests.sh --class`.
 
 ## Duplicate request ids
 

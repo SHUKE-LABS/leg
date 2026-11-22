@@ -878,7 +878,9 @@ accessibility server of a simulator wedges when a long run of the tests
 drives the app again and again, and the test that follows the wedge fails
 with an accessibility timeout instead of an assertion, so every test starts
 from a simulator that was booted for it. Pass the names of the tests to run
-only some of them.
+only some of them. The script runs the build of `xcodebuild build-for-testing`
+in `build/dd`; `--class LegHostUITests/BridgeCapabilityUITests <test ...>`
+runs bridge tests the same way, as the `ios-bridge-lifecycle` CI job does.
 
 
 ## Host fixtures

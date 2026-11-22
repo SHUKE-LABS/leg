@@ -498,8 +498,7 @@ jobs:
             -resultBundlePath "${RUNNER_TEMP}/leghost-shortcut-bridge.xcresult" \
             -parallel-testing-enabled NO \
             -only-testing:LegHostUITests/LegHostUITests/testARealShortcutJSONResultCrossesTheHostAndGuestBoundary \
-            -only-testing:LegHostTests/ShortcutTests \
-            -only-testing:LegHostTests/BridgeListenerTests
+            -only-testing:LegHostTests/ShortcutTests
 
       - name: Upload Xcode test result
         if: ${{ always() }}
@@ -509,6 +508,103 @@ jobs:
           path: ${{ runner.temp }}/leghost-shortcut-bridge.xcresult
           if-no-files-found: warn
           retention-days: 14
+
+  ios-bridge-lifecycle:
+    # The host tests, and the bridge UI tests in shards of one simulator boot
+    # per test (see ios/tests/run-fixture-tests.sh).
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: host
+          - shard: ui-transport
+            tests: >-
+              testTheGuestReachesTheListener
+              testWithoutAListenerTheGuestHasNoTransport
+              testAListenerThatCannotStartStartsNoGuest
+              testTheGuestRefusesBadRequestsWithoutReachingTheHost
+          - shard: ui-lifecycle
+            tests: >-
+              testTheBackgroundClosesTheEndpointAndTheRetryOpensAFreshOne
+              testARelaunchAfterAKillLeavesOnlyTheFreshEndpoint
+              testAFailedStartClosesTheListener
+              testAStartThatFailsAfterTheEndpointWasMadeRemovesIt
+          - shard: ui-endpoint
+            tests: >-
+              testAStartLosingTheEndpointToAnotherSocketLeavesThatSocket
+              testAStartWhoseEndpointWasReplacedLeavesTheReplacement
+              testACleanupThatCannotLookUpTheEndpointKeepsItsRecord
+              testACleanupRetryLeavesASocketThatReplacedTheEndpoint
+    name: ios-bridge-lifecycle (${{ matrix.shard }})
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Report Xcode version
+        run: xcodebuild -version
+
+      - name: Configure the ELF linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          llvm_prefix="$(brew --prefix llvm@18)"
+          test -x "${llvm_prefix}/bin/ld.lld"
+          echo "${llvm_prefix}/bin" >>"${GITHUB_PATH}"
+          "${llvm_prefix}/bin/ld.lld" --version
+
+      - name: Boot an iPhone simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          udid="$(xcrun simctl list devices available -j | python3 -c '
+          import json
+          import sys
+
+          devices = json.load(sys.stdin).get("devices", {})
+          for group in devices.values():
+              for device in group:
+                  if "iPhone" in device.get("name", ""):
+                      print(device["udid"])
+                      raise SystemExit
+          ')"
+          if [[ -z "${udid}" ]]; then
+            echo "::error::no available iPhone simulator was found"
+            exit 1
+          fi
+          xcrun simctl boot "${udid}" 2>/dev/null || true
+          xcrun simctl bootstatus "${udid}" -b
+          echo "SIMULATOR_UDID=${udid}" >>"${GITHUB_ENV}"
+
+      - name: Run the host lifecycle tests
+        if: ${{ matrix.shard == 'host' }}
+        shell: bash
+        run: ios/tests/run-lifecycle-tests.sh --udid "${SIMULATOR_UDID}"
+
+      - name: Build the UI tests
+        if: ${{ matrix.shard != 'host' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build-for-testing \
+            -project ios/LegHost.xcodeproj \
+            -scheme LegHost \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
+            -derivedDataPath build/dd
+
+      - name: Run the bridge UI tests
+        if: ${{ matrix.shard != 'host' }}
+        shell: bash
+        env:
+          TESTS: ${{ matrix.tests }}
+        run: |
+          set -euo pipefail
+          read -r -a tests <<<"${TESTS}"
+          ios/tests/run-fixture-tests.sh --udid "${SIMULATOR_UDID}" \
+            --class LegHostUITests/BridgeCapabilityUITests "${tests[@]}"
 
   cross:
     runs-on: ubuntu-latest

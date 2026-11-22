@@ -7,7 +7,12 @@
 # the wedge fails with an accessibility timeout instead of an assertion.
 # Every test therefore gets a simulator of its own.
 #
-# Usage: ios/tests/run-fixture-tests.sh [--udid <simulator udid>] [test id ...]
+# The tests run from the build of `xcodebuild build-for-testing` in build/dd.
+# `--class` runs the named tests of another UI test class the same way, such
+# as LegHostUITests/BridgeCapabilityUITests; it needs the test ids.
+#
+# Usage: ios/tests/run-fixture-tests.sh [--udid <simulator udid>]
+#            [--class <target/class> test id ...] [test id ...]
 
 set -euo pipefail
 
@@ -41,10 +46,16 @@ ALL_TESTS=(
 
 udid=""
 tests=()
+custom_class=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
     --udid)
         udid="${2:-}"
+        shift 2
+        ;;
+    --class)
+        TEST_CLASS="${2:-}"
+        custom_class=1
         shift 2
         ;;
     *)
@@ -54,6 +65,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 if [[ ${#tests[@]} -eq 0 ]]; then
+    if [[ "${custom_class}" -eq 1 ]]; then
+        echo "error: --class needs the test ids to run" >&2
+        exit 2
+    fi
     tests=("${ALL_TESTS[@]}")
 fi
 if [[ -z "${udid}" ]]; then
