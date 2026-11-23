@@ -294,9 +294,11 @@ shows `attachments=<n>` (images waiting) and `handoffs=<n>`.
 with `png`, `jpeg`, `mismatch`, `unsupported`, `oversized`, `cancel`,
 `denied`, `revoked`, or `unreadable`. `-leghost-fixture image` serves one
 turn that the loopback fixture accepts only as text, one `image/png` block
-of that fixture PNG (by SHA-256), and text, in that order (plus the joined
-prompt `leg` restores after them), answered without a tool round. `ImageAttachmentsTests` runs with the host tests; the UI tests
-and the device run:
+of that fixture PNG (by SHA-256), and text, in that order, answered without
+a tool round. The pinned v0.50.3 `leg` also appends the draft prompt (block
+0 plus block 2) as a fourth text block; the fixture accepts that one block
+and nothing else until #323 removes the duplicate. `ImageAttachmentsTests`
+runs with the host tests; the UI tests and the device run:
 
 ```bash
 bash ios/tests/run-fixture-tests.sh

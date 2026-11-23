@@ -372,7 +372,7 @@ final class LoopbackFixture {
     /// The v0.50.3 `leg` restores the draft prompt (both text blocks joined)
     /// as a trailing text block when no block equals it
     /// (`model::content_with_prompt`); that one block is accepted, nothing
-    /// else. The image is decoded and hashed in memory only; the reasons name
+    /// else, until #323 removes the duplicate. The image is decoded and hashed in memory only; the reasons name
     /// the part that did not match.
     static func imageTurnProblems(_ object: [String: Any]) -> [String] {
         guard let message = (object["messages"] as? [[String: Any]])?.last,
