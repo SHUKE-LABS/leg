@@ -1088,8 +1088,8 @@ enum GuestScreen {
     /// starts without one. A new session is made in the picker, so the guest
     /// asks for the workspace of that session. The guest program shows the
     /// first-run warning then, unless a previous run already acknowledged it,
-    /// and it offers the composer after it. The helper fills in the workspace
-    /// and acknowledges the warning.
+    /// and it offers the composer after it. The helper fills in the workspace,
+    /// acknowledges the warning, and verifies a temporary draft keystroke.
     ///
     /// The screen of the guest is read in one loop, so the terminal is read
     /// once per round and not once per screen that is waited for: the
@@ -1105,35 +1105,71 @@ enum GuestScreen {
         XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
 
         let deadline = Date().addingTimeInterval(180)
+        let pickerPrompt = "Enter reopen"
+        let workspacePrompt = "Enter a path and press Enter to select it."
+        let warningPrompt = "Press Enter to acknowledge and open the composer."
         var created = false
         var asked = false
-        var warned = false
-        var composer = false
-        while !composer && Date() < deadline {
+        var warningSubmitted = false
+        var onboardingReady = false
+        while !onboardingReady && Date() < deadline {
             let screen = text(app)
             if !asked {
-                if !created && shows("Enter reopen", in: screen) {
+                if !created && shows(pickerPrompt, in: screen) {
                     // A new session is made in the picker of the sessions,
                     // and the guest asks for the workspace of that session.
                     GuestKeyboard.focus(app)
                     app.typeText("n")
                     created = true
-                } else if shows("Enter a path and press Enter to select it.", in: screen) {
+                } else if shows(workspacePrompt, in: screen) {
                     GuestKeyboard.focus(app)
                     app.typeText("/tmp")
                     app.typeText("\n")
                     asked = true
                 }
-            } else if !warned && shows("Press Enter to acknowledge and open the composer.", in: screen) {
-                GuestKeyboard.focus(app)
-                app.typeText("\n")
-                warned = true
-            } else if shows("catalog: ", in: screen) {
-                composer = true
+            } else if shows(warningPrompt, in: screen) {
+                if !warningSubmitted {
+                    GuestKeyboard.focus(app)
+                    app.typeText("\n")
+                    warningSubmitted = true
+                }
+            } else if !shows(pickerPrompt, in: screen) && !shows(workspacePrompt, in: screen) {
+                // The warning is a modal drawn over the conversation. Its
+                // background still contains the catalog header, so the
+                // header alone cannot prove that the composer is active.
+                onboardingReady = true
             }
-            if !composer { usleep(3_000_000) }
+            if !onboardingReady { usleep(3_000_000) }
         }
         XCTAssertTrue(asked, "the guest program did not ask for a workspace")
-        XCTAssertTrue(composer, "the composer did not appear")
+        XCTAssertTrue(onboardingReady, "the guest onboarding did not finish")
+        guard asked && onboardingReady else { return }
+
+        // Prove that the hidden keyboard is attached to the live composer,
+        // rather than merely seeing the conversation header behind a modal.
+        let probe = "LEG_COMPOSER_READY_PROBE"
+        GuestKeyboard.focus(app)
+        app.typeText(probe)
+        var inputReachedDraft = false
+        let inputDeadline = Date().addingTimeInterval(30)
+        while Date() < inputDeadline {
+            if shows(probe, in: text(app)) {
+                inputReachedDraft = true
+                break
+            }
+            usleep(1_000_000)
+        }
+        XCTAssertTrue(inputReachedDraft, "the composer did not accept draft input")
+        guard inputReachedDraft else { return }
+
+        for _ in probe {
+            app.keys["delete"].tap()
+        }
+        let clearDeadline = Date().addingTimeInterval(30)
+        while Date() < clearDeadline {
+            if !shows(probe, in: text(app)) { return }
+            usleep(1_000_000)
+        }
+        XCTFail("the composer probe was not removed from the draft")
     }
 }
