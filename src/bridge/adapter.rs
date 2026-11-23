@@ -16,6 +16,8 @@ use std::fmt::Write as _;
 #[cfg(unix)]
 use std::fs;
 use std::hash::{Hash, Hasher};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -248,7 +250,18 @@ impl HostAdapter for SocketHostAdapter {
                     };
                 }
             };
-            let mut connection = UnixHostConnection::new(stream);
+            let mut connection = match UnixHostConnection::new(stream) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return HostExchange {
+                        outcome: HostOutcome::Failed {
+                            reason: "transport_error".to_string(),
+                            message: transport_message(error),
+                        },
+                        reached: true,
+                    };
+                }
+            };
             // The host is connected, so the request may have reached it. A
             // write that failed halfway is not proof that it did not, so the
             // request id is used.
@@ -362,18 +375,72 @@ pub(crate) fn write_over_a_socket(
 
     let stream =
         UnixStream::connect(path).map_err(|error| ConnectionError::Io(error.to_string()))?;
-    let mut connection = UnixHostConnection::new(stream);
+    let mut connection = UnixHostConnection::new(stream)?;
     connection.send(&"x".repeat(bytes), deadline)
 }
 
 #[cfg(unix)]
 impl UnixHostConnection {
     /// Creates a connection over `stream`.
-    fn new(stream: std::os::unix::net::UnixStream) -> Self {
-        Self {
+    fn new(stream: std::os::unix::net::UnixStream) -> Result<Self, ConnectionError> {
+        stream.set_nonblocking(true).map_err(|error| {
+            ConnectionError::Io(format!(
+                "the host socket could not be made nonblocking: {error}"
+            ))
+        })?;
+        Ok(Self {
             stream,
             buffer: Vec::new(),
+        })
+    }
+}
+
+/// Waits until a nonblocking host socket is ready, or until `wait` elapses.
+#[cfg(unix)]
+fn wait_for_socket(
+    stream: &std::os::unix::net::UnixStream,
+    events: libc::c_short,
+    wait: Duration,
+) -> Result<bool, ConnectionError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if crate::interrupt::is_signaled() {
+            return Err(ConnectionError::Cancelled);
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let timeout = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` points to one valid poll descriptor for the
+        // duration of the call, and its fd is borrowed from `stream`.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if ready > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(ConnectionError::Io(
+                    "the host socket is not a valid poll descriptor".to_string(),
+                ));
+            }
+            return Ok(true);
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+        ) {
+            continue;
+        }
+        return Err(ConnectionError::Io(format!(
+            "the host socket could not be polled: {error}"
+        )));
     }
 }
 
@@ -382,15 +449,16 @@ impl HostConnection for UnixHostConnection {
     fn send(&mut self, frame: &str, deadline: Instant) -> Result<(), ConnectionError> {
         use std::io::Write as _;
 
-        // The write is bounded by the deadline: the socket carries a timeout,
-        // and the bridge gives the write up when the deadline is reached
-        // rather than waiting for a host that stopped reading.
+        // The write is bounded by the deadline: the nonblocking socket is
+        // polled in short intervals, and the bridge gives the write up when
+        // the deadline is reached rather than waiting for a host that stopped
+        // reading.
         //
-        // The socket gives up on an attempt after a short interval rather
-        // than after the whole of the remaining time, so the loop looks at
-        // the clock and at the interrupt flag every few tens of
-        // milliseconds. A host that stopped reading therefore cannot hold a
-        // cancelled request until the deadline.
+        // The poll gives up on an attempt after a short interval rather than
+        // after the whole of the remaining time, so the loop looks at the
+        // clock and at the interrupt flag every few tens of milliseconds. A
+        // host that stopped reading therefore cannot hold a cancelled request
+        // until the deadline.
         let mut bytes = frame.as_bytes().to_vec();
         bytes.push(b'\n');
         let mut written = 0;
@@ -402,12 +470,10 @@ impl HostConnection for UnixHostConnection {
             if remaining.is_zero() {
                 return Err(ConnectionError::Timeout);
             }
-            let wait = remaining
-                .min(WRITE_POLL_INTERVAL)
-                .max(Duration::from_millis(1));
-            self.stream
-                .set_write_timeout(Some(wait))
-                .map_err(|error| ConnectionError::Io(error.to_string()))?;
+            let wait = remaining.min(WRITE_POLL_INTERVAL);
+            if !wait_for_socket(&self.stream, libc::POLLOUT, wait)? {
+                continue;
+            }
             match self.stream.write(&bytes[written..]) {
                 Ok(0) => {
                     return Err(ConnectionError::Io(
@@ -438,12 +504,12 @@ impl HostConnection for UnixHostConnection {
     fn receive(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, ConnectionError> {
         use std::io::Read as _;
 
-        // A read timeout that rounds to zero is an error on some systems, so
-        // the wait never drops below a millisecond.
-        let wait = wait.max(Duration::from_millis(1));
-        self.stream
-            .set_read_timeout(Some(wait))
-            .map_err(|error| ConnectionError::Io(error.to_string()))?;
+        if let Some(frame) = self.take_frame()? {
+            return Ok(Some(frame));
+        }
+        if !wait_for_socket(&self.stream, libc::POLLIN, wait)? {
+            return Ok(None);
+        }
 
         let mut chunk = [0u8; 4096];
         match self.stream.read(&mut chunk) {
@@ -459,6 +525,13 @@ impl HostConnection for UnixHostConnection {
                 ) =>
             {
                 Ok(None)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                if crate::interrupt::is_signaled() {
+                    Err(ConnectionError::Cancelled)
+                } else {
+                    Ok(None)
+                }
             }
             Err(error) => Err(ConnectionError::Io(error.to_string())),
         }
