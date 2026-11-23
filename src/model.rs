@@ -143,10 +143,7 @@ pub fn as_single_text(blocks: &[ContentBlock]) -> Option<&str> {
 /// message needs the prompt text restored without changing the trail shape.
 pub fn content_with_prompt(prompt: &str, blocks: &[ContentBlock]) -> Vec<ContentBlock> {
     let mut content = blocks.to_vec();
-    if !content
-        .iter()
-        .any(|block| matches!(block, ContentBlock::Text { text } if text == prompt))
-    {
+    if blocks_text(blocks) != prompt {
         content.push(ContentBlock::text(prompt));
     }
     content
@@ -503,6 +500,29 @@ mod tests {
         assert_eq!(
             content_with_prompt("describe", std::slice::from_ref(&image)),
             vec![image.clone(), ContentBlock::text("describe")]
+        );
+        assert_eq!(
+            content_with_prompt(
+                "describe",
+                &[
+                    ContentBlock::text("des"),
+                    image.clone(),
+                    ContentBlock::text("cribe"),
+                ],
+            ),
+            vec![
+                ContentBlock::text("des"),
+                image.clone(),
+                ContentBlock::text("cribe"),
+            ]
+        );
+        assert_eq!(
+            content_with_prompt("describe", &[ContentBlock::text("other"), image.clone()]),
+            vec![
+                ContentBlock::text("other"),
+                image.clone(),
+                ContentBlock::text("describe"),
+            ]
         );
         assert_eq!(
             content_with_prompt("describe", &[ContentBlock::text("describe"), image]),
