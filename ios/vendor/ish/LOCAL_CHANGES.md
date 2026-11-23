@@ -74,9 +74,11 @@ Two things were wrong:
   numbers a Linux guest uses. Linux has `SO_RCVTIMEO` at 20 and `SO_SNDTIMEO`
   at 21, and a guest asks for those. The option was unknown, so the emulator
   refused it.
-- The value of a timeout is a `struct timeval`, whose fields are 32-bit wide
-  in the guest and 64-bit wide in a 64-bit host. The kernel checks the length
-  of the value it is given, so the guest's eight bytes were refused as well.
+- The value of a timeout has two guest layouts: older i386 binaries use two
+  32-bit fields, while musl 1.2 time64 binaries use two 64-bit fields. The
+  host may use a different layout, and the kernel checks the length of the
+  value it is given, so the hook accepts either guest layout and translates it
+  in both directions.
 
 The change gives the two options the numbers a Linux guest uses and
 translates the timeout in both directions: the guest's timeval goes out as the
