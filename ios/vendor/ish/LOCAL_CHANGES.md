@@ -70,10 +70,10 @@ client among them, failed before it sent anything.
 
 Two things were wrong:
 
-- The numbers the emulator knew the timeout options by, 66 and 67, are not the
-  numbers a Linux guest uses. Linux has `SO_RCVTIMEO` at 20 and `SO_SNDTIMEO`
-  at 21, and a guest asks for those. The option was unknown, so the emulator
-  refused it.
+- The emulator initially knew neither timeout ABI: legacy Linux uses
+  `SO_RCVTIMEO`/`SO_SNDTIMEO` at 20 and 21, while musl 1.2 time64 uses the
+  `*_NEW` IDs 66 and 67. The guest asks for the IDs belonging to its ABI, so
+  the option was unknown and the emulator refused it.
 - The value of a timeout has two guest layouts: older i386 binaries use two
   32-bit fields, while musl 1.2 time64 binaries use two 64-bit fields. The
   host may use a different layout, and the kernel checks the length of the
