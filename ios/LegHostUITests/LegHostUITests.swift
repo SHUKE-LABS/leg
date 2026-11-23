@@ -1162,9 +1162,8 @@ enum GuestScreen {
         XCTAssertTrue(inputReachedDraft, "the composer did not accept draft input")
         guard inputReachedDraft else { return }
 
-        for _ in probe {
-            app.keys["delete"].tap()
-        }
+        GuestKeyboard.focus(app)
+        app.typeText(String(repeating: "\u{8}", count: probe.count))
         let clearDeadline = Date().addingTimeInterval(30)
         while Date() < clearDeadline {
             if !shows(probe, in: text(app)) { return }
