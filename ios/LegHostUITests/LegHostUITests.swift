@@ -26,8 +26,10 @@ final class LegHostUITests: XCTestCase {
     ///
     /// The first request obtains the host approval token. The second redeems
     /// it with the same input and checks the complete deterministic result the
-    /// real iOS host returned. The final sleep keeps the terminal visible so
-    /// the test can read the guest's assertion.
+    /// real iOS host returned. The shell exits with success only after that
+    /// assertion; the test observes the exit status instead of repeatedly
+    /// snapshotting the live terminal, whose large accessibility tree can
+    /// wedge the simulator while the guest is running.
     private static let shortcutBridgeScript = [
         #"request='{"version":1,"request_id":"shortcut-e2e-approval","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}}}';"#,
         #"first=$(printf '%s\n' "$request" | /usr/local/bin/leg-bridge);"#,
@@ -35,8 +37,8 @@ final class LegHostUITests: XCTestCase {
         #"approved='{"version":1,"request_id":"shortcut-e2e-result","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}},"approval_token":"'"$token"'"}';"#,
         #"second=$(printf '%s\n' "$approved" | /usr/local/bin/leg-bridge);"#,
         #"if printf '%s\n' "$second" | grep -F '"status":"ok"' >/dev/null && printf '%s\n' "$second" | grep -F '"result":{"count":2,"ok":true,"source":"ios-shortcuts-fixture"}' >/dev/null; then"#,
-        #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; else"#,
-        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; fi; sleep 600"#,
+        #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; exit 0; else"#,
+        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; exit 1; fi"#,
     ].joined(separator: " ")
 
     /// XCUITest forwards launch arguments through a shell-like boundary. The
@@ -221,7 +223,8 @@ final class LegHostUITests: XCTestCase {
     /// DEBUG-only fixture mode. The guest runs the shipped leg-bridge twice:
     /// once to obtain approval and once to redeem it. The shell assertion is
     /// made against the final bridge response, so the object must survive the
-    /// real host adapter, unified Unix listener, iSH socket shim, and guest binary.
+    /// real host adapter, unified Unix listener, iSH socket shim, and guest
+    /// binary. The shell's exit status reports whether that assertion passed.
     func testARealShortcutJSONResultCrossesTheHostAndGuestBoundary() {
         app.terminate()
         app.launchArguments = ["-leghost-reset"] + Self.launchArguments + [
@@ -234,13 +237,15 @@ final class LegHostUITests: XCTestCase {
 
         XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
                       "the guest terminal is missing")
-        let resultVisible = waitForTerminalText(
-            "SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture",
-            timeout: startTimeout)
+        XCTAssertTrue(app.staticTexts["guest-exited"].waitForExistence(timeout: startTimeout),
+                      "the guest did not finish the Shortcut assertion")
+        let detail = app.staticTexts["guest-status-detail"]
         let state = fixtureStateLabel()
-        XCTAssertTrue(resultVisible,
-                      "the deterministic Shortcut object did not cross the host and guest boundary; "
-                        + "host state: \(state)")
+        XCTAssertEqual(detail.label, "The guest program exited.",
+                       "the guest Shortcut assertion failed; host state: \(state)")
+        XCTAssertTrue(state.contains("replies=2")
+                        && state.contains("reply_statuses=approval_required,ok"),
+                      "the host did not complete both Shortcut bridge exchanges; host state: \(state)")
     }
 
     /// The second launch verifies the root and reuses it instead of importing
