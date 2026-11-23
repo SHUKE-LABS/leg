@@ -369,23 +369,17 @@ final class LoopbackFixture {
     /// The reasons the last message is not the image turn: exactly text, one
     /// `image/png` block whose decoded bytes are the fixture image, and text.
     ///
-    /// The v0.50.3 `leg` restores the draft prompt (both text blocks joined)
-    /// as a trailing text block when no block equals it
-    /// (`model::content_with_prompt`); that one block is accepted, nothing
-    /// else, until #323 removes the duplicate. The image is decoded and hashed in memory only; the reasons name
-    /// the part that did not match.
+    /// The image is decoded and hashed in memory only; the reasons name the
+    /// part that did not match.
     static func imageTurnProblems(_ object: [String: Any]) -> [String] {
         guard let message = (object["messages"] as? [[String: Any]])?.last,
               (message["role"] as? String) == "user",
-              var blocks = message["content"] as? [[String: Any]]
+              let blocks = message["content"] as? [[String: Any]]
         else { return ["image-turn"] }
+        guard blocks.count == 3,
+              blocks.map({ $0["type"] as? String ?? "" }) == ["text", "image", "text"]
+        else { return ["image-order"] }
         let text = { (index: Int) in blocks[index]["text"] as? String ?? "" }
-        if blocks.count == 4, (blocks[3]["type"] as? String) == "text", text(3) == text(0) + text(2) {
-            blocks.removeLast()
-        }
-        guard blocks.map({ $0["type"] as? String ?? "" }) == ["text", "image", "text"] else {
-            return ["image-order"]
-        }
         var problems: [String] = []
         if !((blocks[0]["text"] as? String) ?? "").contains(Self.imageTextBefore)
             || !((blocks[2]["text"] as? String) ?? "").contains(Self.imageTextAfter) {

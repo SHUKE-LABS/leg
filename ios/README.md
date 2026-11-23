@@ -288,17 +288,16 @@ keyboard as text.
   after its session ended is `session_ended`. The catalog cleanup removes the
   images of a deleted guest session.
 
-The pinned `v0.50.3` guest's `leg-tui` carries the receiver. The state line
+The pinned `v0.50.4` guest's `leg-tui` carries the receiver. The state line
 shows `attachments=<n>` (images waiting) and `handoffs=<n>`.
 `-leghost-image-fixture <scenario>` (Debug builds) replaces all three sources
 with `png`, `jpeg`, `mismatch`, `unsupported`, `oversized`, `cancel`,
 `denied`, `revoked`, or `unreadable`. `-leghost-fixture image` serves one
 turn that the loopback fixture accepts only as text, one `image/png` block
 of that fixture PNG (by SHA-256), and text, in that order, answered without
-a tool round. The pinned v0.50.3 `leg` also appends the draft prompt (block
-0 plus block 2) as a fourth text block; the fixture accepts that one block
-and nothing else until #323 removes the duplicate. `ImageAttachmentsTests`
-runs with the host tests; the UI tests and the device run:
+a tool round. The pinned v0.50.4 `leg` sends exactly those three content
+blocks; `ImageAttachmentsTests` runs with the host tests; the UI tests and the
+device run:
 
 ```bash
 bash ios/tests/run-fixture-tests.sh
@@ -326,7 +325,7 @@ downloads exactly those files.
 
 | Input | URL | SHA-256 |
 | --- | --- | --- |
-| leg ios-mobile bundle `v0.50.3` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.50.3/leg-0.50.3-i686-unknown-linux-musl-mobile.tar.gz` | `6da67ca24931a5a8b517ce2b192f2d0def0c232653d96c5611495b597568fe70` |
+| leg ios-mobile bundle `v0.50.4` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.50.4/leg-0.50.4-i686-unknown-linux-musl-mobile.tar.gz` | `0afc1d3e6d791e91e8852fa58639efbe13d09aa3141845ec088704415ccf7e3d` |
 | Alpine i386 root `3.20.3` | `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz` | `4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9` |
 
 The guest bundle is the ios-mobile release asset, not the generic iSH bundle.
@@ -381,7 +380,7 @@ guest/model sees the registered name and bounded text/JSON input shape it
 requested, the approval review, and the structured Shortcut result or error.
 It never receives Shortcut source or an unregistered automation list.
 
-The pinned SHA-256 is the `SHA256SUMS` entry the `v0.50.3` release publishes
+The pinned SHA-256 is the `SHA256SUMS` entry the `v0.50.4` release publishes
 for the ios-mobile asset. The build and `ios/tests/run-pinned-inputs.sh` fail
 closed on an archive that does not match it.
 

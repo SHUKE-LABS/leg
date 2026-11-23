@@ -318,7 +318,7 @@ The host pins its two inputs by URL and SHA-256:
 
 | Input | URL | SHA-256 |
 | --- | --- | --- |
-| leg ios-mobile bundle `v0.50.3` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.50.3/leg-0.50.3-i686-unknown-linux-musl-mobile.tar.gz` | `6da67ca24931a5a8b517ce2b192f2d0def0c232653d96c5611495b597568fe70` |
+| leg ios-mobile bundle `v0.50.4` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.50.4/leg-0.50.4-i686-unknown-linux-musl-mobile.tar.gz` | `0afc1d3e6d791e91e8852fa58639efbe13d09aa3141845ec088704415ccf7e3d` |
 | Alpine i386 root `3.20.3` | `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz` | `4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9` |
 
 Build, install, run and reset it with:

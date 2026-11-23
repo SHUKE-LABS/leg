@@ -10,11 +10,11 @@
 			<key>name</key>
 			<string>leg_guest_bundle</string>
 			<key>url</key>
-			<string>https://github.com/SHUKE-LABS/leg/releases/download/v0.50.3/leg-0.50.3-i686-unknown-linux-musl-mobile.tar.gz</string>
+			<string>https://github.com/SHUKE-LABS/leg/releases/download/v0.50.4/leg-0.50.4-i686-unknown-linux-musl-mobile.tar.gz</string>
 			<key>filename</key>
-			<string>leg-0.50.3-i686-unknown-linux-musl-mobile.tar.gz</string>
+			<string>leg-0.50.4-i686-unknown-linux-musl-mobile.tar.gz</string>
 			<key>sha256</key>
-			<string>6da67ca24931a5a8b517ce2b192f2d0def0c232653d96c5611495b597568fe70</string>
+			<string>0afc1d3e6d791e91e8852fa58639efbe13d09aa3141845ec088704415ccf7e3d</string>
 		</dict>
 		<dict>
 			<key>name</key>
@@ -32,7 +32,7 @@
 		<key>bundle_kind</key>
 		<string>ios-mobile</string>
 		<key>leg_version</key>
-		<string>0.50.3</string>
+		<string>0.50.4</string>
 		<key>target</key>
 		<string>i686-unknown-linux-musl</string>
 		<key>architecture</key>
