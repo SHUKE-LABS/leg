@@ -258,7 +258,7 @@ impl HostAdapter for SocketHostAdapter {
                             reason: "transport_error".to_string(),
                             message: transport_message(error),
                         },
-                        reached: true,
+                        reached: false,
                     };
                 }
             };
