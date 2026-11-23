@@ -589,6 +589,11 @@ jobs:
         shell: bash
         run: ios/tests/run-lifecycle-tests.sh --udid "${SIMULATOR_UDID}"
 
+      - name: Provision the real pinned inputs
+        if: ${{ matrix.shard == 'host' }}
+        shell: bash
+        run: ios/tests/run-pinned-inputs.sh
+
       - name: Build the UI tests
         if: ${{ matrix.shard != 'host' }}
         shell: bash
