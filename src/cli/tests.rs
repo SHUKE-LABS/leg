@@ -1309,6 +1309,45 @@ fn execute_exchange_core_runs_the_loop_inside_one_envelope() {
 }
 
 #[test]
+fn execute_exchange_core_does_not_duplicate_interleaved_prompt_content() {
+    let image = ContentBlock::Image {
+        source: crate::model::ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        },
+    };
+    let content = vec![
+        ContentBlock::text("des"),
+        image,
+        ContentBlock::text("cribe"),
+    ];
+    let mut envelope = MessageEnvelope::new(
+        "m-image-interleaved",
+        "c-image-interleaved",
+        "user",
+        "assistant",
+        MessageKind::Request,
+        "describe",
+        1_700_000_000_000,
+    );
+    envelope.content = Some(content.clone());
+
+    let transport = CapturingTransport::new(vec![AssistantReply::new("answer")]);
+    let participant = LocalParticipant::new(looped(&transport), meta());
+    let raw = serde_json::to_string(&envelope).unwrap();
+    execute_exchange_core(&participant, &meta(), &raw, &mut Vec::new(), &mut NoopSink)
+        .expect("companion exchange succeeds");
+
+    let calls = transport.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0],
+        vec![Message::new(Role::User, content)],
+        "the provider receives the ordered content once"
+    );
+}
+
+#[test]
 fn session_repl_runs_the_tool_loop_and_keeps_its_rounds_in_history() {
     let tool_reply = AssistantReply::from_blocks(
         vec![ContentBlock::text("checking"), tool_use_block()],

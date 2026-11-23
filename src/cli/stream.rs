@@ -984,7 +984,7 @@ mod tests {
     use super::*;
     use std::io;
 
-    use crate::model::{AssistantReply, ImageSource};
+    use crate::model::{AssistantReply, ContentBlock, ImageSource};
     use crate::transport::Transport;
 
     struct BufferedTransport {
@@ -1262,6 +1262,57 @@ mod tests {
         assert_eq!(
             records[1]["response"]["in_reply_to"],
             records[0]["request"]["message_id"]
+        );
+    }
+
+    #[test]
+    fn cold_stream_exchange_does_not_duplicate_interleaved_prompt_content() {
+        let calls = Rc::new(Cell::new(0));
+        let histories = Rc::new(RefCell::new(Vec::new()));
+        let transport = ToolLoop::new(
+            BufferedTransport {
+                reply: Ok(AssistantReply::new("answer")),
+                calls: Rc::clone(&calls),
+                histories: Rc::clone(&histories),
+            },
+            ToolRegistry::new(),
+            None,
+        );
+        let content = vec![
+            ContentBlock::text("des"),
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo=".to_string(),
+                },
+            },
+            ContentBlock::text("cribe"),
+        ];
+        let mut request = request("describe");
+        request.content = Some(content.clone());
+        let mut bytes = Vec::new();
+        let writer = Rc::new(RefCell::new(StreamJsonWriter::new(&mut bytes)));
+        let mut sink = NoopSink;
+        execute_cold_exchange_core(
+            &transport,
+            &ExchangeMeta {
+                model: "test-model".to_string(),
+                base_url: "https://provider.test".to_string(),
+            },
+            Provider::Anthropic,
+            &request,
+            &mut sink,
+            &mut Vec::new(),
+            &writer,
+        )
+        .expect("stream exchange succeeds");
+        drop(writer);
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            histories.borrow()[0],
+            vec![Message::new(Role::User, content)],
+            "the streaming provider receives the ordered content once"
         );
     }
 
