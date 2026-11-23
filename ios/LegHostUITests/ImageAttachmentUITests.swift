@@ -107,6 +107,8 @@ final class ImageAttachmentUITests: XCTestCase {
 
         GuestKeyboard.focus(app)
         type("IOS_IMAGE_BEFORE ")
+        XCTAssertTrue(waitForScreen("IOS_IMAGE_BEFORE"),
+                      "the text before the image is not in the draft")
         app.buttons["attach-photos"].tap()
         XCTAssertTrue(waitForState("attachments=1"), "the image was not staged")
         app.buttons["attachment-insert"].firstMatch.tap()
