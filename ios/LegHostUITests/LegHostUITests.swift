@@ -930,14 +930,11 @@ final class LegHostFixtureUITests: XCTestCase {
         app.launch()
     }
 
-    /// Drives one turn in the guest program: the composer is opened (see
-    /// `GuestScreen.openComposer`) and the prompt is sent with the send
-    /// control.
+    /// Drives one turn in the guest program: the composer is opened and primed
+    /// with the prompt (see `GuestScreen.openComposer`), then the prompt is
+    /// sent with the send control.
     private func driveOneTurn() {
-        GuestScreen.openComposer(app)
-
-        focusGuest()
-        app.typeText(prompt)
+        GuestScreen.openComposer(app, input: prompt)
         let submit = app.buttons["guest-key-submit"]
         XCTAssertTrue(submit.waitForExistence(timeout: 30), "the send control is missing")
         submit.tap()
@@ -1089,7 +1086,7 @@ enum GuestScreen {
     /// asks for the workspace of that session. The guest program shows the
     /// first-run warning then, unless a previous run already acknowledged it,
     /// and it offers the composer after it. The helper fills in the workspace,
-    /// acknowledges the warning, and verifies a temporary draft keystroke.
+    /// acknowledges the warning, and verifies the caller's draft input.
     ///
     /// The screen of the guest is read in one loop, so the terminal is read
     /// once per round and not once per screen that is waited for: the
@@ -1100,7 +1097,7 @@ enum GuestScreen {
     /// The screen of the session that came before is still on the terminal
     /// when a session starts, so the loop waits for the screen the guest
     /// opens with before it looks for the composer.
-    static func openComposer(_ app: XCUIApplication) {
+    static func openComposer(_ app: XCUIApplication, input: String) {
         let terminal = app.otherElements["guest-terminal"]
         XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
 
@@ -1147,28 +1144,17 @@ enum GuestScreen {
 
         // Prove that the hidden keyboard is attached to the live composer,
         // rather than merely seeing the conversation header behind a modal.
-        let probe = "LEG_COMPOSER_READY_PROBE"
         GuestKeyboard.focus(app)
-        app.typeText(probe)
+        app.typeText(input)
         var inputReachedDraft = false
         let inputDeadline = Date().addingTimeInterval(30)
         while Date() < inputDeadline {
-            if shows(probe, in: text(app)) {
+            if shows(input, in: text(app)) {
                 inputReachedDraft = true
                 break
             }
             usleep(1_000_000)
         }
         XCTAssertTrue(inputReachedDraft, "the composer did not accept draft input")
-        guard inputReachedDraft else { return }
-
-        GuestKeyboard.focus(app)
-        app.typeText(String(repeating: "\u{8}", count: probe.count))
-        let clearDeadline = Date().addingTimeInterval(30)
-        while Date() < clearDeadline {
-            if !shows(probe, in: text(app)) { return }
-            usleep(1_000_000)
-        }
-        XCTFail("the composer probe was not removed from the draft")
     }
 }

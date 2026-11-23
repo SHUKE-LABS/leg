@@ -103,10 +103,7 @@ final class ImageAttachmentUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
                       "the terminal is missing")
-        GuestScreen.openComposer(app)
-
-        GuestKeyboard.focus(app)
-        type("IOS_IMAGE_BEFORE ")
+        GuestScreen.openComposer(app, input: "IOS_IMAGE_BEFORE ")
         XCTAssertTrue(waitForScreen("IOS_IMAGE_BEFORE"),
                       "the text before the image is not in the draft")
         app.buttons["attach-photos"].tap()
