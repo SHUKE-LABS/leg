@@ -1356,6 +1356,55 @@ fn a_host_socket_that_is_not_there_is_unreachable() {
 
 #[cfg(unix)]
 #[test]
+fn a_host_socket_reply_is_read_from_a_real_connection() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    let scratch = scratch("socket-reply");
+    let path = scratch.path.join("host.sock");
+    let listener = UnixListener::bind(&path).expect("bind the host socket");
+    let host = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept the bridge");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("read the bridge request");
+        let request: Value = serde_json::from_str(&line).expect("the request is JSON");
+        let reply = json!({
+            "version": 1,
+            "nonce": request["nonce"],
+            "request_id": request["request_id"],
+            "status": "unavailable",
+            "result": null,
+            "error": {
+                "reason": "fixture_unavailable",
+                "message": "the fixture host is unavailable",
+            },
+        });
+        let mut stream = reader.into_inner();
+        writeln!(stream, "{reply}").expect("write the host reply");
+    });
+
+    let mut adapter = adapter::SocketHostAdapter::new(path);
+    let exchange = adapter.dispatch(&host_request(), Instant::now() + Duration::from_secs(5));
+    host.join().expect("the host finished");
+
+    assert_eq!(
+        exchange,
+        HostExchange {
+            outcome: HostOutcome::Unavailable {
+                reason: "fixture_unavailable".to_string(),
+                message: "the fixture host is unavailable".to_string(),
+            },
+            reached: true,
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_host_socket_that_cannot_be_reached_in_time_times_out() {
     let scratch = scratch("late-socket");
     let mut adapter = adapter::SocketHostAdapter::new(scratch.path.join("nothing.sock"));

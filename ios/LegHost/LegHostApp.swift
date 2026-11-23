@@ -256,9 +256,8 @@ struct GuestHostScreen: View {
                 .accessibilityIdentifier(key.identifier)
             }
             #if DEBUG
-            // The guest TUI submits the composer with the send key, which the
-            // software keyboard cannot send. A fixture run offers it on the
-            // screen, so the test can drive one turn reproducibly.
+            // A fixture run offers the send key on the screen, so the test
+            // can drive one turn reproducibly.
             if controller.isFixtureRun {
                 Button {
                     controller.sendInput(GuestTerminalKey.submit)
@@ -283,7 +282,7 @@ struct GuestHostScreen: View {
     /// The label of the interrupt control.
     private static let interruptLabel = "ctrl-c"
     /// The label of the send control.
-    private static let submitLabel = "ctrl-s"
+    private static let submitLabel = "send"
 
     /// The keys the host offers, in the order they are shown.
     private static let controlKeys: [ControlKey] = [

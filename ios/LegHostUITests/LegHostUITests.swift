@@ -26,8 +26,10 @@ final class LegHostUITests: XCTestCase {
     ///
     /// The first request obtains the host approval token. The second redeems
     /// it with the same input and checks the complete deterministic result the
-    /// real iOS host returned. The final sleep keeps the terminal visible so
-    /// the test can read the guest's assertion.
+    /// real iOS host returned. The shell exits with success only after that
+    /// assertion; the test observes the exit status instead of repeatedly
+    /// snapshotting the live terminal, whose large accessibility tree can
+    /// wedge the simulator while the guest is running.
     private static let shortcutBridgeScript = [
         #"request='{"version":1,"request_id":"shortcut-e2e-approval","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}}}';"#,
         #"first=$(printf '%s\n' "$request" | /usr/local/bin/leg-bridge);"#,
@@ -35,8 +37,8 @@ final class LegHostUITests: XCTestCase {
         #"approved='{"version":1,"request_id":"shortcut-e2e-result","capability":"shortcuts.invoke","input":{"name":"LegHost bridge fixture","input":{"format":"json","value":"deterministic"}},"approval_token":"'"$token"'"}';"#,
         #"second=$(printf '%s\n' "$approved" | /usr/local/bin/leg-bridge);"#,
         #"if printf '%s\n' "$second" | grep -F '"status":"ok"' >/dev/null && printf '%s\n' "$second" | grep -F '"result":{"count":2,"ok":true,"source":"ios-shortcuts-fixture"}' >/dev/null; then"#,
-        #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; else"#,
-        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; fi; sleep 600"#,
+        #"printf '%s\n' 'SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture'; exit 0; else"#,
+        #"printf '%s\n' "SHORTCUT_E2E_MISMATCH $second"; exit 1; fi"#,
     ].joined(separator: " ")
 
     /// XCUITest forwards launch arguments through a shell-like boundary. The
@@ -221,7 +223,8 @@ final class LegHostUITests: XCTestCase {
     /// DEBUG-only fixture mode. The guest runs the shipped leg-bridge twice:
     /// once to obtain approval and once to redeem it. The shell assertion is
     /// made against the final bridge response, so the object must survive the
-    /// real host adapter, unified Unix listener, iSH socket shim, and guest binary.
+    /// real host adapter, unified Unix listener, iSH socket shim, and guest
+    /// binary. The shell's exit status reports whether that assertion passed.
     func testARealShortcutJSONResultCrossesTheHostAndGuestBoundary() {
         app.terminate()
         app.launchArguments = ["-leghost-reset"] + Self.launchArguments + [
@@ -234,13 +237,15 @@ final class LegHostUITests: XCTestCase {
 
         XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
                       "the guest terminal is missing")
-        let resultVisible = waitForTerminalText(
-            "SHORTCUT_E2E_RESULT status=ok count=2 ok=true source=ios-shortcuts-fixture",
-            timeout: startTimeout)
+        XCTAssertTrue(app.staticTexts["guest-exited"].waitForExistence(timeout: startTimeout),
+                      "the guest did not finish the Shortcut assertion")
+        let detail = app.staticTexts["guest-status-detail"]
         let state = fixtureStateLabel()
-        XCTAssertTrue(resultVisible,
-                      "the deterministic Shortcut object did not cross the host and guest boundary; "
-                        + "host state: \(state)")
+        XCTAssertEqual(detail.label, "The guest program exited.",
+                       "the guest Shortcut assertion failed; host state: \(state)")
+        XCTAssertTrue(state.contains("replies=2")
+                        && state.contains("reply_statuses=approval_required,ok"),
+                      "the host did not complete both Shortcut bridge exchanges; host state: \(state)")
     }
 
     /// The second launch verifies the root and reuses it instead of importing
@@ -930,63 +935,11 @@ final class LegHostFixtureUITests: XCTestCase {
         app.launch()
     }
 
-    /// Drives one turn in the guest program.
-    ///
-    /// The guest program opens the picker of the sessions when the catalog of
-    /// the guest holds a session, and it asks for a workspace when the run
-    /// starts without one. A new session is made in the picker, so the guest
-    /// asks for the workspace of that session. The guest program shows the
-    /// first-run warning then, unless a previous run already acknowledged it,
-    /// and it offers the composer after it. The test fills in the workspace,
-    /// acknowledges the warning and sends the prompt with the send control.
-    ///
-    /// The screen of the guest is read in one loop, so the terminal is read
-    /// once per round and not once per screen that is waited for: the
-    /// terminal of the guest holds a thousand elements, and reading them all
-    /// made the accessibility server of the simulator give up in the middle
-    /// of a long run.
-    ///
-    /// The screen of the session that came before is still on the terminal
-    /// when a session starts, so the loop waits for the screen the guest
-    /// opens with before it looks for the composer.
+    /// Drives one turn in the guest program: the composer is opened and primed
+    /// with the prompt (see `GuestScreen.openComposer`), then the prompt is
+    /// sent with the send control.
     private func driveOneTurn() {
-        let terminal = app.otherElements["guest-terminal"]
-        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
-
-        let deadline = Date().addingTimeInterval(180)
-        var created = false
-        var asked = false
-        var warned = false
-        var composer = false
-        while !composer && Date() < deadline {
-            let text = terminalText()
-            if !asked {
-                if !created && Self.shows("Enter reopen", in: text) {
-                    // A new session is made in the picker of the sessions,
-                    // and the guest asks for the workspace of that session.
-                    focusGuest()
-                    app.typeText("n")
-                    created = true
-                } else if Self.shows("Enter a path and press Enter to select it.", in: text) {
-                    focusGuest()
-                    app.typeText("/tmp")
-                    app.typeText("\n")
-                    asked = true
-                }
-            } else if !warned && Self.shows("Press Enter to acknowledge and open the composer.", in: text) {
-                focusGuest()
-                app.typeText("\n")
-                warned = true
-            } else if Self.shows("catalog: ", in: text) {
-                composer = true
-            }
-            if !composer { usleep(3_000_000) }
-        }
-        XCTAssertTrue(asked, "the guest program did not ask for a workspace")
-        XCTAssertTrue(composer, "the composer did not appear")
-
-        focusGuest()
-        app.typeText(prompt)
+        GuestScreen.openComposer(app, input: prompt)
         let submit = app.buttons["guest-key-submit"]
         XCTAssertTrue(submit.waitForExistence(timeout: 30), "the send control is missing")
         submit.tap()
@@ -1023,7 +976,7 @@ final class LegHostFixtureUITests: XCTestCase {
     private func waitForTerminalText(_ text: String, timeout: TimeInterval = 120) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if Self.shows(text, in: terminalText()) { return true }
+            if GuestScreen.shows(text, in: GuestScreen.text(app)) { return true }
             // The screen is read through the accessibility tree, and the tree
             // of a simulator is read one snapshot at a time. The wait is
             // polled every third second, so a long wait does not keep the
@@ -1067,33 +1020,9 @@ final class LegHostFixtureUITests: XCTestCase {
         return false
     }
 
-    /// The text of the guest terminal.
-    ///
-    /// The terminal is read as one snapshot of its own tree. The guest
-    /// program draws while the terminal is read, so the elements of the tree
-    /// are resolved one by one against a tree that changes under the reader,
-    /// and the read fails on a screen that moves. The snapshot of the
-    /// terminal holds the labels of the terminal as one string.
-    private func terminalText() -> String {
-        app.otherElements["guest-terminal"].debugDescription
-    }
-
     /// Whether the terminal shows `text` right now.
     private func terminalShows(_ text: String) -> Bool {
-        Self.shows(text, in: terminalText())
-    }
-
-    /// Whether `text` shows up in `screen`.
-    ///
-    /// The words of `text` have to show up in order, but not next to each
-    /// other: the terminal draws the words of a line as they are written.
-    private static func shows(_ text: String, in screen: String) -> Bool {
-        var rest = screen[...]
-        for word in text.split(separator: " ", omittingEmptySubsequences: true) {
-            guard let range = rest.range(of: word) else { return false }
-            rest = rest[range.upperBound...]
-        }
-        return true
+        GuestScreen.shows(text, in: GuestScreen.text(app))
     }
 }
 
@@ -1125,5 +1054,112 @@ enum GuestKeyboard {
     /// give up in the middle of a long run.
     private static func hasFocus(_ app: XCUIApplication) -> Bool {
         app.textFields["guest-input"].debugDescription.contains("Focused")
+    }
+}
+
+/// The screen of the guest program, read through the accessibility tree.
+enum GuestScreen {
+    /// The text of the guest terminal.
+    ///
+    /// The terminal is read as one snapshot of its own tree. The guest
+    /// program draws while the terminal is read, so the elements of the tree
+    /// are resolved one by one against a tree that changes under the reader,
+    /// and the read fails on a screen that moves. The snapshot of the
+    /// terminal holds the labels of the terminal as one string.
+    static func text(_ app: XCUIApplication) -> String {
+        app.otherElements["guest-terminal"].debugDescription
+    }
+
+    /// Whether `text` shows up in `screen`.
+    ///
+    /// The words of `text` have to show up in order, but not next to each
+    /// other: the terminal draws the words of a line as they are written.
+    static func shows(_ text: String, in screen: String) -> Bool {
+        var rest = screen[...]
+        for word in text.split(separator: " ", omittingEmptySubsequences: true) {
+            guard let range = rest.range(of: word) else { return false }
+            rest = rest[range.upperBound...]
+        }
+        return true
+    }
+
+    /// Opens the composer of the guest TUI.
+    ///
+    /// The guest program opens the picker of the sessions when the catalog of
+    /// the guest holds a session, and it asks for a workspace when the run
+    /// starts without one. A new session is made in the picker, so the guest
+    /// asks for the workspace of that session. The guest program shows the
+    /// first-run warning then, unless a previous run already acknowledged it,
+    /// and it offers the composer after it. The helper fills in the workspace,
+    /// acknowledges the warning, and verifies the caller's draft input.
+    ///
+    /// The screen of the guest is read in one loop, so the terminal is read
+    /// once per round and not once per screen that is waited for: the
+    /// terminal of the guest holds a thousand elements, and reading them all
+    /// made the accessibility server of the simulator give up in the middle
+    /// of a long run.
+    ///
+    /// The screen of the session that came before is still on the terminal
+    /// when a session starts, so the loop waits for the screen the guest
+    /// opens with before it looks for the composer.
+    static func openComposer(_ app: XCUIApplication, input: String) {
+        let terminal = app.otherElements["guest-terminal"]
+        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal is missing")
+
+        let deadline = Date().addingTimeInterval(180)
+        let pickerPrompt = "Enter reopen"
+        let workspacePrompt = "Enter a path and press Enter to select it."
+        let warningPrompt = "Press Enter to acknowledge and open the composer."
+        var created = false
+        var asked = false
+        var warningSubmitted = false
+        var onboardingReady = false
+        while !onboardingReady && Date() < deadline {
+            let screen = text(app)
+            if !asked {
+                if !created && shows(pickerPrompt, in: screen) {
+                    // A new session is made in the picker of the sessions,
+                    // and the guest asks for the workspace of that session.
+                    GuestKeyboard.focus(app)
+                    app.typeText("n")
+                    created = true
+                } else if shows(workspacePrompt, in: screen) {
+                    GuestKeyboard.focus(app)
+                    app.typeText("/tmp")
+                    app.typeText("\n")
+                    asked = true
+                }
+            } else if shows(warningPrompt, in: screen) {
+                if !warningSubmitted {
+                    GuestKeyboard.focus(app)
+                    app.typeText("\n")
+                    warningSubmitted = true
+                }
+            } else if !shows(pickerPrompt, in: screen) && !shows(workspacePrompt, in: screen) {
+                // The warning is a modal drawn over the conversation. Its
+                // background still contains the catalog header, so the
+                // header alone cannot prove that the composer is active.
+                onboardingReady = true
+            }
+            if !onboardingReady { usleep(3_000_000) }
+        }
+        XCTAssertTrue(asked, "the guest program did not ask for a workspace")
+        XCTAssertTrue(onboardingReady, "the guest onboarding did not finish")
+        guard asked && onboardingReady else { return }
+
+        // Prove that the hidden keyboard is attached to the live composer,
+        // rather than merely seeing the conversation header behind a modal.
+        GuestKeyboard.focus(app)
+        app.typeText(input)
+        var inputReachedDraft = false
+        let inputDeadline = Date().addingTimeInterval(30)
+        while Date() < inputDeadline {
+            if shows(input, in: text(app)) {
+                inputReachedDraft = true
+                break
+            }
+            usleep(1_000_000)
+        }
+        XCTAssertTrue(inputReachedDraft, "the composer did not accept draft input")
     }
 }

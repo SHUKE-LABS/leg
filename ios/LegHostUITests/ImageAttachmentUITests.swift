@@ -3,9 +3,10 @@ import XCTest
 /// Images picked on the host and handed to a running guest.
 ///
 /// The image sources are the DEBUG fixture: the simulator tests cannot drive
-/// the system pickers. The guest is a shell, which plays the receiver: the
-/// pinned guest bundle predates the `leg-tui` receiver, so the shell
-/// announces one and shows what the host wrote to the terminal.
+/// the system pickers. The handoff tests run a shell that plays the receiver,
+/// so a test can stage a stale or live marker and show what the host wrote to
+/// the terminal; the turn test runs the pinned `leg-tui` against the loopback
+/// fixture.
 final class ImageAttachmentUITests: XCTestCase {
     private let startTimeout: TimeInterval = 300
     private static let provider = ["-leghost-provider", "anthropic"]
@@ -89,6 +90,42 @@ final class ImageAttachmentUITests: XCTestCase {
         XCTAssertTrue(waitForOutput("COUNT=0"), "a refused image reached the guest")
     }
 
+    /// Text, an inserted image and text reach the provider as one turn.
+    ///
+    /// The pinned `leg-tui` receives the image into its draft, and the
+    /// loopback fixture accepts the one request only when its last message is
+    /// the text, an `image/png` block whose bytes are the fixture PNG, and
+    /// the text, in that order. The terminal shows the image as its
+    /// presentation only: no image bytes, no notice and no host path.
+    func testAnInsertedImageReachesTheProviderAsOneOrderedTurn() {
+        app.launchArguments = ["-leghost-fixture-reset", "-leghost-fixture", "image",
+                               "-leghost-image-fixture", "png"] + Self.provider
+        app.launch()
+        XCTAssertTrue(app.otherElements["guest-terminal"].waitForExistence(timeout: startTimeout),
+                      "the terminal is missing")
+        GuestScreen.openComposer(app, input: "IOS_IMAGE_BEFORE ")
+        XCTAssertTrue(waitForScreen("IOS_IMAGE_BEFORE"),
+                      "the text before the image is not in the draft")
+        app.buttons["attach-photos"].tap()
+        XCTAssertTrue(waitForState("attachments=1"), "the image was not staged")
+        app.buttons["attachment-insert"].firstMatch.tap()
+        XCTAssertTrue(waitForState("attachments=0,handoffs=1"), "leg-tui did not take the image")
+        XCTAssertTrue(waitForScreen("IOS_IMAGE_BEFORE [image 1]"), "the image is not in the draft")
+        GuestKeyboard.focus(app)
+        type(" IOS_IMAGE_AFTER")
+        app.buttons["guest-key-submit"].tap()
+
+        XCTAssertTrue(waitForState("requests=1,statuses=200,validation=ok,"),
+                      "the fixture did not accept one ordered text/image/text turn")
+        XCTAssertTrue(waitForScreen("IOS_IMAGE_BEFORE [image: image/png 70 B] IOS_IMAGE_AFTER"),
+                      "the transcript does not show the image presentation")
+        XCTAssertTrue(waitForScreen("IOS_FIXTURE_FINAL_RESPONSE"), "the answer is not in the terminal")
+        let screen = GuestScreen.text(app)
+        for leak in ["iVBORw0KGgo", "IHDR", "leghost-attachment", "Application Support", "CoreSimulator"] {
+            XCTAssertFalse(screen.contains(leak), "the terminal shows \(leak)")
+        }
+    }
+
     // MARK: Helpers
 
     private func launchShell(_ arguments: [String]) {
@@ -114,6 +151,17 @@ final class ImageAttachmentUITests: XCTestCase {
 
     private func waitForOutput(_ text: String, timeout: TimeInterval = 60) -> Bool {
         waitForText(text, timeout: timeout)
+    }
+
+    /// Waits for the guest terminal to show the words of `text` in order.
+    private func waitForScreen(_ text: String, timeout: TimeInterval = 120) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if GuestScreen.shows(text, in: GuestScreen.text(app)) { return true }
+            usleep(3_000_000)
+        }
+        report("no screen text \"\(text)\"")
+        return false
     }
 
     private func waitForState(_ text: String, timeout: TimeInterval = 120) -> Bool {

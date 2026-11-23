@@ -391,7 +391,7 @@ the `ios-mobile` bundle, which has no `leg-web`, and reads its pinned inputs
 from the app bundle, so the generic archive cannot be injected on the device.
 The same provisioner on the build host rejects the generic archive. Against the
 current pins it fails with `leg_guest_bundle has the digest 8709e97d…, expected
-83da3e66…`. Under `ios-mobile` pins carrying the generic digest it fails with
+0afc1d3e…`. Under `ios-mobile` pins carrying the generic digest it fails with
 `the guest bundle contains an unexpected file: leg-web`. The `generic-bundle`
 fixture in `ios/tests/guest_provision_test.c` asserts the same rejection.
 

@@ -288,19 +288,22 @@ keyboard as text.
   after its session ended is `session_ended`. The catalog cleanup removes the
   images of a deleted guest session.
 
-The pinned `v0.44.1` guest predates the receiver, so **Insert** reports
-`receiver_unavailable` until the pin moves
-([#319](https://github.com/SHUKE-LABS/leg/issues/319)). The state line shows
-`attachments=<n>` (images waiting) and `handoffs=<n>`.
+The pinned `v0.50.4` guest's `leg-tui` carries the receiver. The state line
+shows `attachments=<n>` (images waiting) and `handoffs=<n>`.
 `-leghost-image-fixture <scenario>` (Debug builds) replaces all three sources
 with `png`, `jpeg`, `mismatch`, `unsupported`, `oversized`, `cancel`,
-`denied`, `revoked`, or `unreadable`. `ImageAttachmentsTests` runs with the
-host tests; the UI tests and the device run:
+`denied`, `revoked`, or `unreadable`. `-leghost-fixture image` serves one
+turn that the loopback fixture accepts only as text, one `image/png` block
+of that fixture PNG (by SHA-256), and text, in that order, answered without
+a tool round. The pinned v0.50.4 `leg` sends exactly those three content
+blocks; `ImageAttachmentsTests` runs with the host tests; the UI tests and the
+device run:
 
 ```bash
 bash ios/tests/run-fixture-tests.sh
 bash ios/tests/run-fixture-tests.sh --class LegHostUITests/ImageAttachmentUITests \
-  testImagesFromEverySourceReachTheGuestAsOpaqueNotices testARejectedImageStagesNothing
+  testImagesFromEverySourceReachTheGuestAsOpaqueNotices testARejectedImageStagesNothing \
+  testAnInsertedImageReachesTheProviderAsOneOrderedTurn
 bash ios/tests/run-host-tests.sh
 xcodebuild test -project ios/LegHost.xcodeproj -scheme LegHost \
   -destination 'platform=iOS,id=<device-udid>' -derivedDataPath build/dd-device
@@ -322,7 +325,7 @@ downloads exactly those files.
 
 | Input | URL | SHA-256 |
 | --- | --- | --- |
-| leg ios-mobile bundle `v0.44.1` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.44.1/leg-0.44.1-i686-unknown-linux-musl-mobile.tar.gz` | `83da3e66693dc8a20b8d8d910e86ec694984ad35adffa24cd3d7476215509b52` |
+| leg ios-mobile bundle `v0.50.4` | `https://github.com/SHUKE-LABS/leg/releases/download/v0.50.4/leg-0.50.4-i686-unknown-linux-musl-mobile.tar.gz` | `0afc1d3e6d791e91e8852fa58639efbe13d09aa3141845ec088704415ccf7e3d` |
 | Alpine i386 root `3.20.3` | `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86/alpine-minirootfs-3.20.3-x86.tar.gz` | `4c7ba1c9e6642692dd5cb302e5e58943221901f2e15991af7d5cb4ded80dc7b9` |
 
 The guest bundle is the ios-mobile release asset, not the generic iSH bundle.
@@ -377,7 +380,7 @@ guest/model sees the registered name and bounded text/JSON input shape it
 requested, the approval review, and the structured Shortcut result or error.
 It never receives Shortcut source or an unregistered automation list.
 
-The pinned SHA-256 is the `SHA256SUMS` entry the `v0.44.1` release publishes
+The pinned SHA-256 is the `SHA256SUMS` entry the `v0.50.4` release publishes
 for the ios-mobile asset. The build and `ios/tests/run-pinned-inputs.sh` fail
 closed on an archive that does not match it.
 
@@ -579,8 +582,8 @@ process leaving the session running, `leg-bridge --help` running in the
 imported guest and exiting 0 while an unknown argument exits 2, and the
 second launch reusing the verified root instead of importing it again.
 `BridgeCapabilityUITests` sends a request from a guest shell to the listener
-(the pinned 0.44.1 `leg-bridge` predates the Photos and Files capabilities,
-so it uses `files.list` and expects `capability_unsupported` from the host),
+(it uses `files.list`, which the guest `leg-bridge` forwards and the host
+does not serve, and expects `capability_unsupported` from the host),
 checks `no_host_transport` without a listener, the listener's close after
 a failed start, that a start failing after the endpoint was made leaves no
 endpoint in the guest, that a socket the start did not make, at the endpoint
@@ -784,10 +787,8 @@ offers the composer. The simulator test
 1. types `/tmp` and presses Enter to select the workspace,
 2. presses Enter to acknowledge the first-run warning, when it is shown,
 3. types `IOS_FIXTURE_TURN`,
-4. presses the send control (`ctrl-s`) the host offers above the terminal.
-
-The send control is on the screen because the software keyboard cannot send
-the key the guest TUI submits the composer with.
+4. presses the send control (`send`, Enter) the host offers above the
+   terminal.
 
 The host names the two programs of the pinned bundle to the guest program
 (`--leg-bin` and `--supervisor-bin`). The guest program would otherwise find

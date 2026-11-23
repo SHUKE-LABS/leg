@@ -215,9 +215,9 @@ suite and on its own.
 
 The Photos and Files bridge has not been run on a physical device yet. The
 device run is pending in
-[#314](https://github.com/SHUKE-LABS/leg/issues/314): it needs a release
-whose pinned guest carries the bridge capabilities (the pinned `v0.44.1`
-`leg-bridge` predates them) and an operator at the phone. Until then the
+[#314](https://github.com/SHUKE-LABS/leg/issues/314): the pinned `v0.50.4`
+`leg-bridge` carries the bridge capabilities, and the run needs an operator
+at the phone. Until then the
 coverage is the simulator and the fixtures: `BridgeListenerTests`,
 `PhotosAdapterTests`, `FilesAdapterTests`, `GuestSkillInstallerTests`,
 `BridgeCapabilityUITests`, and `SkillRelaunchUITests`.
@@ -241,11 +241,12 @@ build:
 ## Image attachments on the device
 
 The image attachment path ([#291](https://github.com/SHUKE-LABS/leg/issues/291))
-has not been run on a physical device yet. The pinned `v0.44.1` guest has no
-receiver, so the device run waits for the re-pin in
-[#319](https://github.com/SHUKE-LABS/leg/issues/319). Until then the coverage
-is the simulator and the fixtures: `ImageAttachmentsTests` with the host
-tests, `ImageAttachmentUITests`, and the `leg-tui` receiver tests. The run
+has not been run on a physical device yet. The pinned `v0.50.4` guest
+carries the receiver ([#319](https://github.com/SHUKE-LABS/leg/issues/319)),
+and the run needs an operator at the phone. Until then the coverage is the
+simulator and the fixtures: `ImageAttachmentsTests` with the host tests,
+`ImageAttachmentUITests` (including one ordered text/image/text turn through
+the pinned `leg-tui`), and the `leg-tui` receiver tests. The run
 uses the device command of [The tests on the device](#the-tests-on-the-device)
 and records, for one build:
 

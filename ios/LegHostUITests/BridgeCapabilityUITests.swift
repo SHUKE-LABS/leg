@@ -2,10 +2,10 @@ import XCTest
 
 /// The capability bridge between the guest and the host, in a running guest.
 ///
-/// The pinned guest bundle carries a `leg-bridge` that predates the Photos
-/// and Files capabilities, so the exchange uses `files.list`, which the
-/// listener does not serve: the reply proves that a real guest `connect()`
-/// reached the listener of this generation and that the listener answered.
+/// The exchange uses `files.list`, which the guest `leg-bridge` forwards and
+/// the listener does not serve: the reply proves that a real guest
+/// `connect()` reached the listener of this generation and that the listener
+/// answered.
 final class BridgeCapabilityUITests: XCTestCase {
     private let startTimeout: TimeInterval = 300
     private static let provider = ["-leghost-provider", "anthropic"]

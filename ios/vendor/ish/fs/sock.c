@@ -695,28 +695,52 @@ int_t sys_shutdown(fd_t sock_fd, dword_t how) {
 
 #define DEFAULT_TCP_CONGESTION "cubic"
 
-// The guest's timeval has two 32-bit fields, while the host's has 64-bit
-// fields on a 64-bit host. The kernel checks the length of the value it is
-// given, so the timeout options have to be translated in both directions.
+// The guest has two timeval layouts: the legacy i386 layout has two 32-bit
+// fields, while musl 1.2's time64 ABI has two 64-bit fields. The host's
+// timeval can also have 64-bit fields, and the kernel checks the length of the
+// value it is given, so the timeout options have to be translated in both
+// directions without assuming which guest layout the binary uses.
+struct timeval64_ {
+    sqword_t sec;
+    sqword_t usec;
+};
+
 static int sock_timeout_to_host(const char *value, uint_t value_len, struct timeval *host_value) {
-    if (value_len != sizeof(struct timeval_))
-        return _EINVAL;
-    struct timeval_ guest_value;
-    memcpy(&guest_value, value, sizeof(guest_value));
-    host_value->tv_sec = guest_value.sec;
-    host_value->tv_usec = guest_value.usec;
-    return 0;
+    if (value_len == sizeof(struct timeval_)) {
+        struct timeval_ guest_value;
+        memcpy(&guest_value, value, sizeof(guest_value));
+        host_value->tv_sec = guest_value.sec;
+        host_value->tv_usec = guest_value.usec;
+        return 0;
+    }
+    if (value_len == sizeof(struct timeval64_)) {
+        struct timeval64_ guest_value;
+        memcpy(&guest_value, value, sizeof(guest_value));
+        host_value->tv_sec = guest_value.sec;
+        host_value->tv_usec = guest_value.usec;
+        return 0;
+    }
+    return _EINVAL;
 }
 
 static int sock_timeout_from_host(const struct timeval *host_value, char *value, uint_t value_len) {
-    if (value_len < sizeof(struct timeval_))
-        return _EINVAL;
-    struct timeval_ guest_value = {
-        .sec = host_value->tv_sec,
-        .usec = host_value->tv_usec,
-    };
-    memcpy(value, &guest_value, sizeof(guest_value));
-    return 0;
+    if (value_len >= sizeof(struct timeval64_)) {
+        struct timeval64_ guest_value = {
+            .sec = host_value->tv_sec,
+            .usec = host_value->tv_usec,
+        };
+        memcpy(value, &guest_value, sizeof(guest_value));
+        return sizeof(guest_value);
+    }
+    if (value_len >= sizeof(struct timeval_)) {
+        struct timeval_ guest_value = {
+            .sec = host_value->tv_sec,
+            .usec = host_value->tv_usec,
+        };
+        memcpy(value, &guest_value, sizeof(guest_value));
+        return sizeof(guest_value);
+    }
+    return _EINVAL;
 }
 
 int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len) {
@@ -880,10 +904,10 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
             socklen_t host_value_len = sizeof(host_value);
             if (getsockopt(sock->real_fd, real_level, real_opt, &host_value, &host_value_len) < 0)
                 return errno_map();
-            int err = sock_timeout_from_host(&host_value, value, value_len);
-            if (err < 0)
-                return err;
-            value_len = sizeof(struct timeval_);
+            int encoded_len = sock_timeout_from_host(&host_value, value, value_len);
+            if (encoded_len < 0)
+                return encoded_len;
+            value_len = encoded_len;
         } else {
             int err = getsockopt(sock->real_fd, real_level, real_opt, value, &value_len);
             if (err < 0)
